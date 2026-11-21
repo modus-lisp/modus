@@ -16,8 +16,10 @@
   "Initialize the symbol-function table.
    Keyed by name-string, so :TEST 'EQUAL is mandatory."
   (setq *symbol-function-table* (make-hash-table :test 'equal))
-  ;; its pairs are cached by the JIT bridge and the interpreter (see REMHASH)
-  (setq *%ht-pinned-pairs* (cons *symbol-function-table* *%ht-pinned-pairs*)))
+  ;; its pairs are cached by the JIT bridge and the interpreter: they are made
+  ;; on demand (prelude.lisp *%HT-PAIR-SIDES*), so the table is a compact dict,
+  ;; not pinned to an alist and buckets
+  t)
 
 ;;; Parallel hash → function table, keyed by the 60-bit FNV-1a hash that
 ;;; native MVM symbols carry in slot 0. ANSI (funcall 'sym ...) / (apply
@@ -51,7 +53,35 @@
                  (cdr pair)))
       (setq cur (cdr cur)))))
 
+(defvar *native-sym-cache* nil
+  "%NATIVE-SYM-RESOLVE's answers, a 256-slot vector of (SYM . FN) by the
+   symbol's name hash, or NIL.  Any redefinition drops the whole vector
+   (%JIT-FNADDR-THUNK-INVALIDATE, which every DEFUN, (SETF FDEFINITION),
+   FMAKUNBOUND and runtime alias calls before it writes a table).  One cons
+   a slot, so a reader on another thread sees a whole entry or none.")
+
 (defun %native-sym-resolve (sym)
+  "%NATIVE-SYM-RESOLVE-1 through *NATIVE-SYM-CACHE*: (funcall 'f ...) and
+   (apply 'f ...) re-ran it on every call -- two hash lookups and the
+   symbol's package-qualified name, ~220 ns against 4 for #'F.  Filled on
+   the main thread only: a worker's cons lives in its own region."
+  (let* ((c *native-sym-cache*)
+         (h (aref sym 0))
+         (i (and (integerp h) (logand h 255)))
+         (e (and c i (svref c i))))
+    (if (and (consp e) (eq (car e) sym))
+        (cdr e)
+        (let ((fn (%native-sym-resolve-1 sym)))
+          ;; a direct call: (funcall '%mvm-on-main-thread-p) would come back
+          ;; here, and recurse until the stack ran out
+          (when (and i (functionp fn) (%mvm-on-main-thread-p))
+            (unless c
+              (setq c (make-array 256 :initial-element nil))
+              (setq *native-sym-cache* c))
+            (setf (svref c i) (cons sym fn)))
+          fn))))
+
+(defun %native-sym-resolve-1 (sym)
   "Given a symbol (native MVM or CL — both have hash at slot 0), return
    its function value.  On miss, returns SYM itself so the caller's
    downstream dispatch falls through to direct-call (= same path that
@@ -82,7 +112,7 @@
                            ;; CAR's home, read off a literal: FIND-PACKAGE per
                            ;; call cost more than the name lookup it saves.
                            (eq (%cl-sym-package sym) (%cl-sym-package 'car)))
-                       (%fn-entry (gethash (aref sym 0) *native-sym-function-table*))))
+                       (%fn-entry (gethash (%word-aref sym 0) *native-sym-function-table*))))
          (nh (and (not by-hash) (%sym-name-or-hash sym)))
          (fn (or by-hash
                  (and nh
@@ -90,7 +120,7 @@
                       *symbol-function-table*
                       (%fn-entry (gethash (car nh) *symbol-function-table*)))
                  (and *native-sym-function-table*
-                      (%fn-entry (gethash (aref sym 0) *native-sym-function-table*))))))
+                      (%fn-entry (gethash (%word-aref sym 0) *native-sym-function-table*))))))
     ;; Still nothing: SYMBOL-FUNCTION's full lookup, which signals
     ;; UNDEFINED-FUNCTION when there is none.  Returning SYM here made
     ;; (funcall 'undefined ...) call the symbol itself and fault -- a
@@ -137,13 +167,42 @@
               (%kernel-package-name-p pn))
        t))
 
+(defvar *kernel-home-pkg-memo* nil
+  "((PACKAGE NAME . ANSWER) ...): %KERNEL-HOME-PKG-P's answers.")
+
+(defun %kernel-home-pkg-p (pkg)
+  "%KERNEL-HOME-PKG-NAME-P of PKG's name, remembered per package object: an
+   EQ walk of a short list (first asked, first found), where the name test is
+   a STRING= against every kernel package's name.  The entry keeps the name's
+   string, so a renamed package is asked again.  Every BOUNDP, every special
+   or function name a runtime compile resolves, asks this; with the string
+   tests BOUNDP alone was 9% of a REPL DEFUN (call-stack samples on a 68000).
+   Filled by the main thread only, as *RUNTIME-BORN-ANSWERS*."
+  (and pkg (%pkg-p pkg)
+       (let ((pn (%pkg-name pkg)) (cur *kernel-home-pkg-memo*) (tail nil))
+         (loop
+           (when (null cur)
+             (let ((ans (%kernel-home-pkg-name-p pn)))
+               (when (modus-int::%mvm-on-main-thread-p)
+                 (let ((cell (cons (cons pkg (cons pn ans)) nil)))
+                   (if tail (rplacd tail cell) (setq *kernel-home-pkg-memo* cell))))
+               (return ans)))
+           (let ((e (car cur)))
+             (when (and (eq (car e) pkg) (eq (car (cdr e)) pn))
+               (return (cdr (cdr e)))))
+           (setq tail cur)
+           (setq cur (cdr cur))))))
+
 (defun %kernel-shadow-key (pkg nm)
   "\"PKG::NM\" when a symbol of PKG named NM must not share the kernel's
    function cell: PKG is not a kernel package and NM is a kernel function's
-   name.  NIL otherwise (the bare key is right)."
+   name.  NIL otherwise (the bare key is right).  The package is asked first:
+   it is an EQ test, the name a string hash -- and on a Mac a read of the cold
+   functions on disk -- that a COMMON-LISP symbol never needs."
   (let ((pn (and pkg (%pkg-name pkg))))
-    (and pn *kernel-fn-names* (gethash nm *kernel-fn-names*)
-         (not (%kernel-home-pkg-name-p pn))
+    (and pn *kernel-fn-names*
+         (not (%kernel-home-pkg-p pkg))
+         (gethash nm *kernel-fn-names*)
          (concatenate 'string pn "::" nm))))
 
 (defun %sym-name-or-hash (sym)
@@ -435,8 +494,10 @@
         (let ((mkey (%macro-sym-key sym)))
           (when mkey
             (%macro-pkg-rem sym mkey)
-            (%mexp-memo-invalidate)
-            (remhash mkey *macro-function-table*))))))
+            ;; only when there was a macro to forget (%MACRO-PKG-REM-1)
+            (when (gethash mkey *macro-function-table*)
+              (%mexp-memo-invalidate)
+              (remhash mkey *macro-function-table*)))))))
   sym)
 
 (defun fdefinition (sym)
@@ -754,14 +815,19 @@
     r))
 
 (defun %macro-pkg-rem-1 (sym key)
-  (%mexp-memo-invalidate)
-  (let ((pn (%macro-sym-pkg-name sym)))
+  "T when there was an expander to drop.  The expansion memos are dropped only
+   then: FMAKUNBOUND runs at every runtime DEFUN, and dropping the not-a-macro
+   set each time made every EVAL search every operator's expander again."
+  (let ((pn (%macro-sym-pkg-name sym)) (removed nil))
     (when (and pn *macro-pkg-table* (stringp key))
       (let ((al (gethash key *macro-pkg-table*))
             (new nil))
         (dolist (e al)
-          (unless (string= (car e) pn) (setq new (cons e new))))
-        (puthash key *macro-pkg-table* new)))))
+          (if (string= (car e) pn) (setq removed t) (setq new (cons e new))))
+        (when removed
+          (%mexp-memo-invalidate)
+          (puthash key *macro-pkg-table* new))))
+    removed))
 
 ;;; CLHS §3.1.2.1.2.2: a macro function takes 2 args (form, environment).
 ;;; Modus expanders use 1-arg `(lambda (form) ...)` internally, so the
@@ -834,6 +900,21 @@
       ((= nargs 2)
        (%call-interp-closure closure (cdr form)))
       (t (%signal-program-error)))))
+
+(defun %argfn-macro-shim (form &rest extra)
+  "A DEFMACRO's expander when its lambda list is an ordinary one (the
+   compiler's DEFMACRO, %MAKE-ARGFN-EXPANDER): the macro's own function,
+   applied to the call's arguments -- (CDR FORM).  Its arity check is the
+   function's own, so a call with the wrong number of arguments signals."
+  (declare (ignore extra))
+  (let ((fn (car (%get-cenv))))
+    (apply fn (cdr form))))
+
+(defun %make-argfn-expander (fn)
+  "The expander for macro function FN (see %ARGFN-MACRO-SHIM).  Its
+   environment says :%ARGFN, so %EXPANDER-HAS-ENV-P does not take FN for a
+   lexical environment the expansion could depend on."
+  (%make-closure #'%argfn-macro-shim (cons fn :%argfn)))
 
 (defun %compiler-macro-shim (&rest args)
   "Wrapper MACRO-FUNCTION returns for macros the Modus compiler
@@ -930,7 +1011,9 @@
                      "LDB" "MAPHASH" "MAKE-INSTANCE" "GET-SETF-EXPANSION"
                      ;; upstream MACRO-FUNCTION.5
                      "1+" "1-" "CHAR/=" "CHAR<" "CHAR<=" "CHAR=" "CHAR>"
-                     "CHAR>=" "FLOOR"))
+                     "CHAR>=" "FLOOR"
+                     ;; inlined two-argument form (compiler.lisp "RPLACA")
+                     "RPLACA" "RPLACD"))
           (puthash (compute-name-hash n) ht t))
         (setq *%std-fn-not-macro-hashes* ht)
         ht)))
@@ -954,7 +1037,7 @@
        (let ((h (%macro-key-name-hash key)))
          (and (> h 0)
               (not (gethash h (%std-fn-not-macro-set)))
-              (gethash h *macro-table*)))))
+              (%macro-table-ref h)))))
 
 (defun %raw-macro-expander (sym)
   "Internal-only: return the raw expander stored for SYM, or NIL.
@@ -1660,7 +1743,8 @@
 (defun %gv-site-cell (hash site)
   "The globals cell for HASH through SITE, a per-site cons in runtime-compiled
    code (CAR = the cell once found, else NIL), or NIL when HASH has no cell
-   yet.  Unarmed callers only; filled on the main thread only.  Cells are never
+   yet.  Shallow-binding callers only (unarmed, or the armed main thread:
+   see %DYNBIND); filled on the main thread only.  Cells are never
    replaced, so a found one stays the live cell."
   (let ((c (car site)))
     (if (and (consp c) (eq (car c) hash))
@@ -1676,7 +1760,9 @@
    when the read was compiled (a DEFVAR without a value, or a variable defined
    later): through SITE's memoised cell once it exists, instead of a table
    probe per read (cl-bench STAK)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if (and c (not (eq (cdr c) (%word->val #x0BADB0B5))))
             (cdr c)
@@ -1700,20 +1786,26 @@
 (defun %gv-site-ref (hash site)
   "The LET-special save (%GV-SAVE semantics: the unbound marker when unbound)
    through SITE."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site))) (if c (cdr c) (%word->val #x0BADB0B5)))
       (%gv-save hash)))
 
 (defun %dynbind-site (hash val site)
   "%DYNBIND through SITE: unarmed with a cell, store in place."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if c (progn (set-cdr c val) val) (%dynbind hash val)))
       (%dynbind hash val)))
 
 (defun %dynunbind-site (hash saved site)
   "%DYNUNBIND through SITE."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if c (progn (set-cdr c saved) saved) (%dynunbind hash saved)))
       (%dynunbind hash saved)))
@@ -1942,8 +2034,82 @@
    closures) and for DEFTYPE expansion in typep/subtypep (%expand-deftype).
    Those callers evaluate a lambda body against a runtime env-alist, which
    mvm-eval (a top-level-form compiler) does not provide — so %eval-in-env is
-   kept as SHARED infrastructure, not a rollback lever."
-  (mvm-eval form))
+   kept as SHARED infrastructure, not a rollback lever.
+
+   A form that needs no compiler is APPLIED instead (%EVAL-SIMPLE-P): a call
+   of a global function whose arguments are themselves such forms.  The
+   compiler is one for every architecture; it need not run for (+ 1 2) --
+   on a Mac Classic that compile was the whole of a REPL form's 13 s.
+   NOT while a fasl record is being made (*FASL-SLOT*: COMPILE-FILE, the load
+   cache): the record is the form's compiled module, and a form applied
+   without one is replayed from its source -- a toplevel (EVAL-WHEN (:EXECUTE)
+   ...), which COMPILE-FILE turns into NIL, then ran its body at LOAD
+   (ansi-test EVAL-WHEN.1)."
+  (if (and (null *fasl-slot*) (%eval-simple-p form 0))
+      (%eval-simple form)
+      (mvm-eval form)))
+
+(defun %simple-op-p (op)
+  "OP names a global FUNCTION: not a special operator, not a macro, FBOUNDP.
+   Answered once per symbol until a macro table changes (*%SIMPLE-OPS*,
+   dropped by %MEXP-MEMO-INVALIDATE): the questions are lookups by name, and
+   asked of every (EVAL '(F ...)) they were most of the cost of one (qemu-m68k
+   profile; MACRO-FUNCTION alone, which builds the user-facing wrapper closure
+   just to say yes or no, was 17%).  A function that becomes unbound since is
+   still caught: %EVAL-SIMPLE's FDEFINITION signals, as a compiled call would."
+  (let* ((h (modus-int::normalize-name op))
+         (tb *%simple-ops*))
+    (if (and tb (member op (gethash h tb) :test #'eq))
+        t
+        (when (and (not (special-operator-p op))
+                   (not (%raw-macro-expander op))
+                   (not (and *%extra-macro-names*
+                             (gethash h *%extra-macro-names*)))
+                   (fboundp op))
+          (let ((tb (or *%simple-ops* (setq *%simple-ops* (make-hash-table :test 'eql)))))
+            (setf (gethash h tb) (cons op (gethash h tb))))
+          t))))
+
+(defun %eval-simple-p (form depth)
+  "Can FORM be evaluated without compiling it, in the null lexical
+   environment?  A self-evaluating atom; T, NIL or a keyword; a bound global
+   variable that is not a symbol macro; (QUOTE x); or a call of a global
+   FUNCTION -- not a special operator, not a macro -- on a proper list of such
+   forms, nested at most 8 deep.  Anything else is the compiler's."
+  (cond
+    ((consp form)
+     (let ((op (car form)))
+       (and (< depth 8) op (symbolp op)
+            (if (eq op 'quote)
+                (and (consp (cdr form)) (null (cdr (cdr form))))
+                (and (%simple-op-p op)
+                     (let ((a (cdr form)) (ok t))
+                       (loop
+                         (when (or (not ok) (null a)) (return ok))
+                         (if (and (consp a) (%eval-simple-p (car a) (+ depth 1)))
+                             (setq a (cdr a))
+                             (setq ok nil)))))))))
+    ((symbolp form)
+     (or (null form) (eq form t) (keywordp form)
+         (and (boundp form) (not (nth-value 1 (macroexpand-1 form))))))
+    (t t)))
+
+(defun %eval-simple (form)
+  "Evaluate FORM, which %EVAL-SIMPLE-P accepted: arguments left to right, then
+   APPLY of the function -- every value it returns."
+  (cond
+    ((consp form)
+     (if (eq (car form) 'quote)
+         (car (cdr form))
+         (let ((args nil) (a (cdr form)))
+           (loop
+             (when (null a) (return nil))
+             (setq args (cons (%eval-simple (car a)) args))
+             (setq a (cdr a)))
+           (apply (fdefinition (car form)) (nreverse args)))))
+    ((symbolp form)
+     (if (or (null form) (eq form t) (keywordp form)) form (symbol-value form)))
+    (t form)))
 
 ;;; ============================================================
 ;;; Compile: return proper 3 values
@@ -2023,7 +2189,7 @@
        ;; translates the pending ones (F among them) -- a module that cannot be
        ;; translated stays interpreted and still works.
        (when (and (null def) (fboundp '%jit-eager-all))
-         (ignore-errors (funcall (symbol-function '%jit-eager-all))))
+         (ignore-errors (funcall (symbol-function '%jit-eager-all) name)))
        (values name nil nil)))))
 
 
@@ -2700,80 +2866,114 @@
     (if (= code 10) t (and (>= code 32) (<= code 126)))))
 (defun digit-char (weight &optional (radix 10))
   (if (< weight radix) (code-char (if (< weight 10) (+ 48 weight) (+ 55 weight))) nil))
+;;; CHARACTER NAMES, as SBCL spells and reads them.
+;;;
+;;; Every image knows: the control characters' names (CHAR-NAME of 0..32 and 127..159, which
+;;; the printer uses too), SBCL's short aliases (Lf, Nl, Ff, Sp, Del, ^A ...), the code-point
+;;; forms U+XXXX and UXXXX, and a few Unicode names portable code reads.  Every other Unicode
+;;; name -- LATIN_SMALL_LETTER_A, LOWER_ONE_EIGHTH_BLOCK, HANGUL_SYLLABLE_GA, the Unicode 1.0
+;;; aliases like LINE_FEED_(LF) -- comes from the table (mvm/cl-unicode-names.lisp, generated
+;;; at build time from the build host's CHAR-NAME), which hosted images carry and bare-metal
+;;; images leave out (MODUS_UNICODE_NAMES).  %UCN-PRESENT-P says which this image is.
+
+(defun %base-name-char-code (s)
+  "SBCL's names and aliases for the ASCII control characters (S upcased), or NIL."
+  (cond
+    ((and (= (length s) 2) (char= (char s 0) #\^)
+          (>= (char-code (char s 1)) 64) (<= (char-code (char s 1)) 95))
+     (- (char-code (char s 1)) 64))
+    ((member s '("NUL" "NULL") :test #'string=) 0)
+    ((member s '("BACKSPACE" "BS") :test #'string=) 8)
+    ((member s '("TAB" "HT") :test #'string=) 9)
+    ((member s '("NEWLINE" "LINEFEED" "LF" "NL") :test #'string=) 10)
+    ((member s '("PAGE" "FORM" "FORMFEED" "FF" "NP") :test #'string=) 12)
+    ((member s '("RETURN" "CR") :test #'string=) 13)
+    ((member s '("ESC" "ESCAPE" "ALTMODE" "ALT") :test #'string=) 27)
+    ((member s '("SPACE" "SP") :test #'string=) 32)
+    ((member s '("RUBOUT" "DELETE" "DEL") :test #'string=) 127)
+    (t nil)))
+
+(defun %u-hex-name-code (s)
+  "#\\U+FEFF and #\\UFEFF: SBCL reads a character by its code point either way (S upcased)."
+  (let ((n (length s)))
+    (when (and (> n 1) (char= (char s 0) #\U))
+      (let ((i (if (char= (char s 1) #\+) 2 1)) (v 0))
+        (when (< i n)
+          (loop
+            (when (= i n) (return v))
+            (let ((d (digit-char-p (char s i) 16)))
+              (unless d (return nil))
+              (setq v (+ (* v 16) d))
+              (when (>= v #x110000) (return nil)))
+            (setq i (+ i 1))))))))
+
+(defun %fallback-unicode-name-code (s)
+  "Without the table: the Unicode names portable code is known to read (weft, shuttle), as
+   SBCL resolves them.  Any other Unicode name is a loud reader error, never a guess."
+  (cond
+    ((string= s "NO-BREAK_SPACE") #xA0)
+    ((string= s "REPLACEMENT_CHARACTER") #xFFFD)
+    ((string= s "LINE_SEPARATOR") #x2028)
+    ((string= s "PARAGRAPH_SEPARATOR") #x2029)
+    ((string= s "ZERO_WIDTH_NO-BREAK_SPACE") #xFEFF)
+    (t nil)))
+
 (defun name-char (name)
   "Return the character with the given name (case-insensitive), or nil."
-  (let ((s (string-upcase (cond
-                            ((stringp name) name)
-                            ((symbolp name) (symbol-name name))
-                            ((characterp name) (make-string 1 :initial-element name))
-                            (t (coerce name 'string))))))
-    (cond
-      ((string= s "SPACE")     #\Space)
-      ((string= s "NEWLINE")   #\Newline)
-      ((string= s "TAB")       #\Tab)
-      ((string= s "RETURN")    (code-char 13))
-      ((string= s "BACKSPACE") (code-char 8))
-      ((string= s "RUBOUT")    (code-char 127))
-      ((string= s "PAGE")      (code-char 12))
-      ((string= s "LINEFEED")  (code-char 10))
-      ((string= s "ALTMODE")   (code-char 27))
-      ((string= s "BEL")       (code-char 7))
-      ((string= s "BELL")      (code-char 7))
-      ((string= s "NULL")      (code-char 0))
-      ((string= s "NUL")       (code-char 0))
-      ((string= s "ESCAPE")    (code-char 27))
-      ((string= s "DELETE")    (code-char 127))
-      ;; SBCL's names that portable-ish code uses (weft, the browser engine, reads all three):
-      ;; FormFeed as SBCL spells Page, and two Unicode names
-      ((string= s "FORMFEED")  (code-char 12))
-      ((string= s "NO-BREAK_SPACE") (code-char #xA0))
-      ((string= s "REPLACEMENT_CHARACTER") (code-char #xFFFD))
-      ((string= s "LINE_SEPARATOR") (code-char #x2028))
-      ((string= s "PARAGRAPH_SEPARATOR") (code-char #x2029))
-      ((string= s "ZERO_WIDTH_NO-BREAK_SPACE") (code-char #xFEFF))
-      ((string= s "VT")        (code-char 11))
-      ;; #\U+FEFF: SBCL's name for a character by its code point (shuttle's JavaScript whitespace)
-      ((and (> (length s) 2) (char= (char s 0) #\U) (char= (char s 1) #\+)
-            (let ((n (parse-integer s :start 2 :radix 16 :junk-allowed t)))
-              (and n (< n #x110000) (code-char n)))))
-      ;; every name CHAR-NAME gives
-      (t (let ((i 0) (hit nil))
-           (loop
-             (when (or hit (>= i 160)) (return hit))
-             (let ((n (%code-char-name i)))
-               (when (and n (string-equal n s)) (setq hit (code-char i))))
-             (setq i (+ i 1))))))))
+  (let* ((s (string-upcase (cond
+                             ((stringp name) name)
+                             ((symbolp name) (symbol-name name))
+                             ((characterp name) (make-string 1 :initial-element name))
+                             (t (coerce name 'string)))))
+         (code (or (%base-name-char-code s)
+                   (%u-hex-name-code s)
+                   ;; every name CHAR-NAME gives for 0..32 and 127..159 (Soh, Next-Line ...)
+                   (let ((i 0) (hit nil))
+                     (loop
+                       (when (or hit (>= i 160)) (return hit))
+                       (let ((n (%code-char-name i)))
+                         (when (and n (string-equal n s)) (setq hit i)))
+                       (setq i (+ i 1))))
+                   (if (%ucn-present-p)
+                       (%ucn-name-char s)
+                       (%fallback-unicode-name-code s)))))
+    (if code (code-char code) nil)))
 
 (defun %code-char-name (code)
-  "The name of the character with CODE, or NIL.  Every non-graphic
-   character has one (CLHS 13.1.7; FORMAT.C.4A needs ~:C = CHAR-NAME for
-   each): the control characters get their ASCII mnemonics as SBCL spells
-   them, and 128..159 are U80..U9F."
+  "The name of the character with CODE when it is not graphic (0..32 and 127..159), as SBCL
+   spells it, or NIL.  Every non-graphic character has one (CLHS 13.1.7; FORMAT.C.4A needs
+   ~:C = CHAR-NAME for each); the printer writes #\\ with these.  The graphic characters'
+   names (LATIN_SMALL_LETTER_A ...) are CHAR-NAME's, from the Unicode table."
   (cond
-    ((= code 32)  "Space")
-    ((= code 10)  "Newline")
-    ((= code 9)   "Tab")
-    ((= code 13)  "Return")
-    ((= code 8)   "Backspace")
-    ((= code 127) "Rubout")
-    ((= code 12)  "Page")
-    ((= code 27)  "Escape")
-    ((= code 7)   "Bel")
-    ((= code 0)   "Null")
     ((< code 32)
-     (nth code '("Null" "Soh" "Stx" "Etx" "Eot" "Enq" "Ack" "Bel" "Backspace"
+     (nth code '("Nul" "Soh" "Stx" "Etx" "Eot" "Enq" "Ack" "Bel" "Backspace"
                  "Tab" "Newline" "Vt" "Page" "Return" "So" "Si" "Dle" "Dc1"
-                 "Dc2" "Dc3" "Dc4" "Nak" "Syn" "Etb" "Can" "Em" "Sub" "Escape"
+                 "Dc2" "Dc3" "Dc4" "Nak" "Syn" "Etb" "Can" "Em" "Sub" "Esc"
                  "Fs" "Gs" "Rs" "Us")))
+    ((= code 32)  "Space")
+    ((= code 127) "Rubout")
     ((and (>= code 128) (< code 160))
-     (concatenate 'string "U" (string-upcase (write-to-string code :base 16 :radix nil))))
+     (nth (- code 128)
+          '("U80" "U81" "Break-Permitted" "No-Break-Permitted" "U84" "Next-Line"
+            "Start-Selected-Area" "End-Selected-Area" "Character-Tabulation-Set"
+            "Character-Tabulation-With-Justification" "Line-Tabulation-Set"
+            "Partial-Line-Forward" "Partial-Line-Backward" "Reverse-Linefeed"
+            "Single-Shift-Two" "Single-Shift-Three" "Device-Control-String"
+            "Private-Use-One" "Private-Use-Two" "Set-Transmit-State" "Cancel-Character"
+            "Message-Waiting" "Start-Guarded-Area" "End-Guarded-Area" "Start-String" "U99"
+            "Single-Character-Introducer" "Control-Sequence-Introducer" "String-Terminator"
+            "Operating-System-Command" "Privacy-Message" "Application-Program-Command")))
     (t nil)))
 
 (defun char-name (c)
   "Return the name of the character, or nil.  Signals TYPE-ERROR on
-   non-character per CLHS — required by char-name.5 (char-type-error-check)."
+   non-character per CLHS — required by char-name.5 (char-type-error-check).
+   With the Unicode table, every character has SBCL's name (U<hex> when Unicode gives none);
+   without it, only the non-graphic ones do."
   (unless (characterp c) (%signal-type-error))
-  (%code-char-name (%ensure-char-code c)))
+  (let ((code (%ensure-char-code c)))
+    (or (%code-char-name code)
+        (if (%ucn-present-p) (%ucn-char-name code) nil))))
 
 ;; Char comparisons are variadic per CLHS — single-arg returns T,
 ;; multi-arg checks pairwise.  Tests like (CHAR= (progn (incf i) #\a))
@@ -3316,7 +3516,13 @@
                ;; -> bignum-sub -> bignum-add -> here again = infinite
                ;; recursion / stack-overflow SIGSEGV.  logior mnf sign-extends
                ;; bit 62+ and is a raw :or on the tagged fixnum words.
-               (logior lo +fixnum-neg-limit+)
+               ;; ...except that +FIXNUM-NEG-LIMIT+ is -2^62, i.e. MNF, i.e. a
+               ;; BIGNUM literal: the "raw :or" was a tag-check miss into
+               ;; GENERIC-LOGIOR every time, and once that grew a two-limb
+               ;; fast path (%GENERIC-BITWISE) it normalized its result HERE
+               ;; -- unbounded recursion.  lo - max - 1 is two raw fixnum
+               ;; subtractions, each in range for lo in [1, max].
+               (%fixnum-- (%fixnum-- lo +fixnum-max+) 1)
                b))))))
 
 ;;; --- Magnitude arithmetic on LSB-first limb lists ---
@@ -4329,6 +4535,9 @@
     ;; the result; NIL means it would overflow and falls through.)
     ((and (> count 0) (not (bignump n)) (< count +fixnum-bits+)
           (%fixnum-shl-or-nil n count)))
+    ;; Two limbs in, two limbs out: limb arithmetic (see %TWO-LIMB-SHL).
+    ((and (> count 0) (< count +limb-bits+) (%two-limb-int-p n)
+          (%two-limb-shl n count)))
     ((> count 0)
      ;; Left shift: route the full sign+limbs through the limb machinery so
      ;; the result promotes to fixnum / small / big bignum correctly via
@@ -4356,6 +4565,7 @@
          ;; shift arithmetic is fixnum-only
          ((or (bignump k) (>= k (+ (%bignum-integer-length-pos (%int-abs n)) 1)))
           (if (%int-neg-p n) -1 0))
+         ((not (big-bignum-p n)) (%two-limb-sar n k))
          (t (%int-shr-floor n k)))))))
 (defun %fixnum-to-bignum-parts (n)
   "Convert fixnum N to (lo . hi) bignum parts."
@@ -4375,16 +4585,16 @@
     ((or (and (bignump a) (big-bignum-p a))
          (and (bignump b) (big-bignum-p b)))
      (%bignum-add-general a b))
-    ;; Original 2-slot fast path.
+    ;; Original 2-slot fast path.  The parts are read into locals (they were
+    ;; two CONSes per add, as much garbage as the sum itself).
     (t
-     (let ((ap (if (bignump a) (cons (bignum-lo a) (bignum-hi a))
-                   (%fixnum-to-bignum-parts a)))
-           (bp (if (bignump b) (cons (bignum-lo b) (bignum-hi b))
-                   (%fixnum-to-bignum-parts b))))
-       (let ((sum-lo (%fixnum-+ (car ap) (car bp))))
+     (let ((alo (if (bignump a) (aref a 0) (logand a +fixnum-max+)))
+           (ha (if (bignump a) (aref a 1) (if (< a 0) -1 0)))
+           (blo (if (bignump b) (aref b 0) (logand b +fixnum-max+)))
+           (hb (if (bignump b) (aref b 1) (if (< b 0) -1 0))))
+       (let ((sum-lo (%fixnum-+ alo blo)))
          (let ((carry (if (< sum-lo 0) 1 0))
-               (lo (logand sum-lo +fixnum-max+))
-               (ha (cdr ap)) (hb (cdr bp)))
+               (lo (logand sum-lo +fixnum-max+)))
            (let ((sum-hi (%fixnum-+ (%fixnum-+ ha hb) carry)))
              ;; The 2-slot small-bignum representation holds at most 124 bits.
              ;; When both high words share a sign but SUM-HI comes back with the
@@ -4394,9 +4604,13 @@
              ;; with hi ≈ 2^62 and their high words sum out of range).  Route
              ;; those through the general sign-magnitude path, which allocates
              ;; the extra limb instead of silently wrapping to a negative value.
-             (if (and (%same-sign-p ha hb) (not (%same-sign-p ha sum-hi)))
+             ;; SUM-HI = -2^62 is the same overflow in a form the sign test
+             ;; misses: that raw word is below +FIXNUM-MIN+, so the 2-slot
+             ;; result printed as garbage ((+ -2^123 -2^123)).
+             (if (or (and (%same-sign-p ha hb) (not (%same-sign-p ha sum-hi)))
+                     (< sum-hi (%fixnum-- 0 +fixnum-max+)))
                  (%bignum-add-general a b)
-                 (bignum-to-fixnum-if-possible (make-bignum lo sum-hi))))))))))
+                 (%int-from-limbs lo sum-hi)))))))))
 
 (defun %same-sign-p (x y)
   "True if fixnums X and Y have the same sign (both >= 0 or both < 0).
@@ -4540,10 +4754,114 @@
     ((= op 1) (logior x y))
     (t (logxor x y))))
 
+;;; --- TWO-LIMB FAST PATHS (bitwise ops, ASH) --------------------------------
+;;;
+;;; A SMALL bignum IS a two's-complement number already: lo is the low limb
+;;; (unsigned, +fixnum-max+ wide) and hi the signed limb above it, so an
+;;; integer that is a fixnum or a small bignum -- every u64, i.e. every 64-bit
+;;; hash, cipher and checksum word -- is just the pair (lo, hi).  A bitwise op
+;;; is then the op on the two limbs, and a shift by less than a limb moves bits
+;;; between them: plain fixnum arithmetic, one result object at most.  The
+;;; general engines below (limb LISTS for the bitwise ops, digit arrays for
+;;; ASH) cost 200-500 bytes and ~1 us per u64 operation; beacon's SipHash did
+;;; ~200 of them per 32-byte key -- 174 KB and 0.33 ms per hash, its store
+;;; insert 135x slower than SBCL.
+
+(defun %two-limb-int-p (n)
+  "N is a fixnum or a SMALL (two-limb) bignum."
+  (and (integerp n) (or (not (bignump n)) (not (big-bignum-p n)))))
+
+(defun %int-lo-limb (n)
+  "The low limb of a fixnum or small bignum N, in [0, +fixnum-max+]."
+  (if (bignump n) (bignum-lo n) (logand n +fixnum-max+)))
+
+(defun %int-hi-limb (n)
+  "The signed high limb of a fixnum or small bignum N."
+  (if (bignump n) (bignum-hi n) (if (< n 0) -1 0)))
+
+(defun %int-from-limbs (lo hi)
+  "The integer lo + hi * 2^limb, normalized as BIGNUM-TO-FIXNUM-IF-POSSIBLE
+   does (a fixnum when it fits; most-negative-fixnum stays a bignum), without
+   building the bignum first."
+  (cond ((= hi 0) lo)
+        ((and (= hi -1) (> lo 0)) (%fixnum-- (%fixnum-- lo +fixnum-max+) 1))
+        (t (make-bignum lo hi))))
+
+(defun %pow2-limb (k)
+  "2^K for 0 <= K < +limb-bits+: five constant shifts at most (each an inline
+   SHL; no variable-count ASH, which would come back to BIGNUM-ASH)."
+  (let ((p 1))
+    (when (>= k 32) (setq p (ash (ash p 16) 16)) (setq k (%fixnum-- k 32)))
+    (when (>= k 16) (setq p (ash p 16)) (setq k (%fixnum-- k 16)))
+    (when (>= k 8) (setq p (ash p 8)) (setq k (%fixnum-- k 8)))
+    (when (>= k 4) (setq p (ash p 4)) (setq k (%fixnum-- k 4)))
+    (when (>= k 2) (setq p (ash p 2)) (setq k (%fixnum-- k 2)))
+    (if (>= k 1) (ash p 1) p)))
+
+(defun %fx-shr-nonneg (v s)
+  "V >> S for a non-negative fixnum V and 0 <= S < +limb-bits+, by one
+   inline division (no variable-count ASH, which would come back here)."
+  (if (= s 0) v (multiple-value-bind (q r) (%fixnum-truncate2 v (%pow2-limb s)) r q)))
+
+(defun %fx-sar (v s)
+  "Arithmetic V >> S (floor) for a fixnum V and S >= 0."
+  (cond ((>= s +limb-bits+) (if (< v 0) -1 0))
+        ((< v 0) (logxor (%fx-shr-nonneg (logxor v -1) s) -1))
+        (t (%fx-shr-nonneg v s))))
+
+(defun %two-limb-shl (n k)
+  "N * 2^K for a fixnum or small bignum N and 0 < K < +limb-bits+, or NIL
+   when the result does not fit two limbs (the general path takes it)."
+  (let ((lo (%int-lo-limb n)) (hi (%int-hi-limb n))
+        (lim (%pow2-limb (%fixnum-- +limb-bits-1+ k))))   ; |hi| room
+    (if (and (< hi lim) (>= hi (%fixnum-- 0 lim)))
+        (let* ((pk (%pow2-limb k))
+               (keep (%fixnum-- (%pow2-limb (%fixnum-- +limb-bits+ k)) 1))
+               (new-lo (%fixnum-* (logand lo keep) pk))
+               (carry (%fx-shr-nonneg lo (%fixnum-- +limb-bits+ k))))
+          (%int-from-limbs new-lo (%fixnum-+ (%fixnum-* hi pk) carry)))
+        nil)))
+
+(defun %two-limb-sar (n k)
+  "floor(N / 2^K) for a small bignum N and K > 0."
+  (let ((lo (%int-lo-limb n)) (hi (%int-hi-limb n)))
+    (if (>= k +limb-bits+)
+        (%fx-sar hi (%fixnum-- k +limb-bits+))
+        (%int-from-limbs
+         (%fixnum-+ (%fx-shr-nonneg lo k)
+                    (%fixnum-* (logand hi (%fixnum-- (%pow2-limb k) 1))
+                               (%pow2-limb (%fixnum-- +limb-bits+ k))))
+         (%fx-sar hi k)))))
+
 (defun %generic-bitwise (a b op)
   "Apply OP (0=and, 1=ior, 2=xor) to integers A and B as if on infinite
    two's-complement bit strings.  Returns a normalized integer.  TOTAL:
-   never errors on any integer pair."
+   never errors on any integer pair.
+   Two-limb operands take the limb fast path, written out flat (slot reads
+   and inline fixnum ops, no helper calls): it is every u64 logxor."
+  (let ((alo nil) (ahi 0) (blo nil) (bhi 0))
+    (cond ((not (integerp a)) nil)
+          ((bignump a) (unless (= (aref a 0) +bn-sentinel+)
+                         (setq alo (aref a 0)) (setq ahi (aref a 1))))
+          (t (setq alo (logand a +fixnum-max+)) (setq ahi (if (< a 0) -1 0))))
+    (cond ((not (integerp b)) nil)
+          ((bignump b) (unless (= (aref b 0) +bn-sentinel+)
+                         (setq blo (aref b 0)) (setq bhi (aref b 1))))
+          (t (setq blo (logand b +fixnum-max+)) (setq bhi (if (< b 0) -1 0))))
+    (let ((hi (and alo blo
+                   (cond ((= op 0) (logand ahi bhi)) ((= op 1) (logior ahi bhi)) (t (logxor ahi bhi))))))
+      ;; A high limb of -2^62 is no fixnum here (it is the raw word below
+      ;; +FIXNUM-MIN+: (logxor 2^61 -2^61)), so (logxor 2^123 -2^123) needs a
+      ;; third limb: the general engine.
+      (if (and hi (>= hi (%fixnum-- 0 +fixnum-max+)))
+          (let ((lo (cond ((= op 0) (logand alo blo)) ((= op 1) (logior alo blo)) (t (logxor alo blo)))))
+            (cond ((= hi 0) lo)
+                  ((and (= hi -1) (> lo 0)) (%fixnum-- (%fixnum-- lo +fixnum-max+) 1))
+                  (t (make-bignum lo hi))))
+          (%generic-bitwise-limbs a b op)))))
+
+(defun %generic-bitwise-limbs (a b op)
+  "%GENERIC-BITWISE's general engine, over limb lists."
   (let* ((sa (%any-to-limbs a))
          (sb (%any-to-limbs b))
          (la (length (cdr sa)))

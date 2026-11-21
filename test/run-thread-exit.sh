@@ -54,7 +54,9 @@ for i in $(seq 1 "$RUNS"); do
   case $rc in
     0)   passed=$((passed+1)) ;;
     124) hung=$((hung+1));    echo "  run $i: HUNG (rc=124) — the teardown bug" ;;
-    139) crashed=$((crashed+1)); echo "  run $i: crashed rc=139 (reportable; not this test's subject)" ;;
+    # 70: an unhandled hardware fault that said so (translate-x64 / -aarch64
+    # +UNCAUGHT-FAULT-EXIT-CODE+); 139: one from an image that does not.
+    139|70) crashed=$((crashed+1)); echo "  run $i: crashed rc=$rc (reportable; not this test's subject)" ;;
     *)   other=$((other+1));  echo "  run $i: rc=$rc" ;;
   esac
   # Silence an unused-variable warning while keeping the pipe read above real.
@@ -63,7 +65,7 @@ done
 
 echo
 echo "passed          $passed"
-echo "crashed (139)   $crashed"
+echo "crashed (70/139) $crashed"
 echo "other rc        $other"
 echo "HUNG (124)      $hung"
 echo

@@ -591,6 +591,11 @@
    +TARGET-BIG-ENDIAN+ so the image's own compiler does the same.  An integer
    for the same reason: a NIL-valued constant never folds.")
 
+(defparameter +target-w32+ 0
+  "1 when the target is W32-capable (COMPILE-TARGET-W32-CAPABLE), else 0: the
+   running-on twin an image's own compiler folds, as +TARGET-BIG-ENDIAN+ is.
+   An integer for the same reason.  docs/w32.md.")
+
 (defparameter +target-big-endian+ 0
   "1 on a big-endian target, else 0: *TARGET-BIG-ENDIAN-P* as a FOLDED constant, for code that must know the
    target's byte order AFTER the image is built -- the in-image compiler.
@@ -648,6 +653,10 @@
 ;;; objects and conses sit on an 8-byte granule (a cons is its two words, not
 ;;; half of a 16-byte cell).  Forwarding is kept in the collector's kind map.
 (defvar *68k-tags3* nil)
+;;; *68K-NIL-PAGE*: where NIL's page is on 68k, NIL = page + 1 and T = the next
+;;; page + the object tag.  NIL means #xDEAD0000, the page every hosted port
+;;; maps; a board with no MMU and no RAM there (the 68k Mac) puts it in RAM.
+(defvar *68k-nil-page* nil)
 
 (defparameter +tag-cons+      1)
 (defparameter +tag-function+  3)
@@ -655,6 +664,7 @@
 (defparameter +tag-immediate+ 5)
 (defparameter +tag-forward+   15)
 (defparameter +t-value+       #xDEAD1009)
+(defparameter +nil-value+     #xDEAD0001)
 
 (defparameter +fixnum-bits+      62)
 (defparameter +fixnum-max+       4611686018427387903)
@@ -727,6 +737,77 @@
 (defparameter +name-hash-hi-mask+  32767)
 (defparameter +name-hash-lo-mask+  16383)
 
+;;; ============================================================
+;;; THE COMPILATION'S TARGET: compiling-for, not running-on (W32 M1)
+;;; ============================================================
+;;;
+;;; The width names above (+FIXNUM-BITS+ ... +NIL-VALUE+) mean two different
+;;; things depending on who reads them:
+;;;
+;;;   RUNNING-ON  -- runtime code (prelude, the bignum core, cl-*): the machine
+;;;                  it is executing on.  In an image they are FOLDED literals
+;;;                  (WIDTH-CONSTANTS-SOURCE), which is exactly right.
+;;;   COMPILING-FOR -- the compiler deciding what to emit: the target of the
+;;;                  compilation in progress.  On the host these were the
+;;;                  DEFPARAMETERs, set per build.  In an image they were the
+;;;                  SAME folded literals -- the image's OWN target -- so a
+;;;                  self-hosted x64 compiler emitted 62-bit fixnum decisions
+;;;                  and little-endian :u32 splits for any target.
+;;;
+;;; So compiler-side code reads the CT- functions (compiler.lisp) instead.  Each returns
+;;; the field of *COMPILE-TARGET*, the descriptor BUILD-IMAGE binds for the
+;;; whole compilation; with none bound it returns the running-on value, which
+;;; is the right answer for every compilation that targets the machine it runs
+;;; on (MVM-EVAL, COMPILE, the JIT, a host build that never calls BUILD-IMAGE).
+;;; These functions are the ONE sanctioned place compiler-side code names a
+;;; running-on constant; build-checks.lisp's ratchet forbids the bare names in
+;;; the compiler-side files.  A reader is a zero-argument call, not an
+;;; arithmetic form: see +FIXNUM-SIGNED-BITS+ for why that matters.
+;;;
+;;; Every field is computed by MAKE-COMPILE-TARGET-FOR from the target
+;;; descriptor alone -- never from the width constants -- so an image can make
+;;; a descriptor for a target other than its own.  The host DEFPARAMETERs are
+;;; then SET FROM the descriptor (SET-TARGET-FIXNUM-BITS-FOR), so on the host
+;;; the two cannot disagree.
+
+;;; *COMPILE-TARGET*, the COMPILE-TARGET struct and the CT- readers live in
+;;; mvm/compiler.lisp ("THE COMPILATION'S TARGET"): every image that has a
+;;; compiler bakes compiler.lisp, and only some bake this file.
+
+(defun make-compile-target-for (target &optional (soft-float 0))
+  "The COMPILE-TARGET for TARGET (a TARGET struct).  SOFT-FLOAT (0/1) is a
+   build knob, not a property of the architecture, so the caller says it."
+  (let* ((bits (- (* 8 (target-word-size target)) 2))
+         (half (floor bits 2))
+         (k68 (eq (target-name target) :68k))
+         (three (and *68k-tags3* k68))
+         (page (or (and k68 *68k-nil-page*) #xDEAD0000))
+         (otag (if three 7 9)))
+    (multiple-value-bind (mvc mvv) (mv-slot-addrs-for target)
+      (make-compile-target
+       :name (target-name target) :word-size (target-word-size target)
+       :fixnum-bits bits
+       :fixnum-max (- (ash 1 bits) 1) :fixnum-min (- (- (ash 1 bits) 1))
+       :fixnum-limit (ash 1 bits) :fixnum-neg-limit (- (ash 1 bits))
+       :fixnum-half (ash 1 (- bits 1)) :fixnum-neg-half (- (ash 1 (- bits 1)))
+       :fixnum-half-max (- (ash 1 (- bits 1)) 1)
+       :fixnum-signed-bits (+ bits 1) :fixnum-bits-1 (- bits 1)
+       :limb-bits bits :limb-bits-1 (- bits 1) :limb-split-bits (- half 1)
+       :neg-limb-bits (- bits) :neg-limb-bits-1 (- (- bits 1))
+       :fixnum-read-guard (floor (ash 1 (- bits 1)) 10)
+       :small-bignum-bits (* 2 bits)
+       :half-limb-bits half :neg-half-limb-bits (- half)
+       :half-limb-mask (- (ash 1 half) 1)
+       :big-endian (if (eq (target-endianness target) :big) 1 0)
+       :soft-float soft-float
+       :has-fpd (and (member (target-name target) '(:x86-64 :aarch64)) t)
+       ;; W32 (docs/w32.md): the 32-bit ports whose translators implement every
+       ;; W32 opcode.  ppc32 is not one (spec 5.3); no 64-bit target ever is (C1).
+       :w32-capable (and (member (target-name target) '(:i386 :riscv32 :arm32 :armv7 :armv7-rpi :68k)) t)
+       :mv-count-addr mvc :mv-values-addr mvv
+       :tag-cons 1 :tag-function 3 :tag-object otag :tag-immediate 5
+       :tag-forward 15 :t-value (+ page #x1000 otag) :nil-value (+ page 1)))))
+
 (defun set-target-fixnum-bits (bits)
   "Set the target fixnum width and recompute every derived constant.
    BITS is (word-size * 8) - 2."
@@ -789,25 +870,38 @@
 
 (defun set-target-tag-scheme-for (target)
   "The pointer tags of TARGET: the 16-byte scheme, or 68k's 3-bit one."
-  (let ((three (and *68k-tags3* (eq (target-name target) :68k))))
+  (let* ((k68 (eq (target-name target) :68k))
+         (three (and *68k-tags3* k68))
+         (page (or (and k68 *68k-nil-page*) #xDEAD0000)))
     (setf +tag-cons+ 1 +tag-function+ 3 +tag-immediate+ 5
           +tag-object+ (if three 7 9)
           +tag-forward+ 15
-          +t-value+ (if three #xDEAD1007 #xDEAD1009))))
+          +nil-value+ (+ page 1)
+          +t-value+ (+ page #x1000 (if three 7 9)))))
 
 (defun set-target-fixnum-bits-for (target)
-  "Derive the numeric width, endianness and MV-slot addresses from TARGET."
-  (set-target-tag-scheme-for target)
-  (setf *target-big-endian-p* (eq (target-endianness target) :big)
-        +target-big-endian+   (if *target-big-endian-p* 1 0))
-  ;; The fpd-* (unboxed double) ops exist in the interpreter and the x86-64 /
-  ;; aarch64 translators only; an image for one of those may use them in its
-  ;; BAKED code too, not just in code it compiles at runtime.
-  (setf *target-has-fpd-p* (and (member (target-name target) '(:x86-64 :aarch64)) t))
-  (multiple-value-bind (mvc mvv) (mv-slot-addrs-for target)
-    (setf +mv-count-addr+ mvc
-          +mv-values-addr+ mvv))
-  (set-target-fixnum-bits (- (* 8 (target-word-size target)) 2)))
+  "Make TARGET's COMPILE-TARGET, set the host width parameters FROM it, and
+   return it (BUILD-IMAGE binds it as *COMPILE-TARGET*).  The host parameters
+   are still set because host-side code that runs outside a compilation --
+   translators, build scripts -- reads them; the check below makes the two
+   one fact."
+  (let ((ct (make-compile-target-for target +target-soft-float+)))
+    (set-target-tag-scheme-for target)
+    (setf +target-big-endian+   (compile-target-big-endian ct)
+          *target-big-endian-p* (= 1 (compile-target-big-endian ct)))
+    ;; The fpd-* (unboxed double) ops exist in the interpreter and the x86-64 /
+    ;; aarch64 translators only; an image for one of those may use them in its
+    ;; BAKED code too, not just in code it compiles at runtime.
+    (setf *target-has-fpd-p* (compile-target-has-fpd ct))
+    (setf +target-w32+ (if (compile-target-w32-capable ct) 1 0))
+    (setf +mv-count-addr+  (compile-target-mv-count-addr ct)
+          +mv-values-addr+ (compile-target-mv-values-addr ct))
+    (set-target-fixnum-bits (compile-target-fixnum-bits ct))
+    ;; That the two agree is checked on the HOST (build-checks.lisp CHECK J),
+    ;; not here: in an image these names are folded constants of the image's
+    ;; own target, which the SETFs above cannot change -- exactly why the
+    ;; compiler reads the descriptor -- so a check here would fail in modus-sh.
+    ct))
 
 (defun target-object-tag (target)
   "The low-nibble TAG this target's translator puts on an object pointer.
@@ -934,15 +1028,23 @@
      (defconstant +mv-values-addr+ ~D)~%~
      (defconstant +target-big-endian+ ~D)~%~
      (defconstant +target-soft-float+ ~D)~%~
+     (defconstant +target-w32+ ~D)~%~
      (defconstant +tag-cons+ ~D)~%(defconstant +tag-function+ ~D)~%~
      (defconstant +tag-object+ ~D)~%(defconstant +tag-immediate+ ~D)~%~
-     (defconstant +tag-forward+ ~D)~%(defconstant +t-value+ ~D)~%"
-    +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
-    +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+
-    +fixnum-signed-bits+ +fixnum-bits-1+ +limb-bits+ +limb-bits-1+
-    +limb-split-bits+ +neg-limb-bits+ +neg-limb-bits-1+ +fixnum-read-guard+
-    +small-bignum-bits+ +half-limb-bits+ +neg-half-limb-bits+
-    +half-limb-mask+
-    +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+
-    +mv-count-addr+ +mv-values-addr+ +target-big-endian+ +target-soft-float+
-    +tag-cons+ +tag-function+ +tag-object+ +tag-immediate+ +tag-forward+ +t-value+))
+     (defconstant +tag-forward+ ~D)~%(defconstant +t-value+ ~D)~%~
+     (defconstant +nil-value+ ~D)~%"
+    ;; THE COMPILATION'S target (CT-*), not this image's: in an image the bare
+    ;; names are this image's own folded values, so a child build would have
+    ;; inherited the parent's widths.  The name-hash widths are the same on
+    ;; every target (see their defparameter block).
+    (ct-fixnum-bits) (ct-fixnum-max) (ct-fixnum-min) (ct-fixnum-limit) (ct-fixnum-neg-limit)
+    (ct-fixnum-half) (ct-fixnum-neg-half) (ct-fixnum-half-max)
+    (ct-fixnum-signed-bits) (ct-fixnum-bits-1) (ct-limb-bits) (ct-limb-bits-1)
+    (ct-limb-split-bits) (ct-neg-limb-bits) (ct-neg-limb-bits-1) (ct-fixnum-read-guard)
+    (ct-small-bignum-bits) (ct-half-limb-bits) (ct-neg-half-limb-bits)
+    (ct-half-limb-mask)
+    29 14 32767 16383
+    (ct-mv-count-addr) (ct-mv-values-addr) (ct-target-big-endian) (ct-target-soft-float)
+    (if (ct-w32-capable-p) 1 0)
+    (ct-tag-cons) (ct-tag-function) (ct-tag-object) (ct-tag-immediate) (ct-tag-forward)
+    (ct-t-value) (ct-nil-value)))

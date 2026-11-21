@@ -25,6 +25,16 @@
    is correct: the RESULT depends on live runtime state, not the cache.  bc is a
    COPY (mvm-buffer-used-bytes) so it's safe despite *mvm-eval-buffer* reuse.")
 
+(declaim (overridable %mvm-eval-cache-limit))
+(defun %mvm-eval-cache-limit ()
+  "How many forms *MVM-EVAL-CACHE* may hold.  At the limit it is dropped and
+   starts again: it had no bound, so a process that evaluates forms it never
+   repeats -- a REPL session, a server reading requests -- kept every one,
+   with its bytecode and tables, for as long as it ran.  0: no cache at all
+   (MODUS_SMALL_IMAGE, build-cli-common.lisp: a 1 MB Mac's young heap is
+   40 KB)."
+  4096)
+
 (defvar *e2-active-defun-names* nil
   "Names (strings) of the top-level DEFUNs of the mvm-eval module CURRENTLY
    being interpreted.  Def persistence installs those defuns' trampolines
@@ -1559,6 +1569,7 @@
    another slide could not correct where the pages are read-only (iOS)."
   (dolist (h *jit-fnaddr-thunks*)
     (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))
+  (setq *native-sym-cache* nil)              ; resolved again after a restore
   nil)
 
 (defun %jit-after-relocate (l0 l1 d)
@@ -1872,6 +1883,7 @@
    Every call also empties the bridge function cache (*JIT-BRIDGE-GEN*)."
   (%kernel-redirect-hook name)
   (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
+  (setq *native-sym-cache* nil)              ; (funcall 'NAME ...) re-resolves
   ;; Only while this process can write code, as the fill above is: a restored iOS
   ;; snapshot's thunks are read-only pages, and their cache slots were emptied before
   ;; the save (%JIT-BEFORE-SAVE), so there is nothing to clear and the store would fault.
@@ -2423,6 +2435,35 @@
       (and *jit-defun-trampolines*
            (eq current (gethash name *jit-defun-trampolines*)))))
 
+(declaim (overridable %runtime-form-native))
+(defun %runtime-form-native (bc entry ft-list fn-table rt-table lam-offsets)
+  "A NATIVE thunk for the module of a top-level form that builds closures (a
+   DEFMETHOD's method function, a hook pushed onto a list), or NIL to
+   interpret it.  The form runs once, but the closures it makes outlive it, and
+   an interpreted closure re-enters the interpreter at every call.  Nothing
+   here; the native i386 tier (mvm/jit-i386-native.lisp) overrides it.  The x64
+   JIT has its own path (%MVM-EVAL-JIT-RUN)."
+  bc entry ft-list fn-table rt-table lam-offsets
+  nil)
+
+(defun %run-native-thunk (thunk)
+  "Run a form's native THUNK in place of mvm-interpret: its primary value, with
+   *MVM-LAST-MV* set as the interpreter leaves it ((count . secondaries), or NIL
+   for exactly one value)."
+  (let* ((vals (multiple-value-list (funcall thunk)))
+         (n (length vals)))
+    (setq *mvm-last-mv* (if (eql n 1) nil (cons n (cdr vals))))
+    (car vals)))
+
+(declaim (overridable %runtime-defun-hook))
+(defun %runtime-defun-hook (names)
+  "Called with a module's DEFUN names once mvm-eval has installed their
+   interpreter trampolines and registered the module.  Nothing here; the 68k
+   threaded JIT (mvm/jit-68k.lisp, later in the image) overrides it to
+   translate them."
+  names
+  nil)
+
 (defvar *jit-module-registry* nil
   "NAME (string) -> (bc entry ft-list fn-table rt-table lam-offsets persist-names)
    for every runtime DEFUN installed as an interpreter trampoline.  Boots NIL
@@ -2465,6 +2506,14 @@
                  name)))
     (and *jit-source-links* (gethash key *jit-source-links*))))
 
+(defvar *jit-capture-insns* nil
+  "T: compile runtime modules with mvm.lisp's *INSN-SINK* on, so the module
+   carries its instructions already decoded (the native 68k tier turns it on).")
+(defvar *jit-last-insns* nil
+  "(BC . INSNS) of the last module emitted with the sink on: tied to its
+   bytecode vector, so a module registered from elsewhere (a cache) never
+   picks up another module's instructions.")
+
 (defun %jit-register-module (names bc entry ft-list fn-table rt-table lam-offsets)
   (%jit-note-source names)
   (when (and (boundp (quote *%load-depth*)) (eql *%load-depth* 1))
@@ -2474,7 +2523,11 @@
   (when (and (boundp (quote *jit-module-registry*)) (null *jit-module-registry*))
     (setq *jit-module-registry* (make-hash-table :test (function equal))))
   (when (boundp (quote *jit-module-registry*))
-    (let ((m (list bc entry ft-list fn-table rt-table lam-offsets names)))
+    (let ((m (list bc entry ft-list fn-table rt-table lam-offsets names
+                   ;; 7: the instructions, decoded, when this module was emitted
+                   ;; with the sink on (*JIT-CAPTURE-INSNS*)
+                   (and (consp *jit-last-insns*) (eq (car *jit-last-insns*) bc)
+                        (cdr *jit-last-insns*)))))
       (dolist (nm names) (puthash nm *jit-module-registry* m)))))
 
 (defun %jit-registered-p (name)
@@ -2642,10 +2695,13 @@
                                   *jit-eager-failed*))))
                 nil))))))
 
-(defun %jit-eager-all ()
+(declaim (overridable %jit-eager-all))
+(defun %jit-eager-all (&optional name)
   "Translate every registered runtime DEFUN that is still an interpreter
    trampoline to native code and publish it.  Returns (INSTALLED MODULES
-   FAILED).  Needs the JIT active.
+   FAILED).  Needs the JIT active.  NAME is the function COMPILE was given
+   (cl-eval %COMPILE-IMPL); this JIT translates everything pending anyway, the
+   68k threaded JIT (mvm/jit-68k.lisp) only NAME's module.
 
    TO A FIXPOINT.  A module is only translated once every function it calls
    is native, so one pass leaves a caller behind whenever its callee comes
@@ -2726,6 +2782,7 @@
   (let ((v (handler-case *jit-hot-calls* (error (c) nil))))
     (if (integerp v) v 64)))
 
+(declaim (overridable %jit-hot-ns))
 (defun %jit-hot-ns ()
   "Interpreted time (ns) after which a DEFUN is built regardless of its call
    count: about what translating a module costs, so a function past it has
@@ -2862,8 +2919,19 @@
    its first expensive call rather than its 64th.  Once NAME is native, a
    caller still holding this object is forwarded to the native code.
    Multiple values pass through either way."
-  (let ((inner (%mvm-make-trampoline bc ftab rt offset nil lam-offsets))
-        (left (%jit-hot-call-threshold))
+  (let ((inner (%mvm-make-trampoline bc ftab rt offset nil lam-offsets)))
+    ;; NO JIT, NOTHING TO COUNT TOWARD: the plain trampoline.  The counting
+    ;; wrapper reads the clock twice a call (in nanoseconds: a bignum on a
+    ;; 30-bit tower), conses its arguments and values, and -- with promotion
+    ;; answering :RETRY forever -- did so on every call: measured on a 68000
+    ;; Mac, the bulk of an interpreted recursive call.
+    (if (not (%jit-enabled-p))
+        (progn (%note-fn-name inner name) inner)
+        (%mvm-defun-counting-trampoline name bc inner))))
+
+(defun %mvm-defun-counting-trampoline (name bc inner)
+  "%MVM-MAKE-DEFUN-TRAMPOLINE's wrapper round INNER when there is a JIT."
+  (let ((left (%jit-hot-call-threshold))
         (spent 0)
         ;; the native function this trampoline forwards to once there is one:
         ;; set by a promotion here or by its module being built from anywhere
@@ -4308,11 +4376,14 @@
                                                   :function-table %fnt :runtime-table %rt
                                                   :return-raw nil :lambda-offsets %lam)
                                    %bc %fnt %rt %lam))))))
-                    (%mvm-wrap-escaping-result
-                      (mvm-interpret %bc :entry-point %entry
-                                     :function-table %fnt :runtime-table %rt
-                                     :return-raw nil :lambda-offsets %lam)
-                      %bc %fnt %rt %lam)))
+                    (let ((%nt (and %lam (%runtime-form-native %bc %entry %ftl %fnt %rt %lam))))
+                      (if %nt
+                          (progn (setq *jit-native-ran* t) (%run-native-thunk %nt))
+                          (%mvm-wrap-escaping-result
+                            (mvm-interpret %bc :entry-point %entry
+                                           :function-table %fnt :runtime-table %rt
+                                           :return-raw nil :lambda-offsets %lam)
+                            %bc %fnt %rt %lam)))))
          ;; *mvm-last-mv* must be read IMMEDIATELY after the run (see the note
          ;; at the top of this function and interp.lisp) — nothing may come
          ;; between %prim and %mv.
@@ -4424,7 +4495,7 @@
       ;; cached tuple keeps its bytecode by reference into this array, so the
       ;; next compile overwrote cached forms (ANSI probe 8447 + the whole
       ;; 8644-8848 block).  A reuse needs an explicit copy-out first.
-      (setq buf (make-mvm-buffer :bytes (make-array 65536)))
+      (setq buf (make-mvm-buffer :bytes (make-array 65536 :element-type '(unsigned-byte 8))))
       ;; Pass 1: assign cumulative bytecode offsets + register in *functions*.
       (dolist (e all-ir)
         (let* ((info (car e)) (ir (cdr e))
@@ -4508,7 +4579,12 @@
         ;; thunks the host never compiles).
         (s-mt *macro-table*) (s-mnt *macro-name-table*) (s-bmt *bootstrap-macro-template*)
         (s-hdt *hash-dispatch-table*) (s-clhs *clhs-standard-specials-hashes*)
-        (s-memo *mexp-memo*) (s-memogc *mexp-memo-gc*))
+        (s-memo *mexp-memo*) (s-memogc *mexp-memo-gc*)
+        ;; W32 M1: the static build's COMPILE-TARGET is the CHILD's (modus-sh
+        ;; --compile-riscv32 has a 30-bit one bound), but what EVAL compiles
+        ;; here RUNS here, so it must be compiled for this machine: NIL.
+        (s-ct *compile-target*))
+    (setq *compile-target* nil)
     (setq *macro-table* (make-hash-table :test 'eql))
     (setq *macro-name-table* nil) (setq *bootstrap-macro-template* nil)
     (setq *hash-dispatch-table* nil) (setq *clhs-standard-specials-hashes* nil)
@@ -4533,12 +4609,19 @@
       (setq *temp-reg-counter* s-temps) (setq *fp-reg-counter* s-fps)
       (setq *macro-table* s-mt) (setq *macro-name-table* s-mnt) (setq *bootstrap-macro-template* s-bmt)
       (setq *hash-dispatch-table* s-hdt) (setq *clhs-standard-specials-hashes* s-clhs)
-      (setq *mexp-memo* s-memo) (setq *mexp-memo-gc* s-memogc))))
+      (setq *mexp-memo* s-memo) (setq *mexp-memo-gc* s-memogc)
+      (setq *compile-target* s-ct))))
 
 (defun mvm-eval-forms (forms)
-  (if *static-build-p*
-      (%mvm-eval-forms-nested-in-static-build forms)
-      (%mvm-eval-forms-1 forms)))
+  ;; *%SOLE-EVAL-FORM* (compiler.lisp): the one form, for the compiler's
+  ;; DEFMACRO; SETQ and put back, as evaluations nest
+  (let ((saved (and (boundp '*%sole-eval-form*) *%sole-eval-form*)))
+    (setq *%sole-eval-form* (and (consp forms) (null (cdr forms)) (car forms)))
+    (unwind-protect
+         (if *static-build-p*
+             (%mvm-eval-forms-nested-in-static-build forms)
+             (%mvm-eval-forms-1 forms))
+      (setq *%sole-eval-form* saved))))
 
 ;;; ============================================================
 ;;; THE EVAL LOCK — one compiler at a time
@@ -4708,6 +4791,15 @@
             ((member n '("QUOTE" "FUNCTION" "LAMBDA") :test (function string=)) nil)
             (t (%mvm-loop-scan-args (cdr x)))))))
 
+(declaim (overridable %native-thunk-run))
+(defun %native-thunk-run (forms bc entry ft-list fn-table rt-table lam-offsets)
+  "A backend that can run a freshly compiled toplevel module natively itself
+   (the 68k native tier overrides this: a form that loops, run interpreted, is
+   hundreds of times slower) returns (PRIMARY-VALUE) having run it, with
+   *MVM-LAST-MV* set as MVM-INTERPRET leaves it.  NIL: interpret, as before."
+  (declare (ignore forms bc entry ft-list fn-table rt-table lam-offsets))
+  nil)
+
 (defun %mvm-forms-loop-p (forms)
   "True when FORMS runs a loop NOW: a top-level form that is not a definition and
    whose code (not its quoted data, nor the bodies of the lambdas it only makes)
@@ -4731,6 +4823,71 @@
 ;;; come from the compiler -- one replayed from the FASL cache (mvm/fasl.lisp)
 ;;; -- goes through exactly the same steps.  FT-LIST is in REVERSE source
 ;;; order, as the compiler builds it: (name offset length) per module function.
+;;; THE BYTES OF A NATIVE MODULE.  The native 68k tier translates a module from
+;;; the instructions the encoder captured (*INSN-SINK*), never from its bytes,
+;;; and encoding them was ~15% of a DEFUN on the Mac: the opcode lookup, the
+;;; byte stores, and on a 30-bit tower a bignum shift for every 32-bit
+;;; immediate.  So a DEFUN module emitted with the sink on gets NO bytes
+;;; (mvm.lisp *INSN-NO-BYTES*), only its eval thunk's, which is interpreted.
+;;; The rest are made from the captured instructions (%BC-FILL-FROM-INSNS: a
+;;; captured instruction re-encodes to exactly its bytes) the moment anything
+;;; could read them -- the DEFUN hook declined or fell back to the threaded JIT,
+;;; the thunk calls into its module, a FASL records it, the eval cache keeps it,
+;;; %N68-DECODE -- and once the module is native and nothing can, it never is.
+;;; *BC-ELIDED* is (BC . INSNS) while BC's bytes are missing.
+(defvar *bc-elided* nil)
+(defvar *bc-elide-off* nil "T: always encode the bytes.")
+(defvar *bc-elide-verify* nil
+  "T: encode every module's bytes as before AND rebuild them from the captured
+   instructions; a difference is counted in *BC-ELIDE-MISMATCHES*.")
+(defvar *bc-elide-mismatches* nil)
+(defvar *bc-elide-saved* 0 "CENSUS: modules that never needed their bytes.")
+
+(defun %bc-elide-p ()
+  (not (or (and (boundp (quote *bc-elide-off*)) *bc-elide-off*)
+           (and (boundp (quote *bc-elide-verify*)) *bc-elide-verify*))))
+
+(defun %bc-ensure-bytes (bc)
+  "BC's bytes, all of them, if they were elided.  BC."
+  (let ((e *bc-elided*))
+    (when (and (consp e) (eq (car e) bc))
+      (setq *bc-elided* nil)
+      (%bc-fill-from-insns bc (cdr e) 0 (length bc))))
+  bc)
+
+(defun %bc-thunk-calls-module-p (insns entry ft-list)
+  "Does the eval thunk at ENTRY call, or take the address of, a function of
+   its own module?  Then interpreting it runs that function's bytes."
+  (let ((end entry))
+    (dolist (f ft-list) (when (eql (second f) entry) (setq end (+ entry (third f)))))
+    (dolist (i insns nil)
+      (when (and (>= (first i) entry) (< (first i) end))
+        (let ((op (second i)))
+          (when (or (eql op +op-call+) (eql op +op-tailcall+) (eql op +op-fn-addr+))
+            (let ((operand (if (eql op +op-fn-addr+) (second (third i)) (first (third i)))))
+              (when (and (integerp operand) (< operand #x40000000))
+                (return t)))))))))
+
+(defun %bc-elide-settle (bc native-p entry ft-list keep)
+  "After the DEFUN hook: BC's missing bytes are made unless its module went
+   NATIVE-P and nothing will interpret it (KEEP: the eval cache will)."
+  (let ((e *bc-elided*))
+    (when (and (consp e) (eq (car e) bc))
+      (if (or keep (not (eq native-p t))
+              (%bc-thunk-calls-module-p (cdr e) entry ft-list))
+          (%bc-ensure-bytes bc)
+          (progn
+            (setq *bc-elided* nil)
+            (setq *bc-elide-saved* (+ (if (integerp *bc-elide-saved*) *bc-elide-saved* 0) 1)))))))
+
+(defun %bc-elide-verify (bc insns)
+  (let ((copy (make-array (length bc) :element-type (quote (unsigned-byte 8)))))
+    (%bc-fill-from-insns copy insns 0 (length bc))
+    (unless (equalp copy bc)
+      (setq *bc-elide-mismatches*
+            (cons (let ((k (mismatch copy bc))) (list (length bc) k))
+                  *bc-elide-mismatches*)))))
+
 (defun %mvm-eval-publish-and-run (forms bc entry ft-list fn-table rt-table
                                   lam-offsets persist-names %lam-bearing %cacheable)
             ;; WS3 def persistence: install each top-level user DEFUN as a
@@ -4793,7 +4950,13 @@
               (puthash pn *symbol-function-table* tramp))
             (when (boundp (quote *native-sym-function-table*))
               (puthash (compute-name-hash pn)
-                       *native-sym-function-table* tramp)))))))
+                       *native-sym-function-table* tramp))))))
+    ;; RUNTIME DEFUN HOOK: a backend that compiles a runtime DEFUN when it is
+    ;; defined (the 68k threaded JIT, mvm/jit-68k.lisp) overrides it.
+    ;; A module with no bytes keeps none only when the hook made it native and
+    ;; nothing will interpret it: see THE BYTES OF A NATIVE MODULE.
+    (%bc-elide-settle bc (%runtime-defun-hook persist-names) entry ft-list %cacheable))
+  (when %cacheable (%bc-ensure-bytes bc))
   ;; PERF Round 2: cache the compiled module for these forms so a
   ;; later mvm-eval of the same forms skips the whole compile.  bc is a
   ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.
@@ -4806,6 +4969,9 @@
              ;; region-0 -> worker reference after the CL:INTERN
              ;; lock+copy fix.  See %MVM-ON-MAIN-THREAD-P.
              (%mvm-on-main-thread-p))
+    (when (or (null *mvm-eval-cache*)
+              (>= (hash-table-count *mvm-eval-cache*) (%mvm-eval-cache-limit)))
+      (setq *mvm-eval-cache* (make-hash-table :test (quote equal))))
     (setf (gethash forms *mvm-eval-cache*)
           ;; WS4-S5b: ft-list inserted at index 2 (see %mvm-eval-run-tuple
           ;; layout comment).  reverse → source order (fn-table order).
@@ -4842,6 +5008,13 @@
                   (setq *e2-active-defun-names* persist-names)
                   (setq *jit-native-ran* nil)
                   (setq *jit-infra-fallback* nil)
+                  ;; A BACKEND'S OWN NATIVE RUN of a looping form (the 68k
+                  ;; native tier, jit-68k.lisp): (PRIMARY) when it ran it,
+                  ;; NIL to go on as below.
+                  (let ((%nt (%native-thunk-run forms bc entry ft-list fn-table
+                                                rt-table lam-offsets)))
+                    (if %nt
+                        (car %nt)
                   ;; WS4-S5b: JIT when enabled, interpret-fallback on a
                   ;; SETUP failure (page-build fail / unsupported) or
                   ;; the MV out-of-range residual — but NOT on a user condition
@@ -4907,11 +5080,18 @@
                                             :return-raw nil
                                             :lambda-offsets lam-offsets)
                              bc fn-table rt-table lam-offsets))))))
-                      (%mvm-wrap-escaping-result
-                        (mvm-interpret bc :entry-point entry :function-table fn-table
-                                       :runtime-table rt-table :return-raw nil
-                                       :lambda-offsets lam-offsets)
-                        bc fn-table rt-table lam-offsets))))
+                      (let ((%nt (and %lam-bearing (null persist-names)
+                                      (%runtime-form-native bc entry ft-list fn-table
+                                                            rt-table lam-offsets))))
+                        (if %nt
+                            ;; the form's own code from here: its conditions
+                            ;; are the user's (see *JIT-NATIVE-RAN*)
+                            (progn (setq *jit-native-ran* t) (%run-native-thunk %nt))
+                            (%mvm-wrap-escaping-result
+                              (mvm-interpret bc :entry-point entry :function-table fn-table
+                                             :runtime-table rt-table :return-raw nil
+                                             :lambda-offsets lam-offsets)
+                              bc fn-table rt-table lam-offsets))))))))
          (%mv *mvm-last-mv*)
          ;; Cleared as soon as latched — see the sibling seam above.
          (%mvclr (setq *mvm-last-mv* nil)))
@@ -4985,6 +5165,7 @@
   ;; Not for COMPILE-FILE's own compile of a toplevel form (mvm/fasl.lisp): a
   ;; hit would RUN the form, and record nothing.
   (let ((%cacheable (and (not *mvm-eval-no-cache*)
+                         (> (%mvm-eval-cache-limit) 0)
                          (not (and *fasl-compile-only* (%fasl-compile-only-here-p)))
                          (%mvm-eval-cacheable-p forms))))
     (when %cacheable
@@ -5113,7 +5294,9 @@
       (setq *e2-module-defuns* %e2md-saved))
     ;; Small buffer (the default 128MB byte array blows the in-image heap).
     ;; PERF: REUSE a persistent 64KB buffer instead of (make-array 65536) every
-    ;; call.  mvm-buffer-used-bytes copies the bytecode out before the next call,
+    ;; call.  A BYTE vector: MVM-EMIT-BYTE only stores bytes, and a general
+    ;; vector of 65536 is 256 KB (512 KB on 64 bits) of a small image's heap --
+    ;; the largest object in the 68k core (a census of its static heap).  mvm-buffer-used-bytes copies the bytecode out before the next call,
     ;; so nothing retains the buffer — safe to reset + reuse.
     (if *mvm-eval-buffer*
         (progn
@@ -5122,7 +5305,7 @@
           (setf (mvm-buffer-fixups *mvm-eval-buffer*) nil)
           (setq buf *mvm-eval-buffer*))
         (progn
-          (setq buf (make-mvm-buffer :bytes (make-array 65536)))
+          (setq buf (make-mvm-buffer :bytes (make-array 65536 :element-type '(unsigned-byte 8))))
           (setq *mvm-eval-buffer* buf)))
     ;; Pass 1: size each function, assign cumulative bytecode offsets, register
     ;; in *functions* so emit-time CALL resolution finds them.
@@ -5160,13 +5343,42 @@
               (setf (gethash (- rt-next) rt-table) (cons nil 0))
               (setq rt-next (+ rt-next 1)))))))
     ;; Pass 2: emit (CALLs resolve to in-module OR synthetic offsets via *functions*).
-    (dolist (e all-ir)
-      (let* ((ir (cdr e)) (lp (compute-label-positions ir)))
-        (emit-bytecode-for-ir buf ir lp)))
+    ;; With *JIT-CAPTURE-INSNS*, the encoder also hands back every instruction
+    ;; decoded (mvm.lisp *INSN-SINK*): SETQ, not LET -- a compiled LET of a
+    ;; special does not bind it in the image.
+    (setq *insn-sink* (and (boundp (quote *jit-capture-insns*)) *jit-capture-insns* (list :sink)))
+    ;; NO BYTES for a DEFUN module the native tier will translate from the
+    ;; captured instructions (%BC-ELIDE-P): see THE BYTES OF A NATIVE MODULE.
+    (setq *insn-no-bytes* (and *insn-sink* persist-names (%bc-elide-p) t))
+    (unwind-protect
+         (dolist (e all-ir)
+           (let* ((ir (cdr e)) (lp (compute-label-positions ir)))
+             (emit-bytecode-for-ir buf ir lp)))
+      (setq *jit-last-insns* (and *insn-sink* (cons :pending (nreverse (cdr *insn-sink*)))))
+      (setq *insn-sink* nil))
     (dolist (e all-ir)
       (when (string-equal (string (function-info-name (car e))) "%MVM-EVAL-THUNK")
         (setq entry (function-info-bytecode-offset (car e)))))
-    (let ((bc (mvm-buffer-used-bytes buf)))
+    (let ((bc (if *insn-no-bytes*
+                  (make-array (mvm-buffer-position buf) :element-type (quote (unsigned-byte 8)))
+                  (mvm-buffer-used-bytes buf))))
+      ;; tie the captured instructions to THIS bytecode vector
+      (when (and (consp *jit-last-insns*) (eq (car *jit-last-insns*) :pending))
+        (rplaca *jit-last-insns* bc))
+      (setq *bc-elided* nil)
+      (if *insn-no-bytes*
+          (progn
+            (setq *insn-no-bytes* nil)
+            ;; the thunk is interpreted: its bytes now; the rest on demand
+            (dolist (e all-ir)
+              (when (string-equal (string (function-info-name (car e))) "%MVM-EVAL-THUNK")
+                (let ((o (function-info-bytecode-offset (car e))))
+                  (%bc-fill-from-insns bc (cdr *jit-last-insns*)
+                                       o (+ o (function-info-bytecode-length (car e)))))))
+            (setq *bc-elided* (cons bc (cdr *jit-last-insns*))))
+          (when (and (boundp (quote *bc-elide-verify*)) *bc-elide-verify* (consp *jit-last-insns*)
+                     (eq (car *jit-last-insns*) bc))
+            (%bc-elide-verify bc (cdr *jit-last-insns*))))
       (if entry
           (let ((fn-table (make-array (length all-ir))) (i 0)
                 ;; LAMBDA-OFFSETS: the bytecode entry offsets of in-module LAMBDA /
@@ -5217,9 +5429,17 @@
                     ;; which is safe because slot-0 of a #x52 is never DATA.
                     (puthash off lam-offsets (%lam-offset-defun-tag (function-info-name (car e)))))))
             (when %fslot
+              (%bc-ensure-bytes bc)
               (%fasl-record %fslot forms bc entry ft-list fn-table rt-table lam-offsets
                             persist-names %lam-bearing %ftaint0)
               (setq *fasl-effects* nil))
+            ;; The compile is over.  Let go of what only it needed -- the IR and
+            ;; the macroexpansion memo -- so the form does not run with its own
+            ;; compilation still live under it: everything it allocates is
+            ;; collected against that, and on a small heap (a 1 MB Mac's is
+            ;; 40 KB) it is room the form itself needs.
+            (setq all-ir nil)
+            (%mexp-memo-release)
             ;; COMPILE-FILE (mvm/fasl.lisp): built, recorded, and not run.
             (if (and *fasl-compile-only* (%fasl-compile-only-skip-p %fslot forms %ftaint0))
                 nil
@@ -5705,7 +5925,7 @@
              (size (let ((s 0))
                      (dolist (insn ir) (setq s (+ s (ir-instruction-size insn))))
                      s))
-             (buf (make-mvm-buffer :bytes (make-array (+ size 256))))
+             (buf (make-mvm-buffer :bytes (make-array (+ size 256) :element-type '(unsigned-byte 8))))
              (lp (compute-label-positions ir)))
         (emit-bytecode-for-ir buf ir lp)
         (format t "; ~A  (~D bytes of MVM bytecode)~%"
@@ -5781,7 +6001,7 @@
     ((integerp sym) sym)
     ((null sym) (compute-name-hash "NIL"))
     ((eq sym t) (compute-name-hash "T"))
-    ((symbolp sym) (aref sym 0))
+    ((symbolp sym) (%word-aref sym 0))    ; one load: AREF of a symbol is %AREF-SLOW
     ((stringp sym) (compute-name-hash sym))
     (t 0)))
 

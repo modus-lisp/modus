@@ -76,7 +76,12 @@
             (aset s i (mem-ref (+ addr i) :u8))
             (setq i (+ i 1)))))))
 (defun %argc  () (mem-ref #x10000200 :u32))
-(defun %hc-depth () (mem-ref #x10000400 :u64))
+(defun %hc-depth ()
+  ;; :U32, as every 32-bit port and i386: a :U64 MEM-REF on riscv64 hands
+  ;; back the RAW word, so an odd depth read as a non-fixnum object --
+  ;; test/deep-unwind.lisp's depth checks failed and its arithmetic on one
+  ;; died MEMORY-FAULT-ERROR.  The depth word is little-endian and small.
+  (mem-ref #x10000400 :u32))
 (defun %hc-armed-p () (if (eql (mem-ref #x10000180 :u64) 0) nil t))
 ")
 

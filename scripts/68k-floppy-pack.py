@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """68k-floppy-pack.py LOADER IMAGE OUT [--test] -- a self-unpacking 68k image.
 
-LOADER is mvm/68k-unlzma.lisp built by `mvm/build-hosted.lisp 68k`; IMAGE is
+LOADER is mvm/68k-unlzma.lisp + mvm/unlzma-core.lisp built by
+`mvm/build-hosted.lisp 68k` (the two files, in that order); IMAGE is
 any hosted 68k image (a core image included).  IMAGE's PT_LOAD contents go
 into one flat blob, compressed as a raw LZMA1 stream (lc=2 lp=1 pb=2), and the
 result is appended to LOADER, laid out as mvm/68k-unlzma.lisp expects (size,

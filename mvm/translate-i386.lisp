@@ -429,6 +429,33 @@
    INT3 placeholder.  Set by the bare CL image; the legacy bare images keep the
    placeholder and stay byte-identical.")
 
+(defparameter *i386-pit-clock* nil
+  "Bare clock from the PIT instead of the time stamp counter: trap #x0310 reads
+   the tick count the boot stub's timer interrupt keeps at this ADDRESS (100 Hz,
+   boot-i386 EMIT-I386-INTERRUPT-SETUP), #x0311 answers 100.  For CPUs with no
+   RDTSC -- a 486 -- which the bare CL image targets.  NIL: RDTSC
+   (*I386-BARE-CLOCK*).")
+
+(defconstant +i386-gc-static-lo+ #x8090
+  "A bare core boot's STATIC heap: its first byte (boot/boot-i386-cl.lisp
+   writes it, identity-mapped low memory).  Bare images only.")
+(defconstant +i386-gc-static-hi+ #x8094
+  "... and its end; 0 when there is none.")
+
+(defparameter *i386-cl-bare* nil
+  "BARE TRAPS OVER THE HOSTED LAYOUT -- arm32's *ARM32-CL-BARE* for i386: the
+   bare-metal CL image (boot/boot-i386-cl.lisp) runs the hosted address picture
+   (boot-linux-i386.lisp: the fixed block and globals at #x10000000.., the heap
+   at #x19000000, the handler-case block and frames at their hosted
+   addresses, the native collector with the hosted geometry and a margin read
+   from the BSS), mapped into RAM with paging, while every trap that would
+   reach Linux is the bare one (COM1 port I/O, RDTSC).  Set by
+   I386-SET-CL-BARE-MODE; *I386-LINUX-MODE* stays NIL.")
+
+(defun i386-hosted-layout-p ()
+  "Is the memory picture the hosted one (Linux, or bare over it)?"
+  (or *i386-linux-mode* *i386-cl-bare*))
+
 (defun i386-gc-mode-p ()
   "Does this image run the native collector: hosted, or a bare image whose
    boot sets it up (*I386-BARE-GC*)?"
@@ -594,15 +621,14 @@
    the Multiboot board -- above the per-CPU block (#x5B0000), below the cons
    space (8 MB), clear of the stack (down from 4 MB).  #x10000180 is past the
    end of RAM on a `qemu-system-i386 -m 256' board."
-  (let ((base (if *i386-linux-mode* #x10000000 *i386-bare-handler-base*)))
+  (let* ((hosted (i386-hosted-layout-p))
+         (base (if hosted #x10000000 *i386-bare-handler-base*)))
     (setf *i386-jmpbuf-addr*          (+ base #x180)
           *i386-longjmp-scratch-addr* (+ base #x3C0)
-          *i386-hstack-capcount-addr* (+ base #x3F0)
-          *i386-hstack-overflow-addr* (+ base #x3F8)
           *i386-hstack-depth-addr*    (+ base #x400)
           ;; HOSTED: the frames get their own room (see *I386-HOSTED-HSTACK-BASE*).
-          *i386-hstack-base-addr*     (if *i386-linux-mode* *i386-hosted-hstack-base* (+ base #x408))
-          *i386-hstack-max-depth*     (if *i386-linux-mode* 127 63))))
+          *i386-hstack-base-addr*     (if hosted *i386-hosted-hstack-base* (+ base #x408))
+          *i386-hstack-max-depth*     (if hosted 127 63))))
 
 (defparameter *i386-hosted-hstack-base* #x1001E100
   "Hosted handler frames: the free tail of the demand-zeroed BSS, past
@@ -611,8 +637,11 @@
    #xA00 were too few: a CATCH past the cap stores no frame and the LONGJMP out
    of an inner HANDLER-CASE skips it -- the upstream suite's
    (compile-and-load \"roman-numerals.lsp\") lost its fasl cache's %FASL-REJECT
-   that way and every ~R test with it.  The collector's handler-stack root loop
-   reads this base and the depth, so the frames stay roots.")
+   that way and every ~R test with it.  These 127 are now only the FAST
+   PATH: frame 127 and up go to the extension (+I386-HSTACK-EXT-ADDR+, THE
+   HANDLER-FRAME STACK HAS NO SILENT CEILING, i386).  The collector's
+   handler-stack root loop reads this base, the extension and the depth, so
+   the frames stay roots.")
 
 (defparameter *i386-jmpbuf-addr* #x10000180
   "Base of the six-word jmp_buf (ESP/EBP/IP/EBX/ESI/EDI).")
@@ -624,7 +653,9 @@
 (defparameter *i386-hstack-base-addr* #x10000408
   "Handler-stack frame 0.  Frame N is at base + 24*N.")
 (defparameter *i386-hstack-max-depth* 63
-  "Frames that fit below the i386 global slot block at 0x10000A00.")
+  "Frames kept in memory at *I386-HSTACK-BASE-ADDR* (bare: 63, below the
+   global slot block; hosted: 127).  Past them a hosted push goes to the
+   extension and a bare push is the loud overflow.")
 
 (defparameter *i386-longjmp-scratch-addr* #x100003C0
   "Six words.  LONGJMP copies the jmp_buf here BEFORE the pop overwrites it.")
@@ -645,18 +676,68 @@
 (defparameter *i386-gc-to-addr*   #x100003E4
   "This collection's to_start, captured BEFORE the semispace swap.")
 
-(defparameter *i386-hstack-capcount-addr* #x100003F0
-  "Cumulative count of capped pushes (diagnostic only).")
-(defparameter *i386-hstack-overflow-addr* #x100003F8
-  "LIVE capped-push count — the BALANCED-CAP counter.  A capped push stores no
-   frame, so the CLEAR-HANDLER that textually matches it must ABSORB its pop
-   rather than drain a real stored frame (the drain-to-depth-0 class x64 hit on
-   bare metal).  LONGJMP zeroes it: a longjmp unwinds past ALL capped (strictly
-   inner) frames at once, so their pending absorbs must not fire against outer
-   pops later.")
+(defparameter *i386-hstack-fault-addr* #x10000CB0
+  "Where an overflowing handler-frame push records #x0F0F: the pending-fault
+   word %TAKE-PENDING-FAULT reads, (mem-ref #x10000CB0 :u32), in BOTH modes.
+   It is not moved with the handler block: like the MV count at #x10000090 it
+   is a shared-contract address of the runtime's fixed block -- demand-zeroed
+   BSS hosted, the fixed block below the heap (#x10100000) on the bare CL
+   image, and past the end of RAM on the 256 MB ladder board, where the
+   store goes nowhere, as that image's MV-count stores already do.")
+(defconstant +i386-hstack-ext-addr+ #x1001FF00
+  "Hosted Linux: ABSOLUTE address of the handler-frame EXTENSION (frames 127
+   and up), 0 until the first push past the in-memory frames reserves it.  In
+   the free tail of the demand-zeroed BSS: past the in-memory frames (which
+   end at #x1001F8E8), below +LINUX-I386-BSS-END+ (#x10020000); no other
+   address in mvm/, boot/, net/ or lib/ falls in [#x1001F8E8, #x10020000).
+   The i386 image has no threads, so one process-global extension serves.")
+(defconstant +i386-hstack-ext-limit-addr+ #x1001FF04
+  "Hosted Linux: 0, or a TEST-ONLY lower limit on extension frames (raw
+   count).  It is how a test reaches the loud overflow without exhausting the
+   native stack.  Demand-zeroed BSS (the hosted ELF is exec'd fresh, never
+   restored from a core), so it is 0 at startup.")
+(defconstant +i386-hstack-ext-frames+ #x100000
+  "Frames in the extension: 1M x 24 bytes = 24 MB of reserved address space
+   (MAP_NORESERVE, pages touched on demand).  The native stack is a MAP_FIXED
+   8 MB, so it runs out long before this does.")
+(defconstant +i386-hstack-overflow-code+ #x0F0F
+  "Recorded by an overflowing push; %TAKE-PENDING-FAULT turns it into
+   HANDLER-STACK-EXHAUSTED (a STORAGE-CONDITION).")
 
 (defvar *i386-handler-push-label* nil)
+
+;;; SHARED ROUTINES (as the 68k translator's MODUS_68K_SHARED): the heaviest
+;;; inline sequences, by the MODUS_I386_OP_BYTES census, emitted ONCE after the
+;;; last function and CALLed.  A :gc-check was 23 bytes at each of ~29,000
+;;; sites and a :cons 75 bytes at each of ~29,000 (bitmap marks, fill, tag) --
+;;; 2.8 MB of an 18.5 MB image.  Minted only by TRANSLATE-MVM-TO-I386 (the
+;;; image), so the runtime native tier, which translates through
+;;; I386-TRANSLATE-INSN with these NIL, emits the inline forms as before.
+;;; MODUS_I386_SHARED=0 builds the image without them.
+(defvar *i386-shared-gccheck-label* nil)
+(defvar *i386-shared-cons-label* nil)
+(defvar *i386-shared-subtag-label* nil)
+(defvar *i386-shared-arraylen-label* nil)
+(defvar *i386-shared-allocobj-label* nil)
+(defvar *i386-shared-addslow-label* nil)
+(defvar *i386-shared-subslow-label* nil)
+(defun i386-shared-routines-p ()
+  (not (equal (sb-ext:posix-getenv "MODUS_I386_SHARED") "0")))
 (defvar *i386-handler-pop-label* nil)
+
+;;; THE NATIVE TIER (mvm/jit-i386-native.lisp, MODUS_I386_JIT=1): a runtime
+;;; DEFUN translated by this file, baked into the image -- the 68k native
+;;; tier's design (docs/68k-threaded-jit.md).  What the image must provide for
+;;; it, all gated here so an image without it is byte-identical:
+;;;   - the EXPORT TABLE right after %N386-EXPORT-TABLE's code: the routines runtime code
+;;;     calls that are not functions (the collector, the handler-case push and
+;;;     pop), as offsets from the table's magic "modusJXL";
+;;;   - a ROOT WORD at +I386-NATIVE-CONST-ROOT+ the collector forwards: the
+;;;     vector of constants runtime code loads (a heap pointer in code would
+;;;     go stale at the first collection).
+(defparameter *i386-native-tier* nil)
+(defconstant +i386-native-const-root+ #x10000FBC
+  "Hosted i386: the upper half of the 64-bit ports' JIT bump word, unused here.")
 
 ;;; ============================================================
 ;;; i386 Code Buffer
@@ -720,6 +801,7 @@
 
 (defun i386-emit-label (buf label-id)
   "Record current position as a branch target."
+  (setf *i386-last-store* nil)
   (setf (gethash label-id (i386-buffer-labels buf))
         (i386-buffer-position buf)))
 
@@ -769,6 +851,12 @@
                        (aref bytes (+ pos 1)) (logand (ash urel -8) #xFF)
                        (aref bytes (+ pos 2)) (logand (ash urel -16) #xFF)
                        (aref bytes (+ pos 3)) (logand (ash urel -24) #xFF)))))
+            (:rel8
+             ;; a short branch (I386-EMIT-BRANCH): relative to the byte's end
+             (let ((rel (- target (+ pos 1))))
+               (unless (<= -128 rel 127)
+                 (error "i386 rel8 ~D out of range at pos ~D" rel pos))
+               (setf (aref bytes pos) (logand rel #xFF))))
             (:rel32
              ;; rel32 is relative to end of the 4-byte displacement field
              (let* ((rel (- target (+ pos 4))))
@@ -851,6 +939,10 @@
   '(("DIV"         . "IDIV requires the dividend in EDX:EAX")
     ("MOD"         . "IDIV requires the dividend in EDX:EAX")
     ("MUL26LO"     . "MUL requires one operand in EAX")
+    ;; W32 (docs/w32.md): MUL's operand is EAX.  The arm saves and restores
+    ;; EAX around it unless the destination IS VR, so a live VR survives.
+    ("W32-MUL"     . "MUL requires one operand in EAX; EAX saved around it")
+    ("W32-MULHU"   . "MUL requires one operand in EAX; EAX saved around it")
     ("MUL26HI"     . "MUL requires one operand in EAX")
     ("IO-READ"     . "IN uses AL/AX/EAX by ISA")
     ("IO-WRITE"    . "OUT uses AL/AX/EAX by ISA")
@@ -996,6 +1088,13 @@
   ;; Encoding: 03 /r mod=00 r/m=5 disp32
   (i386-check-eax-write reg)
   (i386-emit-byte buf #x03)
+  (i386-emit-byte buf (i386-modrm #b00 reg 5))
+  (i386-emit-u32 buf (logand addr #xFFFFFFFF)))
+
+(defun i386-emit-sub-reg-abs (buf reg addr)
+  "SUB reg, [addr] (absolute 32-bit address, no base register): 2B /r mod=00 r/m=5"
+  (i386-check-eax-write reg)
+  (i386-emit-byte buf #x2B)
   (i386-emit-byte buf (i386-modrm #b00 reg 5))
   (i386-emit-u32 buf (logand addr #xFFFFFFFF)))
 
@@ -1254,12 +1353,43 @@
 
 ;;; --- Jump / Call / Return ---
 
+(defvar *i386-short-branches*
+  (not (equal (sb-ext:posix-getenv "MODUS_I386_SHORT_BRANCHES") "0"))
+  "Translate each image function twice so branches whose target is near are
+   2 bytes, not 5 or 6 (TRANSLATE-MVM-TO-I386).  MODUS_I386_SHORT_BRANCHES=0
+   keeps every branch long.")
+(defvar *i386-jump-index* nil
+  "Inside a function's two-pass translation: the number of the last branch to
+   a label emitted, which names it in both passes.  NIL elsewhere (the
+   collector, the shared routines, the runtime native tier): always long.")
+(defvar *i386-jump-record* nil
+  "First pass: a holder whose car lists (index end-position label shrink) for
+   each long branch; NIL in the second.")
+(defvar *i386-short-jumps* nil
+  "Second pass: the branch numbers to emit short.")
+
+(defun i386-emit-branch (buf short-op long-ops label-id)
+  "A branch to LABEL-ID: SHORT-OP rel8 when the second pass says it fits,
+   else LONG-OPS rel32 (recorded in the first pass)."
+  (let ((idx (and *i386-jump-index* label-id (incf *i386-jump-index*))))
+    (if (and idx *i386-short-jumps* (gethash idx *i386-short-jumps*))
+        (progn
+          (i386-emit-byte buf short-op)
+          (push (list (i386-buffer-position buf) label-id :rel8)
+                (i386-buffer-fixups buf))
+          (i386-emit-byte buf 0))
+        (progn
+          (dolist (b long-ops) (i386-emit-byte buf b))
+          (if label-id
+              (i386-emit-fixup-rel32 buf label-id)
+              (i386-emit-u32 buf 0))
+          (when (and idx *i386-jump-record*)
+            (push (list idx (i386-buffer-position buf) label-id (- (+ (length long-ops) 4) 2))
+                  (car *i386-jump-record*)))))))
+
 (defun i386-emit-jmp-rel32 (buf &optional label-id)
-  "JMP rel32 (near unconditional jump)"
-  (i386-emit-byte buf #xE9)
-  (if label-id
-      (i386-emit-fixup-rel32 buf label-id)
-      (i386-emit-u32 buf 0)))
+  "JMP rel32 (near unconditional jump), or JMP rel8 (see I386-EMIT-BRANCH)"
+  (i386-emit-branch buf #xEB '(#xE9) label-id))
 
 (defun i386-emit-jmp-reg (buf reg)
   "JMP reg (indirect near jump)"
@@ -1296,11 +1426,7 @@
   "Jcc rel32 (conditional jump, near form: 0F 80+cc)"
   (let ((code (cdr (assoc cc *i386-cc-codes*))))
     (unless code (error "i386: unknown condition code ~A" cc))
-    (i386-emit-byte buf #x0F)
-    (i386-emit-byte buf (+ #x80 code))
-    (if label-id
-        (i386-emit-fixup-rel32 buf label-id)
-        (i386-emit-u32 buf 0))))
+    (i386-emit-branch buf (+ #x70 code) (list #x0F (+ #x80 code)) label-id)))
 
 ;;; --- Atomic Exchange ---
 
@@ -1504,18 +1630,64 @@
   (i386-emit-shl-reg-imm buf +scratch0+ 2)
   (i386-emit-add-reg-reg buf +scratch0+ +scratch1+))
 
+(defun i386-emit-x87-muldiv (buf load-a op-b)
+  "st0 = A * or / B as a correctly rounded DOUBLE, A pushed by LOAD-A and the
+   operation done by OP-B (closures that emit).  Unscaled first: at 53-bit
+   precision with the x87's 15-bit exponent, a result in the double's NORMAL
+   range is rounded once, exactly as SSE2 rounds it.  Only a result whose
+   double has a zero exponent field (a denormal, or an underflow to 0) is redone
+   with the 2^-15360 scaling (I386-EMIT-X87-SCALE), which puts the x87's
+   denormal threshold at the double's.  And if the scaled result is 0 while the
+   unscaled double was not, the FPU cannot hold the scaled intermediate --
+   emulators that run the x87 on host doubles (86Box's default, DOSBox), where
+   2^-15360 underflows -- so the unscaled double stands: their arithmetic was
+   IEEE double already.  Before this every * and / scaled, and on those
+   emulators every product and quotient was 0.0.  Clobbers ECX; EAX is saved
+   around FNSTSW."
+  (let ((normal (i386-make-label)) (done (i386-make-label)))
+    (funcall load-a)
+    (funcall op-b)
+    (when *i386-x87-scale*
+      (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+      (i386-emit-x87-mem buf #xDD 2 +i386-esp+ 0)               ; fst qword [esp]
+      (i386-emit-mov-reg-mem buf +scratch0+ +i386-esp+ 4)
+      (i386-emit-test-reg-imm buf +scratch0+ #x7FF00000)
+      (i386-emit-jcc buf :ne normal)                             ; exponent != 0
+      ;; tiny (or zero): again, scaled
+      (i386-emit-byte buf #xDD) (i386-emit-byte buf #xD8)        ; fstp st0
+      (funcall load-a)
+      (i386-emit-x87-scale buf -15360)
+      (funcall op-b)
+      (i386-emit-x87-scale buf 15360)
+      ;; scaled 0 but unscaled not: an FPU without the extended exponent
+      (i386-emit-byte buf #xD9) (i386-emit-byte buf #xE4)        ; ftst
+      (i386-emit-byte buf #x50)                                  ; push eax
+      (i386-emit-byte buf #xDF) (i386-emit-byte buf #xE0)        ; fnstsw ax
+      (i386-emit-byte buf #x9E)                                  ; sahf
+      (i386-emit-byte buf #x58)                                  ; pop eax
+      (i386-emit-jcc buf :ne normal)                             ; scaled result non-zero
+      (i386-emit-mov-reg-mem buf +scratch0+ +i386-esp+ 4)
+      (i386-emit-and-reg-imm buf +scratch0+ #x7FFFFFFF)
+      (i386-emit-or-reg-mem buf +scratch0+ +i386-esp+ 0)
+      (i386-emit-jcc buf :e normal)                              ; unscaled was 0 too
+      (i386-emit-byte buf #xDD) (i386-emit-byte buf #xD8)        ; fstp st0
+      (i386-emit-x87-mem buf #xDD 0 +i386-esp+ 0)               ; fld qword [esp]
+      (i386-emit-label buf normal)
+      (i386-emit-add-reg-imm buf +i386-esp+ 8))
+    (i386-emit-label buf done)))
+
 (defun i386-translate-x87-float (buf opcode operands)
   "The x87 arm of every float opcode; NIL if OPCODE is not one."
   (macrolet ((op= (sym) `(= opcode ,sym)))
     (cond
       ((or (op= +op-fadd+) (op= +op-fsub+) (op= +op-fmul+) (op= +op-fdiv+))
-       (let ((scale (and *i386-x87-scale* (or (op= +op-fmul+) (op= +op-fdiv+)))))
-         (i386-emit-x87-fld-float buf (second operands))
-         (when scale (i386-emit-x87-scale buf -15360))
-         (i386-emit-x87-op-float buf (cond ((op= +op-fadd+) 0) ((op= +op-fmul+) 1)
-                                           ((op= +op-fsub+) 4) (t 6))
-                                 (third operands))
-         (when scale (i386-emit-x87-scale buf 15360))
+       (let ((rf (cond ((op= +op-fadd+) 0) ((op= +op-fmul+) 1) ((op= +op-fsub+) 4) (t 6))))
+         (if (or (op= +op-fmul+) (op= +op-fdiv+))
+             (i386-emit-x87-muldiv buf
+                                   (lambda () (i386-emit-x87-fld-float buf (second operands)))
+                                   (lambda () (i386-emit-x87-op-float buf rf (third operands))))
+             (progn (i386-emit-x87-fld-float buf (second operands))
+                    (i386-emit-x87-op-float buf rf (third operands))))
          (i386-emit-x87-box-st0 buf (first operands) +i386-float-header+))
        t)
       ((op= +op-fsqrt+)
@@ -1581,6 +1753,284 @@
        (i386-emit-x87-mem buf #xD9 3 +scratch0+ -5)              ; fstp dword [ecx-5]
        t)
       (t nil))))
+
+;;; ---- The FP-register class: unboxed singles and doubles (F0..F11) ----
+;;;
+;;; The compiler's call-free float trees (mvm.lisp, +OP-FP-UNBOX+ .. +OP-FP-TOI+)
+;;; keep their values in FP vregs and box once at the root.  x86-64 and aarch64
+;;; give each FP vreg a register; i386 has xmm0..7 on an SSE2 CPU and only the
+;;; x87 stack before one, so here every FP vreg is an 8-byte SLOT of a fixed
+;;; block in the low BSS (a single in its low 4 bytes, a double in all 8), and
+;;; each op loads, computes and stores.  Nothing is live across a call (the
+;;; class's own rule), so one block serves every function.  The same slots on
+;;; both arms: SSE2 (the default) and x87 (MODUS_I386_FP=x87, which the DOS
+;;; target needs), with the x87 arm's exactness rules (I386-TRANSLATE-X87-FLOAT
+;;; above): 53-bit precision, * and / of doubles scaled around the denormal
+;;; range.  A single computed on the x87 rounds to 53 bits and then to 24, which
+;;; is the correctly rounded single for + - * / (53 >= 2*24 + 2).  Box, unbox,
+;;; copies, constants and |x| move words and need no FPU.  FP-TOI uses FISTP
+;;; under a swapped rounding mode on both arms: floor and ceiling would need
+;;; SSE4.1's ROUNDSD otherwise.  Out of fixnum range it is wrong, as FTOI's
+;;; known gap.  The 4-lane classes (V4-*, VI-*) are not here.
+
+(defconstant +i386-fpr-base+ #x1001FA00
+  "Hosted i386: 12 FP vregs x 8 bytes, past the hosted handler frames
+   (*I386-HOSTED-HSTACK-BASE*, which end at #x1001F8E8), below the BSS end.")
+
+(defun i386-fpr (n) (+ +i386-fpr-base+ (* 8 n)))
+
+(defun i386-emit-abs-modrm (buf regfield addr)
+  "ModRM mod=00 rm=101: a disp32 absolute memory operand."
+  (i386-emit-byte buf (i386-modrm #b00 regfield 5))
+  (i386-emit-u32 buf addr))
+
+(defun i386-emit-sse-abs (buf prefix op xmm addr)
+  "[PREFIX] 0F OP xmm, [ADDR]."
+  (when prefix (i386-emit-byte buf prefix))
+  (i386-emit-byte buf #x0F) (i386-emit-byte buf op)
+  (i386-emit-abs-modrm buf xmm addr))
+
+(defun i386-emit-x87-abs (buf opcode regfield addr)
+  (i386-emit-byte buf opcode)
+  (i386-emit-abs-modrm buf regfield addr))
+
+(defun i386-emit-copy-slot (buf dst src bytes)
+  "Copy BYTES (4 or 8) from absolute SRC to absolute DST through +scratch1+."
+  (dotimes (i (floor bytes 4))
+    (i386-emit-mov-reg-abs buf +scratch1+ (+ src (* 4 i)))
+    (i386-emit-mov-abs-reg buf (+ dst (* 4 i)) +scratch1+)))
+
+(defun i386-emit-fp-flags-to-fixnum (buf vd setcc)
+  "VD = fixnum 1 when the flags satisfy SETCC (#x97 above, #x93 above-or-equal), else 0."
+  (i386-emit-byte buf #x0F) (i386-emit-byte buf setcc)
+  (i386-emit-byte buf (i386-modrm #b11 0 +scratch0+))              ; setcc cl
+  (i386-emit-byte buf #x0F) (i386-emit-byte buf #xB6)
+  (i386-emit-byte buf (i386-modrm #b11 +scratch0+ +scratch0+))     ; movzx ecx, cl
+  (i386-emit-shl-reg-imm buf +scratch0+ 1)
+  (i386-store-vreg buf vd +scratch0+))
+
+(defun i386-emit-x87-compare-slots (buf a b dbl)
+  "st0 = A, st1 = B; FUCOMPP; the x87 condition codes in CF/PF/ZF (UCOMISD's
+   flags: A < B -> CF, equal -> ZF, unordered -> all three).  EAX (VR) is saved
+   around FNSTSW with raw PUSH/POP, which leave the flags alone."
+  (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 b)                  ; fld B
+  (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 a)                  ; fld A
+  (i386-emit-byte buf #xDA) (i386-emit-byte buf #xE9)             ; fucompp
+  (i386-emit-byte buf #x50)                                       ; push eax
+  (i386-emit-byte buf #xDF) (i386-emit-byte buf #xE0)             ; fnstsw ax
+  (i386-emit-byte buf #x9E)                                       ; sahf
+  (i386-emit-byte buf #x58))                                      ; pop eax
+
+(defun i386-emit-fp-box-tail (buf vd header)
+  "The double at [ESP] (8 bytes the caller pushed) into a fresh boxed float with
+   HEADER; releases them; VD = the tagged object."
+  (i386-emit-float-alloc buf +scratch1+ +scratch0+)
+  (unless (= header +i386-float-header+)
+    (i386-emit-mov-mem-imm buf +scratch1+ 0 header))
+  (i386-emit-float-bits-from-stack buf +scratch1+ +scratch0+)
+  (i386-emit-add-reg-imm buf +i386-esp+ 8)
+  (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+  (i386-store-vreg buf vd +scratch1+))
+
+(defun i386-translate-fp-reg (buf opcode operands)
+  "The FP-register class (see above); NIL if OPCODE is not one of it."
+  (macrolet ((op= (sym) `(= opcode ,sym)))
+    (let ((x87 *i386-x87*))
+      (cond
+        ;; ---- boxed <-> FP vreg ----
+        ((or (op= +op-fp-unbox+) (op= +op-fpd-unbox+))
+         ;; payload (a double, in a single's box too) -> slot; a single rounds
+         (let ((fd (i386-fpr (first operands))))
+           (i386-load-vreg buf +scratch0+ (second operands))
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (cond ((op= +op-fpd-unbox+)
+                  (i386-emit-byte buf #x8F) (i386-emit-abs-modrm buf 0 fd)        ; pop [fd]
+                  (i386-emit-byte buf #x8F) (i386-emit-abs-modrm buf 0 (+ fd 4))) ; pop [fd+4]
+                 (x87
+                  (i386-emit-x87-mem buf #xDD 0 +i386-esp+ 0)                     ; fld qword [esp]
+                  (i386-emit-x87-abs buf #xD9 3 fd)                               ; fstp dword [fd]
+                  (i386-emit-add-reg-imm buf +i386-esp+ 8))
+                 (t
+                  (i386-emit-movsd-xmm-esp buf +i386-xmm0+)
+                  (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x5A)
+                  (i386-emit-byte buf (i386-modrm #b11 +i386-xmm0+ +i386-xmm0+))  ; cvtsd2ss
+                  (i386-emit-sse-abs buf #xF3 #x11 +i386-xmm0+ fd)               ; movss [fd]
+                  (i386-emit-add-reg-imm buf +i386-esp+ 8))))
+         t)
+        ((op= +op-fpd-box+)
+         (let ((fs (i386-fpr (second operands))))
+           (i386-emit-byte buf #xFF) (i386-emit-abs-modrm buf 6 (+ fs 4))         ; push [fs+4]
+           (i386-emit-byte buf #xFF) (i386-emit-abs-modrm buf 6 fs)               ; push [fs]
+           (i386-emit-fp-box-tail buf (first operands) +i386-float-header+))
+         t)
+        ((op= +op-fp-box+)
+         (let ((fs (i386-fpr (second operands))))
+           (if x87
+               (progn (i386-emit-x87-abs buf #xD9 0 fs)                           ; fld dword [fs]
+                      (i386-emit-x87-box-st0 buf (first operands) #x464))
+               (progn (i386-emit-sse-abs buf #xF3 #x5A +i386-xmm0+ fs)           ; cvtss2sd
+                      (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+                      (i386-emit-movsd-esp-xmm buf +i386-xmm0+)
+                      (i386-emit-fp-box-tail buf (first operands) #x464))))
+         t)
+        ;; ---- packed single lanes ----
+        ((op= +op-fp-lane-load+)
+         (i386-emit-x87-lane-addr buf (second operands) (third operands))         ; ecx = lane + 5
+         (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ -5)
+         (i386-emit-mov-abs-reg buf (i386-fpr (first operands)) +scratch1+)
+         t)
+        ((op= +op-fp-lane-store+)
+         (i386-emit-x87-lane-addr buf (first operands) (second operands))
+         (i386-emit-mov-reg-abs buf +scratch1+ (i386-fpr (third operands)))
+         (i386-emit-mov-mem-reg buf +scratch0+ -5 +scratch1+)
+         t)
+        ;; ---- arithmetic ----
+        ((or (op= +op-fp-add+) (op= +op-fp-sub+) (op= +op-fp-mul+) (op= +op-fp-div+)
+             (op= +op-fpd-add+) (op= +op-fpd-sub+) (op= +op-fpd-mul+) (op= +op-fpd-div+))
+         (let* ((dbl (or (op= +op-fpd-add+) (op= +op-fpd-sub+) (op= +op-fpd-mul+) (op= +op-fpd-div+)))
+                (k (cond ((or (op= +op-fp-add+) (op= +op-fpd-add+)) 0)
+                         ((or (op= +op-fp-sub+) (op= +op-fpd-sub+)) 1)
+                         ((or (op= +op-fp-mul+) (op= +op-fpd-mul+)) 2)
+                         (t 3)))
+                (fd (i386-fpr (first operands)))
+                (fa (i386-fpr (second operands)))
+                (fb (i386-fpr (third operands))))
+           (if x87
+               (flet ((ld () (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 fa))   ; fld A
+                      (op () (i386-emit-x87-abs buf (if dbl #xDC #xD8) (aref #(0 4 1 6) k) fb)))
+                 (if (and dbl (>= k 2))
+                     (i386-emit-x87-muldiv buf #'ld #'op)
+                     (progn (ld) (op)))
+                 (i386-emit-x87-abs buf (if dbl #xDD #xD9) 3 fd))                 ; fstp D
+               (let ((pre (if dbl #xF2 #xF3)))
+                 (i386-emit-sse-abs buf pre #x10 +i386-xmm0+ fa)                  ; movs? xmm0, A
+                 (i386-emit-sse-abs buf pre (aref #(#x58 #x5C #x59 #x5E) k) +i386-xmm0+ fb)
+                 (i386-emit-sse-abs buf pre #x11 +i386-xmm0+ fd))))               ; movs? D, xmm0
+         t)
+        ((op= +op-fpd-itof+)
+         (let ((fd (i386-fpr (first operands))))
+           (i386-load-vreg buf +scratch0+ (second operands))
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)
+           (if x87
+               (progn (i386-emit-push-reg buf +scratch0+)
+                      (i386-emit-x87-mem buf #xDB 0 +i386-esp+ 0)                 ; fild dword [esp]
+                      (i386-emit-add-reg-imm buf +i386-esp+ 4)
+                      (i386-emit-x87-abs buf #xDD 3 fd))                          ; fstp qword [fd]
+               (progn (i386-emit-cvtsi2sd buf +i386-xmm0+ +scratch0+)
+                      (i386-emit-sse-abs buf #xF2 #x11 +i386-xmm0+ fd))))
+         t)
+        ;; ---- compares: fixnum 1 / 0; a NaN answers 0 ----
+        ((or (op= +op-fpd-lt+) (op= +op-fpd-le+) (op= +op-fp-cmp+))
+         (let* ((dbl (not (op= +op-fp-cmp+)))
+                (lt (if dbl (op= +op-fpd-lt+) (= (fourth operands) 0)))
+                (fa (i386-fpr (second operands)))
+                (fb (i386-fpr (third operands))))
+           (if x87
+               ;; st0 = B, st1 = A: "above" is B > A, i.e. A < B
+               (i386-emit-x87-compare-slots buf fb fa dbl)
+               (progn (i386-emit-sse-abs buf (if dbl #xF2 #xF3) #x10 +i386-xmm0+ fb)
+                      (i386-emit-sse-abs buf (if dbl #x66 nil) #x2E +i386-xmm0+ fa))) ; ucomis? B, A
+           (i386-emit-fp-flags-to-fixnum buf (first operands) (if lt #x97 #x93)))
+         t)
+        ;; ---- constants ----
+        ((or (op= +op-fpd-li+) (op= +op-fp-li+))
+         (let ((fd (i386-fpr (first operands))))
+           (i386-emit-byte buf #xC7) (i386-emit-abs-modrm buf 0 fd)
+           (i386-emit-u32 buf (logand (third operands) #xFFFFFFFF))               ; lo
+           (i386-emit-byte buf #xC7) (i386-emit-abs-modrm buf 0 (+ fd 4))
+           (i386-emit-u32 buf (logand (second operands) #xFFFFFFFF))              ; hi
+           (when (op= +op-fp-li+)                       ; exactly a single: no rounding
+             (if x87
+                 (progn (i386-emit-x87-abs buf #xDD 0 fd) (i386-emit-x87-abs buf #xD9 3 fd))
+                 (progn (i386-emit-sse-abs buf #xF2 #x5A +i386-xmm0+ fd)
+                        (i386-emit-sse-abs buf #xF3 #x11 +i386-xmm0+ fd)))))
+         t)
+        ((op= +op-fpd-scale+)
+         ;; Fd *= 2^k, k in [-1022, 1023]: the double 2^k is (k + 1023) << 52
+         (let ((fd (i386-fpr (first operands))))
+           (i386-load-vreg buf +scratch0+ (second operands))
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)
+           (i386-emit-add-reg-imm buf +scratch0+ 1023)
+           (i386-emit-shl-reg-imm buf +scratch0+ 20)
+           (i386-emit-push-reg buf +scratch0+)
+           (i386-emit-push-imm32 buf 0)
+           (if x87
+               (progn (i386-emit-x87-abs buf #xDD 0 fd)
+                      (i386-emit-x87-mem buf #xDC 1 +i386-esp+ 0)                 ; fmul qword [esp]
+                      (i386-emit-x87-abs buf #xDD 3 fd))
+               (progn (i386-emit-sse-abs buf #xF2 #x10 +i386-xmm0+ fd)
+                      (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x59)
+                      (i386-emit-modrm-mem buf +i386-xmm0+ +i386-esp+ 0)          ; mulsd xmm0, [esp]
+                      (i386-emit-sse-abs buf #xF2 #x11 +i386-xmm0+ fd)))
+           (i386-emit-add-reg-imm buf +i386-esp+ 8))
+         t)
+        ;; ---- one-operand: |x| (both), single <-> double ----
+        ((op= +op-fp-op1+)
+         (let ((fd (i386-fpr (first operands))) (fs (i386-fpr (second operands)))
+               (sub (third operands)))
+           (case sub
+             (0 (i386-emit-copy-slot buf fd fs 4)
+                (i386-emit-byte buf #x81) (i386-emit-abs-modrm buf 4 fd) (i386-emit-u32 buf #x7FFFFFFF))
+             (1 (i386-emit-copy-slot buf fd fs 8)
+                (i386-emit-byte buf #x81) (i386-emit-abs-modrm buf 4 (+ fd 4)) (i386-emit-u32 buf #x7FFFFFFF))
+             (2 (if x87
+                    (progn (i386-emit-x87-abs buf #xD9 0 fs) (i386-emit-x87-abs buf #xDD 3 fd))
+                    (progn (i386-emit-sse-abs buf #xF3 #x5A +i386-xmm0+ fs)       ; cvtss2sd
+                           (i386-emit-sse-abs buf #xF2 #x11 +i386-xmm0+ fd))))
+             (t (if x87
+                    (progn (i386-emit-x87-abs buf #xDD 0 fs) (i386-emit-x87-abs buf #xD9 3 fd))
+                    (progn (i386-emit-sse-abs buf #xF2 #x5A +i386-xmm0+ fs)       ; cvtsd2ss
+                           (i386-emit-sse-abs buf #xF3 #x11 +i386-xmm0+ fd))))))
+         t)
+        ;; ---- max / min, SSE's semantics: A when A > B (A < B), else B ----
+        ((op= +op-fp-op2+)
+         (let* ((fd (i386-fpr (first operands))) (fa (i386-fpr (second operands)))
+                (fb (i386-fpr (third operands))) (sub (fourth operands))
+                (dbl (>= sub 2)) (maxp (evenp sub)))
+           (if x87
+               (let ((pick-a (i386-make-label)) (pick-b (i386-make-label)) (done (i386-make-label)))
+                 (i386-emit-x87-compare-slots buf fa fb dbl)          ; flags: A vs B
+                 (if maxp
+                     (progn (i386-emit-jcc buf :a pick-a) (i386-emit-jmp-rel32 buf pick-b))
+                     (progn (i386-emit-jcc buf :e pick-b)             ; equal or unordered
+                            (i386-emit-jcc buf :b pick-a)
+                            (i386-emit-jmp-rel32 buf pick-b)))
+                 (i386-emit-label buf pick-a)
+                 (i386-emit-copy-slot buf fd fa (if dbl 8 4))
+                 (i386-emit-jmp-rel32 buf done)
+                 (i386-emit-label buf pick-b)
+                 (i386-emit-copy-slot buf fd fb (if dbl 8 4))
+                 (i386-emit-label buf done))
+               (let ((pre (if dbl #xF2 #xF3)))
+                 (i386-emit-sse-abs buf pre #x10 +i386-xmm0+ fa)
+                 (i386-emit-sse-abs buf pre (if maxp #x5F #x5D) +i386-xmm0+ fb)
+                 (i386-emit-sse-abs buf pre #x11 +i386-xmm0+ fd))))
+         t)
+        ;; ---- to a fixnum: 0 round-even 1 truncate 2 floor 3 ceiling; +4 double ----
+        ((op= +op-fp-toi+)
+         (let* ((fs (i386-fpr (second operands))) (sub (third operands))
+                (dbl (>= sub 4)) (rc (aref #(0 3 1 2) (logand sub 3))))
+           (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 fs)                        ; fld
+           ;; [esp] result, [esp+4] saved control word, [esp+6] ours
+           (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+           (i386-emit-x87-mem buf #xD9 7 +i386-esp+ 4)                            ; fnstcw [esp+4]
+           (i386-emit-movzx-word buf +scratch0+ +i386-esp+ 4)
+           (i386-emit-and-reg-imm buf +scratch0+ #xF3FF)
+           (unless (zerop rc) (i386-emit-or-reg-imm buf +scratch0+ (ash rc 10)))
+           (i386-emit-mov-mem16-reg buf +i386-esp+ 6 +scratch0+)
+           (i386-emit-x87-mem buf #xD9 5 +i386-esp+ 6)                            ; fldcw [esp+6]
+           (i386-emit-x87-mem buf #xDB 3 +i386-esp+ 0)                            ; fistp dword [esp]
+           (i386-emit-x87-mem buf #xD9 5 +i386-esp+ 4)                            ; fldcw [esp+4]
+           (i386-emit-mov-reg-mem buf +scratch0+ +i386-esp+ 0)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)
+           (i386-store-vreg buf (first operands) +scratch0+))
+         t)
+        ((op= +op-fp-mov+)
+         (unless (= (first operands) (second operands))
+           (i386-emit-copy-slot buf (i386-fpr (first operands)) (i386-fpr (second operands)) 8))
+         t)
+        (t nil)))))
 
 (defun i386-emit-float-bits-to-stack (buf ptr-reg tmp-reg)
   "PTR-REG holds the TAGGED pointer to a float object.  Push 8 bytes and fill
@@ -1700,16 +2150,29 @@
 ;;;     caller-saved, so VR cannot be live across a call by ABI anyway.
 ;;; If you add an opcode that needs EAX for any OTHER reason, it is a bug.
 
+(defvar *i386-last-store* nil
+  "(position vreg reg) after I386-STORE-VREG stored REG into a memory vreg:
+   a load of that vreg into that register at the same position, with no
+   label there, finds the value already in it (I386-EMIT-LABEL clears it).")
+
 (defun i386-load-vreg (buf scratch vreg)
   "Load virtual register VREG into physical register SCRATCH.
-   If VREG already lives in SCRATCH, no code is emitted.
+   If VREG already lives in SCRATCH, no code is emitted; nor when the last
+   thing emitted stored SCRATCH into VREG (*I386-LAST-STORE*).  VN is NIL, a
+   constant on the hosted layout: an immediate, not a load.
    NB pass +scratch0+/+scratch1+, not +i386-eax+ — see the register
    invariant above."
   (let ((phys (i386-vreg-phys vreg))
-        (abs (i386-vreg-abs-addr vreg)))
+        (abs (i386-vreg-abs-addr vreg))
+        (last *i386-last-store*))
     (cond
       (phys (unless (= phys scratch)
               (i386-emit-mov-reg-reg buf scratch phys)))
+      ((and last (= (first last) (i386-buffer-position buf))
+            (eql (second last) vreg) (eql (third last) scratch))
+       nil)
+      ((and abs (= vreg +vreg-vn+) (i386-hosted-layout-p))
+       (i386-emit-mov-reg-imm buf scratch #xDEAD0001))
       (abs  (i386-emit-mov-reg-abs buf scratch abs))
       (t    (i386-emit-mov-reg-mem buf scratch +i386-ebp+ (i386-spill-offset vreg))))))
 
@@ -1720,8 +2183,10 @@
     (cond
       (phys (unless (= phys scratch)
               (i386-emit-mov-reg-reg buf phys scratch)))
-      (abs  (i386-emit-mov-abs-reg buf abs scratch))
-      (t    (i386-emit-mov-mem-reg buf +i386-ebp+ (i386-spill-offset vreg) scratch)))))
+      (abs  (i386-emit-mov-abs-reg buf abs scratch)
+            (setf *i386-last-store* (list (i386-buffer-position buf) vreg scratch)))
+      (t    (i386-emit-mov-mem-reg buf +i386-ebp+ (i386-spill-offset vreg) scratch)
+            (setf *i386-last-store* (list (i386-buffer-position buf) vreg scratch))))))
 
 (defun i386-vreg-or-scratch (buf vreg scratch)
   "If VREG has a physical register, return it.
@@ -1925,10 +2390,13 @@
     (i386-emit-and-reg-imm buf +scratch1+ 15)
     (i386-emit-cmp-reg-imm buf +scratch1+ 15)
     (i386-emit-jcc buf :e c-fwd)
-    ;; size -> EDX.  u8 vectors count BYTES, everything else counts WORDS.
+    ;; size -> EDX.  u8 vectors and narrow strings (#x13, a u8 vector with its
+    ;; subtag rewritten) count BYTES, everything else counts WORDS.
     (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
     (i386-emit-and-reg-imm buf +scratch1+ 255)
     (i386-emit-cmp-reg-imm buf +scratch1+ #x11)
+    (i386-emit-jcc buf :e c-u8)
+    (i386-emit-cmp-reg-imm buf +scratch1+ #x13)
     (i386-emit-jcc buf :e c-u8)
     (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
     (i386-emit-shr-reg-imm buf +scratch1+ 8)     ; element count
@@ -2082,88 +2550,239 @@
     (i386-emit-pop-reg buf +i386-eax+)
     (i386-emit-ret buf)))
 
+;;; ------------------------------------------------------------------
+;;; THE HANDLER-FRAME STACK HAS NO SILENT CEILING (i386)
+;;; ------------------------------------------------------------------
+;;;
+;;; The i386 twin of translate-x64's section of the same name.  Every CATCH /
+;;; UNWIND-PROTECT / HANDLER-CASE / cross-unit BLOCK keeps one 24-byte frame
+;;; (the outer jmp_buf: ESP EBP IP EBX ESI EDI) while its body runs.  The
+;;; frames were a fixed array (127 hosted, 63 bare) whose overflow was a
+;;; transparent no-op (BALANCED-CAP): a push past the cap stored nothing, the
+;;; setjmp site skipped arming and the matching pop "absorbed" -- so a longjmp
+;;; from below the cap went straight to the deepest STORED frame and every
+;;; cleanup past the cap was silently skipped.
+;;;
+;;; HOSTED Linux: frames 0..126 stay at *I386-HOSTED-HSTACK-BASE* (the fast
+;;; path: the old code plus one compare); frame 127 and up go to an EXTENSION
+;;; the push helper reserves itself on first use (mmap2 MAP_NORESERVE,
+;;; +I386-HSTACK-EXT-FRAMES+ frames), its address in +I386-HSTACK-EXT-ADDR+.
+;;; The image has no threads, so the extension is process-global.  Past the
+;;; extension, or when the reservation is refused, the push is LOUD: it
+;;; records #x0F0F at 0x10000CB0 and longjmps to the ARMED frame -- the one
+;;; enclosing the form whose push failed -- exactly as TRAP #x0511 does, and
+;;; that frame's HANDLER-CASE receives HANDLER-STACK-EXHAUSTED from
+;;; %TAKE-PENDING-FAULT.  The failed frame was never stored, so the stack
+;;; stays balanced and every enclosing cleanup runs.
+;;; +I386-HSTACK-EXT-LIMIT-ADDR+ is a test-only lower limit on extension
+;;; frames.
+;;;
+;;; BARE METAL has no mmap: the 63 frames at base+#x408 (below the global
+;;; slot block at #x600) stay, and the 64th push is the same loud overflow
+;;; (its code recorded at the same #x10000CB0, *I386-HSTACK-FAULT-ADDR*).
+;;;
+;;; The frames hold EBX/ESI/EDI = V4/V0/V1, live heap pointers, so they are GC
+;;; roots: the collector's handler-stack loop scans the in-memory frames AND
+;;; the live extension frames (I386-EMIT-GC-TRAMPOLINE).
+
+(defun i386-emit-hstack-ext-frame-addr (buf reg idx-reg)
+  "REG := [+I386-HSTACK-EXT-ADDR+] + IDX-REG*24, IDX-REG an extension index
+   (depth - 127).  REG /= IDX-REG; IDX-REG is preserved."
+  (i386-emit-imul-reg-reg-imm8 buf reg idx-reg +i386-jmpbuf-size+)
+  (i386-emit-add-reg-abs buf reg +i386-hstack-ext-addr+))
+
+(defun i386-emit-hstack-reserve (buf have-ext overflow)
+  "Hosted, first push past the in-memory frames: reserve the extension.
+   mmap2(0, frames*24, PROT_READ|PROT_WRITE,
+         MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0) -- i386 syscall 192,
+   arguments in EBX ECX EDX ESI EDI EBP.  EBX/ESI/EDI are live vregs and EBP
+   the frame pointer, so all four are saved, and ECX (the depth) with them;
+   int 0x80 changes only EAX (saved by the push helper itself).  On success
+   the address goes to the extension word and control continues at HAVE-EXT
+   with ECX = depth; a -errno result (unsigned above -4096) goes to OVERFLOW."
+  (i386-emit-push-reg buf +i386-ebx+)
+  (i386-emit-push-reg buf +i386-esi+)
+  (i386-emit-push-reg buf +i386-edi+)
+  (i386-emit-push-reg buf +i386-ebp+)
+  (i386-emit-push-reg buf +scratch0+)
+  (i386-emit-mov-reg-imm buf +i386-ebx+ 0)
+  (i386-emit-mov-reg-imm buf +scratch0+ (* +i386-jmpbuf-size+ +i386-hstack-ext-frames+))
+  (i386-emit-mov-reg-imm buf +scratch1+ 3)               ; PROT_READ|PROT_WRITE
+  (i386-emit-mov-reg-imm buf +i386-esi+ #x4022)          ; PRIVATE|ANON|NORESERVE
+  (i386-emit-mov-reg-imm buf +i386-edi+ -1)              ; fd -1
+  (i386-emit-mov-reg-imm buf +i386-ebp+ 0)               ; pgoffset
+  (i386-emit-mov-reg-imm buf +i386-eax+ 192)             ; mmap2
+  (i386-emit-int buf #x80)
+  (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+  (i386-emit-pop-reg buf +scratch0+)
+  (i386-emit-pop-reg buf +i386-ebp+)
+  (i386-emit-pop-reg buf +i386-edi+)
+  (i386-emit-pop-reg buf +i386-esi+)
+  (i386-emit-pop-reg buf +i386-ebx+)
+  (i386-emit-cmp-reg-imm buf +scratch1+ -4096)
+  (i386-emit-jcc buf :a overflow)                        ; -errno: refused
+  (i386-emit-mov-abs-reg buf +i386-hstack-ext-addr+ +scratch1+)
+  (i386-emit-jmp-rel32 buf have-ext))
+
+(defun i386-emit-hstack-overflow (buf pop-label)
+  "The loud end of a push that cannot store its frame (entered by a jump from
+   inside the push helper, which has pushed EAX and is itself a call: the
+   stack is abandoned, so neither matters).  Record #x0F0F -- the channel a
+   hardware fault uses, since this code cannot allocate a condition -- then
+   LONGJMP to the armed frame exactly as TRAP #x0511 does: copy the jmp_buf
+   aside, pop (which uncovers the frame below it), restore, jump with EAX = T.
+   With nothing armed: a message and exit 71 hosted, INT3 bare -- never a
+   branch through a zero frame."
+  (let ((armed (i386-make-label))
+        (ljs *i386-longjmp-scratch-addr*))
+    (i386-emit-mov-abs-imm buf *i386-hstack-fault-addr* +i386-hstack-overflow-code+)
+    (i386-emit-mov-reg-imm buf +scratch0+ *i386-jmpbuf-addr*)
+    (dotimes (i +i386-jmpbuf-words+)
+      (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ (* 4 i))
+      (i386-emit-mov-abs-reg buf (+ ljs (* 4 i)) +scratch1+))
+    (i386-emit-mov-reg-abs buf +scratch0+ ljs)
+    (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
+    (i386-emit-jcc buf :ne armed)
+    (i386-emit-abort-msg
+     buf "MODUS i386: handler-frame stack exhausted with no handler armed
+" 71)
+    (i386-emit-label buf armed)
+    (i386-emit-call-rel32 buf pop-label)
+    (i386-emit-mov-reg-abs buf +i386-ebx+ (+ ljs 12))
+    (i386-emit-mov-reg-abs buf +i386-esi+ (+ ljs 16))
+    (i386-emit-mov-reg-abs buf +i386-edi+ (+ ljs 20))
+    (i386-emit-mov-reg-abs buf +i386-ebp+ (+ ljs 4))
+    (i386-emit-mov-reg-abs buf +scratch1+ (+ ljs 8))
+    (i386-emit-mov-reg-abs buf +i386-esp+ ljs)
+    (i386-emit-mov-reg-imm buf +i386-eax+ +i386-mvm-t+)
+    (i386-emit-jmp-reg buf +scratch1+)))
+
 (defun i386-emit-handler-helpers (buf push-label pop-label)
   "Emit __handler_push / __handler_pop: the NESTING half of the handler-case
    traps.  Both preserve EAX (CLEAR-HANDLER is emitted right after a
    handler-case body whose result is in dest — and dest==VR==EAX on i386, so
    clobbering EAX there would hand back a popped frame word as the value).
-   Both clobber only ECX/EDX, the declared scratch pair.
+   Both clobber only ECX/EDX, the declared scratch pair, on every path that
+   returns (the first push past the in-memory frames also makes a syscall,
+   saving what it needs); the overflow path does not return.
 
-   __handler_push: stack the CURRENT jmp_buf, then return EDX = 0 (stored) or
-                   1 (capped).  SETJMP skips arming on 1, which degrades an
-                   over-deep handler-case to a transparent no-op instead of a
-                   stack corrupter.
+   __handler_push: stack the CURRENT jmp_buf.  A frame that cannot be stored
+                   is the LOUD overflow (I386-EMIT-HSTACK-OVERFLOW), never a
+                   dropped frame -- see THE HANDLER-FRAME STACK HAS NO SILENT
+                   CEILING (i386) above.
    __handler_pop:  restore the top stacked frame into the jmp_buf, or zero the
                    jmp_buf when the stack is empty.
+
+   frame[i] = *I386-HSTACK-BASE-ADDR* + i*24 below the in-memory capacity,
+   and (hosted) [+I386-HSTACK-EXT-ADDR+] + (i - 127)*24 above it.
 
    Nesting is NOT deferrable.  SEQUENTIAL handler-cases — exactly what
    init-all-globals does, one per init thunk — work with a single-level
    implementation, so a version without this passes the early milestones and
    fails later, which is the worst available failure shape."
+  (let* ((jb *i386-jmpbuf-addr*)
+         (hd *i386-hstack-depth-addr*)
+         (hs *i386-hstack-base-addr*)
+         (cap *i386-hstack-max-depth*)
+         (hosted *i386-linux-mode*)
+         (ext (i386-make-label))
+         (have-ext (i386-make-label))
+         (reserve (i386-make-label))
+         (overflow (i386-make-label))
+         (store (i386-make-label)))
+    ;; ---------------- __handler_push ----------------
+    (i386-emit-label buf push-label)
+    (i386-emit-push-reg buf +i386-eax+)
+    (i386-emit-mov-reg-abs buf +scratch0+ hd)              ; ECX = depth
+    (i386-emit-cmp-reg-imm buf +scratch0+ cap)
+    (i386-emit-jcc buf :ge (if hosted ext overflow))       ; signed
+    ;; EDX = hs + depth*24
+    (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
+    (i386-emit-add-reg-imm buf +scratch1+ hs)
+    (i386-emit-label buf store)
+    (dotimes (i +i386-jmpbuf-words+)
+      (i386-emit-mov-reg-abs buf +i386-eax+ (+ jb (* 4 i)))
+      (i386-emit-mov-mem-reg buf +scratch1+ (* 4 i) +i386-eax+))
+    (i386-emit-add-reg-imm buf +scratch0+ 1)
+    (i386-emit-mov-abs-reg buf hd +scratch0+)
+    (i386-emit-pop-reg buf +i386-eax+)
+    (i386-emit-ret buf)
+    (when hosted
+      ;; extension frame: EDX = [ext] + (depth - 127)*24
+      (let ((no-limit (i386-make-label)))
+        (i386-emit-label buf ext)
+        (i386-emit-mov-reg-abs buf +scratch1+ +i386-hstack-ext-addr+)
+        (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
+        (i386-emit-jcc buf :e reserve)
+        (i386-emit-label buf have-ext)
+        ;; EAX (saved above) = extension index
+        (i386-emit-mov-reg-reg buf +i386-eax+ +scratch0+)
+        (i386-emit-sub-reg-imm buf +i386-eax+ cap)
+        (i386-emit-cmp-reg-imm buf +i386-eax+ +i386-hstack-ext-frames+)
+        (i386-emit-jcc buf :ae overflow)
+        ;; the test-only lower limit, when one is set
+        (i386-emit-mov-reg-abs buf +scratch1+ +i386-hstack-ext-limit-addr+)
+        (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
+        (i386-emit-jcc buf :e no-limit)
+        (i386-emit-cmp-reg-reg buf +i386-eax+ +scratch1+)
+        (i386-emit-jcc buf :ae overflow)
+        (i386-emit-label buf no-limit)
+        (i386-emit-hstack-ext-frame-addr buf +scratch1+ +i386-eax+)
+        (i386-emit-jmp-rel32 buf store))
+      (i386-emit-label buf reserve)
+      (i386-emit-hstack-reserve buf have-ext overflow))
+    (i386-emit-label buf overflow)
+    (i386-emit-hstack-overflow buf pop-label))
+  ;; ---------------- __handler_pop ----------------
   (let ((jb *i386-jmpbuf-addr*)
         (hd *i386-hstack-depth-addr*)
         (hs *i386-hstack-base-addr*)
-        (ovf *i386-hstack-overflow-addr*))
-    ;; ---------------- __handler_push ----------------
-    (let ((capped (i386-make-label)))
-      (i386-emit-label buf push-label)
-      (i386-emit-push-reg buf +i386-eax+)
-      (i386-emit-mov-reg-abs buf +scratch0+ hd)              ; ECX = depth
-      (i386-emit-cmp-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
-      (i386-emit-jcc buf :ge capped)
-      ;; EDX = hs + depth*24
-      (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
-      (i386-emit-add-reg-imm buf +scratch1+ hs)
-      (dotimes (i +i386-jmpbuf-words+)
-        (i386-emit-mov-reg-abs buf +i386-eax+ (+ jb (* 4 i)))
-        (i386-emit-mov-mem-reg buf +scratch1+ (* 4 i) +i386-eax+))
-      (i386-emit-add-reg-imm buf +scratch0+ 1)
-      (i386-emit-mov-abs-reg buf hd +scratch0+)
-      (i386-emit-mov-reg-imm buf +scratch1+ 0)               ; EDX = 0: stored
-      (i386-emit-pop-reg buf +i386-eax+)
-      (i386-emit-ret buf)
-      (i386-emit-label buf capped)
-      (i386-emit-add-abs-imm8 buf *i386-hstack-capcount-addr* 1)
-      (i386-emit-add-abs-imm8 buf ovf 1)
-      (i386-emit-mov-reg-imm buf +scratch1+ 1)               ; EDX = 1: capped
-      (i386-emit-pop-reg buf +i386-eax+)
-      (i386-emit-ret buf))
-    ;; ---------------- __handler_pop ----------------
-    (let ((no-ovf (i386-make-label))
-          (empty (i386-make-label))
-          (done (i386-make-label)))
-      (i386-emit-label buf pop-label)
-      (i386-emit-push-reg buf +i386-eax+)
-      ;; A pop that textually matches a CAPPED push absorbs it and touches
-      ;; nothing else.
-      (i386-emit-mov-reg-abs buf +scratch0+ ovf)
-      (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
-      (i386-emit-jcc buf :e no-ovf)
-      (i386-emit-add-reg-imm buf +scratch0+ -1)
-      (i386-emit-mov-abs-reg buf ovf +scratch0+)
-      (i386-emit-jmp-rel32 buf done)
-      (i386-emit-label buf no-ovf)
-      (i386-emit-mov-reg-abs buf +scratch0+ hd)
-      (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
-      (i386-emit-jcc buf :e empty)
-      (i386-emit-add-reg-imm buf +scratch0+ -1)
-      (i386-emit-mov-abs-reg buf hd +scratch0+)
-      (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
-      (i386-emit-add-reg-imm buf +scratch1+ hs)
-      (dotimes (i +i386-jmpbuf-words+)
-        (i386-emit-mov-reg-mem buf +i386-eax+ +scratch1+ (* 4 i))
-        (i386-emit-mov-abs-reg buf (+ jb (* 4 i)) +i386-eax+))
-      (i386-emit-jmp-rel32 buf done)
-      (i386-emit-label buf empty)
-      ;; Zero the WHOLE jmp_buf, not just word 0.  Word 0 == 0 is the
-      ;; "no handler armed" sentinel LONGJMP checks, but leaving the other
-      ;; five words holding a dead frame's EBX/ESI/EDI leaves the collector
-      ;; scanning stale roots (they are scanned — see i386-emit-gc-trampoline).
-      (dotimes (i +i386-jmpbuf-words+)
-        (i386-emit-mov-abs-imm buf (+ jb (* 4 i)) 0))
-      (i386-emit-label buf done)
-      (i386-emit-pop-reg buf +i386-eax+)
-      (i386-emit-ret buf))))
+        (cap *i386-hstack-max-depth*)
+        (empty (i386-make-label))
+        (ext (i386-make-label))
+        (load (i386-make-label))
+        (done (i386-make-label)))
+    (i386-emit-label buf pop-label)
+    (i386-emit-push-reg buf +i386-eax+)
+    (i386-emit-mov-reg-abs buf +scratch0+ hd)
+    (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
+    (i386-emit-jcc buf :e empty)
+    (i386-emit-add-reg-imm buf +scratch0+ -1)
+    (i386-emit-mov-abs-reg buf hd +scratch0+)
+    (when *i386-linux-mode*
+      (i386-emit-cmp-reg-imm buf +scratch0+ cap)
+      (i386-emit-jcc buf :ge ext))                         ; signed, as the push's
+    (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
+    (i386-emit-add-reg-imm buf +scratch1+ hs)
+    (i386-emit-label buf load)
+    (dotimes (i +i386-jmpbuf-words+)
+      (i386-emit-mov-reg-mem buf +i386-eax+ +scratch1+ (* 4 i))
+      (i386-emit-mov-abs-reg buf (+ jb (* 4 i)) +i386-eax+))
+    (i386-emit-jmp-rel32 buf done)
+    (when *i386-linux-mode*
+      ;; extension frame (the push that stored it reserved the extension)
+      (i386-emit-label buf ext)
+      (i386-emit-sub-reg-imm buf +scratch0+ cap)
+      (i386-emit-hstack-ext-frame-addr buf +scratch1+ +scratch0+)
+      (i386-emit-jmp-rel32 buf load))
+    (i386-emit-label buf empty)
+    ;; Zero the WHOLE jmp_buf, not just word 0.  Word 0 == 0 is the
+    ;; "no handler armed" sentinel LONGJMP checks, but leaving the other
+    ;; five words holding a dead frame's EBX/ESI/EDI leaves the collector
+    ;; scanning stale roots (they are scanned — see i386-emit-gc-trampoline).
+    (dotimes (i +i386-jmpbuf-words+)
+      (i386-emit-mov-abs-imm buf (+ jb (* 4 i)) 0))
+    (i386-emit-label buf done)
+    (i386-emit-pop-reg buf +i386-eax+)
+    (i386-emit-ret buf)))
+
+(defparameter *i386-gc-margin-addr* nil
+  "Hosted i386: the BSS word holding the VL margin the boot stub chose with the
+   heap's size (boot-linux-i386.lisp, EMIT-I386-CHOOSE-HEAP-SIZE).  When set,
+   the collector reads its margin there instead of *I386-GC-VL-MARGIN*, and a
+   collection whose survivors leave no room below VL exits 3 with
+   \"modus: heap exhausted\" rather than collecting again forever.  NIL: the
+   constant, as every other i386 image (byte-identical).")
 
 (defparameter *i386-gc-vl-margin* #x1000000
   "Bytes VL stops short of the end of the ACTIVE semispace (16 MB, the same as
@@ -2178,6 +2797,85 @@
    as the nondeterministic named-readtables crash (MEM-WRITE to address 0
    after 71 collections).  A single allocation larger than the margin is the
    residual every port has; the cure is a size-aware :gc-check.")
+
+(defun i386-emit-gcnative-typed-walk (buf scan-label start-addr end-addr)
+  "Walk [*START-ADDR, END) OBJECT BY OBJECT, handing each pointer slot to
+   scan_word: END is *END-ADDR, or with END-ADDR NIL the free pointer ESI,
+   which moves as scan_word copies (the Cheney scan of to-space).  A cons
+   (its cons-kind bit) is car and cdr; an object is its header's COUNT slots,
+   a leaf subtag's payload skipped.  Clobbers EAX, ECX, EDX, EBP."
+  (let ((cl (i386-make-label)) (cd (i386-make-label)) (c-cons (i386-make-label))
+        (c-u8 (i386-make-label)) (c-al (i386-make-label))
+        (c-skip (i386-make-label)) (sl (i386-make-label)))
+      (i386-emit-mov-reg-abs buf +i386-ebp+ start-addr)
+      (i386-emit-label buf cl)
+      (if end-addr
+          (i386-emit-cmp-reg-abs buf +i386-ebp+ end-addr)    ; a fixed end
+          (i386-emit-cmp-reg-reg buf +i386-ebp+ +i386-esi+)) ; the free pointer
+      (i386-emit-jcc buf :ae cd)
+      ;; BT [consbmp], (ebp - page_base) >> 4   -> CF = cons-kind bit
+      (i386-emit-mov-reg-reg buf +scratch0+ +i386-ebp+)
+      (i386-emit-byte buf #x2B)                                ; SUB ecx, [page_base]
+      (i386-emit-byte buf (i386-modrm #b00 +scratch0+ 5))
+      (i386-emit-u32 buf *gc-page-base-addr*)
+      (i386-emit-shr-reg-imm buf +scratch0+ 4)
+      (i386-emit-mov-reg-abs buf +scratch1+ *gc-consbmp-addr*)
+      (i386-emit-byte buf #x0F) (i386-emit-byte buf #xA3)      ; BT [edx], ecx
+      (i386-emit-byte buf (i386-modrm #b00 +scratch0+ +scratch1+))
+      (i386-emit-jcc buf :b c-cons)
+      ;; -- object: EAX = header, ECX = subtag, EDX = count --
+      (i386-emit-mov-reg-mem buf +i386-eax+ +i386-ebp+ 0)
+      (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+      (i386-emit-and-reg-imm buf +scratch0+ 255)
+      (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+      (i386-emit-shr-reg-imm buf +scratch1+ 8)
+      ;; EAX = size (copy_object's rule), then EAX = next object
+      (i386-emit-cmp-reg-imm buf +scratch0+ #x11)
+      (i386-emit-jcc buf :e c-u8)
+      (i386-emit-cmp-reg-imm buf +scratch0+ #x13)            ; narrow string
+      (i386-emit-jcc buf :e c-u8)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)
+      (i386-emit-add-reg-imm buf +i386-eax+ 1)
+      (i386-emit-shl-reg-imm buf +i386-eax+ 2)
+      (i386-emit-jmp-rel32 buf c-al)
+      (i386-emit-label buf c-u8)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)
+      (i386-emit-add-reg-imm buf +i386-eax+ 4)
+      (i386-emit-label buf c-al)
+      (i386-emit-add-reg-imm buf +i386-eax+ 15)
+      (i386-emit-and-reg-imm buf +i386-eax+ -16)
+      (i386-emit-add-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-push-reg buf +i386-eax+)                      ; [esp] = next
+      ;; leaf subtags: skip the payload
+      (dolist (st '(#x10 #x11 #x12 #x13 #x14 #x16 #x60 #x64 #x65 #x66))
+        (i386-emit-cmp-reg-imm buf +scratch0+ st)
+        (i386-emit-jcc buf :e c-skip))
+      ;; slots: [ebp+4, ebp+4+4*count)
+      (i386-emit-shl-reg-imm buf +scratch1+ 2)
+      (i386-emit-add-reg-reg buf +scratch1+ +i386-ebp+)
+      (i386-emit-add-reg-imm buf +scratch1+ 4)
+      (i386-emit-mov-abs-reg buf *i386-gcroot-bound-addr* +scratch1+)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-label buf sl)
+      (i386-emit-cmp-reg-abs buf +i386-ebp+ *i386-gcroot-bound-addr*)
+      (i386-emit-jcc buf :ae c-skip)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-jmp-rel32 buf sl)
+      (i386-emit-label buf c-skip)
+      (i386-emit-pop-reg buf +i386-ebp+)                       ; ebp = next
+      (i386-emit-jmp-rel32 buf cl)
+      ;; -- cons: car at +0, cdr at +4, 16 bytes --
+      (i386-emit-label buf c-cons)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-add-reg-imm buf +i386-eax+ 4)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 16)
+      (i386-emit-jmp-rel32 buf cl)
+      (i386-emit-label buf cd)))
 
 (defun i386-emit-gc-trampoline (buf tramp-label collect-label)
   "A complete Cheney copying collector in native i386, called by :gc-check.
@@ -2263,12 +2961,15 @@
       (i386-emit-label buf sd))
 
     ;; --- fixed global roots (same set the x64 trampoline scans) ---
-    (dolist (a (list #x10000FA0     ; global-cell cache vector (%GV-REF-FILL)
-                     #x10000FB0     ; static-literal vector (compile-quote)
-                     #x10000080     ; global special-variable alist
-                     #x10000088     ; symbol intern table
-                     #x10000148     ; keyword intern table
-                     #x10000170))   ; package-by-hash table
+    (dolist (a (append
+                (list #x10000FA0     ; global-cell cache vector (%GV-REF-FILL)
+                      #x10000FB0     ; static-literal vector (compile-quote)
+                      #x10000080     ; global special-variable alist
+                      #x10000088     ; symbol intern table
+                      #x10000148     ; keyword intern table
+                      #x10000170)    ; package-by-hash table
+                ;; the native tier's constant vector (runtime code's LI-CONST)
+                (and *i386-native-tier* (list +i386-native-const-root+))))
       (i386-emit-mov-reg-imm buf +i386-eax+ a)
       (i386-emit-call-rel32 buf scan-label))
 
@@ -2314,11 +3015,18 @@
       (i386-emit-add-reg-imm buf +i386-ebp+ 4)
       (i386-emit-jmp-rel32 buf jl)
       (i386-emit-label buf jd))
-    ;; Live frames only: [hstack_base, hstack_base + 24*depth).  scan_word
-    ;; clobbers EAX/ECX/EDX and EBX/ESI/EDI are collector state, so the bound
-    ;; goes to memory rather than a register.
-    (let ((hl (i386-make-label)) (hd (i386-make-label)))
+    ;; Live frames only: [hstack_base, hstack_base + 24*min(depth, 127)),
+    ;; then (hosted) the live EXTENSION frames [ext, ext + 24*(depth - 127))
+    ;; -- THE HANDLER-FRAME STACK HAS NO SILENT CEILING (i386): a frame past
+    ;; the in-memory ones holds the same EBX/ESI/EDI.  scan_word clobbers
+    ;; EAX/ECX/EDX and EBX/ESI/EDI are collector state, so the bound goes to
+    ;; memory rather than a register.
+    (let ((hl (i386-make-label)) (hd (i386-make-label)) (in-mem (i386-make-label)))
       (i386-emit-mov-reg-abs buf +scratch0+ *i386-hstack-depth-addr*)
+      (i386-emit-cmp-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
+      (i386-emit-jcc buf :le in-mem)
+      (i386-emit-mov-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
+      (i386-emit-label buf in-mem)
       (i386-emit-imul-reg-reg-imm8 buf +scratch0+ +scratch0+ +i386-jmpbuf-size+)
       (i386-emit-add-reg-imm buf +scratch0+ *i386-hstack-base-addr*)
       (i386-emit-mov-abs-reg buf *i386-gcroot-bound-addr* +scratch0+)
@@ -2331,6 +3039,35 @@
       (i386-emit-add-reg-imm buf +i386-ebp+ 4)
       (i386-emit-jmp-rel32 buf hl)
       (i386-emit-label buf hd))
+    (when *i386-linux-mode*
+      (let ((xl (i386-make-label)) (xd (i386-make-label)))
+        (i386-emit-mov-reg-abs buf +scratch0+ *i386-hstack-depth-addr*)
+        (i386-emit-sub-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
+        (i386-emit-jcc buf :le xd)                       ; no extension frame
+        (i386-emit-imul-reg-reg-imm8 buf +scratch0+ +scratch0+ +i386-jmpbuf-size+)
+        (i386-emit-add-reg-abs buf +scratch0+ +i386-hstack-ext-addr+)
+        (i386-emit-mov-abs-reg buf *i386-gcroot-bound-addr* +scratch0+)
+        (i386-emit-mov-reg-abs buf +i386-ebp+ +i386-hstack-ext-addr+)
+        (i386-emit-label buf xl)
+        (i386-emit-cmp-reg-abs buf +i386-ebp+ *i386-gcroot-bound-addr*)
+        (i386-emit-jcc buf :ae xd)
+        (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+        (i386-emit-call-rel32 buf scan-label)
+        (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+        (i386-emit-jmp-rel32 buf xl)
+        (i386-emit-label buf xd)))
+
+    ;; --- a STATIC heap (bare core boots): what the core restored, walked
+    ;; typed as roots by every collection and never copied (it is below both
+    ;; semispaces, so scan_word's from-space test passes it by).  The 68k's
+    ;; MODUS_68K_GC_STATIC.  An empty span (0 0) skips it.
+    (when *i386-cl-bare*
+      (let ((skip (i386-make-label)))
+        (i386-emit-mov-reg-abs buf +scratch0+ +i386-gc-static-hi+)
+        (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
+        (i386-emit-jcc buf :e skip)
+        (i386-emit-gcnative-typed-walk buf scan-label +i386-gc-static-lo+ +i386-gc-static-hi+)
+        (i386-emit-label buf skip)))
 
     ;; --- Cheney scan of to-space: [to_start, free_ptr), OBJECT BY OBJECT ---
     ;; This walked to-space WORD BY WORD, handing every word to scan_word --
@@ -2347,74 +3084,7 @@
     ;; copy_object computes it, and a LEAF subtag (byte vector, SAP, floats,
     ;; the raw vectors) has its payload skipped.  Every other object has
     ;; exactly COUNT slots scanned -- not its alignment padding either.
-    (let ((cl (i386-make-label)) (cd (i386-make-label)) (c-cons (i386-make-label))
-          (c-u8 (i386-make-label)) (c-al (i386-make-label))
-          (c-skip (i386-make-label)) (sl (i386-make-label)))
-      (i386-emit-mov-reg-abs buf +i386-ebp+ *i386-gc-to-addr*)
-      (i386-emit-label buf cl)
-      (i386-emit-cmp-reg-reg buf +i386-ebp+ +i386-esi+)
-      (i386-emit-jcc buf :ae cd)
-      ;; BT [consbmp], (ebp - page_base) >> 4   -> CF = cons-kind bit
-      (i386-emit-mov-reg-reg buf +scratch0+ +i386-ebp+)
-      (i386-emit-byte buf #x2B)                                ; SUB ecx, [page_base]
-      (i386-emit-byte buf (i386-modrm #b00 +scratch0+ 5))
-      (i386-emit-u32 buf *gc-page-base-addr*)
-      (i386-emit-shr-reg-imm buf +scratch0+ 4)
-      (i386-emit-mov-reg-abs buf +scratch1+ *gc-consbmp-addr*)
-      (i386-emit-byte buf #x0F) (i386-emit-byte buf #xA3)      ; BT [edx], ecx
-      (i386-emit-byte buf (i386-modrm #b00 +scratch0+ +scratch1+))
-      (i386-emit-jcc buf :b c-cons)
-      ;; -- object: EAX = header, ECX = subtag, EDX = count --
-      (i386-emit-mov-reg-mem buf +i386-eax+ +i386-ebp+ 0)
-      (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
-      (i386-emit-and-reg-imm buf +scratch0+ 255)
-      (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
-      (i386-emit-shr-reg-imm buf +scratch1+ 8)
-      ;; EAX = size (copy_object's rule), then EAX = next object
-      (i386-emit-cmp-reg-imm buf +scratch0+ #x11)
-      (i386-emit-jcc buf :e c-u8)
-      (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)
-      (i386-emit-add-reg-imm buf +i386-eax+ 1)
-      (i386-emit-shl-reg-imm buf +i386-eax+ 2)
-      (i386-emit-jmp-rel32 buf c-al)
-      (i386-emit-label buf c-u8)
-      (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)
-      (i386-emit-add-reg-imm buf +i386-eax+ 4)
-      (i386-emit-label buf c-al)
-      (i386-emit-add-reg-imm buf +i386-eax+ 15)
-      (i386-emit-and-reg-imm buf +i386-eax+ -16)
-      (i386-emit-add-reg-reg buf +i386-eax+ +i386-ebp+)
-      (i386-emit-push-reg buf +i386-eax+)                      ; [esp] = next
-      ;; leaf subtags: skip the payload
-      (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
-        (i386-emit-cmp-reg-imm buf +scratch0+ st)
-        (i386-emit-jcc buf :e c-skip))
-      ;; slots: [ebp+4, ebp+4+4*count)
-      (i386-emit-shl-reg-imm buf +scratch1+ 2)
-      (i386-emit-add-reg-reg buf +scratch1+ +i386-ebp+)
-      (i386-emit-add-reg-imm buf +scratch1+ 4)
-      (i386-emit-mov-abs-reg buf *i386-gcroot-bound-addr* +scratch1+)
-      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
-      (i386-emit-label buf sl)
-      (i386-emit-cmp-reg-abs buf +i386-ebp+ *i386-gcroot-bound-addr*)
-      (i386-emit-jcc buf :ae c-skip)
-      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
-      (i386-emit-call-rel32 buf scan-label)
-      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
-      (i386-emit-jmp-rel32 buf sl)
-      (i386-emit-label buf c-skip)
-      (i386-emit-pop-reg buf +i386-ebp+)                       ; ebp = next
-      (i386-emit-jmp-rel32 buf cl)
-      ;; -- cons: car at +0, cdr at +4, 16 bytes --
-      (i386-emit-label buf c-cons)
-      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
-      (i386-emit-call-rel32 buf scan-label)
-      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
-      (i386-emit-add-reg-imm buf +i386-eax+ 4)
-      (i386-emit-call-rel32 buf scan-label)
-      (i386-emit-add-reg-imm buf +i386-ebp+ 16)
-      (i386-emit-jmp-rel32 buf cl)
-      (i386-emit-label buf cd))
+    (i386-emit-gcnative-typed-walk buf scan-label *i386-gc-to-addr* nil)
 
     ;; --- swap semispaces, IN THE ACTIVE REGION'S CONTROL BLOCK ---
     (i386-emit-mov-reg-abs buf +scratch0+ *i386-gc-rcb-addr*)
@@ -2428,8 +3098,64 @@
         (progn
           (i386-emit-add-reg-abs buf +i386-eax+ *i386-gc-size-addr*)
           ;; ...less the overshoot margin: see *I386-GC-VL-MARGIN*.
-          (i386-emit-sub-reg-imm buf +i386-eax+ *i386-gc-vl-margin*)))
+          (if *i386-gc-margin-addr*
+              (i386-emit-sub-reg-abs buf +i386-eax+ *i386-gc-margin-addr*)
+              (i386-emit-sub-reg-imm buf +i386-eax+ *i386-gc-vl-margin*))))
     (i386-emit-mov-abs-reg buf *vl-addr* +i386-eax+)
+    ;; HEAP EXHAUSTED: the survivors reach past VL, so the next :gc-check
+    ;; collects again, forever (measured: the library ladder in an 8 MB
+    ;; semispace spun for 20 minutes).  Say so and exit 3, as arm32 / 68k do.
+    (when *i386-gc-margin-addr*
+      (let ((room (i386-make-label))
+            (msg (if *i386-linux-mode*
+                     "modus: heap exhausted (raise --dynamic-space-size)
+"
+                     "
+modus: heap exhausted -- this machine needs more RAM
+")))
+        (i386-emit-cmp-reg-reg buf +i386-esi+ +i386-eax+)        ; free ptr vs new VL
+        (i386-emit-jcc buf :b room)
+        ;; write(2, msg, len) with the message on the stack, then exit_group(3)
+        (let ((bytes (map 'list #'char-code msg)))
+          (loop while (/= 0 (mod (length bytes) 4)) do (setq bytes (append bytes (list 0))))
+          (loop for i from (- (length bytes) 4) downto 0 by 4
+                do (i386-emit-push-imm32 buf (logior (nth i bytes) (ash (nth (+ i 1) bytes) 8)
+                                                     (ash (nth (+ i 2) bytes) 16)
+                                                     (ash (nth (+ i 3) bytes) 24)))))
+        (if *i386-linux-mode*
+            (progn
+              (i386-emit-mov-reg-imm buf +i386-ebx+ 2)
+              (i386-emit-mov-reg-reg buf +scratch0+ +i386-esp+)
+              (i386-emit-mov-reg-imm buf +scratch1+ (length msg))
+              (i386-emit-mov-reg-imm buf +i386-eax+ 4)                  ; SYS_write
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
+              (i386-emit-mov-reg-imm buf +i386-ebx+ 3)
+              (i386-emit-mov-reg-imm buf +i386-eax+ 252)                ; SYS_exit_group
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80))
+            ;; BARE METAL: there is no INT 80h to take (it reset the machine:
+            ;; no IDT entry).  The message to COM1, a byte at a time as the
+            ;; transmitter empties, then stop.
+            (let ((next (i386-make-label)) (wait (i386-make-label)) (halt (i386-make-label)))
+              (i386-emit-mov-reg-reg buf +i386-esi+ +i386-esp+)
+              (i386-emit-mov-reg-imm buf +scratch0+ (length msg))
+              (i386-emit-byte buf #xFC)                                  ; cld
+              (i386-emit-label buf next)
+              (i386-emit-byte buf #x66) (i386-emit-byte buf #xBA)        ; mov dx, 3FDh
+              (i386-emit-byte buf #xFD) (i386-emit-byte buf #x03)
+              (i386-emit-label buf wait)
+              (i386-emit-byte buf #xEC)                                  ; in al, dx
+              (i386-emit-byte buf #xA8) (i386-emit-byte buf #x20)        ; test al, 20h
+              (i386-emit-jcc buf :e wait)
+              (i386-emit-byte buf #x66) (i386-emit-byte buf #xBA)        ; mov dx, 3F8h
+              (i386-emit-byte buf #xF8) (i386-emit-byte buf #x03)
+              (i386-emit-byte buf #xAC)                                  ; lodsb
+              (i386-emit-byte buf #xEE)                                  ; out dx, al
+              (i386-emit-byte buf #x49)                                  ; dec ecx
+              (i386-emit-jcc buf :ne next)
+              (i386-emit-label buf halt)
+              (i386-emit-byte buf #xFA) (i386-emit-byte buf #xF4)        ; cli; hlt
+              (i386-emit-jmp-rel32 buf halt)))
+        (i386-emit-label buf room)))
 
     ;; --- MCGC point (c): byte-exact clear of the reclaimed range's bitmaps ---
     ;; EBX is the semispace this collection just evacuated; its bits are stale.
@@ -2491,7 +3217,7 @@
       (function-frame-slots bytecode offset)
       :legacy))
 
-(defun i386-emit-prologue (buf &optional (slots :legacy))
+(defun i386-emit-prologue (buf &optional (slots :legacy) no-v23)
   "Emit i386 function prologue.
    PUSH EBP; MOV EBP, ESP; SUB ESP, frame_size;
    save callee-saved EBX, ESI, EDI;
@@ -2506,10 +3232,12 @@
   ;; Copy incoming V2/V3 from caller-pushed stack args to local spill slots.
   ;; CALL handler always pushes V2/V3 before every CALL instruction.
   ;; [EBP+8] = V2 incoming, [EBP+12] = V3 incoming.
-  (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+ 8)   ; load V2 from [EBP+8]
-  (i386-emit-mov-mem-reg buf +i386-ebp+ -16 +scratch0+)  ; store to local V2 slot
-  (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+ 12)  ; load V3 from [EBP+12]
-  (i386-emit-mov-mem-reg buf +i386-ebp+ -20 +scratch0+)) ; store to local V3 slot
+  ;; NO-V23: the function never reads them (I386-V23-UNREAD-P)
+  (unless no-v23
+    (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+ 8)   ; load V2 from [EBP+8]
+    (i386-emit-mov-mem-reg buf +i386-ebp+ -16 +scratch0+)  ; store to local V2 slot
+    (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+ 12)  ; load V3 from [EBP+12]
+    (i386-emit-mov-mem-reg buf +i386-ebp+ -20 +scratch0+))) ; store to local V3 slot
 
 (defun i386-emit-epilogue (buf)
   "Emit i386 function epilogue. Return value should be in EAX (VR)."
@@ -2551,6 +3279,92 @@
 ;;; Single-instruction translator.  Called from the main translation
 ;;; loop for each decoded MVM instruction.
 
+;;; ============================================================
+;;; W32: native 32-bit words (docs/w32.md, spec 4.4)
+;;; ============================================================
+;;; A W32 operand is the raw word in a 32-bit register.  Scratch ECX/EDX, as
+;;; the VR-preserving ALU arms use; EAX (= VR) only for MUL, which needs it,
+;;; and then SAVED around it unless the destination is VR: inside a W32 tree
+;;; an earlier operand may be sitting in VR while a later multiply runs.
+;;; (Spills are EBP-relative, so the PUSH/POP does not move them.)  x86 masks
+;;; immediate shift counts to 5 bits; W32 counts are 0..31 by construction,
+;;; and 0 emits nothing.
+(defun i386-emit-rol-reg-imm (buf reg count)
+  "ROL reg, imm8 (C1 /0 ib)."
+  (i386-emit-byte buf #xC1)
+  (i386-emit-byte buf (i386-modrm #b11 0 reg))
+  (i386-emit-byte buf count))
+
+(defun i386-translate-w32 (buf op o0 o1 o2)
+  (let ((c +scratch0+) (d +scratch1+) (eax +i386-eax+))
+    (flet ((done () (i386-store-vreg buf o0 c))
+           (two () (i386-load-vreg buf d o2) (i386-load-vreg buf c o1)))
+      (cond
+        ((= op +op-w32-li+) (i386-emit-mov-reg-imm buf c o1) (done))
+        ((= op +op-w32-load+)
+         (i386-load-vreg buf c o1)
+         (i386-emit-mov-reg-mem buf c c o2) (done))
+        ((= op +op-w32-store+)
+         ;; (w32-store Vaddr Vs off), Vaddr a RAW address
+         (i386-load-vreg buf c o0)
+         (i386-load-vreg buf d o1)
+         (i386-emit-mov-mem-reg buf c o2 d))
+        ((or (= op +op-w32-mul+) (= op +op-w32-mulhu+))
+         (let ((save (not (eql (i386-vreg-phys o0) eax))))
+           (when save (i386-emit-push-reg buf eax))
+           (i386-load-vreg buf c o2)                  ; before EAX is written:
+           (i386-load-vreg buf eax o1)                ; o2 may live in EAX
+           (i386-emit-mul-reg buf c)                  ; EDX:EAX = EAX * ECX
+           (i386-emit-mov-reg-reg buf c (if (= op +op-w32-mul+) eax d))
+           (when save (i386-emit-pop-reg buf eax))
+           (done)))
+        ((or (= op +op-w32-shl+) (= op +op-w32-shr+) (= op +op-w32-sar+)
+             (= op +op-w32-rotl+))
+         (i386-load-vreg buf c o1)
+         (unless (= o2 0)
+           (cond ((= op +op-w32-shl+) (i386-emit-shl-reg-imm buf c o2))
+                 ((= op +op-w32-shr+) (i386-emit-shr-reg-imm buf c o2))
+                 ((= op +op-w32-sar+) (i386-emit-sar-reg-imm buf c o2))
+                 (t                   (i386-emit-rol-reg-imm buf c o2))))
+         (done))
+        ((= op +op-w32-not+)      (i386-load-vreg buf c o1) (i386-emit-not-reg buf c) (done))
+        ((= op +op-w32-from-fix+) (i386-load-vreg buf c o1) (i386-emit-sar-reg-imm buf c 1) (done))
+        ((= op +op-w32-hi16+)
+         (i386-load-vreg buf c o1)
+         (i386-emit-shr-reg-imm buf c 16)
+         (i386-emit-shl-reg-imm buf c 1) (done))       ; tag
+        ((= op +op-w32-lo16+)
+         (i386-load-vreg buf c o1)
+         (i386-emit-shl-reg-imm buf c 16)
+         (i386-emit-shr-reg-imm buf c 15) (done))      ; lo<<1, tagged
+        ((= op +op-w32-join+)
+         ;; o1, o2 tagged fixnums 0..65535: (hi<<1)<<15 | (lo<<1)>>1
+         (two)
+         (i386-emit-shl-reg-imm buf c 15)
+         (i386-emit-shr-reg-imm buf d 1)
+         (i386-emit-or-reg-reg buf c d) (done))
+        ((or (= op +op-w32-ltu+) (= op +op-w32-lts+) (= op +op-w32-eq+))
+         (two)
+         (i386-emit-cmp-reg-reg buf c d)               ; flags = ECX - EDX
+         ;; MOV ECX, 0 as B9 imm32 -- not XOR, which would clobber the flags
+         (i386-emit-byte buf #xB9) (dotimes (k 4) (i386-emit-byte buf 0))
+         ;; SETB / SETL / SETE CL
+         (i386-emit-byte buf #x0F)
+         (i386-emit-byte buf (cond ((= op +op-w32-ltu+) #x92)
+                                   ((= op +op-w32-lts+) #x9C)
+                                   (t #x94)))
+         (i386-emit-byte buf (i386-modrm #b11 0 c))
+         (i386-emit-shl-reg-imm buf c 1)                ; tagged 1 / 0
+         (done))
+        (t
+         (two)
+         (cond ((= op +op-w32-add+) (i386-emit-add-reg-reg buf c d))
+               ((= op +op-w32-sub+) (i386-emit-sub-reg-reg buf c d))
+               ((= op +op-w32-and+) (i386-emit-and-reg-reg buf c d))
+               ((= op +op-w32-or+)  (i386-emit-or-reg-reg buf c d))
+               (t                   (i386-emit-xor-reg-reg buf c d)))
+         (done))))))
+
 (defun i386-translate-insn (state opcode operands mvm-next-pos)
   "Translate one MVM instruction to i386 native code.
    OPCODE: numeric MVM opcode.
@@ -2570,6 +3384,10 @@
     (macrolet ((op= (sym) `(= opcode ,sym)))
       (cond
         ((and *i386-x87* (i386-translate-x87-float buf opcode operands)) nil)
+        ;; the FP-register class (unboxed float trees), unless floats are soft
+        ((and (not (eql modus.mvm::+target-soft-float+ 1))
+              (i386-translate-fp-reg buf opcode operands))
+         nil)
         ;; NO SSE2: the compiler lowers every float op to mvm/softfloat.lisp, so
         ;; one reaching here is a gap -- recorded and INT3, never an SSE2
         ;; instruction a pre-Pentium-4 CPU would fault on.
@@ -2610,9 +3428,10 @@
            ;; handler path.  CLEAR-HANDLER (#x0512) keeps the bracket — there
            ;; EAX holds the handler-case BODY's result and must be preserved,
            ;; which is exactly what the bracket does.
-           (let ((eax-is-result (member code *i386-eax-live-traps*)))
-           (unless eax-is-result
-             (i386-emit-push-reg buf +i386-eax+))
+           (let* ((eax-is-result (member code *i386-eax-live-traps*))
+                  (after-push (progn (unless eax-is-result
+                                       (i386-emit-push-reg buf +i386-eax+))
+                                     (i386-buffer-position buf))))
            (cond
              ((frame-enter-code-p code)
               ;; Frame-enter: nparams (the prologue reserved the frame).
@@ -2719,6 +3538,17 @@
               ;; CNTFRQ: #x0310's rate, TAGGED, in VR.  mov eax, 2000.
               (i386-emit-byte buf #xB8) (i386-emit-u32 buf 2000))
 
+             ((and (= code #x0310) *i386-pit-clock*)
+              ;; the PIT's tick count (boot-i386's timer interrupt), TAGGED in
+              ;; EAX: 30 bits wrap after ~124 days at 100 Hz
+              (i386-emit-mov-reg-abs buf +i386-eax+ *i386-pit-clock*)
+              (i386-emit-byte buf #x25) (i386-emit-u32 buf #x3FFFFFFF)  ; and eax, 2^30-1
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xE0))      ; shl eax,1 (tag)
+
+             ((and (= code #x0311) *i386-pit-clock*)
+              ;; ticks per second: PIT divisor 11932 -> 1193182/11932 = 100.0 Hz
+              (i386-emit-mov-reg-imm buf +i386-eax+ (* 2 100)))
+
              ((and (= code #x0310) *i386-bare-clock*)
               ;; RDTSC, bare metal (no clock_gettime): bits 12..41 of the time
               ;; stamp counter -- a 30-bit fixnum, monotonic between wraps (2^42
@@ -2791,7 +3621,6 @@
                 (i386-emit-byte buf #x8B) (i386-emit-byte buf #x44)
                 (i386-emit-byte buf #x24) (i386-emit-byte buf #x04)  ; mov eax,[esp+4]
                 (i386-emit-byte buf #xA3) (i386-emit-u32 buf #x10000CB0) ; [CB0]=eax
-                (i386-emit-mov-abs-imm buf *i386-hstack-overflow-addr* 0)
                 (dotimes (i +i386-jmpbuf-words+)
                   (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ (* 4 i))
                   (i386-emit-mov-abs-reg buf (+ ljs (* 4 i)) +scratch1+))
@@ -3301,12 +4130,12 @@
              ;; Both modes: the block is placed per mode by
              ;; i386-set-handler-block (bare: #x5C0000 + the same offsets).
              ((and (= code #x0510) *i386-handler-push-label*)
-              (let ((skiparm (i386-make-label))
-                    (resume (i386-make-label)))
-                ;; Stack the OUTER frame first; EDX comes back 1 if capped.
+              (let ((resume (i386-make-label)))
+                ;; Stack the OUTER frame first.  A push that cannot store it
+                ;; does not return here: it longjmps to the OUTER frame (THE
+                ;; HANDLER-FRAME STACK HAS NO SILENT CEILING, i386), so this
+                ;; site always arms.
                 (i386-emit-call-rel32 buf *i386-handler-push-label*)
-                (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
-                (i386-emit-jcc buf :ne skiparm)
                 ;; Arm: ECX = &jmp_buf, then the five register words.
                 (i386-emit-mov-reg-imm buf +scratch0+ *i386-jmpbuf-addr*)
                 (i386-emit-mov-mem-reg buf +scratch0+  0 +i386-esp+)
@@ -3328,7 +4157,6 @@
                   (i386-emit-byte buf (i386-modrm #b11 0 +scratch1+))
                   (i386-emit-fixup-diff32 buf resume anchor))
                 (i386-emit-mov-mem-reg buf +scratch0+ 8 +scratch1+)
-                (i386-emit-label buf skiparm)
                 ;; First return: NIL.  Read from *vn-addr* rather than baking
                 ;; #xDEAD0001 in — bare-metal i386 uses 0 for NIL, and
                 ;; :bnnull compares against this very slot.
@@ -3340,9 +4168,6 @@
               ;; overwrites the jmp_buf, then restore and transfer.
               (let ((armed (i386-make-label))
                     (ljs *i386-longjmp-scratch-addr*))
-                ;; This longjmp unwinds past every capped (strictly inner)
-                ;; frame at once, so their pending absorbs must be discarded.
-                (i386-emit-mov-abs-imm buf *i386-hstack-overflow-addr* 0)
                 (i386-emit-mov-reg-imm buf +scratch0+ *i386-jmpbuf-addr*)
                 (dotimes (i +i386-jmpbuf-words+)
                   (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ (* 4 i))
@@ -3530,18 +4355,30 @@
                   (incf (gethash (+ #x10000 code) tbl 0))))
               (unless (member code *i386-safe-nop-traps*)
                 (i386-emit-unimpl-trap buf code))))
+           ;; a trap that emitted nothing (most frame-enters): take the PUSH
+           ;; back rather than follow it with a POP
            (unless eax-is-result
-             (i386-emit-pop-reg buf +i386-eax+)))))
+             (if (= (i386-buffer-position buf) after-push)
+                 (decf (i386-buffer-position buf))
+                 (i386-emit-pop-reg buf +i386-eax+))))))
 
         ;; ============================================
         ;; Data Movement
         ;; ============================================
         ((op= +op-mov+)
          ;; (mov Vd Vs) -- route through load/store helpers for VA/VL/VN safety
-         (let ((vd (first operands))
-               (vs (second operands)))
-           (i386-load-vreg buf +scratch0+ vs)
-           (i386-store-vreg buf vd +scratch0+)))
+         ;; Straight between them when either side is a register (a vreg in
+         ;; a register is EAX/EBX/ESI/EDI, and writing EAX is legal exactly
+         ;; when Vd is VR); through ECX only memory to memory.
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (pd (i386-vreg-phys vd))
+                (ps (i386-vreg-phys vs)))
+           (cond ((eql vd vs) nil)
+                 (pd (i386-load-vreg buf pd vs))
+                 (ps (i386-store-vreg buf vd ps))
+                 (t (i386-load-vreg buf +scratch0+ vs)
+                    (i386-store-vreg buf vd +scratch0+)))))
 
         ((op= +op-li+)
          ;; (li Vd imm64) -- on i386, truncate to low 32 bits
@@ -3622,6 +4459,15 @@
            (i386-emit-imul-reg-reg buf +scratch0+ +scratch1+)
            ;; Result is already correctly tagged (a * (b<<1) = (a*b)<<1)
            (i386-store-vreg buf vd +scratch0+)))
+
+        ;; ---- W32 (docs/w32.md): see I386-TRANSLATE-W32 ----
+        ((member opcode (list +op-w32-li+ +op-w32-add+ +op-w32-sub+ +op-w32-mul+ +op-w32-mulhu+
+                          +op-w32-and+ +op-w32-or+ +op-w32-xor+ +op-w32-not+
+                          +op-w32-shl+ +op-w32-shr+ +op-w32-sar+ +op-w32-rotl+
+                          +op-w32-ltu+ +op-w32-lts+ +op-w32-eq+ +op-w32-from-fix+
+                          +op-w32-hi16+ +op-w32-lo16+ +op-w32-join+ +op-w32-load+
+                          +op-w32-store+))
+         (i386-translate-w32 buf opcode (first operands) (second operands) (third operands)))
 
         ((op= +op-mul26lo+)
          ;; (mul26lo Vd Va Vb) — low 26 bits of untag(Va)*untag(Vb), tagged
@@ -3865,10 +4711,15 @@
          ;; operand there across the type-check `:or / :test` pair that
          ;; precedes open-coded generic arithmetic.  Clobbering it made
          ;; `(+ a b)` compute (a|b)+b.  Use the ECX/EDX scratch pair.
-         (let ((va (first operands)) (vb (second operands)))
-           (i386-load-vreg buf +scratch1+ vb)
-           (i386-load-vreg buf +scratch0+ va)
-           (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)))
+         (let* ((va (first operands)) (vb (second operands))
+                (pb (i386-vreg-phys vb)))
+           (if pb
+               ;; CMP r/m32(Va), r32(Vb): Va where it lives
+               (i386-emit-vreg-operand buf '(#x39) pb va)
+               (progn
+                 (i386-load-vreg buf +scratch1+ vb)
+                 (i386-load-vreg buf +scratch0+ va)
+                 (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)))))
 
         ((op= +op-test+)
          ;; (test Va Vb) -- AND, sets flags, discards result
@@ -3885,12 +4736,11 @@
         ;; (cmp-imm / test-imm Va imm32): as CMP / TEST with the immediate in
         ;; SCRATCH1 -- VR-preserving like them
         ((or (op= +op-cmp-imm+) (op= +op-test-imm+))
+         ;; on the operand where it lives (no destination: EAX is only read)
          (let ((va (first operands)) (imm (%imm32-signed (second operands))))
-           (i386-emit-mov-reg-imm buf +scratch1+ imm)
-           (i386-load-vreg buf +scratch0+ va)
            (if (op= +op-cmp-imm+)
-               (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
-               (i386-emit-test-reg-reg buf +scratch0+ +scratch1+))))
+               (i386-emit-cmp-vreg-imm buf va imm)
+               (i386-emit-test-vreg-imm buf va imm))))
 
         ;; ============================================
         ;; Branches
@@ -3947,8 +4797,11 @@
                 (target-pos (+ mvm-next-pos off))
                 (label (i386-ensure-label-at state target-pos)))
            ;; VR-PRESERVING (WS5): no destination — must not clobber EAX/VR.
-           (i386-load-vreg buf +scratch0+ vs)
-           (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)
+           ;; NIL is a constant on the hosted layout: compare in place.
+           (if (i386-hosted-layout-p)
+               (i386-emit-cmp-vreg-imm buf vs #xDEAD0001)
+               (progn (i386-load-vreg buf +scratch0+ vs)
+                      (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)))
            (i386-emit-jcc buf :e label)))
 
         ((op= +op-bnnull+)
@@ -3958,8 +4811,11 @@
                 (target-pos (+ mvm-next-pos off))
                 (label (i386-ensure-label-at state target-pos)))
            ;; VR-PRESERVING (WS5): no destination — must not clobber EAX/VR.
-           (i386-load-vreg buf +scratch0+ vs)
-           (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)
+           ;; NIL is a constant on the hosted layout: compare in place.
+           (if (i386-hosted-layout-p)
+               (i386-emit-cmp-vreg-imm buf vs #xDEAD0001)
+               (progn (i386-load-vreg buf +scratch0+ vs)
+                      (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)))
            (i386-emit-jcc buf :ne label)))
 
         ;; ============================================
@@ -3971,17 +4827,7 @@
          ;; With type check: verify low 4 bits == 0x01
          (let ((vd (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           ;; Type check — VR-PRESERVING: value in ECX, tag scratch in EDX
-           (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
-           (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +scratch1+ +tag-cons+)
-           (let ((ok-label (i386-make-label)))
-             (i386-emit-jcc buf :e ok-label)
-             (i386-emit-int3 buf)   ; trap on non-cons
-             (i386-emit-label buf ok-label))
-           ;; Strip tag, load car (word 0)
-           (i386-emit-sub-reg-imm buf +scratch0+ +tag-cons+)
-           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)
+           (i386-emit-cons-field buf 0)
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-cdr+)
@@ -3989,17 +4835,7 @@
          ;; cdr at [ptr - tag + 4] = [ptr - 1 + 4] = [ptr + 3]
          (let ((vd (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           ;; Type check — VR-PRESERVING: value in ECX, tag scratch in EDX
-           (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
-           (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +scratch1+ +tag-cons+)
-           (let ((ok-label (i386-make-label)))
-             (i386-emit-jcc buf :e ok-label)
-             (i386-emit-int3 buf)
-             (i386-emit-label buf ok-label))
-           ;; Strip tag, load cdr (word 1 = offset 4 on 32-bit)
-           (i386-emit-sub-reg-imm buf +scratch0+ +tag-cons+)
-           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 4)
+           (i386-emit-cons-field buf 4)
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-cons+)
@@ -4010,6 +4846,16 @@
          ;; IMPORTANT: Load cdr into scratch0 FIRST — loading car into EAX
          ;; clobbers VR, so if vb-arg=VR we'd get car's value for cdr.
          (let ((vd (first operands)) (va-arg (second operands)) (vb-arg (third operands)))
+          (if *i386-shared-cons-label*
+           ;; car in ECX, cdr in EDX (a vreg is EAX/EBX/ESI/EDI or memory,
+           ;; so neither load disturbs the other); the routine returns the
+           ;; tagged cons in ECX.  See I386-EMIT-SHARED-ROUTINES.
+           (progn
+             (i386-load-vreg buf +scratch0+ va-arg)
+             (i386-load-vreg buf +scratch1+ vb-arg)
+             (i386-emit-call-rel32 buf *i386-shared-cons-label*)
+             (i386-store-vreg buf vd +scratch0+))
+          (progn
            ;; Load cdr value first (before EAX is touched)
            ;; VR-PRESERVING: car, cdr and the alloc pointer are three live
            ;; values but only ECX/EDX are available, so cdr goes via one
@@ -4045,7 +4891,7 @@
            (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
            (i386-emit-add-reg-imm buf +scratch1+ 16)
            (i386-emit-mov-abs-reg buf *va-addr* +scratch1+)
-           (i386-store-vreg buf vd +scratch0+)))
+           (i386-store-vreg buf vd +scratch0+)))))
 
         ((op= +op-setcar+)
          ;; (setcar Vd Vs) -- [Vd - tag] = Vs
@@ -4147,6 +4993,14 @@
          ;; Header word at [VA]: (count << 8) | subtag  (matches x64 format)
          ;; Result = VA | object_tag, advance VA by aligned size
          (let ((vd (first operands)) (count (second operands)) (subtag (third operands)))
+          (if *i386-shared-allocobj-label*
+           ;; header in ECX, size in EDX; the tagged object back in ECX
+           (progn
+             (i386-emit-mov-reg-imm buf +scratch0+ (logior (ash count 8) subtag))
+             (i386-emit-mov-reg-imm buf +scratch1+ (logand (+ (* (1+ count) 4) 15) (lognot 15)))
+             (i386-emit-call-rel32 buf *i386-shared-allocobj-label*)
+             (i386-store-vreg buf vd +scratch0+))
+          (progn
            (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)
            (i386-emit-mov-mem-imm buf +scratch1+ 0
                                   (logior (ash count 8) subtag))
@@ -4180,7 +5034,7 @@
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
            (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
-           (i386-store-vreg buf vd +scratch1+)))
+           (i386-store-vreg buf vd +scratch1+)))))
 
         ((op= +op-alloc-array+)
          ;; (alloc-array Vd Vcount) — dynamic array allocation
@@ -4214,33 +5068,34 @@
         ((op= +op-obj-ref+)
          ;; (obj-ref Vd Vobj idx:imm8) -- load object slot
          (let ((vd (first operands)) (vobj (second operands)) (idx (third operands)))
-           (if (= vobj +vreg-vfp+)
-               (progn
-                 (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+
+           ;; Straight into Vd's register when it has one (writing EAX is
+           ;; legal exactly when Vd is VR), through the object's register when
+           ;; it has one, the tag folded into the displacement.
+           (let ((dst (or (i386-vreg-phys vd) +scratch0+)))
+             (if (= vobj +vreg-vfp+)
+                 (i386-emit-mov-reg-mem buf dst +i386-ebp+
                                         (+ +frame-slot-base+ (* idx -4)))
-                 (i386-store-vreg buf vd +scratch0+))
-               (progn
-                 (i386-load-vreg buf +scratch0+ vobj)
-                 (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
-                 (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ (* (1+ idx) 4))
-                 (i386-store-vreg buf vd +scratch0+)))))
+                 (let ((base (or (i386-vreg-phys vobj)
+                                 (progn (i386-load-vreg buf +scratch0+ vobj) +scratch0+))))
+                   (i386-emit-mov-reg-mem buf dst base (- (* (1+ idx) 4) +tag-object+))))
+             (unless (i386-vreg-phys vd)
+               (i386-store-vreg buf vd +scratch0+)))))
 
         ((op= +op-obj-set+)
          ;; (obj-set Vobj idx:imm8 Vs) -- store object slot
          (let ((vobj (first operands)) (idx (second operands)) (vs (third operands)))
-           (if (= vobj +vreg-vfp+)
-               ;; Frame slot store: use safe EBP-relative offset below spill area
-               (progn
-                 (i386-load-vreg buf +scratch0+ vs)
+           ;; The value from its own register when it has one, the object's
+           ;; register as the base when it has one, the tag folded into the
+           ;; displacement; ECX / EDX only for what lives in memory.
+           (let ((val (or (i386-vreg-phys vs)
+                          (progn (i386-load-vreg buf +scratch0+ vs) +scratch0+))))
+             (if (= vobj +vreg-vfp+)
+                 ;; Frame slot store: use safe EBP-relative offset below spill area
                  (i386-emit-mov-mem-reg buf +i386-ebp+
-                                        (+ +frame-slot-base+ (* idx -4)) +scratch0+))
-               ;; Normal object slot store
-               ;; IMPORTANT: Load value FIRST — loading vobj into EAX clobbers VR.
-               (progn
-                 (i386-load-vreg buf +scratch0+ vs)
-                 (i386-load-vreg buf +scratch1+ vobj)
-                 (i386-emit-sub-reg-imm buf +scratch1+ +tag-object+)
-                 (i386-emit-mov-mem-reg buf +scratch1+ (* (1+ idx) 4) +scratch0+)))))
+                                        (+ +frame-slot-base+ (* idx -4)) val)
+                 (let ((base (or (i386-vreg-phys vobj)
+                                 (progn (i386-load-vreg buf +scratch1+ vobj) +scratch1+))))
+                   (i386-emit-mov-mem-reg buf base (- (* (1+ idx) 4) +tag-object+) val))))))
 
         ;; ============================================
         ;; SAP (System Area Pointer) — a 1-slot object, subtag #x16, whose
@@ -4322,24 +5177,9 @@
          ;; way, so the tag check already covers it; only T needs naming.
          (let ((vd (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (let ((fail-label (i386-make-label))
-                 (done-label (i386-make-label)))
-             (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
-             (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
-             (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
-             (i386-emit-jcc buf :ne fail-label)
-             ;; T-immediate check (register compare, not a >2^31 imm32).
-             (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
-             (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
-             (i386-emit-jcc buf :e fail-label)
-             (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
-             (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header
-             (i386-emit-and-reg-imm buf +scratch0+ #xFF)          ; mask to subtag
-             (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
-             (i386-emit-jmp-rel32 buf done-label)
-             (i386-emit-label buf fail-label)
-             (i386-emit-mov-reg-imm buf +scratch0+ 0)
-             (i386-emit-label buf done-label))
+           (if *i386-shared-subtag-label*
+               (i386-emit-call-rel32 buf *i386-shared-subtag-label*)
+               (i386-emit-subtag-body buf))
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-aref+)
@@ -4400,24 +5240,9 @@
          ;; NIL, i.e. "not an array of N+ slots".
          (let ((vd (first operands)) (vobj (second operands)))
            (i386-load-vreg buf +scratch0+ vobj)
-           (let ((fail-label (i386-make-label))
-                 (done-label (i386-make-label)))
-             (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
-             (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
-             (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
-             (i386-emit-jcc buf :ne fail-label)
-             (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
-             (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
-             (i386-emit-jcc buf :e fail-label)
-             (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
-             (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header word
-             (i386-emit-shr-reg-imm buf +scratch0+ 8)             ; count = header >> 8
-             (i386-emit-and-reg-imm buf +scratch0+ #xFFFFFF)      ; mask to 24 bits
-             (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
-             (i386-emit-jmp-rel32 buf done-label)
-             (i386-emit-label buf fail-label)
-             (i386-emit-mov-reg-imm buf +scratch0+ 0)
-             (i386-emit-label buf done-label))
+           (if *i386-shared-arraylen-label*
+               (i386-emit-call-rel32 buf *i386-shared-arraylen-label*)
+               (i386-emit-arraylen-body buf))
            (i386-store-vreg buf vd +scratch0+)))
 
         ;; ============================================
@@ -4466,14 +5291,19 @@
          (let* ((target-offset (first operands))
                 (fn-table (i386-translate-state-function-table state))
                 (label (when fn-table (gethash target-offset fn-table))))
-           ;; Push V3 first (higher address), then V2 (lower address)
-           (i386-emit-push-mem buf +i386-ebp+ -20)  ; V3
-           (i386-emit-push-mem buf +i386-ebp+ -16)  ; V2
-           (if label
+           (if (and label (i386-v23-unread-p
+                           (and *i386-offset-names* (gethash target-offset *i386-offset-names*))))
+               ;; a fixed-arity callee of at most two parameters: no V2/V3
                (i386-emit-call-rel32 buf label)
-               (i386-emit-call-rel32 buf nil))
-           ;; Clean up pushed V2/V3
-           (i386-emit-add-reg-imm buf +i386-esp+ 8)))
+               (progn
+                 ;; Push V3 first (higher address), then V2 (lower address)
+                 (i386-emit-push-mem buf +i386-ebp+ -20)  ; V3
+                 (i386-emit-push-mem buf +i386-ebp+ -16)  ; V2
+                 (if label
+                     (i386-emit-call-rel32 buf label)
+                     (i386-emit-call-rel32 buf nil))
+                 ;; Clean up pushed V2/V3
+                 (i386-emit-add-reg-imm buf +i386-esp+ 8)))))
 
         ((op= +op-call-ind+)
          ;; (call-ind Vs) -- indirect call through register
@@ -4555,17 +5385,21 @@
          ;; Both at absolute addresses. If VA >= VL, trigger GC.
          ;; IMPORTANT: Use scratch0 (ECX), NOT EAX! EAX is VR and may hold
          ;; a live value (e.g., the car arg popped before GC-CHECK + CONS).
-         (i386-emit-mov-reg-abs buf +scratch0+ *va-addr*)
-         (i386-emit-cmp-reg-abs buf +scratch0+ *vl-addr*)
-         (let ((ok-label (i386-make-label)))
-           (i386-emit-jcc buf :b ok-label)   ; unsigned below -> room left
-           ;; GC needed
-           (let ((gc-lbl (and *i386-gc-enabled*
-                              (i386-translate-state-gc-label state))))
-             (if gc-lbl
-                 (i386-emit-call-rel32 buf gc-lbl)
-                 (i386-emit-int buf #x31)))  ; trap to GC handler
-           (i386-emit-label buf ok-label)))
+         (if (and *i386-shared-gccheck-label* (i386-translate-state-gc-label state))
+             ;; the same test, once, in I386-EMIT-SHARED-ROUTINES (clobbers ECX)
+             (i386-emit-call-rel32 buf *i386-shared-gccheck-label*)
+             (progn
+               (i386-emit-mov-reg-abs buf +scratch0+ *va-addr*)
+               (i386-emit-cmp-reg-abs buf +scratch0+ *vl-addr*)
+               (let ((ok-label (i386-make-label)))
+                 (i386-emit-jcc buf :b ok-label)   ; unsigned below -> room left
+                 ;; GC needed
+                 (let ((gc-lbl (and *i386-gc-enabled*
+                                    (i386-translate-state-gc-label state))))
+                   (if gc-lbl
+                       (i386-emit-call-rel32 buf gc-lbl)
+                       (i386-emit-int buf #x31)))  ; trap to GC handler
+                 (i386-emit-label buf ok-label)))))
 
         ((op= +op-write-barrier+)
          ;; (write-barrier Vobj) -- mark card table dirty (stub)
@@ -4712,7 +5546,10 @@
          (let* ((vd (first operands))
                 (idx (second operands))
                 (pd (i386-vreg-phys vd))
-                (dst (or pd +i386-eax+))
+                ;; a spilled VD goes through ECX, never EAX: EAX is VR (the
+                ;; invariant above), and with pooled string literals
+                ;; (*NARROW-LITERALS-P*) a spilled LI-CONST is common
+                (dst (or pd +scratch0+))
                 (start (i386-current-pos buf)))
            (i386-emit-mov-reg-imm buf dst 0)
            (let ((emitted (- (i386-current-pos buf) start)))
@@ -4965,8 +5802,19 @@
                ;; translation): degrade to plain wrapping arithmetic, exactly
                ;; like translate-x64's fallback branch.
                (i386-store-vreg buf vd +scratch1+)
-               (let ((done (i386-make-label)))
+               (let ((done (i386-make-label))
+                     (shared (and (member kind '(:add :sub))
+                                  (if (eq kind :add) *i386-shared-addslow-label*
+                                      *i386-shared-subslow-label*))))
                  (i386-emit-jcc buf :no done)
+                (if shared
+                 ;; ---- overflow slow path, shared: ECX = vb and EDX the
+                 ;; wrapped result, from which the routine recovers va ----
+                 (progn
+                   (i386-emit-call-rel32 buf shared)
+                   (i386-emit-label buf done)
+                   (i386-store-vreg buf vd +scratch1+))
+                (progn
                  ;; ---- overflow slow path ----
                  ;; va/vb are still intact: the fast path touched only ECX/EDX.
                  (i386-load-vreg buf +scratch0+ va)         ; ECX = va
@@ -4989,7 +5837,7 @@
                  (i386-emit-pop-reg buf +i386-edi+)
                  (i386-emit-pop-reg buf +i386-esi+)
                  (i386-emit-label buf done)
-                 (i386-store-vreg buf vd +scratch1+)))))
+                 (i386-store-vreg buf vd +scratch1+)))))))
 
         ;; ================================================================
         ;; IEEE 64-bit float arithmetic — SSE2 lowering (#200/#201).
@@ -5312,6 +6160,108 @@
     (i386-fixup-labels buf)
     buf))
 
+;;; THE BOOT-ONLY TAIL (compiler.lisp *BOOT-TAIL-LAST*, set by the bare
+;;; build): the functions only boot runs are laid out last.  Everything a
+;;; restored process still needs -- the collector, the shared routines, the
+;;; handler-case helpers -- is emitted IN FRONT of them, and *I386-BOOT-TAIL*
+;;; is (start . end), their native positions: once a saved core is restored
+;;; that code is dead, and the entry stub lays the heap over its pages
+;;; (boot/boot-i386-cl.lisp, scripts/dos386-core.py).
+(defvar *i386-boot-tail* nil)
+
+;;; FIXED-ARITY CALLS.  A function whose final definition takes exactly N <= 2
+;;; required parameters and nothing else never reads V2/V3, which every call
+;;; passes on the stack (PUSH, PUSH, CALL, ADD ESP,8: 9 of a call's 14 bytes).
+;;; Direct calls to one skip them, and its prologue skips copying them.  The
+;;; test is the compiler's own for eliding the argument count
+;;; (%NARGS-UNREAD-P, *ELIDE-FIXED-NARGS*), sound for the same reason: an
+;;; i386 image's callers are bound to the image's definitions (no call pads).
+;;; Image translation only: the runtime native tier leaves this NIL.
+(defvar *i386-offset-names* nil
+  "TRANSLATE-MVM-TO-I386: bytecode offset -> function name, when the build
+   elides fixed argument counts.")
+
+(defun i386-fixed-params (name)
+  "N when NAME's final definition takes exactly N required parameters and
+   nothing else, else NIL."
+  (let ((h modus.mvm::*fixed-arity-params*))
+    (and h (gethash name h))))
+
+(defun i386-v23-unread-p (name)
+  "Does a function NAME never read V2/V3 (fixed, at most two parameters)?"
+  (let ((n (and name *i386-offset-names* (i386-fixed-params name))))
+    (and n (<= n 2))))
+
+(defun i386-layout-group (entry)
+  "0 hot, 1 cold (bytecode offset >= *COLD-PC*), 2 boot-only (between
+   *BOOT-TAIL-PC* and *COLD-PC*): the order the image's functions are
+   translated in."
+  (let ((off (second entry))
+        (tail modus.mvm::*boot-tail-pc*)
+        (cold modus.mvm::*cold-pc*))
+    (cond ((and cold (>= off cold)) 1)
+          ((and tail (>= off tail)) 2)
+          (t 0))))
+
+(defun i386-emit-resident-routines (buf)
+  "The code emitted once after the image's resident functions: the GC
+   trampoline, the shared routines, the handler-case helpers."
+  ;; The GC trampoline, emitted once after the last function.
+  (when *i386-gc-collect-label*
+    (when *i386-fn-align*
+      (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
+                              *i386-fn-align*))
+            do (i386-emit-nop buf)))
+    ;; The checker polices OPCODE codegen (EAX doubles as VR there).  Inside
+    ;; the collector every mutator register is already saved by PUSHAD, so
+    ;; EAX is an ordinary temp; silence the checker for this block.
+    (let ((*i386-check-eax-invariant* nil))
+      (i386-emit-gc-trampoline buf *i386-gc-collect-label* nil)))
+  (when *i386-shared-cons-label*
+    (let ((*i386-check-eax-invariant* nil))
+      (i386-emit-shared-routines buf)))
+  ;; The handler-case push/pop helpers, likewise emitted once after the last
+  ;; function.  They use EAX as a copy temp but SAVE AND RESTORE it, which
+  ;; the per-opcode checker cannot see; silence it for this block.
+  (when *i386-handler-push-label*
+    (when *i386-fn-align*
+      (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
+                              *i386-fn-align*))
+            do (i386-emit-nop buf)))
+    (let ((*i386-check-eax-invariant* nil))
+      (i386-emit-handler-helpers buf *i386-handler-push-label*
+                                 *i386-handler-pop-label*))))
+
+;;; MODUS_I386_OP_BYTES=FILE (build host only; the image is unchanged): the
+;;; native bytes the image's translation emits per MVM opcode, with the number
+;;; of instructions, written to FILE sorted by bytes.  What makes i386 code
+;;; large, so the heaviest inline sequences can be found and shared.
+(defvar *i386-op-bytes*
+  (let ((f (sb-ext:posix-getenv "MODUS_I386_OP_BYTES")))
+    (and f (plusp (length f)) (cons f (make-hash-table)))))
+
+(defun i386-op-bytes-count (opcode n)
+  (let ((e (or (gethash opcode (cdr *i386-op-bytes*))
+               (setf (gethash opcode (cdr *i386-op-bytes*)) (list 0 0)))))
+    (incf (first e) n)
+    (incf (second e))))
+
+(defun i386-op-bytes-write ()
+  (when *i386-op-bytes*
+    (let ((rows nil) (total 0))
+      (maphash (lambda (op e)
+                 (let ((oi (gethash op *opcode-table*)))
+                   (incf total (first e))
+                   (push (list (if oi (string (opcode-info-name oi)) (format nil "#x~X" op))
+                               (first e) (second e))
+                         rows)))
+               (cdr *i386-op-bytes*))
+      (with-open-file (o (car *i386-op-bytes*) :direction :output :if-exists :supersede)
+        (format o "# opcode bytes count bytes/insn share   (total ~D)~%" total)
+        (dolist (r (sort rows #'> :key #'second))
+          (format o "~A ~D ~D ~,1F ~,1F%~%" (first r) (second r) (third r)
+                  (/ (second r) (max 1 (third r))) (/ (* 100.0 (second r)) (max 1 total))))))))
+
 (defun translate-mvm-to-i386 (bytecode function-table)
   "Translate MVM bytecode to i386 native code.
    BYTECODE: vector of (unsigned-byte 8) containing MVM instructions.
@@ -5320,7 +6270,23 @@
   ;; Reset the per-translation LI-CONST patch list (see
   ;; *i386-li-const-patches* / cross.lisp's apply-li-const-patches).
   (setf *i386-li-const-patches* nil)
+  ;; THE BOOT-ONLY TAIL: the table comes in compile order, so the functions
+  ;; the compiler laid out last (bytecode offset >= *BOOT-TAIL-PC*) are
+  ;; translated last, the rest keeping their order; see *I386-BOOT-TAIL*.
+  ;; With a keep list (compiler.lisp *COLD-KEEP*) the compiler lays out hot,
+  ;; boot-only, cold; translated here as hot, cold, boot-only, so the code a
+  ;; demand-paged image pages ([native start, tail start)) is contiguous and
+  ;; the tail is still last.
+  (when (or modus.mvm::*boot-tail-pc* modus.mvm::*cold-pc*)
+    (setf function-table
+          (stable-sort (copy-list function-table) #'< :key #'i386-layout-group)))
+  (setf *i386-offset-names*
+        (and modus.mvm::*elide-fixed-nargs* modus.mvm::*fixed-arity-params*
+             (let ((h (make-hash-table)))
+               (dolist (e function-table h)
+                 (setf (gethash (second e) h) (first e))))))
   (let* ((buf (make-i386-buffer))
+         (routines-done nil)
          (n-functions (length function-table))
          (fn-labels (make-array n-functions))
          (fn-map (make-hash-table :test 'equal))
@@ -5365,8 +6331,17 @@
     ;; garbage from-space.  Bare-metal i386 therefore keeps `int $0x31` and is
     ;; byte-identical to a pre-collector build; wiring it up is a separate job
     ;; that starts with the boot-side init.
+    (setf *i386-boot-tail* nil)
     (setf *i386-gc-collect-label*
           (and *i386-gc-enabled* (i386-gc-mode-p) (i386-make-label)))
+    (let ((shared (and *i386-gc-collect-label* (i386-shared-routines-p))))
+      (setf *i386-shared-gccheck-label* (and shared (i386-make-label))
+            *i386-shared-cons-label* (and shared (i386-make-label))
+            *i386-shared-subtag-label* (and shared (i386-make-label))
+            *i386-shared-arraylen-label* (and shared (i386-make-label))
+            *i386-shared-allocobj-label* (and shared (i386-make-label))
+            *i386-shared-addslow-label* (and shared (i386-make-label))
+            *i386-shared-subslow-label* (and shared (i386-make-label))))
     ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512) -- in
     ;; BOTH modes now.  They used to be hosted-only, to keep the bare images
     ;; (REPL/SSH, which have no handler-case) byte-identical; those images are
@@ -5382,6 +6357,14 @@
           for fn-offset = (second entry)
           for fn-length = (third entry)
           do (progn
+               ;; the collector and shared routines after the hot functions,
+               ;; the tail's start before the first boot-only one
+               (let ((group (i386-layout-group entry)))
+                 (when (and (>= group 1) (not routines-done))
+                   (i386-emit-resident-routines buf)
+                   (setf routines-done t))
+                 (when (and (= group 2) (not *i386-boot-tail*))
+                   (setf *i386-boot-tail* (cons (i386-current-pos buf) nil))))
                ;; Function-entry alignment.  With *i386-fn-tag-3* on, :fn-addr
                ;; OR-3s the entry address, so the low nibble must be 0 at the
                ;; RUNTIME virtual address — hence padding is computed against
@@ -5392,59 +6375,84 @@
                                             (i386-current-pos buf))
                                          *i386-fn-align*))
                        do (i386-emit-nop buf))))
-          do (let* ((fn-label (aref fn-labels i))
-                    (state (make-i386-translate-state
-                            :buf buf
-                            :mvm-bytes bytecode
-                            :mvm-length fn-length
-                            :mvm-offset fn-offset
-                            :gc-label *i386-gc-collect-label*
-                            :function-table fn-offset-to-label)))
-               ;; Emit function label
-               (i386-emit-label buf fn-label)
-               ;; Emit prologue
-               (i386-emit-prologue buf (if (zerop fn-length)
-                                           :legacy
-                                           (i386-function-frame-slots bytecode fn-offset)))
-               ;; Pass 1: scan branch targets
-               (i386-scan-branch-targets state)
-               ;; Pass 2: translate
-               (let ((pos fn-offset)
-                     (limit (+ fn-offset fn-length)))
-                 (loop while (< pos limit)
-                       do (progn
-                            (let ((label (gethash pos
-                                                  (i386-translate-state-label-map state))))
-                              (when label
-                                (i386-emit-label buf label)))
-                            (let* ((decoded (decode-instruction bytecode pos))
-                                   (opcode (car decoded))
-                                   (operands (cadr decoded))
-                                   (new-pos (cddr decoded)))
-                              (i386-translate-insn state opcode operands new-pos)
-                              (setf pos new-pos)))))))
-    ;; The GC trampoline, emitted once after the last function.
-    (when *i386-gc-collect-label*
-      (when *i386-fn-align*
-        (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
-                                *i386-fn-align*))
-              do (i386-emit-nop buf)))
-      ;; The checker polices OPCODE codegen (EAX doubles as VR there).  Inside
-      ;; the collector every mutator register is already saved by PUSHAD, so
-      ;; EAX is an ordinary temp; silence the checker for this block.
-      (let ((*i386-check-eax-invariant* nil))
-        (i386-emit-gc-trampoline buf *i386-gc-collect-label* nil)))
-    ;; The handler-case push/pop helpers, likewise emitted once after the last
-    ;; function.  They use EAX as a copy temp but SAVE AND RESTORE it, which
-    ;; the per-opcode checker cannot see; silence it for this block.
-    (when *i386-handler-push-label*
-      (when *i386-fn-align*
-        (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
-                                *i386-fn-align*))
-              do (i386-emit-nop buf)))
-      (let ((*i386-check-eax-invariant* nil))
-        (i386-emit-handler-helpers buf *i386-handler-push-label*
-                                   *i386-handler-pop-label*)))
+          do (let ((fn-label (aref fn-labels i)))
+               (flet ((translate-body ()
+                        (setf *i386-last-store* nil)
+                        (let ((state (make-i386-translate-state
+                                      :buf buf
+                                      :mvm-bytes bytecode
+                                      :mvm-length fn-length
+                                      :mvm-offset fn-offset
+                                      :gc-label *i386-gc-collect-label*
+                                      :function-table fn-offset-to-label)))
+                          ;; Emit function label
+                          (i386-emit-label buf fn-label)
+                          ;; Emit prologue
+                          (i386-emit-prologue buf (if (zerop fn-length)
+                                                      :legacy
+                                                      (i386-function-frame-slots bytecode fn-offset))
+                                              (i386-v23-unread-p (first entry)))
+                          ;; Pass 1: scan branch targets
+                          (i386-scan-branch-targets state)
+                          ;; Pass 2: translate
+                          (let ((pos fn-offset)
+                                (limit (+ fn-offset fn-length)))
+                            (loop while (< pos limit)
+                                  do (progn
+                                       (let ((label (gethash pos
+                                                             (i386-translate-state-label-map state))))
+                                         (when label
+                                           (i386-emit-label buf label)))
+                                       (let* ((decoded (decode-instruction bytecode pos))
+                                              (opcode (car decoded))
+                                              (operands (cadr decoded))
+                                              (new-pos (cddr decoded))
+                                              (at (and *i386-op-bytes* (i386-current-pos buf))))
+                                         (i386-translate-insn state opcode operands new-pos)
+                                         (when at
+                                           (i386-op-bytes-count opcode (- (i386-current-pos buf) at)))
+                                         (setf pos new-pos))))))))
+                 (if (not *i386-short-branches*)
+                     (translate-body)
+                     ;; SHORT BRANCHES: translate the function twice.  The first
+                     ;; time every branch to a label is long, and each is
+                     ;; numbered and recorded; then everything that pass
+                     ;; appended is undone, and the second pass emits short
+                     ;; every branch whose first-pass distance fits.  Code only
+                     ;; shrinks the second time, so a distance that fitted
+                     ;; still does -- one pass of relaxation is enough.
+                     (let ((pos0 (i386-buffer-position buf))
+                           (fix0 (i386-buffer-fixups buf))
+                           (lic0 *i386-li-const-patches*)
+                           (short (make-hash-table)))
+                       (let ((*i386-jump-index* 0)
+                             (*i386-jump-record* (list nil))
+                             (*i386-op-bytes* nil))
+                         (translate-body)
+                         (dolist (r (car *i386-jump-record*))
+                           (destructuring-bind (idx end label shrink) r
+                             (let ((target (gethash label (i386-buffer-labels buf))))
+                               (when (and target (<= -128 (+ (- target end) shrink) 127))
+                                 (setf (gethash idx short) t))))))
+                       (setf (i386-buffer-position buf) pos0
+                             (i386-buffer-fixups buf) fix0
+                             *i386-li-const-patches* lic0)
+                       (let ((*i386-jump-index* 0)
+                             (*i386-short-jumps* short))
+                         (translate-body)))))
+               ;; the native tier's export table, right after the code of
+               ;; jit-i386-native.lisp's %N386-EXPORT-TABLE, so the image finds
+               ;; it a few words past that function wherever the build put it
+               (when (and *i386-native-tier*
+                          (string-equal (first entry) "%N386-EXPORT-TABLE"))
+                 (i386-emit-native-exports buf))))
+    (i386-op-bytes-write)
+    ;; the collector and the shared routines, unless the boot-only tail came
+    ;; first (then they are already in front of it)
+    (unless routines-done
+      (i386-emit-resident-routines buf))
+    (when *i386-boot-tail*
+      (setf (cdr *i386-boot-tail*) (i386-current-pos buf)))
     ;; Resolve all label fixups
     (i386-fixup-labels buf)
     ;; Resolve fn-map: replace label IDs with actual native byte positions
@@ -5460,6 +6468,228 @@
 ;;; ============================================================
 ;;; Target Descriptor Installation
 ;;; ============================================================
+
+(defun i386-set-cl-bare-mode (globals-base margin-addr &optional tick-addr)
+  "Translate the bare-metal CL image over the hosted layout (*I386-CL-BARE*):
+   bare traps, the hosted globals block at GLOBALS-BASE, the native collector
+   with its margin at MARGIN-ADDR (the boot stub chooses the heap's size from
+   the RAM the loader reports), the clock traps on the PIT's tick word at
+   TICK-ADDR (any 386 or later; NIL: RDTSC, a Pentium's), and function entries
+   16-aligned and OR-3 tagged as in the hosted CLI."
+  (setf *i386-linux-mode* nil
+        *i386-cl-bare* t
+        *i386-bare-gc* t
+        *i386-bare-clock* t
+        *i386-fn-tag-3* t
+        *i386-fn-align* 16
+        *i386-native-code-offset* 0
+        *i386-gc-margin-addr* margin-addr
+        *i386-pit-clock* tick-addr)
+  (i386-set-globals-base globals-base))
+
+(defun i386-emit-cons-field (buf offset)
+  "ECX = the word at OFFSET (0 car, 4 cdr) of the cons in ECX, or INT3 when
+   ECX is not a cons.  Clobbers EDX.  11 bytes, where the old form (copy, AND,
+   CMP, then SUB) was 16 at each of ~17,000 sites:
+     lea edx,[ecx-1] ; test dl,15 ; jz ok ; int3 ; ok: mov ecx,[edx+OFFSET]"
+  (i386-emit-byte buf #x8D) (i386-emit-byte buf #x51)
+  (i386-emit-byte buf (logand (- +tag-cons+) #xFF))       ; lea edx, [ecx-1]
+  (i386-emit-byte buf #xF6) (i386-emit-byte buf #xC2)
+  (i386-emit-byte buf +tag-mask+)                         ; test dl, 15
+  (i386-emit-byte buf #x74) (i386-emit-byte buf #x01)     ; jz +1
+  (i386-emit-int3 buf)
+  (if (zerop offset)
+      (progn (i386-emit-byte buf #x8B) (i386-emit-byte buf #x0A))          ; mov ecx, [edx]
+      (progn (i386-emit-byte buf #x8B) (i386-emit-byte buf #x4A)
+             (i386-emit-byte buf offset))))                                ; mov ecx, [edx+4]
+
+(defun i386-emit-vreg-operand (buf opcodes reg-field vreg)
+  "OPCODES, then the ModR/M (and displacement) naming VREG where it lives --
+   its register, its frame slot, or its absolute word -- as the r/m operand,
+   with REG-FIELD in the reg field.  The caller appends any immediate."
+  (dolist (b opcodes) (i386-emit-byte buf b))
+  (let ((phys (i386-vreg-phys vreg))
+        (abs (i386-vreg-abs-addr vreg)))
+    (cond (phys (i386-emit-byte buf (i386-modrm #b11 reg-field phys)))
+          (abs  (i386-emit-byte buf (i386-modrm #b00 reg-field 5))
+                (i386-emit-u32 buf abs))
+          (t (let ((d (i386-spill-offset vreg)))
+               (if (<= -128 d 127)
+                   (progn (i386-emit-byte buf (i386-modrm #b01 reg-field +i386-ebp+))
+                          (i386-emit-byte buf (logand d #xFF)))
+                   (progn (i386-emit-byte buf (i386-modrm #b10 reg-field +i386-ebp+))
+                          (i386-emit-u32 buf (logand d #xFFFFFFFF)))))))))
+
+(defun i386-emit-cmp-vreg-imm (buf vreg imm)
+  "CMP VREG, IMM where VREG lives; the flags of the 32-bit compare.  An 8-bit
+   immediate when IMM fits signed (it is sign-extended); CMP EAX, imm32 is
+   one byte shorter than the general form."
+  (let ((imm (if (>= imm #x80000000) (- imm #x100000000) imm)))
+    (cond ((<= -128 imm 127)
+           (i386-emit-vreg-operand buf '(#x83) 7 vreg)
+           (i386-emit-byte buf (logand imm #xFF)))
+          ((eql (i386-vreg-phys vreg) +i386-eax+)
+           (i386-emit-byte buf #x3D) (i386-emit-u32 buf (logand imm #xFFFFFFFF)))
+          (t (i386-emit-vreg-operand buf '(#x81) 7 vreg)
+             (i386-emit-u32 buf (logand imm #xFFFFFFFF))))))
+
+(defun i386-emit-test-vreg-imm (buf vreg imm)
+  "TEST VREG, IMM where VREG lives.  A mask of 0..#x7F tests the low byte
+   (F6 /0 ib): the result's bits above 7 are zero either way, so ZF, SF and
+   PF come out as from the 32-bit test (CF and OF are cleared by both).  The
+   byte form names AL/BL only, or a frame slot's low byte; ESI/EDI take the
+   32-bit form."
+  (let* ((imm (logand imm #xFFFFFFFF))
+         (phys (i386-vreg-phys vreg)))
+    (if (and (<= 0 imm #x7F)
+             (or (null phys) (eql phys +i386-eax+) (eql phys +i386-ebx+)))
+        (progn (i386-emit-vreg-operand buf '(#xF6) 0 vreg)
+               (i386-emit-byte buf imm))
+        (progn (i386-emit-vreg-operand buf '(#xF7) 0 vreg)
+               (i386-emit-u32 buf imm)))))
+
+(defun i386-emit-subtag-body (buf)
+  "ECX = the object's subtag as a fixnum, or 0 when ECX is not an object
+   pointer (or is T).  Clobbers EDX.  The :obj-subtag arm, inline or shared."
+       (let ((fail-label (i386-make-label))
+             (done-label (i386-make-label)))
+         (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
+         (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
+         (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
+         (i386-emit-jcc buf :ne fail-label)
+         ;; T-immediate check (register compare, not a >2^31 imm32).
+         (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
+         (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
+         (i386-emit-jcc buf :e fail-label)
+         (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+         (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header
+         (i386-emit-and-reg-imm buf +scratch0+ #xFF)          ; mask to subtag
+         (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+         (i386-emit-jmp-rel32 buf done-label)
+         (i386-emit-label buf fail-label)
+         (i386-emit-mov-reg-imm buf +scratch0+ 0)
+         (i386-emit-label buf done-label)))
+
+(defun i386-emit-arraylen-body (buf)
+  "ECX = the object's element count as a fixnum, or 0 when ECX is not an
+   object pointer (or is T).  Clobbers EDX.  The :array-len arm."
+       (let ((fail-label (i386-make-label))
+             (done-label (i386-make-label)))
+         (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
+         (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
+         (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
+         (i386-emit-jcc buf :ne fail-label)
+         (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
+         (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
+         (i386-emit-jcc buf :e fail-label)
+         (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+         (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header word
+         (i386-emit-shr-reg-imm buf +scratch0+ 8)             ; count = header >> 8
+         (i386-emit-and-reg-imm buf +scratch0+ #xFFFFFF)      ; mask to 24 bits
+         (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+         (i386-emit-jmp-rel32 buf done-label)
+         (i386-emit-label buf fail-label)
+         (i386-emit-mov-reg-imm buf +scratch0+ 0)
+         (i386-emit-label buf done-label)))
+
+(defun i386-emit-shared-routines (buf)
+  "The shared :gc-check and :cons (see *I386-SHARED-CONS-LABEL*).
+   gc-check: clobbers ECX, as the inline form does; the collector's PUSHAD
+   sees every mutator register, and the extra return address on the stack is
+   below the 2^30 heap, so the conservative scan passes over it.
+   cons: car in ECX, cdr in EDX -> the tagged cons in ECX; clobbers EDX and
+   keeps EAX (VR), which it borrows as the cell's base."
+  ;; gc-check
+  (i386-emit-label buf *i386-shared-gccheck-label*)
+  (i386-emit-mov-reg-abs buf +scratch0+ *va-addr*)
+  (i386-emit-cmp-reg-abs buf +scratch0+ *vl-addr*)
+  (let ((ok (i386-make-label)))
+    (i386-emit-jcc buf :b ok)
+    (i386-emit-call-rel32 buf *i386-gc-collect-label*)
+    (i386-emit-label buf ok))
+  (i386-emit-ret buf)
+  ;; cons
+  (i386-emit-label buf *i386-shared-cons-label*)
+  (i386-emit-push-reg buf +i386-eax+)
+  (i386-emit-mov-reg-abs buf +i386-eax+ *va-addr*)
+  (i386-emit-mov-mem-reg buf +i386-eax+ 0 +scratch0+)
+  (i386-emit-mov-mem-reg buf +i386-eax+ 4 +scratch1+)
+  (i386-emit-fill-slots buf +i386-eax+ '(8 12) :cons +scratch0+)
+  (i386-emit-gc-mark-start buf +i386-eax+ t)
+  (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+  (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
+  (i386-emit-add-reg-imm buf +i386-eax+ 16)
+  (i386-emit-mov-abs-reg buf *va-addr* +i386-eax+)
+  (i386-emit-pop-reg buf +i386-eax+)
+  (i386-emit-ret buf)
+  ;; obj-subtag and array-len: ECX -> ECX, clobbering EDX
+  (i386-emit-label buf *i386-shared-subtag-label*)
+  (i386-emit-subtag-body buf)
+  (i386-emit-ret buf)
+  (i386-emit-label buf *i386-shared-arraylen-label*)
+  (i386-emit-arraylen-body buf)
+  (i386-emit-ret buf)
+  ;; alloc-obj: header in ECX, size (16-aligned) in EDX -> the tagged object
+  ;; in ECX; clobbers EDX, keeps EAX.  The payload and alignment tail get the
+  ;; fill word walking down from the end, as the inline form's wide case.
+  (i386-emit-label buf *i386-shared-allocobj-label*)
+  (i386-emit-push-reg buf +i386-eax+)
+  (i386-emit-mov-reg-abs buf +i386-eax+ *va-addr*)
+  (i386-emit-mov-mem-reg buf +i386-eax+ 0 +scratch0+)    ; header
+  (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+  (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)       ; new VA
+  (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+  (i386-emit-fill-range buf +scratch0+ +i386-eax+ :obj)
+  (i386-emit-gc-mark-start buf +i386-eax+)                ; object-start only
+  (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+  (i386-emit-or-reg-imm buf +scratch0+ +tag-object+)
+  (i386-emit-pop-reg buf +i386-eax+)
+  (i386-emit-ret buf)
+  ;; :add-checked / :sub-checked's overflow: ECX = vb, EDX = the wrapped
+  ;; result; va is EDX - ECX (add) or EDX + ECX (sub).  GENERIC-ADD /
+  ;; -SUBTRACT with V0 = va, V1 = vb, nargs 2 and the CALLER's V2/V3 (its
+  ;; frame: EBP is still the caller's here) -> EDX; EAX is the result too,
+  ;; exactly as the inline slow path leaves it.
+  (loop for (label op gen) in (list (list *i386-shared-addslow-label* :sub *i386-genadd-label*)
+                                    (list *i386-shared-subslow-label* :add *i386-gensub-label*))
+        do (i386-emit-label buf label)
+           (when gen
+             (if (eq op :sub)
+                 (i386-emit-sub-reg-reg buf +scratch1+ +scratch0+)
+                 (i386-emit-add-reg-reg buf +scratch1+ +scratch0+))
+             (i386-emit-push-reg buf +i386-esi+)
+             (i386-emit-push-reg buf +i386-edi+)
+             (i386-emit-mov-reg-reg buf +i386-esi+ +scratch1+)
+             (i386-emit-mov-reg-reg buf +i386-edi+ +scratch0+)
+             (i386-emit-byte buf #xC7)
+             (i386-emit-byte buf (i386-modrm #b00 0 5))
+             (i386-emit-u32 buf *nargs-addr*)
+             (i386-emit-u32 buf 2)
+             (i386-emit-push-mem buf +i386-ebp+ -20)
+             (i386-emit-push-mem buf +i386-ebp+ -16)
+             (i386-emit-call-rel32 buf gen)
+             (i386-emit-add-reg-imm buf +i386-esp+ 8)
+             (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+             (i386-emit-pop-reg buf +i386-edi+)
+             (i386-emit-pop-reg buf +i386-esi+))
+           (i386-emit-ret buf)))
+
+(defun i386-native-export-labels ()
+  "The image routines the native tier links runtime code to, in the order
+   jit-i386-native.lisp reads them: the collector, handler push, handler pop."
+  (list *i386-gc-collect-label* *i386-handler-push-label* *i386-handler-pop-label*))
+
+(defun i386-emit-native-exports (buf)
+  "\"modusJXL\", a count, then per routine its offset from the magic (a
+   :DIFF32 fixup, anchor = the magic), or #x7FFFFFFF when the image has none."
+  (loop while (/= 0 (mod (i386-current-pos buf) 4)) do (i386-emit-byte buf 0))
+  (let ((magic (i386-current-pos buf)) (labels (i386-native-export-labels)))
+    (loop for c across "modusJXL" do (i386-emit-byte buf (char-code c)))
+    (i386-emit-u32 buf (length labels))
+    (dolist (l labels)
+      (if l
+          (i386-emit-fixup-diff32 buf l magic)
+          (i386-emit-u32 buf #x7FFFFFFF)))))
 
 (defun i386-translate-single-instruction (opcode operands target buf)
   "Translate one MVM instruction to i386 code.
@@ -5477,6 +6707,56 @@
   (setf (target-emit-epilogue modus.mvm:*target-i386*)
         (lambda (target buf) (declare (ignore target)) (i386-emit-epilogue buf)))
   modus.mvm:*target-i386*)
+
+;;; HOST ONLY from here (the native tier bakes this file up to
+;;; INSTALL-I386-TRANSLATOR).
+
+(defun i386-native-state-name-p (name)
+  "Per-translation state, not configuration: the native tier binds these."
+  (or (search "-LABEL*" name)
+      (member name '("*I386-LI-CONST-PATCHES*" "*I386-UNIMPL-OPS*" "*I386-EAX-VIOLATIONS*"
+                     "*I386-CUR-OPNAME*" "*I386-CUR-DEST-IS-VR*" "*I386-CHECK-EAX-INVARIANT*"
+                     "*I386-EAX-INVARIANT-FATAL*" "*I386-NATIVE-CODE-OFFSET*"
+                     "*I386-REG-NAMES*")
+              :test #'string=)))
+
+(defun i386-native-dumpable-p (v)
+  (typecase v
+    ((or number character string symbol) t)
+    (cons (and (i386-native-dumpable-p (car v)) (i386-native-dumpable-p (cdr v))))
+    (simple-vector (every #'i386-native-dumpable-p v))
+    (t nil)))
+
+(defun i386-native-coinit-text ()
+  "Source text for jit-i386-native.lisp's %N386-COINIT body: SETQs giving the
+   image's emitter the configuration this image was translated with (a
+   DEFVAR's initial value never runs in the image).  Called by cross.lisp's
+   LATE-SOURCE-FILL, when the host's values are final.  Every bound special of
+   this package that is configuration and readable data."
+  (let ((forms nil) (skipped nil) (pkg (find-package :modus.mvm.i386)))
+    (do-symbols (s pkg)
+      (let ((n (symbol-name s)))
+        (when (and (eq (symbol-package s) pkg) (boundp s)
+                   (> (length n) 2) (char= (char n 0) #\*)
+                   (char= (char n (1- (length n))) #\*)
+                   (not (i386-native-state-name-p n)))
+          (if (i386-native-dumpable-p (symbol-value s))
+              ;; from KEYWORD so every symbol in a value prints with its package
+              (push (cons n (let ((*package* (find-package :keyword)))
+                              (format nil "'~S" (symbol-value s))))
+                    forms)
+              (push n skipped)))))
+    (setq forms (sort forms #'string< :key #'car))
+    (format t "~&;; i386 native tier: ~D emitter settings carried into the image~@[; not data: ~{~A~^ ~}~]~%"
+            (length forms) (sort skipped #'string<))
+    (with-output-to-string (o)
+      (let ((*package* pkg) (*print-readably* nil) (*print-pretty* nil) (*print-base* 10)
+            (*print-radix* nil) (*print-circle* nil))
+        (format o "(progn")
+        (dolist (f forms)
+          ;; package-qualified: jit-i386-native.lisp reads in MODUS.MVM
+          (format o "~%    (setq modus.mvm.i386::~A ~A)" (string-downcase (car f)) (cdr f)))
+        (format o "~%    t)")))))
 
 ;;; ============================================================
 ;;; Debugging Utilities

@@ -6,7 +6,8 @@
 ;;;;   READ   — the CL reader (READ-FROM-STRING over mvm/cl-reader.lisp)
 ;;;;   EVAL   — EVAL = MVM-EVAL: compile the form to MVM bytecode with the
 ;;;;            self-hosted compiler, then run it through MVM-INTERPRET
-;;;;   PRINT  — WRITE-OBJECT (mvm/prelude.lisp), which writes to serial
+;;;;   PRINT  — PRIN1-TO-STRING (the CL printer), then the string to serial;
+;;;;            WRITE-OBJECT (mvm/prelude.lisp) only if the printer fails
 ;;;;
 ;;;; The ONLY bespoke part is the character source: READ-CHAR-SERIAL (compiled
 ;;;; to TRAP #x0301 — poll the COM1 line-status register at 0x3FD, then IN from
@@ -37,13 +38,31 @@
 (defvar *serial-repl-len* 0)
 (defvar *serial-repl-cap* 0)
 
+;;; The buffer starts at 512 characters and doubles as a form needs it, up to
+;;; 16384: a fixed 16 KB string was 40% of a 1 MB Mac's young heap (measured:
+;;; DEFMACRO exhausted its 40 KB semispaces with it live).
 (defun %srepl-init-buf ()
-  (setq *serial-repl-cap* 16384)
-  (setq *serial-repl-buf* (%make-string-array 16384))
+  (setq *serial-repl-cap* 512)
+  (setq *serial-repl-buf* (%make-string-array 512))
   (setq *serial-repl-len* 0))
+
+(defun %srepl-grow ()
+  "Double the buffer (to at most 16384 characters), keeping what it holds."
+  (let* ((cap (* 2 *serial-repl-cap*))
+         (new (%make-string-array cap))
+         (old *serial-repl-buf*)
+         (i 0))
+    (loop
+      (when (>= i *serial-repl-len*) (return nil))
+      (%prim-aset new i (%prim-aref old i))
+      (setq i (+ i 1)))
+    (setq *serial-repl-buf* new)
+    (setq *serial-repl-cap* cap)))
 
 (defun %srepl-push (code)
   "Append CODE to the buffer (dropping the char if the buffer is full)."
+  (when (and (>= *serial-repl-len* *serial-repl-cap*) (< *serial-repl-cap* 16384))
+    (%srepl-grow))
   (if (< *serial-repl-len* *serial-repl-cap*)
       ;; The store is bound to a variable deliberately: a variable-index ASET
       ;; in non-value position can drop its value (MVM active limitation #2).
@@ -129,17 +148,29 @@
 ;;; Eval + print
 ;;; ===========================================================================
 
+;;; PRINT is the CL printer: PRIN1 for a value, PRINC (the report) for an
+;;; error.  WRITE-OBJECT, the prelude's boot printer, knows no ratios, prints
+;;; :A as A, 4.5 as 4.500000, a structure as #(%STRUCT-INSTANCE ...), a package
+;;; as its internal vectors and an error as #(UNDEFINED-FUNCTION ((NAME . SQ))
+;;; %CONDITION-MARKER) -- measured on a Mac Classic.  It stays the fallback
+;;; for when the printer itself fails.
+
+(defun %srepl-write-via (fn obj budget)
+  (let ((s (handler-case (funcall fn obj) (t (c) nil))))
+    (if (stringp s)
+        (write-string-serial s)
+        (progn (setq *write-object-budget* budget)
+               (handler-case (write-object obj) (t (c2) (write-string-serial "<unprintable>")))))))
+
 (defun %srepl-report-condition (c)
   (write-string-serial "ERROR: ")
-  (setq *write-object-budget* 400)
-  (handler-case (write-object c) (t (c2) (write-string-serial "<condition>")))
+  (%srepl-write-via (function princ-to-string) c 400)
   (write-char-serial 10))
 
 (defun %srepl-eval-print (form)
   (handler-case
       (let ((v (eval form)))
-        (setq *write-object-budget* 100000)
-        (write-object v)
+        (%srepl-write-via (function prin1-to-string) v 100000)
         (write-char-serial 10))
     (t (c) (%srepl-report-condition c))))
 

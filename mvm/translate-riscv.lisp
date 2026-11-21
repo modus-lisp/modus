@@ -52,6 +52,14 @@
 (defconstant +rv-s11+  27)   ; x27 - saved 11
 (defconstant +rv-t3+   28)   ; x28 - temporary 3
 (defconstant +rv-t4+   29)   ; x29 - temporary 4
+;; The Linux syscall numbers the hosted traps use (see *RISCV-LINUX-MODE*
+;; below for why they are named).  DEFINED HERE, BEFORE ANY USE: the image's
+;; own compiler folds a constant only if its DEFCONSTANT came first, and
+;; modus-sh bakes this file (the RV32 DDC); defined at the end, every hosted
+;; write/read/exit trap compiled in-image loaded garbage into a7 (W32 M1).
+(defconstant +rv-linux-sys-read+  63)
+(defconstant +rv-linux-sys-write+ 64)
+(defconstant +rv-linux-sys-exit+  93)
 (defconstant +rv-t5+   30)   ; x30 - temporary 5
 (defconstant +rv-t6+   31)   ; x31 - temporary 6
 
@@ -87,7 +95,13 @@
 ;;; ============================================================
 
 (defstruct rv-buffer
-  (bytes (make-array 131072))           ; fixed-size, position tracks fill
+  ;; An OCTET vector: every store is a byte (LOGAND #xFF).  A generic vector
+  ;; costs a WORD per byte -- 8x on a 64-bit host -- and the doubling below
+  ;; takes a CL image's ~36 MB of RV32 code to a 64M-slot, 512 MB vector, which
+  ;; killed modus-sh --compile-riscv32 (the RV32 DDC) once the input passed 90%
+  ;; of the dump: every prefix up to 22 MB of native code compiled, the whole
+  ;; dump segfaulted.  (W32 M1.)
+  (bytes (make-array 131072 :element-type '(unsigned-byte 8) :initial-element 0))
   (position 0)
   (labels (make-hash-table :test 'eql))
   (fixups nil))    ; list of (byte-position label-id type)
@@ -109,7 +123,8 @@
   (let ((bytes (rv-buffer-bytes buf))
         (pos (rv-buffer-position buf)))
     (when (>= (+ pos 4) (length bytes))
-      (let ((new (make-array (* 2 (length bytes)) :initial-element 0)))
+      (let ((new (make-array (* 2 (length bytes)) :element-type '(unsigned-byte 8)
+                             :initial-element 0)))
         (replace new bytes)
         (setf (rv-buffer-bytes buf) new)
         (setf bytes new)))
@@ -318,6 +333,10 @@
 (defun rv-emit-slt (buf rd rs1 rs2)
   "SLT rd, rs1, rs2 (set less than, signed)"
   (rv-emit-u32 buf (rv-encode-r-type #x00 rs2 rs1 #x2 rd #x33)))
+
+(defun rv-emit-sltu (buf rd rs1 rs2)
+  "SLTU rd, rs1, rs2 (set less than, unsigned).  W32's w32-ltu."
+  (rv-emit-u32 buf (rv-encode-r-type #x00 rs2 rs1 #x3 rd #x33)))
 
 ;; --- RV64 R-type word ops (opcode #b0111011 = #x3B) ---
 
@@ -873,7 +892,8 @@
 (defparameter *rv-hosted-globals-base* #x10000380
   "Convention slots for the HOSTED port, inside the mmap'd heap and above the
    Cheney metadata at #x10000040: in the free span below the handler stack,
-   past the longjmp scratch (#x300) and the capped count (#x360).
+   past the longjmp scratch (#x300).  (#x360 held the old BALANCED-CAP's
+   capped-push count; nothing uses it now.)
 
    NOT #x10000A00, where it was (i386's choice).  i386 and ARM32 stack 4-byte
    words, so their 21 handler frames end at #x100006A8; this port's frames are
@@ -1176,6 +1196,74 @@
     (rv-emit-genarith-call tmp ra rb 0 nil)
     (rv-current-offset tmp)))
 
+;;; ============================================================
+;;; W32 (RV32 only; see the arm in TRANSLATE-MVM-INSN-RISCV)
+;;; ============================================================
+(defun rv-translate-w32 (buf op o0 o1 o2)
+  "Emit one W32 opcode on RV32.  O0..O2 are its decoded operands (registers,
+   or the immediate in its place).  A vreg is put in a physical register as
+   TRANSLATE-MVM-INSN-RISCV's RESOLVE / RESOLVE2 do (t0 / t1 when spilled), and
+   results go back through t0.  Plain calls, not the arm's local functions, so
+   nothing here closes over them (this file is baked into modus-sh)."
+  (let ((t0 +rv-t0+) (t1 +rv-t1+))
+    (cond
+      ((= op +op-w32-li+)
+       (rv-emit-li buf t0 o1)
+       (rv-store-vreg buf o0 t0))
+      ((= op +op-w32-store+)
+       ;; (w32-store Vaddr Vs off): Vaddr holds a RAW address
+       (let ((ra (rv-vreg-or-load buf o0 t0)) (rs (rv-vreg-or-load buf o1 t1)))
+         (rv-emit-sw buf rs ra o2)))
+      ((= op +op-w32-load+)
+       (let ((ra (rv-vreg-or-load buf o1 t0)))
+         (rv-emit-lw buf t0 ra o2)
+         (rv-store-vreg buf o0 t0)))
+      ((or (= op +op-w32-not+) (= op +op-w32-from-fix+)
+           (= op +op-w32-hi16+) (= op +op-w32-lo16+))
+       (let ((rs (rv-vreg-or-load buf o1 t0)))
+         (cond ((= op +op-w32-not+)      (rv-emit-not buf t0 rs))
+               ((= op +op-w32-from-fix+) (rv-emit-srai buf t0 rs 1))   ; untag
+               ((= op +op-w32-hi16+)     (rv-emit-srli buf t0 rs 16)
+                                         (rv-emit-slli buf t0 t0 1))   ; tag
+               (t                        (rv-emit-slli buf t0 rs 16)   ; lo16:
+                                         (rv-emit-srli buf t0 t0 15))) ; lo<<1, tagged
+         (rv-store-vreg buf o0 t0)))
+      ((or (= op +op-w32-shl+) (= op +op-w32-shr+) (= op +op-w32-sar+)
+           (= op +op-w32-rotl+))
+       (let ((rs (rv-vreg-or-load buf o1 t0)) (n o2))
+         (cond ((= op +op-w32-shl+) (rv-emit-slli buf t0 rs n))
+               ((= op +op-w32-shr+) (rv-emit-srli buf t0 rs n))
+               ((= op +op-w32-sar+) (rv-emit-srai buf t0 rs n))
+               ((= n 0)             (rv-emit-mv buf t0 rs))
+               ;; rotl: the right half first, into t1 -- RS may BE t0
+               (t (rv-emit-srli buf t1 rs (- 32 n))
+                  (rv-emit-slli buf t0 rs n)
+                  (rv-emit-or buf t0 t0 t1)))
+         (rv-store-vreg buf o0 t0)))
+      ((= op +op-w32-join+)
+       ;; o1, o2: tagged fixnums 0..65535 (hi<<1, lo<<1) -> hi*2^16 + lo
+       (let ((ra (rv-vreg-or-load buf o1 t0)))
+         (rv-emit-slli buf t0 ra 15)                 ; (hi<<1)<<15 = hi<<16
+         (let ((rb (rv-vreg-or-load buf o2 t1)))
+           (rv-emit-srli buf t1 rb 1)                ; untag lo
+           (rv-emit-or buf t0 t0 t1)))
+       (rv-store-vreg buf o0 t0))
+      (t
+       (let ((ra (rv-vreg-or-load buf o1 t0)) (rb (rv-vreg-or-load buf o2 t1)))
+         (cond ((= op +op-w32-add+)   (rv-emit-add buf t0 ra rb))
+               ((= op +op-w32-sub+)   (rv-emit-sub buf t0 ra rb))
+               ((= op +op-w32-mul+)   (rv-emit-mul buf t0 ra rb))
+               ((= op +op-w32-mulhu+) (rv-emit-mulhu buf t0 ra rb))
+               ((= op +op-w32-and+)   (rv-emit-and buf t0 ra rb))
+               ((= op +op-w32-or+)    (rv-emit-or buf t0 ra rb))
+               ((= op +op-w32-xor+)   (rv-emit-xor buf t0 ra rb))
+               ((= op +op-w32-ltu+)   (rv-emit-sltu buf t0 ra rb) (rv-emit-slli buf t0 t0 1))
+               ((= op +op-w32-lts+)   (rv-emit-slt buf t0 ra rb) (rv-emit-slli buf t0 t0 1))
+               (t                     (rv-emit-xor buf t0 ra rb)            ; eq
+                                      (rv-emit-seqz buf t0 t0)
+                                      (rv-emit-slli buf t0 t0 1)))
+         (rv-store-vreg buf o0 t0))))))
+
 (defun translate-mvm-insn-riscv (buf opcode operands mvm-pc
                                   &key (pass2 nil) label-map function-table)
   "Translate a single MVM instruction to RISC-V native code.
@@ -1429,12 +1517,11 @@
             ;; The resume address is AUIPC-relative and points at the
             ;; instruction AFTER the whole block, so both the first call and the
             ;; longjmp land there — no skip-branch, exactly x64's shape.
+            ;; The push always stores the outer frame (or, when it cannot,
+            ;; longjmps loudly to it and never returns), so this site always
+            ;; arms.  See THE HANDLER-FRAME STACK HAS NO SILENT CEILING.
             (rv-emit-handler-push buf)
-            (let ((to-skip (rv-current-offset buf)))
-              ;; A capped push stored no frame, so DO NOT arm: an over-deep
-              ;; handler-case degrades to a transparent no-op rather than
-              ;; overwriting the frame that is still live.
-              (rv-emit-bne buf +rv-t3+ +rv-x0+ 0)              ; patched
+            (progn
               (rv-emit-li buf +rv-t0+ *rv-jmpbuf-addr*)
               (rv-emit-store-word buf +rv-sp+ +rv-t0+ 0)
               (rv-emit-store-word buf +rv-fp+ +rv-t0+ 8)
@@ -1449,7 +1536,6 @@
                 (dotimes (i 8)
                   (rv-emit-store-word buf (rv-resolve-vreg (+ 4 i))
                                       +rv-t0+ (* 8 (+ 3 i))))
-                (rv-patch-branch-here buf to-skip)
                 ;; First return: NIL, which lives in VN.
                 (rv-emit-mv buf +rv-a0+ +rv-s10+)          ; VN
                 ;; Patch the ADDI so auipc+addi == the address of the NEXT
@@ -2133,10 +2219,10 @@
          ;; terminates, because (car NIL) is NIL and the walk recurses on NIL
          ;; forever.  Both answers are in registers before any branch and each
          ;; branch skips exactly one 4-byte MV, so the arm is size-stable.
-         (rv-emit-li buf +rv-t2+ +t-value+)
+         (rv-emit-li buf +rv-t2+ (ct-t-value))
          (rv-emit-andi buf +rv-t1+ rs #x0F)   ; +tag-mask+   ; read RS while it is still RS
          (rv-emit-xor buf +rv-t4+ rs +rv-s10+)      ; t4 = 0 iff RS is NIL
-         (rv-emit-addi buf +rv-t3+ +rv-x0+ +tag-cons+)
+         (rv-emit-addi buf +rv-t3+ +rv-x0+ (ct-tag-cons))
          (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; default NIL
          (rv-emit-bne buf +rv-t1+ +rv-t3+ 8)        ; not a cons -> keep NIL
          (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; cons-tagged -> T
@@ -2151,10 +2237,10 @@
          ;; Same ordering requirement as :consp — read RS before writing t0.
          ;; Four-bit mask and the NIL exclusion, both for the reasons given on
          ;; :consp -- (atom NIL) is T.
-         (rv-emit-li buf +rv-t2+ +t-value+)
+         (rv-emit-li buf +rv-t2+ (ct-t-value))
          (rv-emit-andi buf +rv-t1+ rs #x0F)   ; +tag-mask+
          (rv-emit-xor buf +rv-t4+ rs +rv-s10+)      ; t4 = 0 iff RS is NIL
-         (rv-emit-addi buf +rv-t3+ +rv-x0+ +tag-cons+)
+         (rv-emit-addi buf +rv-t3+ +rv-x0+ (ct-tag-cons))
          (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; default T
          (rv-emit-bne buf +rv-t1+ +rv-t3+ 8)        ; not a cons -> keep T
          (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; cons-tagged -> NIL
@@ -2263,7 +2349,7 @@
          ;; nibble on RV64 but is an immediate, and T-9 is unmapped.  Both
          ;; answers are in registers before the branches, each branch skips a
          ;; fixed run, so the arm is size-stable.
-         (rv-emit-li buf +rv-t3+ +t-value+)
+         (rv-emit-li buf +rv-t3+ (ct-t-value))
          (rv-emit-andi buf +rv-t1+ rs #x0F)   ; +tag-mask+, read RS
          (rv-emit-mv buf +rv-t4+ rs)                  ; keep RS: it may be t0
          (rv-emit-addi buf +rv-t2+ +rv-x0+ (rv-object-tag))
@@ -2519,7 +2605,7 @@
              (progn
                (rv-emit-auipc buf +rv-t0+ (logand hi20 #xFFFFF))
                (rv-emit-addi buf +rv-t0+ +rv-t0+ (logand lo12 #xFFF))
-               (rv-emit-ori buf +rv-t0+ +rv-t0+ +tag-function+)))
+               (rv-emit-ori buf +rv-t0+ +rv-t0+ (ct-tag-function))))
          (store-result vd +rv-t0+)))
 
       (#.+op-li-const+
@@ -2561,7 +2647,7 @@
        ;; vreg, and a funcall inside a loop would otherwise untag the caller's
        ;; own copy of the function pointer once per iteration.
        (let ((rs (resolve (vreg 0))))
-         (rv-emit-addi buf +rv-t1+ rs (- +tag-function+))
+         (rv-emit-addi buf +rv-t1+ rs (- (ct-tag-function)))
          (rv-emit-jalr buf +rv-ra+ +rv-t1+ 0)))
 
       (#.+op-ret+
@@ -3086,7 +3172,27 @@
        ;; The count is stored TAGGED (<<1), matching i386/x64.
        (let ((tagged (ash (vreg 0) 1)))
          (rv-emit-li buf +rv-t2+ tagged)
-         (rv-emit-store-abs buf +rv-t2+ +mv-count-addr+)))
+         (rv-emit-store-abs buf +rv-t2+ (ct-mv-count-addr))))
+
+;; ---- W32: native 32-bit words (docs/w32.md, spec 4.4) ----------------
+      ;; RV32 ONLY: a W32 operand is a raw word in a 32-bit register, so each
+      ;; op is one RV32 instruction (and a tag where the result is a fixnum).
+      ;; On RV64 there is no such word in a register, and the compiler never
+      ;; emits these for a 64-bit target (C1); reaching one there is recorded
+      ;; as a gap and traps, like any unimplemented opcode.  Scratch: RESOLVE
+      ;; loads into t0, RESOLVE2 into t1, results go through t0 -- each arm
+      ;; orders its steps so a source living in t0/t1 is read before it is
+      ;; overwritten.
+      ((#.+op-w32-li+ #.+op-w32-add+ #.+op-w32-sub+ #.+op-w32-mul+ #.+op-w32-mulhu+
+        #.+op-w32-and+ #.+op-w32-or+ #.+op-w32-xor+ #.+op-w32-not+
+        #.+op-w32-shl+ #.+op-w32-shr+ #.+op-w32-sar+ #.+op-w32-rotl+
+        #.+op-w32-ltu+ #.+op-w32-lts+ #.+op-w32-eq+ #.+op-w32-from-fix+
+        #.+op-w32-hi16+ #.+op-w32-lo16+ #.+op-w32-join+ #.+op-w32-load+ #.+op-w32-store+)
+       (if *riscv-64-bit*
+           (progn (rv-note-unimpl opcode)
+                  (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode)
+                  (rv-emit-ebreak buf))
+           (rv-translate-w32 buf opcode (vreg 0) (vreg 1) (vreg 2))))
 
       ;; ---- Unknown opcode ----
       (otherwise
@@ -3142,40 +3248,106 @@
 (defparameter *rv-hstack-base-addr* #x80700408  ; BARE default; riscv-set-linux-mode moves it
   "Frame 0.  Frame N is at base + 96*N.")
 (defparameter *rv-hstack-max-depth* 21
-  "Frames that fit between the stack base and #x10000C10, which is where the
-   shared low-memory map puts the longjmp scratch.  21 nested handler-cases; a
-   deeper one is CAPPED (see below) rather than allowed to run off the end.
-   HOSTED mode moves the frames to their own region and raises this to
-   +RV-HOSTED-HSTACK-MAX-DEPTH+ (RISCV-SET-LINUX-MODE).")
+  "Frames held in the fixed area: 21 between the bare stack base and the end
+   of the bare block's frame span (#x80700BE8), +RV-HOSTED-HSTACK-MAX-DEPTH+
+   hosted (RISCV-SET-LINUX-MODE).  A push past them goes OUT OF LINE: to the
+   hosted extension, or to the loud overflow -- see THE HANDLER-FRAME STACK HAS
+   NO SILENT CEILING (RISC-V).")
 
-;;; 21 IS NOT ENOUGH FOR A HOSTED CL IMAGE.  A CATCH or HANDLER-CASE past the cap
-;;; stores no frame, and a LONGJMP discards every capped frame at once -- so a
-;;; THROW that an inner capped HANDLER-CASE passes on goes straight to the 21st
-;;; stored frame and skips its own capped CATCH.  A LOAD from inside a LOAD,
-;;; with the fasl cache recording, is deeper than 21: the cache's
-;;; %FASL-REJECT (every EVAL-WHEN, every DEFMACRO) escaped to LOAD's catch-all,
-;;; and the upstream ANSI suite could not even load its own aux files.  x86-64
-;;; holds 64 frames, i386 63, aarch64 its own page.
+;;; 21 IS NOT ENOUGH FOR A HOSTED CL IMAGE.  A LOAD from inside a LOAD, with
+;;; the fasl cache recording, is deeper than 21: the cache's %FASL-REJECT
+;;; (every EVAL-WHEN, every DEFMACRO) escaped to LOAD's catch-all, and the
+;;; upstream ANSI suite could not even load its own aux files.  So hosted keeps
+;;; its first 256 frames in a region of their own, and every deeper one in the
+;;; extension (below).
 (defconstant +rv-hosted-hstack-frames-offset+ #x20000
   "Hosted: the frame area, as an offset from the heap base.  Its own region,
    above everything the low block already holds (RV32's staged argv ends at
    #x1E000), and below the allocator's start, so the collector's scan of the
-   whole low block still covers every saved frame.")
+   whole low block still covers every frame stored there.")
 (defconstant +rv-hosted-hstack-max-depth+ 256
-  "Hosted nesting depth: 256 frames x 96 bytes = #x6000, ending at #x26000.")
+  "Hosted in-memory frames: 256 x 96 bytes = #x6000, ending at #x26000.")
 
 (defparameter *rv-longjmp-scratch-addr* #x80700300  ; BARE default; riscv-set-linux-mode moves it
   "Twelve words.  LONGJMP copies the jmpbuf here BEFORE the pop overwrites it --
    the pop restores the OUTER frame into the jmpbuf, and longjmp still needs the
    INNER one it is jumping to.  #x300 because #x250..#x3FF is the one free span
    in the fixed block below the handler stack.")
-(defparameter *rv-hstack-capped-addr* #x80700360  ; BARE default; riscv-set-linux-mode moves it
-  "LIVE count of capped pushes.  A capped push stores NO frame, so the
-   CLEAR-HANDLER that textually matches it must ABSORB its pop instead of
-   draining a real frame — otherwise an over-deep handler-case silently pops
-   somebody else's.  LONGJMP zeroes it: it unwinds past every capped (strictly
-   inner) frame at once, so their pending absorbs must not fire against outer
-   pops afterwards.")
+
+;;; ------------------------------------------------------------------
+;;; THE HANDLER-FRAME STACK HAS NO SILENT CEILING (RISC-V)
+;;; ------------------------------------------------------------------
+;;;
+;;; The RISC-V twin of translate-x64's and translate-aarch64's sections of the
+;;; same name.  Every CATCH / UNWIND-PROTECT / HANDLER-CASE keeps one 96-byte
+;;; frame (the jmpbuf it shadows: sp, fp, resume ip, V4..V11) while its body
+;;; runs.  The frames used to be a fixed array with a BALANCED CAP: a push past
+;;; it stored nothing and bumped a "capped" count, the SETJMP site skipped
+;;; arming, the matching pop absorbed -- so a longjmp from below the cap went
+;;; straight to the deepest STORED frame and every cleanup past the cap was
+;;; silently skipped (r36: 255 of 301 cleanups ran, both widths, hosted).
+;;;
+;;; HOSTED (Linux, both widths): frames 0..255 stay where they were (heap
+;;; +#x20000..+#x25FFF; the fast path is the old code plus one compare).
+;;; Frame 256 and up go to an EXTENSION the push's out-of-line slow path
+;;; reserves on first use -- mmap(MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE),
+;;; 222 on both widths (mmap2 on RV32, offset 0), RV-HSTACK-EXT-FRAMES frames,
+;;; address space only -- its address in the word at heap +#x26000.  Heap
+;;; +#x26008 is a TEST-ONLY lower limit on extension frames (0 = none).  Both
+;;; words sit in the gap between the frame area's end (#x26000) and the
+;;; allocator's start (#x28000), which nothing else in mvm/, boot/, net/ or
+;;; lib/ names; the heap is a fresh MAP_ANONYMOUS mapping (boot-linux-riscv*,
+;;; MAP_FIXED, no image restore on this port), so both start at 0.  The
+;;; image is single-threaded (no hosted-actors layer on RISC-V), so one
+;;; process-global extension is the whole story.
+;;;
+;;; A push that cannot be stored -- past the extension, past the test limit,
+;;; or the reservation refused -- is LOUD: it records #x0F0F in the
+;;; pending-fault word (#x10000CB0 hosted, where %TAKE-PENDING-FAULT reads it)
+;;; and longjmps to the frame that is armed now, exactly as TRAP #x0511 does.
+;;; That frame is the one enclosing the form whose push failed; it receives a
+;;; HANDLER-STACK-EXHAUSTED.  The failed frame was never stored, so the stack
+;;; stays balanced and every enclosing cleanup runs.  Nothing armed: a message
+;;; on fd 2 and exit_group(70) hosted, EBREAK with a7 = #x0F0F bare -- never a
+;;; branch through a zero jmpbuf.
+;;;
+;;; BARE METAL has no mmap and no consumer for the pending-fault word: the
+;;; push past frame 21 is the same loud overflow, recording #x0F0F at
+;;; #x80700CB0 (the bare block's twin of #x10000CB0; #x10000CB0 itself is
+;;; next to the UART's MMIO window on virt) and longjmping to the armed frame.
+;;;
+;;; GC.  A frame holds V4..V11, which are heap pointers, so frames ARE roots.
+;;; The fixed area is covered by the collector's whole-low-block scan; the
+;;; extension is not, so RV-EMIT-GC-COLLECTOR scans its LIVE frames
+;;; [ext, ext + (depth - 256) * 96) explicitly.
+;;;
+;;; The push and pop stay inline at every site with their fast path; the slow
+;;; paths are emitted ONCE per translation, after the code (RV-EMIT-HSTACK-
+;;; STUBS), and reached through a fixed-size AUIPC+JALR with t0 as the link.
+
+(defconstant +rv-hstack-ext-addr+ #x10026000
+  "Hosted: ABSOLUTE address of the extension (frames 256 and up), 0 until the
+   first push past 256 reserves it.")
+(defconstant +rv-hstack-ext-limit-addr+ #x10026008
+  "Hosted: 0, or a TEST-ONLY lower limit on extension frames (a push of
+   extension frame >= limit overflows).")
+(defun rv-hstack-ext-frames ()
+  "Frames in the extension: 1M (96 MB of address space) on RV64, 256K (24 MB)
+   on RV32 -- either way far past what a default 8 MB native stack can nest."
+  (if *riscv-64-bit* #x100000 #x40000))
+(defconstant +rv-hstack-overflow-code+ #x0F0F
+  "Recorded in the pending-fault word by an overflowing push;
+   %TAKE-PENDING-FAULT turns it into HANDLER-STACK-EXHAUSTED.")
+(defparameter *rv-pending-fault-addr* #x80700CB0  ; BARE default; riscv-set-linux-mode moves it
+  "Where an overflowing push records #x0F0F: the shared #x10000CB0 hosted (the
+   signal stub's word too); bare, the same offset in the DRAM block, past the
+   21 bare frames (which end at #x80700BE8).")
+
+(defparameter *rv-hstack-push-slow-offset* nil
+  "Native offset of the push's out-of-line slow path while translating; :MEASURE
+   in pass 1, NIL outside a translation.")
+(defparameter *rv-hstack-pop-slow-offset* nil
+  "Native offset of the pop's out-of-line slow path (hosted only), as above.")
 
 ;;; The hosted convention slots must lie OUTSIDE the handler stack: a frame
 ;;; push writes over them silently, and they write over a live frame.
@@ -3185,9 +3357,31 @@
           (or (>= g stack-hi) (<= (+ g 16) stack-lo)))
         () "riscv: hosted globals #x~X overlap the handler stack" *rv-hosted-globals-base*)
 
+(defun rv-emit-stub-call (buf target)
+  "Call an out-of-line handler-stack stub at native offset TARGET with t0 as
+   the link register: AUIPC+JALR, 8 bytes at any distance, so pass 1 (TARGET
+   :MEASURE) measures what pass 2 emits."
+  (let* ((off (cond ((integerp target) (- target (rv-current-offset buf)))
+                    ((eq target :measure) 0)
+                    (t (error "riscv: a handler-stack slow path is called outside ~
+                               TRANSLATE-MVM-TO-RISCV, which emits it"))))
+         (lo12 (logand off #xFFF))
+         (lo12-sext (if (>= lo12 #x800) (- lo12 #x1000) lo12))
+         (hi20 (logand (ash (- off lo12-sext) -12) #xFFFFF)))
+    (rv-emit-auipc buf +rv-t0+ hi20)
+    (rv-emit-jalr buf +rv-t0+ +rv-t0+ (logand lo12-sext #xFFF))))
+
+(defun rv-emit-frame-addr (buf base index)
+  "BASE += INDEX*96, built as 64+32 through t4 so nothing here is multi-word."
+  (rv-emit-slli buf +rv-t4+ index 6)
+  (rv-emit-add buf base base +rv-t4+)
+  (rv-emit-slli buf +rv-t4+ index 5)
+  (rv-emit-add buf base base +rv-t4+))
+
 (defun rv-emit-handler-push (buf)
   "Stack the CURRENT jmpbuf so a nested handler-case does not overwrite it.
-   Leaves t3 = 0 if a frame was stored, 1 if the push was CAPPED.
+   Clobbers t0..t6.  Always stores the frame, or does not return (the loud
+   overflow longjmps to the armed frame).
 
    NESTING IS NOT DEFERRABLE.  SEQUENTIAL handler-cases work with a single-level
    implementation -- and that is exactly what init-all-globals does, one per init
@@ -3197,81 +3391,194 @@
    Branch distances are BACK-PATCHED from measured positions, never counted."
   (rv-emit-li buf +rv-t1+ *rv-hstack-depth-addr*)
   (rv-emit-load-word buf +rv-t2+ +rv-t1+ 0)              ; t2 = depth
-  (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)                   ; assume capped
   (rv-emit-addi buf +rv-t4+ +rv-x0+ *rv-hstack-max-depth*)
-  ;; Both addresses are materialised BEFORE the branch.  RV-EMIT-LI is
-  ;; multi-instruction; back-patching no longer cares about the count, but
-  ;; keeping LI out of a branched span keeps both arms the shape of the rest
-  ;; of this file.
+  ;; Both addresses are materialised BEFORE the branch; the slow path takes
+  ;; t1 (depth address), t2 (depth) and t6 (jmpbuf) from here.
   (rv-emit-li buf +rv-t5+ *rv-hstack-base-addr*)
   (rv-emit-li buf +rv-t6+ *rv-jmpbuf-addr*)
-  (let ((to-capped (rv-current-offset buf)))
+  (let ((to-slow (rv-current-offset buf)))
+    ;; SIGNED, as before: a real depth is never negative.
     (rv-emit-bge buf +rv-t2+ +rv-t4+ 0)                  ; patched below
-    ;; dest = base + depth*96, built as 64+32 so nothing here is multi-word
-    (rv-emit-slli buf +rv-t0+ +rv-t2+ 6)
-    (rv-emit-add buf +rv-t5+ +rv-t5+ +rv-t0+)
-    (rv-emit-slli buf +rv-t0+ +rv-t2+ 5)
-    (rv-emit-add buf +rv-t5+ +rv-t5+ +rv-t0+)
+    (rv-emit-frame-addr buf +rv-t5+ +rv-t2+)
     (dotimes (i +rv-jmpbuf-words+)
       (rv-emit-load-word buf +rv-t0+ +rv-t6+ (* 8 i))
       (rv-emit-store-word buf +rv-t0+ +rv-t5+ (* 8 i)))
     (rv-emit-addi buf +rv-t2+ +rv-t2+ 1)
     (rv-emit-store-word buf +rv-t2+ +rv-t1+ 0)
-    (rv-emit-addi buf +rv-t3+ +rv-x0+ 0)                 ; stored, not capped
     (let ((to-done (rv-current-offset buf)))
       (rv-emit-jal buf +rv-x0+ 0)                        ; patched below
-      (rv-patch-branch-here buf to-capped)
-      ;; --- capped: bump the LIVE capped count, leaving t3 = 1
-      (rv-emit-li buf +rv-t1+ *rv-hstack-capped-addr*)
-      (rv-emit-load-word buf +rv-t0+ +rv-t1+ 0)
-      (rv-emit-addi buf +rv-t0+ +rv-t0+ 1)
-      (rv-emit-store-word buf +rv-t0+ +rv-t1+ 0)
+      (rv-patch-branch-here buf to-slow)
+      (rv-emit-stub-call buf *rv-hstack-push-slow-offset*)
       (rv-patch-jal-here buf to-done))))
 
 (defun rv-emit-handler-pop (buf)
   "Restore the top stacked frame into the jmpbuf, or ZERO the jmpbuf when the
-   stack is empty.  Clobbers t0..t6 only.
+   stack is empty.  Clobbers t0..t6 only (V0 carries a handler-case's result
+   here).  Hosted, a frame past the fixed area is restored by the out-of-line
+   slow path, from the extension."
+  (rv-emit-li buf +rv-t1+ *rv-hstack-depth-addr*)
+  (rv-emit-load-word buf +rv-t2+ +rv-t1+ 0)
+  (rv-emit-li buf +rv-t5+ *rv-hstack-base-addr*)
+  (rv-emit-li buf +rv-t6+ *rv-jmpbuf-addr*)
+  (let ((to-empty (rv-current-offset buf))
+        (to-slow nil)
+        (dones nil))
+    (rv-emit-beq buf +rv-t2+ +rv-x0+ 0)                  ; patched
+    (rv-emit-addi buf +rv-t2+ +rv-t2+ -1)
+    (rv-emit-store-word buf +rv-t2+ +rv-t1+ 0)
+    (when *riscv-linux-mode*
+      (rv-emit-addi buf +rv-t4+ +rv-x0+ *rv-hstack-max-depth*)
+      (setq to-slow (rv-current-offset buf))
+      (rv-emit-bge buf +rv-t2+ +rv-t4+ 0))               ; patched
+    (rv-emit-frame-addr buf +rv-t5+ +rv-t2+)
+    (dotimes (i +rv-jmpbuf-words+)
+      (rv-emit-load-word buf +rv-t0+ +rv-t5+ (* 8 i))
+      (rv-emit-store-word buf +rv-t0+ +rv-t6+ (* 8 i)))
+    (push (rv-current-offset buf) dones)
+    (rv-emit-jal buf +rv-x0+ 0)                          ; patched
+    (when to-slow
+      (rv-patch-branch-here buf to-slow)
+      (rv-emit-stub-call buf *rv-hstack-pop-slow-offset*)
+      (push (rv-current-offset buf) dones)
+      (rv-emit-jal buf +rv-x0+ 0))                       ; patched
+    (rv-patch-branch-here buf to-empty)
+    ;; Empty.  ZERO THE WHOLE JMPBUF, not just word 0.  Word 0 = 0 is the "no
+    ;; handler armed" sentinel LONGJMP tests, but leaving the other eleven
+    ;; words holding a dead frame's callee-saved registers would leave stale
+    ;; values for the next restore to load.
+    (dotimes (i +rv-jmpbuf-words+)
+      (rv-emit-store-word buf +rv-x0+ +rv-t6+ (* 8 i)))
+    (dolist (d dones) (rv-patch-jal-here buf d))))
 
-   THREE ARMS, and the first one is the subtle one: a pop that textually matches
-   a CAPPED push must ABSORB it and touch nothing else.  Draining a real frame
-   there would pop a handler that is still armed — the drain-to-depth-0 class."
-  ;; --- arm 1: capped > 0 ?  absorb and return.
-  (rv-emit-li buf +rv-t1+ *rv-hstack-capped-addr*)
-  (rv-emit-load-word buf +rv-t0+ +rv-t1+ 0)
-  (let ((to-not-capped (rv-current-offset buf)))
-    (rv-emit-beq buf +rv-t0+ +rv-x0+ 0)                  ; patched
-    (rv-emit-addi buf +rv-t0+ +rv-t0+ -1)
-    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 0)
-    (let ((to-done-1 (rv-current-offset buf)))
-      (rv-emit-jal buf +rv-x0+ 0)                        ; patched
-      (rv-patch-branch-here buf to-not-capped)
-      ;; --- arm 2: depth > 0 ?  restore frame[depth-1] into the jmpbuf.
-      (rv-emit-li buf +rv-t1+ *rv-hstack-depth-addr*)
-      (rv-emit-load-word buf +rv-t2+ +rv-t1+ 0)
-      (rv-emit-li buf +rv-t5+ *rv-hstack-base-addr*)
-      (rv-emit-li buf +rv-t6+ *rv-jmpbuf-addr*)
-      (let ((to-empty (rv-current-offset buf)))
-        (rv-emit-beq buf +rv-t2+ +rv-x0+ 0)              ; patched
-        (rv-emit-addi buf +rv-t2+ +rv-t2+ -1)
-        (rv-emit-store-word buf +rv-t2+ +rv-t1+ 0)
-        (rv-emit-slli buf +rv-t0+ +rv-t2+ 6)
-        (rv-emit-add buf +rv-t5+ +rv-t5+ +rv-t0+)
-        (rv-emit-slli buf +rv-t0+ +rv-t2+ 5)
-        (rv-emit-add buf +rv-t5+ +rv-t5+ +rv-t0+)
+(defun rv-emit-hstack-pop-slow (buf)
+  "Hosted pop slow path.  Entered with t2 = the new depth (>= the fixed area's
+   frames, already stored), t6 = the jmpbuf, t0 = return address.
+   jmpbuf := extension frame (t2 - 256).  Clobbers t3..t5."
+  (rv-emit-li buf +rv-t4+ +rv-hstack-ext-addr+)
+  (rv-emit-load-word buf +rv-t5+ +rv-t4+ 0)
+  (rv-emit-addi buf +rv-t3+ +rv-t2+ (- *rv-hstack-max-depth*))
+  (rv-emit-frame-addr buf +rv-t5+ +rv-t3+)
+  (dotimes (i +rv-jmpbuf-words+)
+    (rv-emit-load-word buf +rv-t4+ +rv-t5+ (* 8 i))
+    (rv-emit-store-word buf +rv-t4+ +rv-t6+ (* 8 i)))
+  (rv-emit-jalr buf +rv-x0+ +rv-t0+ 0))
+
+(defun rv-emit-hstack-overflow (buf)
+  "The loud end of a push that cannot store its frame.  Record #x0F0F for
+   %TAKE-PENDING-FAULT -- the channel a hardware fault uses, since this code
+   cannot allocate a condition -- and LONGJMP to the armed frame exactly as
+   TRAP #x0511 does (copy aside, pop, restore, jump with V0 = T)."
+  (rv-emit-li buf +rv-t3+ *rv-pending-fault-addr*)
+  (rv-emit-li buf +rv-t4+ +rv-hstack-overflow-code+)
+  (rv-emit-sw buf +rv-t4+ +rv-t3+ 0)
+  (rv-emit-longjmp-to-armed
+   buf (lambda ()
+         (if *riscv-linux-mode*
+             (let* ((msg (format nil "modus: handler-frame stack exhausted ~
+                                      with no handler armed~%"))
+                    (bytes (map 'list #'char-code msg))
+                    (padded (append bytes
+                                    (make-list (mod (- (length bytes)) 4)
+                                               :initial-element 0))))
+               ;; a1 = the message, which follows the JAL that skips it.
+               (rv-emit-auipc buf +rv-a1+ 0)
+               (rv-emit-addi buf +rv-a1+ +rv-a1+ 12)
+               (let ((over (rv-current-offset buf)))
+                 (rv-emit-jal buf +rv-x0+ 0)
+                 (loop for (b0 b1 b2 b3) on padded by #'cddddr
+                       do (rv-emit-u32 buf (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
+                 (rv-patch-jal-here buf over))
+               (rv-emit-addi buf +rv-a0+ +rv-x0+ 2)
+               (rv-emit-addi buf +rv-a2+ +rv-x0+ (length bytes))
+               (rv-emit-addi buf +rv-a7+ +rv-x0+ 64)                 ; write
+               (rv-emit-ecall buf)
+               (rv-emit-addi buf +rv-a0+ +rv-x0+ 70)
+               (rv-emit-addi buf +rv-a7+ +rv-x0+ 94)        ; exit_group
+               (rv-emit-ecall buf))
+             (progn
+               (rv-emit-li buf +rv-a7+ +rv-hstack-overflow-code+)
+               (rv-emit-ebreak buf))))))
+
+(defun rv-emit-hstack-push-slow (buf)
+  "Push slow path: the frame does not fit the fixed area.  Entered with t1 =
+   the depth word's address, t2 = depth (>= the fixed area's frames), t6 = the
+   jmpbuf, t0 = return address.  Hosted: store it in the extension (reserving
+   that on first use), depth += 1, return; clobbers t2..t5.  Otherwise, or past
+   the extension / test limit / a refused reservation: the loud overflow,
+   which does not return."
+  (if (not *riscv-linux-mode*)
+      (rv-emit-hstack-overflow buf)
+      (let ((overflows nil) (have nil))
+        (rv-emit-addi buf +rv-t3+ +rv-t2+ (- *rv-hstack-max-depth*)) ; index
+        (rv-emit-li buf +rv-t4+ +rv-hstack-ext-limit-addr+)
+        (rv-emit-load-word buf +rv-t4+ +rv-t4+ 0)
+        (let ((no-limit (rv-current-offset buf)))
+          (rv-emit-beq buf +rv-t4+ +rv-x0+ 0)
+          (push (rv-current-offset buf) overflows)
+          (rv-emit-bgeu buf +rv-t3+ +rv-t4+ 0)
+          (rv-patch-branch-here buf no-limit))
+        (rv-emit-li buf +rv-t4+ (rv-hstack-ext-frames))
+        (push (rv-current-offset buf) overflows)
+        (rv-emit-bgeu buf +rv-t3+ +rv-t4+ 0)
+        (rv-emit-li buf +rv-t4+ +rv-hstack-ext-addr+)
+        (rv-emit-load-word buf +rv-t5+ +rv-t4+ 0)
+        (setq have (rv-current-offset buf))
+        (rv-emit-bne buf +rv-t5+ +rv-x0+ 0)
+        ;; First use: mmap(0, frames*96, PROT_READ|PROT_WRITE,
+        ;; MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0).  The kernel
+        ;; changes only a0; the argument registers are the caller's live
+        ;; values (V0..V3 and more), so a0..a5 and a7 are saved around it.
+        ;; t0..t6 survive the ECALL.
+        (rv-emit-addi buf +rv-sp+ +rv-sp+ -64)
+        (loop for r in (list +rv-a0+ +rv-a1+ +rv-a2+ +rv-a3+ +rv-a4+ +rv-a5+ +rv-a7+)
+              for k from 0
+              do (rv-emit-store-word buf r +rv-sp+ (* 8 k)))
+        (rv-emit-addi buf +rv-a0+ +rv-x0+ 0)
+        (rv-emit-li buf +rv-a1+ (* +rv-jmpbuf-size+ (rv-hstack-ext-frames)))
+        (rv-emit-addi buf +rv-a2+ +rv-x0+ 3)
+        (rv-emit-li buf +rv-a3+ #x4022)
+        (rv-emit-addi buf +rv-a4+ +rv-x0+ -1)
+        (rv-emit-addi buf +rv-a5+ +rv-x0+ 0)
+        (rv-emit-addi buf +rv-a7+ +rv-x0+ 222)               ; mmap / mmap2
+        (rv-emit-ecall buf)
+        (rv-emit-mv buf +rv-t5+ +rv-a0+)
+        (loop for r in (list +rv-a0+ +rv-a1+ +rv-a2+ +rv-a3+ +rv-a4+ +rv-a5+ +rv-a7+)
+              for k from 0
+              do (rv-emit-load-word buf r +rv-sp+ (* 8 k)))
+        (rv-emit-addi buf +rv-sp+ +rv-sp+ 64)
+        (rv-emit-li buf +rv-t4+ -4096)
+        (push (rv-current-offset buf) overflows)
+        (rv-emit-bgeu buf +rv-t5+ +rv-t4+ 0)                 ; -errno: refused
+        (rv-emit-li buf +rv-t4+ +rv-hstack-ext-addr+)
+        (rv-emit-store-word buf +rv-t5+ +rv-t4+ 0)
+        (rv-patch-branch-here buf have)
+        ;; frame := ext + index*96
+        (rv-emit-frame-addr buf +rv-t5+ +rv-t3+)
         (dotimes (i +rv-jmpbuf-words+)
-          (rv-emit-load-word buf +rv-t0+ +rv-t5+ (* 8 i))
-          (rv-emit-store-word buf +rv-t0+ +rv-t6+ (* 8 i)))
-        (let ((to-done-2 (rv-current-offset buf)))
-          (rv-emit-jal buf +rv-x0+ 0)                    ; patched
-          (rv-patch-branch-here buf to-empty)
-          ;; --- arm 3: empty.  ZERO THE WHOLE JMPBUF, not just word 0.
-          ;; Word 0 = 0 is the "no handler armed" sentinel LONGJMP tests, but
-          ;; leaving the other eleven words holding a dead frame's callee-saved
-          ;; registers would leave stale values for the next restore to load.
-          (dotimes (i +rv-jmpbuf-words+)
-            (rv-emit-store-word buf +rv-x0+ +rv-t6+ (* 8 i)))
-          (rv-patch-jal-here buf to-done-2)
-          (rv-patch-jal-here buf to-done-1))))))
+          (rv-emit-load-word buf +rv-t4+ +rv-t6+ (* 8 i))
+          (rv-emit-store-word buf +rv-t4+ +rv-t5+ (* 8 i)))
+        (rv-emit-addi buf +rv-t2+ +rv-t2+ 1)
+        (rv-emit-store-word buf +rv-t2+ +rv-t1+ 0)
+        (rv-emit-jalr buf +rv-x0+ +rv-t0+ 0)
+        (dolist (o overflows) (rv-patch-branch-here buf o))
+        (rv-emit-hstack-overflow buf))))
+
+(defun rv-emit-hstack-stubs (buf)
+  "Emit the handler stack's out-of-line slow paths at BUF's current offset:
+   the pop's (hosted only) first, then the push's.  Returns their offsets."
+  (let ((pop (and *riscv-linux-mode* (rv-current-offset buf))))
+    (when pop (rv-emit-hstack-pop-slow buf))
+    (let ((push (rv-current-offset buf)))
+      (rv-emit-hstack-push-slow buf)
+      (values push pop))))
+
+(defun rv-hstack-stubs-size ()
+  "Bytes RV-EMIT-HSTACK-STUBS emits (fixed: every call in it is AUIPC+JALR)."
+  (let ((*rv-hstack-push-slow-offset* :measure)
+        (*rv-hstack-pop-slow-offset* :measure)
+        (b (make-rv-buffer)))
+    (rv-emit-hstack-stubs b)
+    (rv-current-offset b)))
 
 (defun rv-float-load-bits (buf ptr acc tmp)
   "Reassemble the four tagged 16-bit chunks of the double whose TAGGED pointer is
@@ -3635,6 +3942,22 @@
       (rv-emit-li buf +rv-t2+ +rv-hosted-convention-base+)
       (rv-emit-li buf +rv-s11+ (rv-hosted-root-block-end))
       (scan-range +rv-t2+ +rv-s11+ w)
+      ;; ---- roots: the handler-frame EXTENSION's live frames ----
+      ;; [ext, ext + (depth - 256) * 96): a frame holds V4..V11, heap
+      ;; pointers a LONGJMP restores, and the low-block scan above does not
+      ;; reach the extension (THE HANDLER-FRAME STACK HAS NO SILENT CEILING).
+      (rv-emit-li buf +rv-t0+ *rv-hstack-depth-addr*)
+      (rv-emit-load-word buf +rv-t3+ +rv-t0+ 0)
+      (rv-emit-addi buf +rv-t3+ +rv-t3+ (- *rv-hstack-max-depth*))
+      (let ((none (fwd #'rv-emit-bge +rv-x0+ +rv-t3+)))   ; depth <= 256
+        (rv-emit-li buf +rv-t0+ +rv-hstack-ext-addr+)
+        (rv-emit-load-word buf +rv-t2+ +rv-t0+ 0)
+        (let ((unreserved (fwd #'rv-emit-beq +rv-t2+ +rv-x0+)))
+          (rv-emit-mv buf +rv-s11+ +rv-t2+)
+          (rv-emit-frame-addr buf +rv-s11+ +rv-t3+)
+          (scan-range +rv-t2+ +rv-s11+ w)
+          (here unreserved))
+        (here none))
       ;; ---- Cheney: a5 = object scan (up), a6 = cons scan (down) ----
       (rv-emit-mv buf +rv-a5+ +rv-s3+)
       (rv-emit-mv buf +rv-a6+ +rv-s4+)
@@ -3854,11 +4177,6 @@
     (dotimes (i +rv-jmpbuf-words+)
       (rv-emit-load-word buf +rv-t3+ +rv-t0+ (* 8 i))
       (rv-emit-store-word buf +rv-t3+ +rv-t2+ (* 8 i)))
-    ;; Zero the LIVE capped count: this unwind passes every capped
-    ;; (strictly inner) frame at once, so their pending absorbs must
-    ;; not fire against an outer pop afterwards.
-    (rv-emit-li buf +rv-t1+ *rv-hstack-capped-addr*)
-    (rv-emit-store-word buf +rv-x0+ +rv-t1+ 0)
     (rv-emit-handler-pop buf)
     ;; Restore from the scratch copy.  V0 is loaded LAST but one so
     ;; nothing below clobbers it, and t2 holds the jump target.
@@ -3869,7 +4187,7 @@
     (rv-emit-load-word buf +rv-t2+ +rv-t0+ 16)       ; resume ip
     (rv-emit-load-word buf +rv-fp+ +rv-t0+ 8)
     (rv-emit-load-word buf +rv-sp+ +rv-t0+ 0)
-    (rv-emit-li buf +rv-a0+ +t-value+)               ; second return: T
+    (rv-emit-li buf +rv-a0+ (ct-t-value))               ; second return: T
     (rv-emit-jalr buf +rv-x0+ +rv-t2+ 0)
     (rv-patch-branch-here buf to-nohandler)
     (funcall no-handler-fn)))
@@ -3932,7 +4250,11 @@
       (setf *rv-fn-starts* fn-starts))
 
     ;; ---- Pass 1: Measure native code sizes ----
-    ;; Emit into a temporary buffer to measure sizes, build label-map
+    ;; Emit into a temporary buffer to measure sizes, build label-map.  The
+    ;; handler stack's slow paths are not placed yet: their calls measure as
+    ;; the fixed-size AUIPC+JALR pass 2 emits.
+    (setf *rv-hstack-push-slow-offset* :measure
+          *rv-hstack-pop-slow-offset* :measure)
     (let ((measure-buf (make-rv-buffer)))
       (dolist (insn insns)
         (destructuring-bind (mvm-pc opcode operands next-pc) insn
@@ -3944,9 +4266,20 @@
                                     :function-table native-fn-table)))
       ;; Record end position
       (setf (gethash mvm-len label-map) (rv-current-offset measure-buf)))
-    ;; Pass 1's end is where pass 2 will emit the hosted collector.
-    (setf *rv-gc-collector-offset*
-          (and *riscv-linux-mode* (gethash mvm-len label-map)))
+    ;; Pass 1's end is where pass 2 will emit the handler stack's slow paths
+    ;; (the pop's, hosted only, then the push's), and the hosted collector
+    ;; follows them.
+    (let* ((end (gethash mvm-len label-map))
+           (stubs (rv-hstack-stubs-size)))
+      (setf *rv-hstack-pop-slow-offset* (and *riscv-linux-mode* end)
+            *rv-hstack-push-slow-offset*
+            (+ end (if *riscv-linux-mode*
+                       (let ((b (make-rv-buffer)))
+                         (rv-emit-hstack-pop-slow b)
+                         (rv-current-offset b))
+                       0))
+            *rv-gc-collector-offset*
+            (and *riscv-linux-mode* (+ end stubs))))
 
     ;; Build native function table from MVM function table
     ;; Key by bytecode offset (which is what CALL operands use)
@@ -3990,12 +4323,19 @@
                                     :function-table native-fn-table
                                     :pass2 t)))
       (setf (gethash mvm-len label-map) (rv-current-offset final-buf))
+      (multiple-value-bind (push pop) (rv-emit-hstack-stubs final-buf)
+        (assert (and (eql push *rv-hstack-push-slow-offset*)
+                     (eql pop *rv-hstack-pop-slow-offset*)) ()
+                "riscv: handler-stack slow paths expected at ~S/~S, emitted at ~S/~S"
+                *rv-hstack-push-slow-offset* *rv-hstack-pop-slow-offset* push pop))
       (when *riscv-linux-mode*
         (assert (eql (rv-current-offset final-buf) *rv-gc-collector-offset*) ()
-                "riscv: hosted collector expected at ~D, pass 2 ended at ~D"
+                "riscv: hosted collector expected at ~D, the slow paths ended at ~D"
                 *rv-gc-collector-offset* (rv-current-offset final-buf))
         (rv-emit-gc-collector final-buf))
-      (setf *rv-gc-collector-offset* nil)
+      (setf *rv-gc-collector-offset* nil
+            *rv-hstack-push-slow-offset* nil
+            *rv-hstack-pop-slow-offset* nil)
       ;; Re-derive the function map from PASS 2's positions and RETURN it.
       ;; This map was already being built (from pass 1) and then dropped on
       ;; the floor: the second value was never returned, so cross.lisp fell
@@ -4065,9 +4405,8 @@
    is 64, where x86-64 says 0 and 1.  They are named in boot-linux-riscv.lisp
    rather than inlined here because the x86 numbers are muscle memory.")
 
-(defconstant +rv-linux-sys-read+  63)
-(defconstant +rv-linux-sys-write+ 64)
-(defconstant +rv-linux-sys-exit+  93)
+;; +RV-LINUX-SYS-READ+ / -WRITE+ / -EXIT+ are defined with the register
+;; constants at the top of this file: they are used long before this point.
 
 (defun riscv-set-linux-mode (on)
   "Turn hosted mode on or off, moving the convention slots with it.  Kept
@@ -4085,7 +4424,7 @@
   (let ((base (if on #x10000000 #x80700000)))
     (setf *rv-jmpbuf-addr*          (+ base #x180)
           *rv-longjmp-scratch-addr* (+ base #x300)
-          *rv-hstack-capped-addr*   (+ base #x360)
+          *rv-pending-fault-addr*   (+ base #xCB0)
           *rv-hstack-depth-addr*    (+ base #x400)
           *rv-hstack-base-addr*     (if on
                                         (+ base +rv-hosted-hstack-frames-offset+)

@@ -53,9 +53,96 @@
 ;; operand (a heap pointer) that yields garbage (e.g. (logand 2^62 (1- 2^62))
 ;; returned 66281634333124 instead of 0).  These read the decomposed limbs the
 ;; host already stored.
-(defun %lit-bignum-big-p (value) (big-bignum-p value))
-(defun %lit-bn-lo (value) (bignum-lo value))
-(defun %lit-bn-hi (value) (bignum-hi value))
-(defun %lit-bb-sign (value) (%bb-sign value))
-(defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
-(defun %lit-bb-limb (value k) (%bb-limb value k))
+;;
+;; THAT IS RIGHT ONLY WHEN THE TARGET'S LIMBS ARE THIS IMAGE'S LIMBS (W32 M1).
+;; A self-hosted x64 compiler building for a 30-bit target (modus-sh
+;; --compile-riscv32) sees literals that are bignums THERE but fixnums HERE --
+;; +FIXNUM-LIMIT+ = 2^30 is one; reading "slot 0" of the fixnum 2^30 was
+;; `The value 0 is not of type (INTEGER 0 -1)' and the init thunk silently
+;; vanished from the image -- and literals that are bignums here have 62-bit
+;; limbs where the target wants 30-bit ones.  So when the widths differ, the
+;; literal is decomposed into the TARGET's limbs from this image's own limbs
+;; with fixnum-only arithmetic: every field read is at most 31 bits wide, taken
+;; from 62-bit limbs, so nothing here can leave the fixnum range.  When the
+;; widths agree, the slot readers below run exactly as before.
+(defun %lit-same-width-p () (= (ct-limb-bits) +limb-bits+))
+
+(defun %lit-mag-limbs (value)
+  "VALUE's magnitude as a vector of THIS image's limbs (+LIMB-BITS+ wide,
+   LSB first), and its sign (1 / -1) as a second value."
+  (cond
+    ((fixnump value)
+     (let ((v (make-array 1)))
+       (setf (aref v 0) (if (< value 0) (- 0 value) value))
+       (values v (if (< value 0) -1 1))))
+    ((big-bignum-p value)
+     (let* ((n (%bb-nlimbs value)) (v (make-array n)))
+       (dotimes (i n) (setf (aref v i) (%bb-limb value i)))
+       (values v (%bb-sign value))))
+    (t
+     ;; a small (2-slot) bignum: value = lo + hi * 2^B, two's complement
+     (let ((lo (bignum-lo value)) (hi (bignum-hi value)) (v (make-array 2)))
+       (if (>= hi 0)
+           (progn (setf (aref v 0) lo) (setf (aref v 1) hi) (values v 1))
+           (progn
+             ;; -(lo + hi*2^B) = (2^B - lo) + (-hi - 1)*2^B, or (-hi)*2^B if lo = 0
+             (if (= lo 0)
+                 (progn (setf (aref v 0) 0) (setf (aref v 1) (- 0 hi)))
+                 (progn (setf (aref v 0) (+ (- +fixnum-max+ lo) 1))
+                        (setf (aref v 1) (- (- 0 hi) 1))))
+             (values v -1)))))))
+
+(defun %lit-mag-length (limbs)
+  "INTEGER-LENGTH of the magnitude held in LIMBS."
+  (let ((top (- (length limbs) 1)))
+    (loop (when (or (< top 0) (not (= (aref limbs top) 0))) (return nil))
+          (setq top (- top 1)))
+    (if (< top 0) 0 (+ (* top +limb-bits+) (integer-length (aref limbs top))))))
+
+(defun %lit-mag-field (limbs start width)
+  "Bits [START, START+WIDTH) of the magnitude in LIMBS; WIDTH <= 31."
+  (let* ((i (floor start +limb-bits+))
+         (o (- start (* i +limb-bits+)))
+         (n (length limbs))
+         (mask (- (ash 1 width) 1)))
+    (if (>= i n)
+        0
+        (let ((low (ash (aref limbs i) (- 0 o)))
+              (have (- +limb-bits+ o)))
+          (if (or (<= width have) (>= (+ i 1) n))
+              (logand low mask)
+              (let ((need (- width have)))
+                (logand (logior low (ash (logand (aref limbs (+ i 1)) (- (ash 1 need) 1)) have))
+                        mask)))))))
+
+(defun %lit-bignum-big-p (value)
+  (if (%lit-same-width-p)
+      (big-bignum-p value)
+      (> (%lit-mag-length (%lit-mag-limbs value)) (ct-small-bignum-bits))))
+;; A target SMALL bignum holds fewer than 2 x target-limb bits, so on a host
+;; whose limbs are wider it is a FIXNUM here, and plain arithmetic is exact.
+(defun %lit-bn-lo (value)
+  (if (%lit-same-width-p)
+      (bignum-lo value)
+      (if (fixnump value)
+          (logand value (ct-fixnum-max))
+          (error "cross-width literal: ~A is no small bignum on the target" value))))
+(defun %lit-bn-hi (value)
+  (if (%lit-same-width-p)
+      (bignum-hi value)
+      (if (fixnump value)
+          (ash value (ct-neg-limb-bits))
+          (error "cross-width literal: ~A is no small bignum on the target" value))))
+(defun %lit-bb-sign (value)
+  (if (%lit-same-width-p)
+      (%bb-sign value)
+      (multiple-value-bind (limbs sign) (%lit-mag-limbs value) limbs sign)))
+(defun %lit-bb-nlimbs (value)
+  (if (%lit-same-width-p)
+      (%bb-nlimbs value)
+      (let ((len (%lit-mag-length (%lit-mag-limbs value))) (b (ct-limb-bits)))
+        (floor (+ len (- b 1)) b))))
+(defun %lit-bb-limb (value k)
+  (if (%lit-same-width-p)
+      (%bb-limb value k)
+      (%lit-mag-field (%lit-mag-limbs value) (* k (ct-limb-bits)) (ct-limb-bits))))

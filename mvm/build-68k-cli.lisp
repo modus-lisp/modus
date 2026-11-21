@@ -97,6 +97,9 @@
   (syscall3 5 *cstr-scratch* 193 420))
 (defun %sys-close (fd) (syscall3 6 fd 0 0))
 (defun %sys-getpid () (syscall3 20 0 0 0))
+;; getcwd(2) is syscall 183 on m68k too (cl-fileio's %sys-getcwd asks this;
+;; its default, x86-64's 79, is settimeofday here).
+(defun %sys-getcwd-nr () 183)
 (defun %sys-read-raw (fd buf-addr count) (syscall3 3 fd buf-addr count))
 (defun %sys-write-raw (fd buf-addr count) (syscall3 4 fd buf-addr count))
 (defun %sys-lseek (fd offset whence) (syscall3 19 fd offset whence))
@@ -182,7 +185,11 @@
 (when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
   (setq *cli-arch-override-source*
         (concatenate 'string *cli-arch-override-source*
-                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)))
+                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)
+                     ;; but no 32-bit (#x15) strings from the in-image compiler:
+                     ;; their accessors assume the 64-bit layout (compiler.lisp
+                     ;; *STRING32-P*)
+                     "(defun %string32-strings-p () nil)" (string #\Newline)))
   ;; ... and pooled literals are narrow too (cross.lisp *POOL-NARROW-STRINGS*,
   ;; set from this below: MODUS.MVM does not exist yet here).
   (defparameter cl-user::*68k-pool-narrow* t))
@@ -220,50 +227,11 @@
 
 (when cl-user::*68k-gc-static-on*
   (setq *cli-arch-override-source*
-        (concatenate 'string *cli-arch-override-source* (cl-user::%68k-granule-subst "
-(defun %gc-static-freeze ()
-  \"Post the collector's freeze request (translate-68k.lisp *68K-GC-STATIC*)
-   and allocate until a collection has happened: what boot left live is then
-   static.  Called once, between boot and the toplevel.\"
-  (setf (mem-ref #x10006000 :u32) 1)
-  (let ((before (mem-ref #x10000060 :u32)) (junk nil))
-    (loop
-      (unless (eql (mem-ref #x10000060 :u32) before) (return nil))
-      (setq junk (make-list 32))))
-  (%gc-cards-init))
-
-(defun %gc-cards-init ()
-  \"The static heap's CARDS (translate-68k.lisp M68K-EMIT-GC-CARD-WALK): the
-   smallest card (512 bytes up, at most 2 KB) that fits the span in the mark
-   table at #x10006100, the crossing table at #x1001E000 -- each card's first
-   object start, in 16-byte granules -- and, LAST, the span, which arms the
-   barrier and the card walk.  Reads headers a byte at a time: no bignum.\"
-  (let* ((olo (mem-ref #x10006004 :u32)) (ohi (mem-ref #x10006008 :u32))
-         (chi (mem-ref #x10006010 :u32))
-         (lo (logand olo -512))
-         (shift 9) (ncards 0) (a olo))
-    (loop
-      (setq ncards (ash (+ (- chi lo) (ash 1 shift) -1) (- shift)))
-      (when (or (<= ncards 7680) (>= shift MAX-SHIFT)) (return nil))
-      (setq shift (+ shift 1)))
-    (when (<= ncards 7680)
-      (dotimes (i ncards)
-        (setf (mem-ref (+ #x1001E000 i) :u8) 255)
-        (setf (mem-ref (+ #x10006100 i) :u8) 0))
-      (loop
-        (when (>= a ohi) (return nil))
-        (let* ((st (mem-ref (+ a 3) :u8))
-               (n (+ (* (mem-ref a :u8) 65536) (* (mem-ref (+ a 1) :u8) 256)
-                     (mem-ref (+ a 2) :u8)))
-               (size (logand (+ (if (or (= st 17) (= st 19)) (+ n 4) (* (+ n 1) 4)) GRAN-1) MINUS-GRAN))
-               (c (ash (- a lo) (- shift))))
-          (when (= (mem-ref (+ #x1001E000 c) :u8) 255)
-            (setf (mem-ref (+ #x1001E000 c) :u8)
-                  (ash (- (- a lo) (ash c shift)) MINUS-KSHIFT)))
-          (setq a (+ a size))))
-      (setf (mem-ref #x10006018 :u32) lo)
-      (setf (mem-ref #x10006020 :u32) shift)
-      (setf (mem-ref #x1000601C :u32) (ash ncards shift)))))
+        (concatenate 'string *cli-arch-override-source* (cl-user::%68k-granule-subst (concatenate 'string "
+" (with-open-file (in (merge-pathnames "68k-gc-static.lisp"     ; MVM-TEXT is not loaded yet
+                                       (directory-namestring (truename *load-truename*))))
+    (let ((s (make-string (file-length in))))
+      (subseq s 0 (read-sequence s in)))) "
 
 ;; A SAVED CORE (scripts/68k-core-link.py): the low block and the static heap,
 ;; mapped by the ELF itself.  #x10006014 is non-zero only in a core, so boot
@@ -296,7 +264,8 @@
     (setf (mem-ref #x10006000 :u32) 0)
     (setf (mem-ref #x10000400 :u32) 0)             ; handler depth
     (setf (mem-ref #x10000180 :u32) 0)             ; armed jmpbuf
-    (setf (mem-ref #x10000360 :u32) 0)             ; capped pushes
+    (setf (mem-ref #x10005600 :u32) 0)             ; handler-frame extension (not in the core)
+    (setf (mem-ref #x10005608 :u32) 0)             ; its test-only limit
     (setf (mem-ref h :u32) 12865357)               ; magic
     (setf (mem-ref (+ h 4) :u32) y)
     (setf (mem-ref (+ h 8) :u32) #x10000000)  (setf (mem-ref (+ h 12) :u32) #x20000)
@@ -311,7 +280,7 @@
       (%cli-exit 3))
     (%sys-close fd)
     (%cli-exit 0)))
-")))
+"))))
   (setq *cli-arch-kernel-epilogue*
         "  ;; --- the heap boot built becomes static (MODUS_68K_GC_STATIC) ---
   ;; MODUS_68K_SAVE_CORE=PATH (the build's core run): freeze, then write the
@@ -355,10 +324,16 @@
 ;; MODUS_68K_SHARED: the most repeated sequences (CONS so far) as one shared copy
 ;; each, called (translate-68k.lisp *68K-SHARED-SEQUENCES*).  1 = on, 0 = off;
 ;; unset, it follows MODUS_SMALL_IMAGE.
+;; A comma list of sequence names shares only those: MODUS_68K_SHARED=cons,alloc-obj.
 (let ((v (sb-ext:posix-getenv "MODUS_68K_SHARED")))
   (setf *68k-shared-sequences*
         (cond ((null v) (and cl-user::*small-image* t))
               ((string= v "0") nil)
+              ((find-if #'alpha-char-p v)
+               (loop for start = 0 then (1+ end)
+                     for end = (or (position #\, v :start start) (length v))
+                     collect (intern (string-upcase (string-trim " " (subseq v start end))) "KEYWORD")
+                     while (< end (length v))))
               (t t))))
 
 ;; Small images: shifted-byte immediates as MOVEQ + LSL (translate-68k.lisp
@@ -378,6 +353,10 @@
     (setf modus.mvm::*68k-gc-poison* t)
     (format t "~&;; MODUS_68K_GC_POISON: collections poison the evacuated semispace~%")))
 
+;; MODUS_68K_CALL_SAVES=1: image calls save and restore live temps as on every
+;; other target.  Unset/0 (and no threaded code): they do not -- on the native
+;; 68k a callee cannot clobber them (compiler.lisp *CALL-TEMPS-SURVIVE*).  Set
+;; after MODUS_68K_THREADED below.
 ;; MODUS_68K_PROFILE=1: per-function execution counters (translate-68k.lisp
 ;; *68K-PROFILE*) -- a profiling build, for choosing what stays native.
 (when (let ((v (sb-ext:posix-getenv "MODUS_68K_PROFILE"))) (and v (string/= v "0")))
@@ -402,6 +381,35 @@
           (loop for l = (read-line in nil) while l
                 do (let ((n (string-trim " " l))) (when (plusp (length n)) (setf (gethash n h) t)))))
         (setf *68k-hot-names* h)))))
+(let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_SAVES")))
+  (setf modus.mvm::*call-temps-survive*
+        (and (not *68k-threaded*) (not (and v (string= v "1"))))))
+;; MODUS_BOOT_TAIL=0: the boot-only functions where they fall; otherwise last,
+;; moved past the constant pool (compiler.lisp *BOOT-TAIL-LAST*).  Not with
+;; threaded or paged code (that tail is the stream section).
+(let ((v (sb-ext:posix-getenv "MODUS_BOOT_TAIL")))
+  (setf modus.mvm::*boot-tail-last* (and (not *68k-threaded*) (not *68k-paged*) (not (and v (string= v "0"))))))
+;; MODUS_68K_CALL_ISLANDS=0: no call islands (translate-68k.lisp
+;; *68K-CALL-ISLANDS*); otherwise on, without threaded or paged code.
+(let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_ISLANDS")))
+  (setf *68k-call-islands* (and (not *68k-threaded*) (not *68k-paged*) (not (and v (string= v "0"))))))
+;; MODUS_68K_FIXED_NARGS=1: every image call stores its argument count, as on
+;; other targets; otherwise a call to a fixed-arity function does not
+;; (compiler.lisp *ELIDE-FIXED-NARGS*).  Not with threaded code.
+(let ((v (sb-ext:posix-getenv "MODUS_68K_FIXED_NARGS")))
+  (setf modus.mvm::*elide-fixed-nargs*
+        (and (not *68k-threaded*) (not (and v (string= v "1"))))))
+;; MODUS_TYPE_ERROR_CODES=0: a type-error arm loads its quoted type as before;
+;; otherwise it passes a small integer (compiler.lisp *TYPE-ERROR-CODES*).
+(let ((v (sb-ext:posix-getenv "MODUS_TYPE_ERROR_CODES")))
+  (unless (and v (string= v "0"))
+    (setf modus.mvm::*type-error-codes* (make-hash-table :test 'equal))))
+;; MODUS_STATIC_SYMBOL_SHORT_MISS=0: a quoted symbol's miss arm loads both name
+;; hashes as before; otherwise it passes the slot index alone
+;; (compiler.lisp *STATIC-SYMBOL-SHORT-MISS*).
+(let ((v (sb-ext:posix-getenv "MODUS_STATIC_SYMBOL_SHORT_MISS")))
+  (unless (and v (string= v "0"))
+    (setf modus.mvm::*static-symbol-short-miss* t)))
 (let* ((out (or (sb-ext:posix-getenv "MODUS_CLI_OUT")
                 "/tmp/modus-68k-cli"))
        (image (build-image :target :linux-68k

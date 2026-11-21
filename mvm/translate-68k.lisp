@@ -133,6 +133,47 @@
   "MODUS_68K_HOT: an EQUAL hash of function names to keep native when
    threading (cross.lisp turns it into bytecode offsets for *68K-THREADED*).")
 (defvar *68k-cold-fns* nil "Hash: cold function start pc -> (end-pc . branch-width).")
+(defvar *68k-jit-shapes* (and (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+                              (not (equal (sb-ext:posix-getenv "MODUS_68K_JIT_SHAPES") "0")))
+  "MODUS_68K_JIT=1: the image carries the shapes the runtime threaded JIT needs
+   beyond its own (mvm/jit-68k.lisp): (:LI-CELL R) for R in V0..V15 and VR --
+   R = the 32-bit word in the CELL whose address follows the token.  A cell is
+   a low-block word, which every collection scans and forwards, so a quoted
+   heap object a runtime DEFUN loads can move.")
+(defun m68k-jit-census ()
+  "The keys in MODUS_68K_JIT_CENSUS (default mvm/68k-jit-repl-shapes.txt):
+   lines of COUNT KEY, ;-comments allowed; most asked for first."
+  (let ((f (or (sb-ext:posix-getenv "MODUS_68K_JIT_CENSUS")
+               (namestring (merge-pathnames "mvm/68k-jit-repl-shapes.txt" cl-user::*modus-base*)))))
+    (with-open-file (in f)
+      (let ((*package* (find-package :keyword)) (*read-eval* nil) (rows nil))
+        (loop for n = (read in nil :eof) until (eq n :eof)
+              do (push (cons n (read in)) rows))
+        (mapcar (function cdr) (stable-sort (nreverse rows) (function >) :key (function car)))))))
+
+(defun m68k-jit-equivalents (key)
+  "As jit-68k.lisp's %T68-EQUIVALENTS: keys the runtime JIT accepts for KEY --
+   a register CMP with its operands swapped and its branch mirrored, TEST's
+   operands swapped, a commutative operation's sources swapped."
+  (let ((out nil))
+    (when (and (eq (first key) :fused) (consp (second key)) (= (length (second key)) 3))
+      (destructuring-bind (op a b) (second key)
+        (let ((br (third key)))
+          (cond ((= op 48)
+                 (push (list :fused (list op b a)
+                             (case br (67 70) (70 67) (68 69) (69 68) (t br)) (fourth key))
+                       out))
+                ((= op 49) (push (list :fused (list op b a) br (fourth key)) out))))))
+    (when (and (integerp (first key)) (member (first key) '(32 34 40 41 42 173 174))
+               (= (length key) 4))
+      (push (list (first key) (second key) (fourth key) (third key)) out))
+    out))
+
+(defvar *68k-jit-indexed* nil
+  "MODUS_68K_JIT: an EQUAL hash of the shape keys the image's table indexes for
+   the runtime JIT (the census's, or the equivalents the image has), NIL for
+   all of them.")
+
 (defvar *68k-thread-shapes* nil "Hash: shape key -> shape (vector index label count key).")
 (defvar *68k-thread-next-label* nil)
 (defvar *68k-stream-fixups* nil "List of (byte-pos label size base).")
@@ -142,6 +183,118 @@
    offset is a MOVE.L #imm32,D0 whose 32-bit immediate (bytes +2..+5, big-endian)
    cross.lisp's apply-li-const-patches fills with the constant-pool slot's
    tagged address.  Reset at the start of every translation.")
+
+;;; THE 68000 (MODUS_68K_CPU=68000): a Mac Classic / Plus / SE.  No long
+;;; branches, no 32-bit PC-relative LEA, no 32-bit multiply or divide, no
+;;; EXTB.L, no scaled index, and a word or long access at an ODD address is a
+;;; bus error.  So, in this mode: a long BRA / BSR is JMP / JSR to an ABSOLUTE
+;;; address and a long Bcc is B!cc.S over one (the native code's runtime
+;;; address is known only after layout: the translator records each such word
+;;; in *68K-ABS-PATCHES* and cross.lisp's apply-68k-abs-patches fills it in);
+;;; the PC-relative LEA is LEA abs.L; MULS.L / MULU.L / DIVS.L are calls to
+;;; shared subroutines (m68k-emit-68000-helpers); EXTB.L is EXT.W + EXT.L; the
+;;; threaded dispatcher scales its index with adds; and every token-stream
+;;; operand -- at any alignment -- is read a byte at a time.  A boot stub has
+;;; no runtime address to patch, so ITS long branches are 16-bit (the fixup
+;;; range check fails loudly if one does not reach).  QEMU's -cpu m68000
+;;; rejects the 68020 instructions; it does NOT model the odd-address fault.
+(defvar *68k-cpu-68000* (equal (sb-ext:posix-getenv "MODUS_68K_CPU") "68000")
+  "T: emit 68000 code only (see above).")
+(defvar *68k-abs-patches* nil
+  "List of (NATIVE-BYTE-OFFSET . TARGET-NATIVE-OFFSET): a 32-bit absolute
+   address of native code, written by cross.lisp after layout.  Reset at the
+   start of every translation.")
+(defvar *68k-native-p* nil
+  "T while translating the image's native code (absolute patches possible).")
+;;; PAGED THREADED CODE (MODUS_68K_PAGED=1, with MODUS_68K_THREADED): every cold
+;;; function's token stream moves to one STREAM SECTION at the end of the native
+;;; code and can run from ANY address, so a small machine can keep it on disk
+;;; and load it on demand (a code cache, Mac-segment fashion).  A cold function
+;;; is a resident stub -- MOVEA.L A5,A1 / MOVE.W #i,D0 / BRA cold-enter --
+;;; and COLD-ENTER loads A5 from entry i of the STREAM TABLE (resident, one
+;;; longword a function: the stream's current address, 0 when not loaded).
+;;; Position independence: a stream's own branches were already relative; its
+;;; call / tail-call / function-address operands (:REL) become ABSOLUTE
+;;; addresses of the target's entry (resident), patched after layout like the
+;;; 68000's (cross.lisp apply-68k-abs-patches); constant-pool operands (:LIC)
+;;; were already absolute.  MODUS_68K_PAGED_SHIFT=N is the test: after
+;;; everything is resolved the stream section is MOVED N bytes and only the
+;;; table follows it -- anything still position-dependent breaks.
+(defvar *68k-paged* (let ((v (sb-ext:posix-getenv "MODUS_68K_PAGED"))) (and v (string= v "1")))
+  "T: paged threaded code (see above).")
+(defvar *68k-paged-control* (equal (sb-ext:posix-getenv "MODUS_68K_PAGED_CONTROL") "1")
+  "The position test's NEGATIVE CONTROL: :REL stays relative, as unpaged.  A
+   paged image built so and moved by MODUS_68K_PAGED_SHIFT must break.")
+(defvar *68k-paged-fns* nil "Paged: (INDEX START-PC STREAM-LABEL CHUNK-START CHUNK-END), newest first.")
+(defvar *68k-cold-enter-label* nil)
+(defvar *68k-stream-table-label* nil)
+(defvar *68k-stream-section-label* nil)
+;;; THE MAC'S STREAM LOADER (paged + Mac mode).  The disk builder
+;;; (scripts/mac68k-disk.py --paged) gives the boot blocks only the RESIDENT
+;;; part of the image and marks every stream-table entry "not loaded" -- bit 0
+;;; set, its home address otherwise (streams are word-aligned).  COLD-ENTER
+;;; takes such an entry to the loader, which reads the blocks holding the
+;;; stream from the boot drive into a staging buffer (the ROM's _Read, the
+;;; boot blocks' way), copies the stream into the CODE CACHE and makes the
+;;; entry its address.  Its length is the gap to the next stream, from the
+;;; HOME TABLE (read-only, one longword more than the table: the section's
+;;; end).  The disk holds the image at byte 1024, so a home address H is disk
+;;; byte 1024 + H - load address.  No eviction yet: a full cache stops.
+(defvar *68k-paged-cache* nil
+  "Mac paged: (CACHE-LO CACHE-HI STAGING STAGING-SIZE LOAD-ADDR), set by
+   boot-mac68k's MAC68K-CONFIGURE from the machine's layout.")
+(defconstant +68k-cache-ptr+ #x10006034
+  "Paged Mac: the code cache's next free byte (raw), in the low block so the
+   boot stub sets it for the machine it finds itself on.")
+(defconstant +68k-cache-hi+ #x10006038 "Paged Mac: the code cache's end (raw).")
+(defconstant +68k-cache-lo+ #x1000603C
+  "Paged Mac: where the code cache's streams start (raw), past its owner map.")
+(defconstant +68k-mac-file-refnum+ #x10006050
+  "The static block's word for a Mac image launched from Mac OS
+   (scripts/mac68k-chain.py): the reference number of the open file that IS
+   its boot disk, which the code loader and the disk service then _Read
+   instead of the boot drive.  0 (as the core sends it) = the boot drive.")
+(defconstant +68k-mac-host+ #x10006054
+  "The static block's word for a Mac image running as a Mac OS application
+   (scripts/mac68k-chain.s, a relocating load): the address of the
+   application's HOST TABLE -- putc, getc, poll, each a long address the
+   console's putc / getc jump through (M68K-EMIT-MAC-CONSOLE), keeping the
+   same registers.  The application then owns the screen, the keyboard and
+   the events (a window, menus, WaitNextEvent) and the image takes none of
+   them: the boot stub skips InitEvents, HideCursor and the serial drivers,
+   and the screen console (mac/mac-console.lisp) stays off.  0 (as the core
+   sends it) = a bare Mac.")
+(defconstant +68k-cache-map+ #x10006040
+  "Paged Mac: the cache's OWNER MAP (raw address; the cache's own first bytes):
+   one 16-bit word per 64-byte granule from here to the cache's end -- the
+   stream index + 1 that was last placed over it, 0 for none.  Streams are
+   placed on 64-byte boundaries, so a granule has at most one stream.")
+(defconstant +68k-cache-granule-shift+ 6)
+(defvar *68k-stream-home-label* nil)
+(defvar *68k-reload-label* nil
+  "Paged Mac: the RELOAD token's handler (M68K-EMIT-PAGED-SECTION): a root
+   into a stream the cache evicted while it was active points at a reload
+   record, whose token this is.")
+(defvar *68k-stream-end-label* nil)
+
+(defvar *68k-paged-layout* nil
+  "After a paged translation: plist :table :section :end :count -- native
+   offsets of the stream table, the section and its end (cross.lisp, the Mac
+   disk builder).")
+
+(defvar *68k-mul32-label* nil)
+(defvar *68k-mulu64-label* nil)
+(defvar *68k-divs32-label* nil)
+
+(defun m68k-emit-abs32 (buf label-id &optional (ref-pos (+ (m68k-buffer-position buf) 2)) ord)
+  "Two placeholder words for the absolute address of LABEL-ID (native code
+   only).  REF-POS / ORD feed branch relaxation the way a :disp32 does."
+  (unless *68k-native-p*
+    (error "68k: an absolute code address outside the native code (boot stub?)"))
+  (m68k-emit-word buf 0)
+  (push (list (1- (m68k-buffer-word-count buf)) label-id :abs32 ref-pos ord)
+        (m68k-buffer-fixups buf))
+  (m68k-emit-word buf 0))
 
 (defun m68k-emit-word (buf word)
   "Emit a 16-bit instruction word."
@@ -167,10 +320,41 @@
   "Current byte position in the code buffer."
   (m68k-buffer-position buf))
 
+(defvar *68k-last-label-pos* -1
+  "Where the last label was placed: the peepholes below never merge across a
+   position something may branch to.")
+
+(defvar *68k-insn-history* nil
+  "The last (up to three) MVM instructions translated since the last label,
+   most recent first, as (OPCODE . OPERANDS): straight-line context for
+   M68K-KNOWN-CONS-P.  A label clears it -- a branch may land there.")
+
+(defvar *68k-fused-insn* nil
+  "Set by a handler that consumed the next MVM instruction (as (OPCODE .
+   OPERANDS)), so *68K-INSN-HISTORY* still sees it.")
+
 (defun m68k-emit-label (buf label-id)
   "Record current position as a branch target."
+  (setq *68k-insn-history* nil)
+  (setq *68k-last-label-pos* (m68k-buffer-position buf))
   (setf (gethash label-id (m68k-buffer-labels buf))
         (m68k-buffer-position buf)))
+
+;;; PEEPHOLES at the two places the vreg discipline makes redundant moves: a
+;;; spilled vreg stored from Dn and loaded straight back into Dn, and a value
+;;; pushed and popped straight back into a register (an argument shuffle).
+;;; Both only in native code, at an even position no label marks, looking only
+;;; at the instruction just emitted -- so the two relaxation passes make the
+;;; same decisions and nothing that branches can land between the pair.
+(defun m68k-peephole-ok-p (buf)
+  (let ((pos (m68k-buffer-position buf)))
+    (and *68k-native-p* (evenp pos) (not (eql pos *68k-last-label-pos*))
+         (>= (m68k-buffer-word-count buf) 2))))
+
+(defvar *68k-last-store* nil
+  "(BUF WORD-COUNT-AFTER AN DISP DN) of the last MOVE.L Dn,d16(An) emitted.")
+(defvar *68k-last-push* nil
+  "(BUF WORD-COUNT-AFTER DN) of the last MOVE.L Dn,-(SP) emitted.")
 
 (defun m68k-emit-fixup (buf label-id fixup-type)
   "Record a fixup. FIXUP-TYPE is :disp16 or :disp32."
@@ -188,6 +372,17 @@
         (let ((target (gethash label-id (m68k-buffer-labels buf))))
           (unless target
             (error "68k: undefined label ~D" label-id))
+          (when (and *68k-boot-tail-pos* (member fixup-type '(:disp16 :disp8-in-opcode :disp32))
+                     (not (eql (m68k-code-region (* 2 word-idx)) (m68k-code-region target))))
+            (error "68k: a PC-relative reference across a moved region (word ~D -> ~D)"
+                   (* 2 word-idx) target))
+          (when (and (eq fixup-type :abs32) *68k-cold-bodies*
+                     (let ((r (m68k-code-region target)))
+                       (and (not (member r '(0 1)))
+                            (not (eql r (m68k-code-region (* 2 word-idx))))
+                            (not (gethash word-idx *68k-cold-stub-homes*)))))
+            (error "68k: an absolute reference into a cold body from outside it (word ~D -> ~D)"
+                   (* 2 word-idx) target))
           (ecase fixup-type
             (:disp16
              ;; 16-bit displacement relative to the extension word position
@@ -208,6 +403,14 @@
                (setf (aref words word-idx)
                      (logior (logand (aref words word-idx) #xFF00)
                              (logand disp #xFF)))))
+            (:abs32
+             ;; 68000: an absolute native address, filled in after layout
+             ;; (cross.lisp apply-68k-abs-patches).  Distances still feed
+             ;; branch relaxation, measured as a :disp32's would be.
+             (let ((disp (- target (- ref-pos 2))))
+               (when (and ord *68k-branch-distances*)
+                 (setf (gethash ord *68k-branch-distances*) (cons disp ref-pos)))
+               (push (cons (* 2 word-idx) target) *68k-abs-patches*)))
             (:disp32
              ;; 32-bit displacement (two words) — full 32-bit signed range,
              ;; no realistic overflow but the assert keeps the invariant.
@@ -325,13 +528,33 @@
 
 (defun m68k-emit-move-disp-dn (buf an disp dn)
   "MOVE.L d16(An), Dd"
+  ;; PEEPHOLE: MOVE.L Dd,d16(An) just emitted -> Dd already holds it.
+  (let ((ls *68k-last-store*))
+    (when (and ls (eq (first ls) buf) (= (second ls) (m68k-buffer-word-count buf))
+               (eql (third ls) an) (eql (fourth ls) disp) (m68k-peephole-ok-p buf))
+      ;; the same register: nothing; another: a register move (2 bytes, not 4)
+      (unless (eql (fifth ls) dn)
+        (m68k-emit-move-dn-dn buf (fifth ls) dn))
+      (return-from m68k-emit-move-disp-dn nil)))
   (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-dn+ dn +ea-mode-an-disp+ an))
+  (m68k-emit-word buf (logand disp #xFFFF)))
+
+(defun m68k-emit-move-disp-disp (buf src-an src-disp dst-an dst-disp)
+  "MOVE.L d16(As), d16(Ad) -- memory to memory, 6 bytes"
+  (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-disp+ dst-an +ea-mode-an-disp+ src-an))
+  (m68k-emit-word buf (logand src-disp #xFFFF))
+  (m68k-emit-word buf (logand dst-disp #xFFFF)))
+
+(defun m68k-emit-push-disp (buf an disp)
+  "MOVE.L d16(An), -(SP) -- 4 bytes"
+  (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-predec+ +68k-a7+ +ea-mode-an-disp+ an))
   (m68k-emit-word buf (logand disp #xFFFF)))
 
 (defun m68k-emit-move-dn-disp (buf dn an disp)
   "MOVE.L Dd, d16(An)"
   (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-disp+ an +ea-mode-dn+ dn))
-  (m68k-emit-word buf (logand disp #xFFFF)))
+  (m68k-emit-word buf (logand disp #xFFFF))
+  (setq *68k-last-store* (list buf (m68k-buffer-word-count buf) an disp dn)))
 
 (defun m68k-emit-move-disp-an (buf src-an disp dst-an)
   "MOVEA.L d16(An), Ad"
@@ -523,8 +746,84 @@
                               (ash +ea-mode-dn+ 3)
                               (logand dn 7))))
 
+(defun m68k-emit-68000-binop (buf label src dst)
+  "68000: Ddst = HELPER(Ddst, Dsrc) through a shared subroutine taking D0 and
+   D1 and answering in D0; every other register, and D0/D1 when neither is
+   DST, keeps its value.  The operands go through the stack, so SRC and DST
+   may be any data registers, D0 and D1 included."
+  (m68k-emit-word buf #x48E7) (m68k-emit-word buf #xC000)  ; MOVEM.L D0-D1,-(SP)
+  (m68k-emit-word buf (logior #x2F00 (logand src 7)))      ; MOVE.L Dsrc,-(SP)
+  (m68k-emit-word buf (logior #x2F00 (logand dst 7)))      ; MOVE.L Ddst,-(SP)
+  (m68k-emit-word buf #x201F)                              ; MOVE.L (SP)+,D0
+  (m68k-emit-word buf #x221F)                              ; MOVE.L (SP)+,D1
+  (m68k-emit-bsr buf label)
+  (case dst
+    (0 (m68k-emit-word buf #x2E80))                        ; MOVE.L D0,(SP)
+    (1 (m68k-emit-word buf #x2F40) (m68k-emit-word buf 4)) ; MOVE.L D0,4(SP)
+    (t (m68k-emit-move-dn-dn buf +68k-d0+ dst)))
+  (m68k-emit-word buf #x4CDF) (m68k-emit-word buf #x0003)) ; MOVEM.L (SP)+,D0-D1
+
+(defparameter +68k-68000-mul32+
+  '(#x48E7 #x3000        ; MOVEM.L D2-D3,-(SP)
+               #x2400 #x4842 #xC4C1 ; D2 = ah*bl
+               #x2601 #x4843 #xC6C0 ; D3 = bh*al
+               #xD443 #x4842 #x4242 ; D2 = (D2+D3).w << 16
+               #xC0C1 #xD082        ; D0 = al*bl + D2
+               #x4CDF #x000C #x4E75)
+  "MUL32: D0 = low 32 bits of D0 * D1 (sign does not matter for the low half)
+   = al*bl + ((ah*bl + al*bh) << 16).")
+
+(defparameter +68k-68000-mulu64+
+  '(#x48E7 #x3C00                ; MOVEM.L D2-D5,-(SP)
+               #x2400 #xC4C1                ; D2 = p0 = al*bl
+               #x2600 #x4843 #xC6C1         ; D3 = p1 = ah*bl
+               #x2801 #x4844 #x2A04 #xC8C0  ; D4 = p2 = bh*al, D5.w = bh
+               #x2200 #x4841 #xC2C5         ; D1 = p3 = ah*bh
+               #xD684 #x6406 #x0681 #x0001 #x0000 ; D3 = p1+p2, carry -> D1 += 2^16
+               #x2803 #x4844 #x4244         ; D4 = (mid & #xFFFF) << 16
+               #x4243 #x4843                ; D3 = mid >> 16
+               #x7A00 #xD484 #xD385 #xD283  ; D2 += D4; D1 += X + D3
+               #x2002                       ; D0 = D2
+               #x4CDF #x003C #x4E75)
+  "MULU64: D1:D0 = D0 * D1, unsigned (D0 low, D1 high).")
+
+(defparameter +68k-68000-divs32+
+  '(#x48E7 #x3800                ; MOVEM.L D2-D4,-(SP)
+               #x7800                       ; D4 = 0: the sign
+               #x4A80 #x6A04 #x4480 #x4604  ; |D0|, flip D4
+               #x4A81 #x6A04 #x4481 #x4604  ; |D1|, flip D4
+               #x7400 #x761F                ; D2 = 0 (remainder), D3 = 31
+               #xD080 #xD582 #xB481 #x6504 #x9481 #x5280 #x51CB #xFFF2
+               #x4A04 #x6702 #x4480         ; negate when the signs differed
+               #x4CDF #x001C #x4E75)
+  "DIVS32: D0 = D0 / D1, signed, truncated (DIVS.L's quotient); restoring
+   division on the magnitudes, 32 steps.")
+
+(defun m68k-emit-68000-helpers (buf)
+  "The 68000's MULS.L / MULU.L (64) / DIVS.L, as subroutines on D0 and D1."
+  (loop for (label words) in (list (list *68k-mul32-label* +68k-68000-mul32+)
+                                   (list *68k-mulu64-label* +68k-68000-mulu64+)
+                                   (list *68k-divs32-label* +68k-68000-divs32+))
+        do (m68k-emit-label buf label)
+           (dolist (w words) (m68k-emit-word buf w))))
+
+(defun m68k-68000-local-helper (buf words)
+  "Outside the native code (a boot stub): a private copy of a helper, jumped
+   over; its label."
+  (let ((over (mvm-make-label)) (here (mvm-make-label)))
+    (m68k-emit-bra buf over)
+    (m68k-emit-label buf here)
+    (dolist (w words) (m68k-emit-word buf w))
+    (m68k-emit-label buf over)
+    here))
+
 (defun m68k-emit-muls (buf src dst)
   "MULS.L Ds, Dd - signed multiply (32x32->32 low)"
+  (when *68k-cpu-68000*
+    (return-from m68k-emit-muls
+      (m68k-emit-68000-binop buf (or *68k-mul32-label*
+                                     (m68k-68000-local-helper buf +68k-68000-mul32+))
+                             src dst)))
   ;; 68020+ long multiply: 0100 1100 00 mode reg, then extension word
   ;; Extension: 0 Dl 1 0000 0000 0 Dh (for 32-bit result, Dh is unused)
   (m68k-emit-word buf (logior (ash #b01001100 8)
@@ -539,6 +838,13 @@
 
 (defun m68k-emit-mulu-64 (buf src dlo dhi)
   "MULU.L Ds, Dhi:Dlo - unsigned multiply (32x32->64)"
+  (when *68k-cpu-68000*
+    ;; the one caller (:mul26hi) multiplies D0 by D1 into D1:D0, the helper's shape
+    (unless (and (= src +68k-d1+) (= dlo +68k-d0+) (= dhi +68k-d1+))
+      (error "68k 68000: MULU.L ~D -> ~D:~D is not D1 -> D1:D0" src dhi dlo))
+    (return-from m68k-emit-mulu-64
+      (m68k-emit-bsr buf (or *68k-mulu64-label*
+                             (m68k-68000-local-helper buf +68k-68000-mulu64+)))))
   ;; 68020+ long multiply with 64-bit result
   ;; Extension word bit 10=1 for 64-bit result, bit 11=0 for unsigned
   (m68k-emit-word buf (logior (ash #b01001100 8)
@@ -551,6 +857,11 @@
 
 (defun m68k-emit-divs (buf src dst)
   "DIVS.L Ds, Dd - signed divide (Dd / Ds -> Dd quotient)"
+  (when *68k-cpu-68000*
+    (return-from m68k-emit-divs
+      (m68k-emit-68000-binop buf (or *68k-divs32-label*
+                                     (m68k-68000-local-helper buf +68k-68000-divs32+))
+                             src dst)))
   ;; 68020+ long divide: 0100 1100 01 mode reg, then extension word
   (m68k-emit-word buf (logior (ash #b01001100 8)
                               (ash #b01 6)
@@ -637,6 +948,19 @@
    +M68K-UART-BASE+ does not exist in our address space there.
    M68K-SET-LINUX-MODE moves the slots and turns the console byte into write(2).")
 
+(defparameter *68k-mac-mode* nil
+  "T when building a BARE 68k MACINTOSH image (boot/boot-mac68k.lisp): booted
+   from the disk's boot blocks by the Mac ROM, no OS, no MMU.  It keeps the
+   HOSTED memory map -- the low block at #x10000000, the heap above it, the
+   native collector -- in real RAM (a Mac with at least 384 MB, as Basilisk II
+   gives), and swaps the Linux service traps for the Mac's: the console is the
+   ROM's serial driver, the clock is Ticks, exit is a halt.  ARM32's
+   *ARM32-CL-BARE* shape.  M68K-SET-MAC-MODE.")
+
+(defun m68k-hosted-layout-p ()
+  "The hosted memory map: Linux/m68k, or a bare Mac that keeps it."
+  (or *68k-linux-mode* *68k-mac-mode*))
+
 (defparameter *68k-hosted-globals-base* #x10000A00
   "Convention slots for the HOSTED port, inside the mmap'd heap and above the
    Cheney metadata at #x10000040 — the address every hosted port picks.")
@@ -662,7 +986,7 @@
 ;;; so the 68k images must be run with at least that much RAM -- the harness
 ;;; passes -m 512.  Unlike RISC-V (where it lands in UART MMIO) and ppc32
 ;;; (outside the mapped TLBs), on m68k virt it is ordinary RAM.
-(defun m68k-mvcount-addr () modus.mvm::+mv-count-addr+)
+(defun m68k-mvcount-addr () (conv-real modus.mvm::+mv-count-addr+))
 
 ;;; A5 = THE HOSTED GLOBALS BASE (*68K-A5-GLOBALS*, MODUS_68K_A5_GLOBALS;
 ;;; unset, it follows MODUS_SMALL_IMAGE).  A5 is otherwise unused outside the
@@ -675,8 +999,8 @@
 
 (defun m68k-a5-disp (addr)
   "ADDR's displacement from A5 when A5 holds the globals base and it fits d16."
-  (and *68k-a5-globals* *68k-linux-mode*
-       (let ((d (- addr *68k-hosted-globals-base*)))
+  (and *68k-a5-globals* (m68k-hosted-layout-p)
+       (let ((d (- addr (conv-real *68k-hosted-globals-base*))))
          (and (<= -32768 d 32767) d))))
 
 (defun m68k-emit-store-absl (buf dn addr)
@@ -815,6 +1139,25 @@
                               (ash #b00 3)
                               (logand dst-dn 7))))
 
+(defun m68k-emit-rol-dn (buf count-dn dst-dn)
+  "ROL.L Dc, Dd (rotate left by register).  W32's w32-rotl."
+  (m68k-emit-word buf (logior (ash #b1110 12)
+                              (ash (logand count-dn 7) 9)
+                              (ash 1 8)      ; left
+                              (ash +68k-size-long+ 6)
+                              (ash 1 5)      ; register
+                              (ash #b11 3)   ; type=RO
+                              (logand dst-dn 7))))
+
+(defun m68k-emit-not-l (buf dn)
+  "NOT.L Dn.  W32's w32-not."
+  (m68k-emit-word buf (logior #x4680 (logand dn 7))))
+
+(defun m68k-emit-scc (buf cc dn)
+  "Scc Dn: the LOW BYTE of Dn = #xFF if condition CC (4 bits) holds, else 0.
+   W32's compares (CS unsigned <, LT signed <, EQ)."
+  (m68k-emit-word buf (logior #x50C0 (ash (logand cc 15) 8) (logand dn 7))))
+
 ;;; --- Compare ---
 
 (defun m68k-emit-cmp-dn-dn (buf src dst)
@@ -882,14 +1225,52 @@
 (defvar *68k-fn-entry-positions* nil
   "Pass 1: native positions of the function entries, for the margin.")
 
+(defvar *68k-branch-onepass* nil
+  "ONE PASS (the native tier's REPL modules, jit-68k-native %N68-TRANSLATE): with
+   no plan, a branch whose target is already placed is as short as its
+   distance allows, and a forward one is a word (Bcc.W, +-32 KB) -- a module
+   is far smaller than that; a word displacement that overflows signals in
+   M68K-FIXUP-LABELS, and the caller translates again in two passes.")
+
+(defun m68k-onepass-size (buf label-id pos)
+  "*68K-BRANCH-ONEPASS*'s size for a branch at POS to LABEL-ID."
+  (let ((tp (and label-id (gethash label-id (m68k-buffer-labels buf)))))
+    (if (null tp)
+        :word
+        (let ((d (- tp (+ pos 2))))
+          (cond ((and (/= d 0) (<= -128 d 127)) :byte)
+                ((<= -32768 d 32767) :word)
+                (t :long))))))
+
+(defvar *68k-long-absolute* nil
+  "While translating native code with a moved region (a boot tail, cold code):
+   a long branch is JMP / JSR abs.L on any CPU, as on the 68000 -- a 68020's
+   BRA.L / BSR.L is PC-relative, and the region it crosses into moves
+   (M68K-RELAX-PLAN makes every crossing branch long; M68K-FIXUP-LABELS fails
+   a PC-relative one).")
+
 (defun m68k-emit-branch (buf base label-id)
   "BRA (BASE #x6000), BSR (#x6100) or Bcc (#x6000 | cc<<8) to LABEL-ID, in the
    size the relaxation plan gives this branch's ordinal (long without one)."
   (let* ((ord (incf *68k-branch-ordinal*))
-         (size (if (and *68k-branch-plan* label-id (< ord (length *68k-branch-plan*)))
-                   (aref *68k-branch-plan* ord)
-                   :long))
-         (pos (m68k-buffer-position buf)))
+         (pos (m68k-buffer-position buf))
+         (size (cond ((and *68k-branch-plan* label-id (< ord (length *68k-branch-plan*)))
+                      (aref *68k-branch-plan* ord))
+                     ((and *68k-branch-onepass* label-id)
+                      (m68k-onepass-size buf label-id pos))
+                     (t :long))))
+    ;; 68000: a boot stub's long branch is 16-bit; native code's is absolute.
+    (when (and *68k-cpu-68000* (eq size :long) (not *68k-native-p*))
+      (setq size :word))
+    (when (and (or *68k-cpu-68000* *68k-long-absolute*) (eq size :long))
+      (unless label-id (error "68k 68000: a long branch with no label"))
+      (case base
+        (#x6000 (m68k-emit-word buf #x4EF9))             ; JMP abs.L
+        (#x6100 (m68k-emit-word buf #x4EB9))             ; JSR abs.L
+        (t (m68k-emit-word buf (logior (logxor base #x0100) #x06)) ; B!cc.S over:
+           (m68k-emit-word buf #x4EF9)))                 ; JMP abs.L
+      (m68k-emit-abs32 buf label-id (+ pos 4) ord)
+      (return-from m68k-emit-branch nil))
     (ecase size
       (:byte
        (m68k-emit-word buf base)                ; the fixup fills the low byte
@@ -910,6 +1291,71 @@
                  (m68k-buffer-fixups buf)))
          (m68k-emit-word buf 0))))))
 
+;;; COLD NATIVE CODE (compiler.lisp *COLD-KEEP*, *COLD-PC*; the Mac's Quadra
+;;; map).  Every cold function keeps a 16-byte STUB in the resident image, at
+;;; the label its callers and #'NAME use:
+;;;     JSR cold-enter.L | HOME.L | T.L | I.W
+;;; and its code -- the BODY -- goes in the image's tail after the boot-only
+;;; functions, followed by a TRAILER: the body-relative word offsets (/2) of
+;;; its absolute references to itself, then their count (a word).  T is body +
+;;; trailer; HOME the body's address as linked; I its index.  The tail is never
+;;; read at boot (mac68k-core.py puts it on the disk after the boot read), so
+;;; HOME is only a disk position: disk byte = HOME - the descriptor's BIAS.
+;;; At the first call COLD-ENTER reads the body into the code area's top (the
+;;; JIT's grows from the bottom), adds (where it landed - HOME) at each trailer
+;;; offset, rewrites the stub to JMP there and goes there, every register as
+;;; the caller left it.  So a body must reach everything outside itself
+;;; ABSOLUTELY: a branch whose ends are in different REGIONS (resident, the
+;;; boot tail, each cold body) is long (M68K-RELAX-PLAN), and a PC-relative
+;;; fixup across regions fails the build (M68K-FIXUP-LABELS).
+(defvar *68k-cold-area* nil
+  "(LO HI LOAD-ADDR): the code area a disk boot's COLD-ENTER loads into, and
+   the load address the build's disk bias is reckoned from (boot-mac68k
+   MAC68K-CONFIGURE).  NIL: no cold native code.")
+(defconstant +68k-cold-floor+ #x10006068
+  "Raw: the lowest byte of cold code loaded into the code area (0: none yet).")
+(defconstant +68k-jit-top+ #x1000606C
+  "Raw: the top of what the JIT has reserved in the code area (0: nothing).")
+(defconstant +68k-reloc-delta+ #x10006070
+  "Raw: the application's relocation (BASE - DEST), from its loader; 0 else.")
+(defconstant +68k-reloc-kmap+ #x10006074
+  "Raw: how far the application's loader moved the kind map (HEXTRA); 0 else.")
+(defvar *68k-cold-pc* nil "While translating: the first cold function's bytecode offset.")
+(defvar *68k-cold-native* nil
+  "While translating with cold native code: hash, a cold function's start pc ->
+   (INDEX STUB-T-WORD BODY-LABEL).")
+(defvar *68k-cold-enter2-label* nil "COLD-ENTER, the cold native loader.")
+(defvar *68k-routines-label* nil
+  "With cold native code: where the shared routines start, the resident
+   functions' end.  The functions before it are never written at run time;
+   the routines after it keep state inline (the console's), so a floppy's
+   preset dictionary (scripts/mac68k-floppy.lisp --core) ends here.")
+(defvar *68k-cold-desc-label* nil)
+(defvar *68k-cold-start-label* nil)
+(defvar *68k-cold-xindex-label* nil)
+(defvar *68k-cold-bodies* nil
+  "After translating: a vector of the cold bodies, (START . END) native
+   positions, ascending.  The relaxation plan reads pass 1's.")
+(defvar *68k-cold-stub-homes* nil
+  "While translating: word indices of the stubs' HOME words (the one absolute
+   reference into a body from outside it).")
+
+(defun m68k-code-region (pos)
+  "Which part of the native code POS is in: 0 resident, 1 the boot tail, or a
+   cold body's start position."
+  (let ((tail *68k-boot-tail-pos*))
+    (cond ((or (null tail) (< pos tail)) 0)
+          ((or (null *68k-cold-bodies*) (zerop (length *68k-cold-bodies*))
+               (< pos (car (aref *68k-cold-bodies* 0))))
+           1)
+          (t (let ((v *68k-cold-bodies*) (lo 0) (hi (1- (length *68k-cold-bodies*))))
+               ;; the last body starting at or before POS
+               (loop while (< lo hi)
+                     do (let ((mid (ash (+ lo hi 1) -1)))
+                          (if (<= (car (aref v mid)) pos) (setq lo mid) (setq hi (1- mid)))))
+               (let ((b (aref v lo)))
+                 (if (< pos (cdr b)) (car b) 1)))))))
+
 (defun m68k-relax-plan (n-branches)
   "The pass-2 size of each branch, from pass 1's distances and entry positions."
   (let ((plan (make-array (1+ n-branches) :initial-element :long))
@@ -925,9 +1371,14 @@
            ;; long form's own 4 extension bytes are between it and a forward
            ;; target, and vanish in the shorter forms.
            (let* ((d (if (> disp 0) (- disp 4) disp))
-                  (margin (* 16 (1+ (crossed (- ref-pos 4) (+ (- ref-pos 2) disp))))))
+                  (margin (* 16 (1+ (crossed (- ref-pos 4) (+ (- ref-pos 2) disp)))))
+                  (tail *68k-boot-tail-pos*)
+                  (target (+ (- ref-pos 2) disp)))
              (setf (aref plan ord)
-                   (cond ((and (if (> disp 0) (>= d 2) t)
+                   (cond ((and tail (not (eql (m68k-code-region ref-pos)
+                                              (m68k-code-region target))))
+                          :long)                ; across regions: absolute
+                         ((and (if (> disp 0) (>= d 2) t)
                                (<= (+ -128 margin) d (- 127 margin)))
                           :byte)
                          ((<= (+ -32768 margin) d (- 32767 margin)) :word)
@@ -990,9 +1441,54 @@
                               (ash +ea-mode-an-ind+ 3)
                               (logand an 7))))
 
+(defvar *68k-hpush-shared-label* nil
+  "(Defined before TRANSLATE-MVM-TO-68K-1, which binds it.)  While translating the image (*68K-CALL-ISLANDS*): the shared handler push
+   SETJMP calls.  NIL: inline, as the native REPL tier emits it.")
+(defvar *68k-hpop-label* nil "... the shared handler pop (CLEAR-HANDLER).")
+(defvar *68k-longjmp-label* nil "... the shared LONGJMP.")
+
+(defvar *68k-boot-tail* nil
+  "After a translation with a boot tail (compiler.lisp *BOOT-TAIL-PC*): (START
+   END), native offsets of the boot-only functions, which cross.lisp moves to
+   the image's end (*68K-TAIL-MOVE*).  NIL otherwise.")
+(defvar *68k-boot-tail-pos* nil
+  "While translating: the native position where the boot tail starts.  A
+   branch whose ends lie on its two sides is long -- absolute on a 68000 --
+   since the tail moves (M68K-RELAX-PLAN).")
+
+(defvar *68k-call-islands* nil
+  "When T (the Quadra map), the image's native code carries CALL ISLANDS: at a
+   function boundary every ~24 KB of bytecode, a JMP abs.L stub to each of the
+   most-called routines -- the write barrier, the shared CONS and ALLOC-OBJ,
+   the collector, and the eight Lisp functions most CALLed in the bytecode --
+   so a call to one is a BSR.W (4 bytes) to the island behind it rather than a
+   JSR abs.L (6) to a routine megabytes away.  ~160,000 such calls.  Placed by
+   bytecode offset, so both relaxation passes place them alike.")
+(defvar *68k-island-map* nil
+  "While translating with islands: label -> the current island's stub for it.")
+
+(defun m68k-via-island (label-id)
+  (or (and label-id *68k-island-map* (gethash label-id *68k-island-map*)) label-id))
+
+(defun m68k-emit-island (buf targets)
+  "A call island: for each label in TARGETS a stub, JMP abs.L to it; the
+   stubs become the calls' targets (*68K-ISLAND-MAP*).  Between functions:
+   nothing falls through into it."
+  (m68k-word-align buf)
+  (let ((map (make-hash-table :test 'eql)))
+    (dolist (target targets)
+      (when target
+        (let ((stub (mvm-make-label)))
+          (m68k-emit-label buf stub)
+          (m68k-emit-word buf #x4EF9)                     ; JMP abs.L
+          (m68k-emit-abs32 buf target)
+          (setf (gethash target map) stub))))
+    (setq *68k-island-map* map)))
+
 (defun m68k-emit-bsr (buf &optional label-id)
-  "BSR to LABEL-ID (relaxed; long without a plan)."
-  (m68k-emit-branch buf #x6100 label-id))
+  "BSR to LABEL-ID (relaxed; long without a plan) -- through the current call
+   island's stub when it has one (*68K-CALL-ISLANDS*)."
+  (m68k-emit-branch buf #x6100 (m68k-via-island label-id)))
 
 (defun m68k-emit-rts (buf)
   "RTS - return from subroutine"
@@ -1012,10 +1508,20 @@
   "MOVE.L Dn, -(SP) - push data register"
   ;; Destination: -(A7) = mode 4, reg 7
   (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-predec+ +68k-a7+
-                                             +ea-mode-dn+ dn)))
+                                             +ea-mode-dn+ dn))
+  (setq *68k-last-push* (list buf (m68k-buffer-word-count buf) dn)))
 
 (defun m68k-emit-pop-dn (buf dn)
   "MOVE.L (SP)+, Dn - pop to data register"
+  ;; PEEPHOLE: MOVE.L Ds,-(SP) just emitted -> MOVE.L Ds,Dn (or nothing).
+  (let ((lp *68k-last-push*))
+    (when (and lp (eq (first lp) buf) (= (second lp) (m68k-buffer-word-count buf))
+               (m68k-peephole-ok-p buf))
+      (setq *68k-last-push* nil)
+      (decf (m68k-buffer-word-count buf))
+      (decf (m68k-buffer-position buf) 2)
+      (unless (= (third lp) dn) (m68k-emit-move-dn-dn buf (third lp) dn))
+      (return-from m68k-emit-pop-dn nil)))
   ;; Source: (A7)+ = mode 3, reg 7
   (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-dn+ dn
                                              +ea-mode-an-postinc+ +68k-a7+)))
@@ -1291,7 +1797,124 @@
 ;;; MVM Opcode Translation
 ;;; ============================================================
 
+(defvar *68k-fast-at* nil
+  "THE SELF-CALL ENTRY.  A fixed-arity function's FRAME-ENTER becomes
+     entry: CMPI.L #n,(nargs).L / BEQ fast / LINK+MOVEM / <the compiler's
+            arity check: reached only on a mismatch, it signals>
+     fast:  LINK+MOVEM          <- emitted in front of the check's OK label
+     ok:    body
+   which costs an ordinary caller exactly what LINK+MOVEM / CMPI / BEQ ok did.
+   A direct call to ITSELF with the right count then skips the count store
+   and the check: SET-NARGS emits nothing and the CALL is BSR fast.  This is
+   the bytecode PC of OK while it is pending (NIL otherwise).")
+(defvar *68k-fast-label* nil "The current function's FAST label (see *68K-FAST-AT*).")
+(defvar *68k-fast-n* nil "Its fixed argument count.")
+(defvar *68k-fast-entry-pc* nil "Its bytecode entry, the FRAME-ENTER's PC.")
+(defvar *68k-fast-prologue* nil "(NPARAMS SLOTS) for the second prologue.")
+(defvar *68k-fast-call* nil "T between a self-call's SET-NARGS and its CALL.")
+
+(defvar *68k-insn-tail* nil
+  "The native tier's instruction list from the one being translated on, as
+   (PC OPCODE OPERANDS NEXT-PC): M68K-INSN-AT reads the lookahead here, since a
+   module translated from its captured instructions may have no bytes.")
+
+(defun m68k-insn-at (pc)
+  "The instruction at PC as DECODE-INSTRUCTION returns it, (OPCODE OPERANDS
+   . NEXT-PC): from *68K-INSN-TAIL* when it holds PC, else decoded."
+  (let ((tail *68k-insn-tail*))
+    (loop repeat 6
+          while (consp tail)
+          do (let ((i (car tail)))
+               (when (eql (first i) pc)
+                 (return-from m68k-insn-at (cons (second i) (cons (third i) (fourth i))))))
+             (setq tail (cdr tail)))
+    (decode-instruction *68k-bytecode* pc)))
+
+(defun m68k-known-cons-p (vs)
+  "Whether VS is known to hold a cons here: the three instructions just
+   translated, with no label since, are the compiler's guard (OBJ-TAG T,VS /
+   CMP-IMM T,cons-tag / BNE) -- COMPILE-CXR-GUARD-AND-DEREF puts :CAR / :CDR
+   straight after it.  Never in a threaded handler (*68K-BYTECODE* NIL)."
+  (let ((h *68k-insn-history*))
+    (and *68k-bytecode* (= (length h) 3)
+         (eql (car (first h)) +op-bne+)
+         (eql (car (second h)) +op-cmp-imm+)
+         (eql (third (second h)) (ash +tag-cons+ +fixnum-shift+))
+         (eql (car (third h)) +op-obj-tag+)
+         (eql (second (second h)) (second (third h)))   ; the same temp
+         (eql (third (third h)) vs))))
+
+(defun m68k-li-a5-load (buf vd imm pc)
+  "LI VD,IMM then LOAD VD,(VD) at PC -- a fixed low-block word read into the
+   register that held its address (dead after) -- as one A5-relative MOVE
+   (*68K-A5-GLOBALS*, M68K-A5-DISP): 4 bytes for the 6-byte immediate, the
+   MOVEA and the indirect load.  ~20,000 sites: the static-symbol vector's
+   root, the global-cell cache, the runtime-lock gate.  T when emitted (the
+   translation then resumes after the LOAD)."
+  (progn
+    (when (and *68k-bytecode* *68k-label-map* (integerp imm)
+               (< pc (length *68k-bytecode*))
+               (null (gethash pc *68k-label-map*)))
+      (let* ((d (m68k-insn-at pc))
+             (ops (cadr d))
+             (disp (and (eql (car d) +op-load+)
+                        (eql (first ops) vd) (eql (second ops) vd)
+                        (member (logand (third ops) 3) '(0 2 3))
+                        (m68k-a5-disp (logand imm #xFFFFFFFF)))))
+        (when disp
+          (if (zerop (logand (third ops) 3))
+              (progn (m68k-emit-move-byte-disp-dn buf +68k-a5+ disp +68k-d0+)
+                     (m68k-emit-andi buf +68k-d0+ #xFF))
+              (m68k-emit-move-disp-dn buf +68k-a5+ disp +68k-d0+))
+          (m68k-store-vreg buf vd +68k-d0+)
+          (setq *68k-skip-to* (cddr d))
+          t)))))
+
+(defun m68k-li-shr-fold (vd imm next-pc)
+  "LI VD,IMM followed by SHR VD,VD,K (K <= 8, not a branch target): the
+   compiler's raw-address idiom -- a TAGGED constant shifted to the raw word at
+   run time (EMIT-LI-TAGGED of a CONV-REAL address, then :SHR), ~10 bytes of
+   68k for the shift alone at ~25,000 sites.  Returns IMM shifted right by K
+   and resumes after the SHR (*68K-SKIP-TO*); else IMM unchanged."
+  (when (and *68k-bytecode* *68k-label-map* (integerp imm)
+             (< next-pc (length *68k-bytecode*))
+             (null (gethash next-pc *68k-label-map*)))
+    (let ((d (m68k-insn-at next-pc)))
+      (when (and (eql (car d) +op-shr+)
+                 (eql (first (cadr d)) vd) (eql (second (cadr d)) vd)
+                 (integerp (third (cadr d))) (<= 1 (third (cadr d)) 8))
+        (setq *68k-skip-to* (cddr d))
+        (return-from m68k-li-shr-fold
+          (ash (logand imm #xFFFFFFFF) (- (third (cadr d))))))))
+  imm)
+
+(defun m68k-fast-entry-plan (frame-pc next-pc)
+  "For the FRAME-ENTER at FRAME-PC: (values N OK-PC) when the next
+   instructions are the compiler's fixed-count check (GET-NARGS ... BEQ ok)."
+  (when (and *68k-bytecode* *68k-label-map* (< next-pc (length *68k-bytecode*))
+             (null (gethash next-pc *68k-label-map*)))
+    (let ((d (m68k-insn-at next-pc))
+          (f (m68k-insn-at frame-pc)))
+      (when (and (eql (car d) +op-get-nargs+) (eql (car f) +op-trap+)
+                 (eql (cddr f) next-pc))
+        (m68k-nargs-check-at (cddr d) (first (cadr d)))))))
+
 (defun m68k-translate-insn (buf opcode operands mvm-pc label-map function-table)
+  "Translate a single MVM instruction to 68k native code (then, in front of
+   a pending self-call OK label, the second prologue: see *68K-FAST-AT*)."
+  (setq *68k-fused-insn* nil)
+  (%m68k-translate-insn-1 buf opcode operands mvm-pc label-map function-table)
+  (flet ((note (e) (let ((h *68k-insn-history*))
+                     (setq *68k-insn-history* (list* e (and h (list (first h) (second h))))))))
+    (note (cons opcode operands))
+    ;; an instruction this one consumed (OBJ-TAG's CMP-IMM) is history too
+    (when *68k-fused-insn* (note *68k-fused-insn*)))
+  (when (and *68k-bytecode* *68k-fast-at* (eql mvm-pc *68k-fast-at*))
+    (setq *68k-fast-at* nil)
+    (m68k-emit-label buf *68k-fast-label*)
+    (m68k-emit-prologue buf (first *68k-fast-prologue*) (second *68k-fast-prologue*))))
+
+(defun %m68k-translate-insn-1 (buf opcode operands mvm-pc label-map function-table)
   "Translate a single MVM instruction to 68k native code."
   (declare (ignorable mvm-pc function-table))
 
@@ -1314,7 +1937,7 @@
                                     +op-f32-load+ +op-f32-store+)))
       (pushnew opcode *68k-unimpl-opcodes*)
       (m68k-emit-illegal buf)
-      (return-from m68k-translate-insn nil))
+      (return-from %m68k-translate-insn-1 nil))
 
     (case opcode
       ;;; --- NOP / BREAK / TRAP ---
@@ -1329,6 +1952,20 @@
          (cond
            ((frame-enter-code-p code)
             ;; Frame-enter: CODE carries the parameter count -- see m68k-emit-prologue.
+            ;; A fixed-count function checks the count FIRST (*68K-FAST-AT*).
+            (when *68k-bytecode*
+              (setq *68k-fast-at* nil *68k-fast-label* nil *68k-fast-call* nil)
+              (multiple-value-bind (n ok) (m68k-fast-entry-plan (- mvm-pc 3) mvm-pc)
+                (when n
+                  (let ((fast (mvm-make-label)))
+                    (m68k-emit-word buf #x0CB9)                 ; CMPI.L #n,abs.L
+                    (m68k-emit-long buf n)
+                    (m68k-emit-long buf (m68k-nargs-addr))
+                    (m68k-emit-bcc-word buf +68k-cc-eq+ fast)
+                    (setq *68k-fast-at* ok *68k-fast-label* fast *68k-fast-n* n
+                          *68k-fast-entry-pc* (- mvm-pc 3)
+                          *68k-fast-prologue* (list (frame-enter-nparams code)
+                                                    (frame-enter-slots code)))))))
             (m68k-emit-prologue buf (frame-enter-nparams code) (frame-enter-slots code)))
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
@@ -1336,65 +1973,39 @@
            ((= code #x0510)
             ;; SETJMP.  Stack the outer jmpbuf, then save A7 / A6 / resume
             ;; address / D4..D7.  First return NIL; LONGJMP re-enters at RESUME
-            ;; with D2 = T.  A capped push arms nothing.  The resume address is
-            ;; LEA (bd.l,PC) with the same hand-referenced :disp32 fixup
-            ;; +op-fn-addr+ uses.
-            (let ((skip (mvm-make-label))
-                  (resume (mvm-make-label)))
-              (m68k-emit-handler-push buf)
-              (m68k-emit-tst buf +68k-d0+)
-              (m68k-emit-bne buf skip)
+            ;; with D2 = T.  Every push stores its frame or overflows LOUDLY
+            ;; (it then longjmps and never returns here), so the jmpbuf is
+            ;; always armed.  The resume address is LEA (bd.l,PC) with the
+            ;; same hand-referenced :disp32 fixup +op-fn-addr+ uses.
+            (let ((resume (mvm-make-label)))
+              (if *68k-hpush-shared-label*
+                  (m68k-emit-bsr buf *68k-hpush-shared-label*)  ; the shared push
+                  (m68k-emit-handler-push buf))
               (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
               (m68k-emit-move-an-disp buf +68k-a7+ +68k-a1+ 0)
               (m68k-emit-move-an-disp buf +68k-a6+ +68k-a1+ 4)
-              (m68k-emit-word buf #x41FB)                     ; LEA (bd.l,PC),A0
-              (let ((ext-pos (m68k-buffer-position buf)))
-                (m68k-emit-word buf #x0170)
-                (m68k-emit-word buf 0)
-                (push (list (1- (m68k-buffer-word-count buf)) resume :disp32
-                            (+ ext-pos 2))
-                      (m68k-buffer-fixups buf))
-                (m68k-emit-word buf 0))
+              (m68k-emit-lea-label buf resume +68k-a0+)
               (m68k-emit-move-an-disp buf +68k-a0+ +68k-a1+ 8)
               (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
                     for i from 3
                     do (m68k-emit-move-dn-disp buf d +68k-a1+ (* 4 i)))
               (when *68k-threaded*                        ; the token pointer
                 (m68k-emit-move-an-disp buf +68k-a5+ +68k-a1+ 28))
-              (m68k-emit-label buf skip)
               (m68k-emit-move-an-dn buf +68k-a4+ +68k-d2+)      ; first return: NIL
               (m68k-emit-label buf resume)))
+           ((and (= code #x0511) *68k-longjmp-label*)
+            ;; LONGJMP, shared: it depends on nothing at the site
+            (m68k-emit-bra buf *68k-longjmp-label*))
            ((= code #x0511)
-            ;; LONGJMP.  Copy the jmpbuf aside first, zero the live capped count,
-            ;; pop, then restore and JMP with D2 = T.  Nothing armed (word 0 = 0):
-            ;; ILLEGAL rather than a jump to address zero.
-            (let ((nohandler (mvm-make-label)))
-              (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
-              (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
-              (m68k-emit-tst buf +68k-d0+)
-              (m68k-emit-beq buf nohandler)
-              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a0+)
-              (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
-              (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
-              (m68k-emit-move-imm-dn buf 0 +68k-d0+)
-              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
-              (m68k-emit-handler-pop buf)
-              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a1+)
-              (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
-                    for i from 3
-                    do (m68k-emit-move-disp-dn buf +68k-a1+ (* 4 i) d))
-              (m68k-emit-move-disp-an buf +68k-a1+ 8 +68k-a0+)  ; resume
-              (when *68k-threaded*
-                (m68k-emit-move-disp-an buf +68k-a1+ 28 +68k-a5+))
-              (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
-              (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
-              (m68k-emit-move-imm-dn buf +t-value+ +68k-d2+)  ; second return: T
-              (m68k-emit-jmp-an-ind buf +68k-a0+)
-              (m68k-emit-label buf nohandler)
-              (m68k-emit-illegal buf)))
+            ;; LONGJMP.  Copy the jmpbuf aside first, pop, then restore and
+            ;; JMP with D2 = T.  Nothing armed (word 0 = 0): ILLEGAL rather
+            ;; than a jump to address zero.
+            (m68k-emit-longjmp buf (lambda () (m68k-emit-illegal buf))))
            ((= code #x0512)
             ;; CLEAR-HANDLER: pop one frame; D2 (the result) untouched.
-            (m68k-emit-handler-pop buf))
+            (if *68k-hpop-label*
+                (m68k-emit-bsr buf *68k-hpop-label*)
+                (m68k-emit-handler-pop buf)))
            ((= code #x0530)
             ;; COPY-OVERFLOW-ARGS: the &rest/&key prologue's RUNTIME copy of
             ;; arguments 4.. into frame slots 4.., as translate-x64/i386/riscv
@@ -1564,6 +2175,117 @@
             (m68k-emit-asr-imm buf +68k-d1+ 1)
             (m68k-emit-move-imm-dn buf +68k-linux-sys-exit+ +68k-d0+)
             (m68k-emit-trap buf 0))
+           ;; --- THE BARE MAC (*68K-MAC-MODE*): the ROM is the platform -------
+           ((and (= code #x0300) *68k-mac-mode*)
+            ;; serial write: the untagged byte to putc
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
+            (m68k-emit-asr-imm buf +68k-d0+ 1)
+            (m68k-emit-mac-putc buf))
+           ((and (= code #x0301) *68k-mac-mode*)
+            ;; serial read: getc waits for a byte; TAGGED in V0, as hosted
+            (m68k-emit-bsr-long buf *68k-mac-getc-label*)
+            (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
+            (m68k-emit-lsl-imm buf +68k-d2+ 1))
+           ((and (= code #x0502) *68k-mac-mode*)
+            ;; SYSCALL3 on a bare Mac is a Mac SERVICE: V0 the service, V1..V3
+            ;; its arguments, all TAGGED; the result TAGGED in V0.  Service 1:
+            ;; read V3 bytes from disk byte V1 of the boot drive to address V2
+            ;; (M68K-EMIT-MAC-SERVICE).  Service 2: _BlockMove.  Service 3: flush
+            ;; the instruction cache.  Service 4: a plain copy.  Services 5-8,
+            ;; any drive (M68K-EMIT-MAC-SERVICE): 5 select drive V1; 6 read V3
+            ;; bytes from byte V1 of it to V2; 7 write V3 bytes from V2 there;
+            ;; 8 the word at byte V2 of the V1-th drive-queue element.  Any
+            ;; other: -1.
+            (let ((other (mvm-make-label)) (out (mvm-make-label)) (svc1 (mvm-make-label)))
+              (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
+              (m68k-emit-asr-imm buf +68k-d0+ 1)
+              (m68k-emit-cmpi buf +68k-d0+ 1)
+              (m68k-emit-beq buf svc1)
+              ;; Service 3: code was written as data (the threaded JIT): flush the
+              ;; instruction cache on a 68020 or later (the paged loader's
+              ;; sequence; a no-op on a 68000).  Result 0.
+              (let ((not3 (mvm-make-label)))
+                (m68k-emit-cmpi buf +68k-d0+ 3)
+                (m68k-emit-bne buf not3)
+                (dolist (w '(#x0C38 #x0002 #x012F #x650C #x48E7 #xE0C0 #x7001 #xA198 #x4CDF #x0307))
+                  (m68k-emit-word buf w))
+                (m68k-emit-move-imm-dn buf 0 +68k-d2+)
+                (m68k-emit-bra buf out)
+                (m68k-emit-label buf not3))
+              ;; Service 4: copy V3 bytes from address V1 to address V2 with plain
+              ;; moves -- longwords when all three are 4-aligned, else bytes --
+              ;; never overlapping upward.  For a screen at a high address (the
+              ;; console's): _BlockMove on a 68040 copies with MOVE16, line
+              ;; bursts the Quadras' video memory does not take (MAME's Quadra
+              ;; 950 ran into its interrupt handlers until the stack was gone).
+              ;; Result 0.
+              (let ((not4 (mvm-make-label)))
+                (m68k-emit-cmpi buf +68k-d0+ 4)
+                (m68k-emit-bne buf not4)
+                (dolist (w '(#x48E7 #x40C0 #x2003 #xE280 #x2040 #x2004 #xE280 #x2240 #x2005
+                             #xE280 #x2209 #x8280 #x2F01 #x2208 #x829F #x0241 #x0003 #x660C
+                             #xE488 #x6712 #x22D8 #x5380 #x66FA #x600A #x4A80 #x6706 #x12D8
+                             #x5380 #x66FA #x4CDF #x0302))
+                  (m68k-emit-word buf w))
+                (m68k-emit-move-imm-dn buf 0 +68k-d2+)
+                (m68k-emit-bra buf out)
+                (m68k-emit-label buf not4))
+              ;; 5-8: the service routine, D0 the service, D1-D3 as for 1
+              (let ((not58 (mvm-make-label)))
+                (m68k-emit-cmpi buf +68k-d0+ 5)
+                (m68k-emit-bcc-word buf +68k-cc-cs+ not58)
+                (m68k-emit-cmpi buf +68k-d0+ 8)
+                (m68k-emit-bcc-word buf +68k-cc-hi+ not58)
+                (m68k-emit-bra buf svc1)
+                (m68k-emit-label buf not58))
+              ;; Service 2: the ROM's _BlockMove of V3 bytes from address V1 to
+              ;; address V2 (overlap-safe; the console's scroll).  Result 0.
+              (m68k-emit-cmpi buf +68k-d0+ 2)
+              (m68k-emit-bne buf other)
+              (dolist (w '(#x48E7 #x00C0)) (m68k-emit-word buf w))   ; MOVEM.L A0/A1,-(SP)
+              (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d0+)
+              (m68k-emit-asr-imm buf +68k-d0+ 1)
+              (m68k-emit-word buf #x2040)                            ; MOVEA.L D0,A0: from
+              (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d0+)
+              (m68k-emit-asr-imm buf +68k-d0+ 1)
+              (m68k-emit-word buf #x2240)                            ; MOVEA.L D0,A1: to
+              (m68k-emit-move-dn-dn buf +68k-d5+ +68k-d0+)
+              (m68k-emit-asr-imm buf +68k-d0+ 1)                     ; D0: bytes
+              (m68k-emit-word buf #xA02E)                            ; _BlockMove
+              (dolist (w '(#x4CDF #x0300)) (m68k-emit-word buf w))   ; MOVEM.L (SP)+,A0/A1
+              (m68k-emit-move-imm-dn buf 0 +68k-d2+)
+              (m68k-emit-bra buf out)
+              (m68k-emit-label buf svc1)
+              (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+              (m68k-emit-asr-imm buf +68k-d1+ 1)
+              (m68k-emit-move-dn-dn buf +68k-d5+ +68k-d2+)
+              (m68k-emit-asr-imm buf +68k-d2+ 1)
+              (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d3+)
+              (m68k-emit-asr-imm buf +68k-d3+ 1)
+              (m68k-emit-bsr-long buf *68k-mac-service-label*)
+              (m68k-emit-bra buf out)
+              (m68k-emit-label buf other)
+              (m68k-emit-move-imm-dn buf -1 +68k-d2+)
+              (m68k-emit-label buf out)
+              (m68k-emit-lsl-imm buf +68k-d2+ 1)))
+           ((and (= code #x0310) *68k-mac-mode*)
+            ;; the clock: Ticks ($16A), the ROM's 60 Hz count, TAGGED
+            (m68k-emit-word buf #x2438) (m68k-emit-word buf #x016A)   ; MOVE.L $16A.W,D2
+            (m68k-emit-lsl-imm buf +68k-d2+ 1))
+           ((and (= code #x0311) *68k-mac-mode*)
+            ;; its rate: 60 Hz, TAGGED
+            (m68k-emit-move-imm-dn buf 120 +68k-d2+))
+           ((and (or (= code #x0500) (= code #x0304)) *68k-mac-mode*)
+            ;; exit / halt: nothing to return to -- spin with interrupts on, so
+            ;; the ROM's serial and tick machinery keep running
+            (m68k-emit-word buf #x60FE))                              ; BRA.S *
+           ((and (= code #x0520) *68k-mac-mode*)
+            ;; signal handlers: none on a bare Mac (a fault is the ROM's)
+            nil)
+           ((and *68k-mac-mode* (> code 15))
+            ;; a Linux service trap: a gap here, recorded, and ILLEGAL if run
+            (pushnew (+ #x10000 code) *68k-unimpl-opcodes*)
+            (m68k-emit-word buf #x4AFC))
            ((= code #x0300)
             ;; BARE METAL: serial write.  V0 IS D2, NOT D0 — this arm read D0
             ;; until 2026-09-24, left behind when *68K-VREG-MAP* slid the window
@@ -1644,8 +2366,9 @@
               (m68k-store-vreg buf vd +68k-d0+))))))
 
       (#.+op-li+
-       (let ((vd (first operands))
-             (imm (second operands)))
+       (let* ((vd (first operands))
+              (imm (m68k-li-shr-fold vd (second operands) mvm-pc)))
+        (unless (m68k-li-a5-load buf vd imm (or *68k-skip-to* mvm-pc))
          ;; 32-bit on 68k
          (let ((imm32 (logand imm #xFFFFFFFF))
                (pd (m68k-vreg-phys vd)))
@@ -1671,7 +2394,7 @@
               (m68k-emit-moveq buf +68k-d0+ (logand imm32 #xFF))
               (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+ (m68k-spill-offset vd)))
              (t
-              (m68k-emit-move-imm-disp buf imm32 +68k-a6+ (m68k-spill-offset vd)))))))
+              (m68k-emit-move-imm-disp buf imm32 +68k-a6+ (m68k-spill-offset vd))))))))
 
       (#.+op-push+
        (let ((vs (first operands)))
@@ -1681,9 +2404,9 @@
               (m68k-emit-push-dn buf (m68k-reg-number ps)))
              ((and ps (eq (m68k-reg-type ps) :address))
               (m68k-emit-push-an buf (m68k-reg-number ps)))
+             ;; spilled: straight from its frame slot (4 bytes, not 6)
              (t
-              (m68k-load-vreg buf +68k-d0+ vs)
-              (m68k-emit-push-dn buf +68k-d0+))))))
+              (m68k-emit-push-disp buf +68k-a6+ (m68k-spill-offset vs)))))))
 
       (#.+op-pop+
        (let ((vd (first operands)))
@@ -1721,13 +2444,16 @@
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
-         (let ((da (m68k-vreg-or-scratch buf va +68k-d0+))
-               (db (m68k-vreg-or-scratch buf vb +68k-d1+)))
-           ;; We need the result in a scratch. If da!=d0, move it.
-           (unless (= da +68k-d0+)
-             (m68k-emit-move-dn-dn buf da +68k-d0+))
-           (m68k-emit-add-dn-dn buf db +68k-d0+)
-           (m68k-store-vreg buf vd +68k-d0+))))
+         (let* ((da (m68k-vreg-or-scratch buf va +68k-d0+))
+                (db (m68k-vreg-or-scratch buf vb +68k-d1+))
+                (dd (m68k-vreg-data-reg vd)))
+           ;; Into VD's own register when it has one: ADD commutes, so when VD
+           ;; is VB's register add VA into it.  Else via D0 as before.
+           (when (and dd (= dd db) (/= dd da)) (rotatef da db))
+           (let ((acc (if (and dd (/= dd db)) dd +68k-d0+)))
+             (unless (= da acc) (m68k-emit-move-dn-dn buf da acc))
+             (m68k-emit-add-dn-dn buf db acc)
+             (m68k-store-vreg buf vd acc)))))
 
       ((#.+op-sub+ #.+op-sub-checked+ #.+op-subs+)
        ;; :SUBS shares this clause.  :adds/:subs are "arithmetic that also sets
@@ -1752,12 +2478,17 @@
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
-         (let ((da (m68k-vreg-or-scratch buf va +68k-d0+)))
-           (unless (= da +68k-d0+)
-             (m68k-emit-move-dn-dn buf da +68k-d0+))
+         ;; Into VD's own register when it has one and it is not VB's
+         ;; (SUB does not commute).  Else via D0 as before.
+         (let* ((da (m68k-vreg-or-scratch buf va +68k-d0+))
+                (dd (m68k-vreg-data-reg vd))
+                (db0 (m68k-vreg-data-reg vb))
+                (acc (if (and dd (not (eql dd db0))) dd +68k-d0+)))
+           (unless (= da acc)
+             (m68k-emit-move-dn-dn buf da acc))
            (let ((db (m68k-vreg-or-scratch buf vb +68k-d1+)))
-             (m68k-emit-sub-dn-dn buf db +68k-d0+)
-             (m68k-store-vreg buf vd +68k-d0+)))))
+             (m68k-emit-sub-dn-dn buf db acc)
+             (m68k-store-vreg buf vd acc)))))
 
       ((#.+op-mul+ #.+op-mul-checked+)
        ;; :MUL-CHECKED shares this clause.  The checked opcodes mean "tagged
@@ -1778,6 +2509,14 @@
          (let ((db (m68k-vreg-or-scratch buf vb +68k-d1+)))
            (m68k-emit-muls buf db +68k-d0+)
            (m68k-store-vreg buf vd +68k-d0+))))
+
+      ;; ---- W32 (docs/w32.md): see M68K-TRANSLATE-W32 ----
+      ((#.+op-w32-li+ #.+op-w32-add+ #.+op-w32-sub+ #.+op-w32-mul+ #.+op-w32-mulhu+
+        #.+op-w32-and+ #.+op-w32-or+ #.+op-w32-xor+ #.+op-w32-not+
+        #.+op-w32-shl+ #.+op-w32-shr+ #.+op-w32-sar+ #.+op-w32-rotl+
+        #.+op-w32-ltu+ #.+op-w32-lts+ #.+op-w32-eq+ #.+op-w32-from-fix+
+        #.+op-w32-hi16+ #.+op-w32-lo16+ #.+op-w32-join+ #.+op-w32-load+ #.+op-w32-store+)
+       (m68k-translate-w32 buf opcode (first operands) (second operands) (third operands)))
 
       (#.+op-mul26lo+
        ;; Low 26 bits of untag(Va)*untag(Vb), tagged
@@ -1919,9 +2658,11 @@
           ;; *ARITH-RANGE-BY-SHIFT*): ASL sets V exactly when a bit shifted
           ;; out differs from the sign, i.e. when (x << s) >> s /= x.  The
           ;; scratch gets x, which is its value on the fall-through.
+          ;; The scratch VD is dead after the guard (the flag's contract in
+          ;; compiler.lisp), so it is not written: one frame store less per
+          ;; operand when it is a spilled vreg.
           (progn
             (m68k-load-vreg buf +68k-d0+ vs)
-            (m68k-store-vreg buf vd +68k-d0+)
             (m68k-emit-asl-imm buf +68k-d0+ amt)
             (m68k-emit-bcc-word buf +68k-cc-vs+ (ensure-label target-pc))
             (setq *68k-skip-to* skip-to))
@@ -2017,11 +2758,20 @@
          (m68k-emit-cmp-dn-dn buf +68k-d1+ da)))
 
       (#.+op-test-imm+
-       (progn
+       (let ((imm (logand (%imm32-signed (second operands)) #xFFFFFFFF)))
+        (if (and (= 1 (logcount imm)) (m68k-next-op-in mvm-pc (list +op-beq+ +op-bne+)))
+         ;; ONE BIT, then BEQ/BNE: BTST #bit on the operand where it lives.
+         ;; Z is set exactly when (x & imm) = 0, as AND + TST leave it; N is
+         ;; not, which is why only an equality branch may follow.  The tag test
+         ;; of every arithmetic op (EMIT-ARITH-PAIR) is two of these.
+         (let ((dn (m68k-vreg-or-scratch buf (first operands) +68k-d0+)))
+           (m68k-emit-word buf (logior #x0800 dn))       ; BTST #n,Dn
+           (m68k-emit-word buf (1- (integer-length imm))))
+        (progn
          (m68k-load-vreg buf +68k-d0+ (first operands))
          (m68k-emit-imm-dn buf (logand (%imm32-signed (second operands)) #xFFFFFFFF) +68k-d1+)
          (m68k-emit-and-dn-dn buf +68k-d1+ +68k-d0+)
-         (m68k-emit-tst buf +68k-d0+)))
+         (m68k-emit-tst buf +68k-d0+)))))
 
       ;;; --- Branches ---
       (#.+op-br+
@@ -2091,26 +2841,36 @@
              (vs (second operands)))
          ;; Type check (trap on a non-cons), then the car at the tag-folded
          ;; displacement: -tag(A0) is the cons's first word.
+         (if (m68k-known-cons-p vs)
+             ;; the guard just checked it: no second check, no copy through D0
+             (progn (m68k-load-vreg-to-an buf +68k-a0+ vs)
+                    (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-cons+) +68k-d0+))
+         (progn
          (m68k-load-vreg buf +68k-d0+ vs)
          (if *68k-car-label*
              (m68k-emit-bsr buf *68k-car-label*)
              (progn
                (m68k-emit-check-cons buf +68k-d0+)
                (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-               (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-cons+) +68k-d0+)))
+               (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-cons+) +68k-d0+)))))
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-cdr+
        (let ((vd (first operands))
              (vs (second operands)))
          ;; Type check, then the cdr at (4 - tag)(A0)
+         (if (m68k-known-cons-p vs)
+             ;; the guard just checked it: no second check, no copy through D0
+             (progn (m68k-load-vreg-to-an buf +68k-a0+ vs)
+                    (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-cons+) +68k-d0+))
+         (progn
          (m68k-load-vreg buf +68k-d0+ vs)
          (if *68k-cdr-label*
              (m68k-emit-bsr buf *68k-cdr-label*)
              (progn
                (m68k-emit-check-cons buf +68k-d0+)
                (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-               (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-cons+) +68k-d0+)))
+               (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-cons+) +68k-d0+)))))
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-cons+
@@ -2281,26 +3041,30 @@
              (idx (third operands)))
          (if (= vobj +vreg-vfp+)
              ;; Frame slot access: use safe A6-relative offset below spill area
-             (progn
+             ;; Straight into VD's data register when it has one; the
+             ;; store-then-reload peephole matches on that register.
+             (let ((dd (or (m68k-vreg-data-reg vd) +68k-d0+)))
                (m68k-emit-move-disp-dn buf +68k-a6+
-                                        (+ +68k-frame-slot-base+ (* idx -4))
-                                        +68k-d0+)
-               (m68k-store-vreg buf vd +68k-d0+))
+                                       (+ +68k-frame-slot-base+ (* idx -4)) dd)
+               (m68k-store-vreg buf vd dd))
              ;; Normal object slot access.  The tagged pointer goes straight
              ;; to A0 and the tag folds into the displacement: (4(i+1)-tag)(A0)
              ;; is the same address SUBI #tag then 4(i+1)(A0) was, minus the
              ;; SUBI (6 bytes) and a MOVEA.
-             (let ((disp (- (* (1+ idx) 4) +tag-object+)))
+             ;; Straight into VD's data register when it has one (a spilled
+             ;; VD goes through D0, which the store-then-reload peephole needs).
+             (let ((disp (- (* (1+ idx) 4) +tag-object+))
+                   (dd (or (m68k-vreg-data-reg vd) +68k-d0+)))
                (if (<= -32768 disp 32767)
                    (progn
                      (m68k-load-vreg-to-an buf +68k-a0+ vobj)
-                     (m68k-emit-move-disp-dn buf +68k-a0+ disp +68k-d0+))
+                     (m68k-emit-move-disp-dn buf +68k-a0+ disp dd))
                    (progn
                      (m68k-load-vreg buf +68k-d0+ vobj)
                      (m68k-emit-subi buf +68k-d0+ +tag-object+)
                      (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-                     (m68k-emit-move-disp-dn buf +68k-a0+ (* (1+ idx) 4) +68k-d0+)))
-               (m68k-store-vreg buf vd +68k-d0+)))))
+                     (m68k-emit-move-disp-dn buf +68k-a0+ (* (1+ idx) 4) dd)))
+               (m68k-store-vreg buf vd dd)))))
 
       (#.+op-obj-set+
        (let ((vobj (first operands))
@@ -2308,10 +3072,9 @@
              (vs (third operands)))
          (if (= vobj +vreg-vfp+)
              ;; Frame slot store: use safe A6-relative offset below spill area
-             (progn
-               (m68k-load-vreg buf +68k-d0+ vs)
-               (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+
-                                        (+ +68k-frame-slot-base+ (* idx -4))))
+             ;; From VS's own data register when it has one (no copy to D0).
+             (m68k-emit-move-dn-disp buf (m68k-vreg-or-scratch buf vs +68k-d0+) +68k-a6+
+                                     (+ +68k-frame-slot-base+ (* idx -4)))
              ;; Normal object slot store, the tag folded as in OBJ-REF.  A0
              ;; is translator scratch, never a vreg, so loading it first
              ;; cannot clobber VS.
@@ -2319,27 +3082,56 @@
                (if (<= -32768 disp 32767)
                    (progn
                      (m68k-load-vreg-to-an buf +68k-a0+ vobj)
-                     (m68k-load-vreg buf +68k-d1+ vs)
-                     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ disp))
+                     ;; from VS where it lives: its data register, or its frame
+                     ;; slot memory to memory (6 bytes, not 4 + 4 through D1)
+                     (let ((ds (m68k-vreg-data-reg vs)))
+                       (cond (ds (m68k-emit-move-dn-disp buf ds +68k-a0+ disp))
+                             ((null (m68k-vreg-phys vs))
+                              (m68k-emit-move-disp-disp buf +68k-a6+ (m68k-spill-offset vs)
+                                                        +68k-a0+ disp))
+                             (t (m68k-load-vreg buf +68k-d1+ vs)
+                                (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ disp)))))
                    (progn
                      (m68k-load-vreg buf +68k-d0+ vobj)
                      (m68k-emit-subi buf +68k-d0+ +tag-object+)
                      (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
                      (m68k-load-vreg buf +68k-d1+ vs)
                      (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ (* (1+ idx) 4))))
-               (when *68k-barrier-label*
-                 (m68k-emit-move-an-dn buf +68k-a0+ +68k-d0+)
-                 (m68k-emit-bsr buf *68k-barrier-label*))))))
+               (cond (*68k-barrier-a0-label*
+                      (m68k-emit-bsr buf *68k-barrier-a0-label*))
+                     (*68k-barrier-label*
+                      (m68k-emit-move-an-dn buf +68k-a0+ +68k-d0+)
+                      (m68k-emit-bsr buf *68k-barrier-label*)))))))
 
       (#.+op-obj-tag+
-       (let ((vd (first operands))
-             (vs (second operands)))
-         (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-moveq buf +68k-d1+ (m68k-tag-mask))  ; AND in 4 bytes, not 6
-         (m68k-emit-and-dn-dn buf +68k-d1+ +68k-d0+)
-         ;; Tag as fixnum: shift left 1
-         (m68k-emit-lsl-imm buf +68k-d0+ 1)
-         (m68k-store-vreg buf vd +68k-d0+)))
+       (let* ((vd (first operands))
+              (vs (second operands))
+              ;; the compiler's tag test: CMP-IMM VD,K next (no label between)
+              (nx (and *68k-bytecode* *68k-label-map*
+                       (< mvm-pc (length *68k-bytecode*))
+                       (null (gethash mvm-pc *68k-label-map*))
+                       (m68k-insn-at mvm-pc)))
+              (k (and nx (eql (car nx) +op-cmp-imm+) (eql (first (cadr nx)) vd)
+                      (logand (%imm32-signed (second (cadr nx))) #xFFFFFFFF)))
+              (ds (m68k-vreg-data-reg vs)))
+         ;; D1 = the tag (MOVEQ mask; AND the operand where it lives), doubled
+         ;; to the fixnum it is, stored to VD.  Fused with that CMP-IMM, the
+         ;; compare is SUBQ / CMPI on D1 -- the same flags for every Bcc --
+         ;; and the CMP-IMM is skipped: ~4 bytes of 68k less at each of the
+         ;; ~40,000 tag tests (CONSP, the CAR / CDR guard ...).
+         (m68k-emit-moveq buf +68k-d1+ (m68k-tag-mask))
+         (if ds
+             (m68k-emit-and-dn-dn buf ds +68k-d1+)
+             (progn (m68k-load-vreg buf +68k-d0+ vs)
+                    (m68k-emit-and-dn-dn buf +68k-d0+ +68k-d1+)))
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d1+)
+         (m68k-store-vreg buf vd +68k-d1+)
+         (when k
+           (cond ((<= 1 k 8) (m68k-emit-subq buf +68k-d1+ k))
+                 ((zerop k) (m68k-emit-tst buf +68k-d1+))
+                 (t (m68k-emit-cmpi buf +68k-d1+ k)))
+           (setq *68k-skip-to* (cddr nx)
+                 *68k-fused-insn* (cons (car nx) (cadr nx))))))
 
       (#.+op-obj-subtag+
        (let ((vd (first operands))
@@ -2385,7 +3177,7 @@
              (width (third operands)))
          ;; Load address into A0
          (m68k-load-vreg-to-an buf +68k-a0+ vaddr)
-         (ecase width
+         (ecase (logand width 3)   ; widths 4..7 / 8+: the TLS / conv marks
            (0 (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d0+)
               (m68k-emit-andi buf +68k-d0+ #xFF))        ; zero-extend
            (1 (m68k-emit-move-word-an-ind-dn buf +68k-a0+ +68k-d0+)
@@ -2400,7 +3192,7 @@
              (width (third operands)))
          (m68k-load-vreg-to-an buf +68k-a0+ vaddr)
          (m68k-load-vreg buf +68k-d0+ vs)
-         (ecase width
+         (ecase (logand width 3)   ; widths 4..7 / 8+: the TLS / conv marks
            (0 (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+))
            (1 (m68k-emit-move-word-dn-an-ind buf +68k-d0+ +68k-a0+))
            (2 (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+))
@@ -2414,7 +3206,11 @@
       (#.+op-call+
        ;; Target operand is the bytecode offset of the called function.
        (let* ((target-offset (first operands))
-              (label (gethash target-offset label-map)))
+              (label (if (and *68k-bytecode* *68k-fast-call*
+                              (eql target-offset *68k-fast-entry-pc*))
+                         *68k-fast-label*
+                         (gethash target-offset label-map))))
+         (when *68k-bytecode* (setq *68k-fast-call* nil))
          (if label
              (m68k-emit-bsr buf label)
              ;; Unknown target: emit BSR with no fixup
@@ -2534,14 +3330,21 @@
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-ftoi+
-       ;; Double -> tagged fixnum, TRUNCATING: FINTRZ first (round toward
-       ;; zero, whatever FPCR's mode), then FMOVE.L of an already-integral value.
+       ;; Double -> tagged fixnum, TRUNCATING: FMOVE.L under FPCR's
+       ;; round-toward-zero mode, the caller's mode put back after.  NOT FINTRZ:
+       ;; the 68040 does not implement it (Motorola's FPSP emulates it in
+       ;; software -- Linux/m68k carries the FPSP, a bare Mac does not), and
+       ;; Basilisk II's emulation of it rounds a negative value toward +1
+       ;; (-3.5 -> -2), which r31-float-negative caught on the Mac ladder.
        (let ((vd (first operands)))
          (m68k-load-vreg buf +68k-d0+ (second operands))
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-float-unbox buf 0)
-         (m68k-emit-fop buf #x03 0 0)                         ; FINTRZ FP0,FP0
+         (m68k-emit-word buf #xF201) (m68k-emit-word buf #xB000)   ; FMOVE.L FPCR,D1
+         (m68k-emit-word buf #xF23C) (m68k-emit-word buf #x9000)   ; FMOVE.L #RZ,FPCR
+         (m68k-emit-long buf #x00000010)
          (m68k-emit-fmove-l-to-dn buf 0 +68k-d0+)
+         (m68k-emit-word buf #xF201) (m68k-emit-word buf #x9000)   ; FMOVE.L D1,FPCR
          (m68k-emit-lsl-imm buf +68k-d0+ 1)                   ; tag
          (m68k-store-vreg buf vd +68k-d0+)))
 
@@ -2572,17 +3375,10 @@
          (when (= target #xFFFFFFF0)                     ; undefined name: NIL
            (m68k-emit-move-an-dn buf +68k-a4+ +68k-d0+)
            (m68k-store-vreg buf vd +68k-d0+)
-           (return-from m68k-translate-insn nil))
+           (return-from %m68k-translate-insn-1 nil))
          (unless label
            (error "68k fn-addr: no function at bytecode offset ~D" target))
-         (m68k-emit-word buf #x43FB)                     ; LEA (bd.l,PC),A1
-         (let ((ext-pos (m68k-buffer-position buf)))
-           (m68k-emit-word buf #x0170)                   ; full extension word
-           (m68k-emit-word buf 0)                        ; bd high (patched)
-           (push (list (1- (m68k-buffer-word-count buf)) label :disp32
-                       (+ ext-pos 2))
-                 (m68k-buffer-fixups buf))
-           (m68k-emit-word buf 0))                       ; bd low (patched)
+         (m68k-emit-lea-label buf label +68k-a1+)
          (m68k-emit-move-an-dn buf +68k-a1+ +68k-d0+)
          (m68k-emit-ori buf +68k-d0+ +tag-function+)
          (m68k-store-vreg buf vd +68k-d0+)))
@@ -2719,7 +3515,7 @@
              (width (third operands)))
          ;; Load port address
          (m68k-emit-move-imm-an buf port +68k-a0+)
-         (ecase width
+         (ecase (logand width 3)   ; widths 4..7 / 8+: the TLS / conv marks
            (0 (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d0+)
               (m68k-emit-andi buf +68k-d0+ #xFF))
            (1 (m68k-emit-move-word-an-ind-dn buf +68k-a0+ +68k-d0+)
@@ -2734,7 +3530,7 @@
              (width (third operands)))
          (m68k-emit-move-imm-an buf port +68k-a0+)
          (m68k-load-vreg buf +68k-d0+ vs)
-         (ecase width
+         (ecase (logand width 3)   ; widths 4..7 / 8+: the TLS / conv marks
            (0 (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+))
            (1 (m68k-emit-move-word-dn-an-ind buf +68k-d0+ +68k-a0+))
            (2 (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+))
@@ -2979,11 +3775,32 @@
        ;; MOVEQ + MOVE.L to absolute long: 8 bytes, was 14 (MOVE.L #, MOVEA.L #,
        ;; MOVE.L (A1)).  D0 is scratch; nothing after reads A1 for this address.
        (let ((n (logand (first operands) #xFF)))
-         (m68k-emit-imm-dn buf n +68k-d0+)
-         (m68k-emit-store-absl buf +68k-d0+ (m68k-nargs-addr))))
+         (if (and *68k-bytecode* *68k-fast-label* (eql n *68k-fast-n*)
+                  (< mvm-pc (length *68k-bytecode*))
+                  (null (gethash mvm-pc label-map))
+                  (let ((d (m68k-insn-at mvm-pc)))
+                    (and (eql (car d) +op-call+)
+                         (eql (first (cadr d)) *68k-fast-entry-pc*))))
+             ;; A self-call with the function's own count: no count, and the
+             ;; CALL goes to the fast entry (*68K-FAST-AT*).
+             (setq *68k-fast-call* t)
+             (progn
+               (m68k-emit-imm-dn buf n +68k-d0+)
+               (m68k-emit-store-absl buf +68k-d0+ (m68k-nargs-addr))))))
 
       (#.+op-get-nargs+
        (let ((vd (first operands)))
+         ;; THE ARITY CHECK, FUSED.  The compiler's entry check is GET-NARGS vD /
+         ;; LI vB n<<1 / CMP vD vB / BEQ ok (emit-arity-check-prologue and the
+         ;; range version).  The good case is first: CMPI.L #n,(nargs).L + BEQ
+         ;; ok, 2 instructions where the sequence below takes 6 with a spill;
+         ;; on a mismatch the sequence still runs, unchanged, for the error path.
+         (multiple-value-bind (n target) (m68k-nargs-check-at mvm-pc vd)
+           (when (and n (not (and *68k-bytecode* *68k-fast-at*)))
+             (m68k-emit-word buf #x0CB9)                 ; CMPI.L #imm,abs.L
+             (m68k-emit-long buf n)
+             (m68k-emit-long buf (m68k-nargs-addr))
+             (m68k-emit-bcc-word buf +68k-cc-eq+ (ensure-label target))))
          (m68k-emit-load-abs buf +68k-d0+ (m68k-nargs-addr))
          (m68k-emit-lsl-imm buf +68k-d0+ 1)     ; tag as fixnum
          (m68k-store-vreg buf vd +68k-d0+)))
@@ -3055,15 +3872,17 @@
 ;;; the new frontier in them.
 
 (defconstant +68k-gc-meta+ #x10000040)
-(defconstant +68k-gc-kind-map+ #x1FC00000
+(defvar *68k-gc-kind-map* #x1FC00000
   "The kind map's FIXED address: just past the largest heap the stub will
    choose (#x10000000 + 248 MB + 4 MB guard), where ARM32's has always been.
    The stub maps only the S/16 bytes a heap of size S needs, so a small heap
-   costs a small map, and the bias below stays a translate-time constant.")
+   costs a small map, and the bias below stays a translate-time constant.
+   A board with less address space below 2^29 (the 68k Mac: RAM ends at
+   384 MB) moves it, and caps its heap below it.")
 (defun m68k-kind-bias ()
   "K: the kind byte of address A is at K + (A >> kind-shift), one byte per
    heap granule."
-  (- +68k-gc-kind-map+ (ash #x10000000 (- (m68k-kind-shift)))))
+  (- *68k-gc-kind-map* (ash (conv-real #x10000000) (- (m68k-kind-shift)))))
 (defvar *68k-gc-static* nil
   "STATIC BOOT HEAP (MODUS_68K_GC_STATIC; unset, it follows MODUS_SMALL_IMAGE).
    A request word makes the collector, at the end of the collection that sees
@@ -3088,6 +3907,9 @@
 (defconstant +68k-card-crossing+ #x1001E000
   "One byte per static card: where its first object starts, in 16-byte
    granules from the card's start (255: none).  The 8 KB below the heap.")
+(defvar *68k-barrier-a0-label* nil
+  "The write barrier's second entry: the address in A0 (MOVE.L A0,D0, then the
+   barrier) -- an OBJ-SET site has its object in A0, and saves the move.")
 (defvar *68k-barrier-label* nil
   "While translating a static-heap image: the shared write barrier.  D0 = the
    object (or cons) just stored into; marks its card when it is static.
@@ -3095,6 +3917,10 @@
 
 (defconstant +68k-gc-heap-start+ #x10020000
   "Where the first semispace starts (boot-linux-68k's heap + alloc-start).")
+(defvar *68k-gc-heap-start* +68k-gc-heap-start+
+  "The same, for this build: a Mac layout's :ALLOC-START moves it (MAC68K-CONFIGURE).")
+(defvar *68k-card-crossing* +68k-card-crossing+
+  "The crossing table, for this build: the 8 KB below *68K-GC-HEAP-START*.")
 
 (defconstant +68k-gc-margin-max+ #x100000
   "The collector leaves min(1 MB, a quarter of a semispace) free below VL --
@@ -3105,6 +3931,302 @@
    evacuated with #x00000BA9, so a pointer the collector failed to update
    faults on its first read instead of reading the stale copy.  Set by
    build-68k-cli.lisp from MODUS_68K_GC_POISON=1.  Off: byte-identical.")
+
+;;; The handler-frame stack's constants and specials (THE HANDLER-FRAME STACK,
+;;; at SETJMP / LONGJMP below): declared before the collector and the
+;;; translation driver, which bind and read them.
+(defconstant +68k-jmpbuf-words+ 7)
+(defparameter *68k-hstack-max-depth* 46
+  "Handler frames in the fixed area: as many 32-byte frames as fit below the
+   hosted globals at #x10000A00 (they end at #x100009C8).  Deeper frames go to
+   the hosted extension; on bare metal the next push is the loud overflow.")
+(defconstant +68k-hstack-ext-addr+ #x10005600
+  "Hosted: the extension's address (0 until the first push past the fixed area
+   reserves it).  In the low block, which the heap's anonymous mapping zeroes
+   at a plain boot and %68K-SAVE-CORE zeroes in a saved core.")
+(defconstant +68k-hstack-ext-limit-addr+ #x10005608
+  "Hosted, TEST ONLY: when non-zero, the extension holds at most this many
+   frames, so a test reaches the loud overflow without exhausting the native
+   stack.  A raw 32-bit count; %GC-WRITE64 of a small count at this address
+   writes it here (its high half goes to the unused word after it).")
+(defconstant +68k-hstack-ext-frames+ #x80000
+  "Frames in the hosted extension: 512K = 16 MB of address space.  A nesting
+   level costs more than 32 bytes of native stack, so the stack (8 MB under
+   qemu-user's default) runs out first.")
+(defconstant +68k-hstack-overflow-code+ #x0F0F
+  "Recorded at #x10000CB0 by an overflowing push; %TAKE-PENDING-FAULT turns it
+   into HANDLER-STACK-EXHAUSTED.")
+(defconstant +68k-pending-fault-addr+ #x10000CB0)
+(defvar *68k-hpush-label* nil
+  "While translating: the label of the out-of-line slow push (see above).")
+(defvar *68k-hext-addr-label* nil
+  "While translating a hosted image: the label of the pop's extension-frame
+   address routine.")
+(defvar *68k-hstack-used* nil
+  "Set by the first push or pop emitted, so an image with no SETJMP carries
+   neither stub.")
+
+(defvar *68k-mac-console-label* nil
+  "While translating a *68K-MAC-MODE* image: the label of the serial console's
+   putc (M68K-EMIT-MAC-CONSOLE).")
+(defvar *68k-mac-getc-label* nil
+  "... and of its getc, +68K-MAC-GETC-WORD+ words on.")
+(defvar *68k-mac-service-label* nil
+  "... and of the disk-read service SYSCALL3 reaches on a bare Mac
+   (M68K-EMIT-MAC-SERVICE).")
+
+(defparameter +68k-mac-console-code+
+  #(#x48E7 #x6040 #x4A39 #x1000 #x910C #x663E #x41F9 #x1000 #x9000 #x2238 #x016A
+    #x5681 #x4A68 #x0010 #x6F0E #xB2B8 #x016A #x62F4 #x50F9 #x1000 #x910C #x601E
+    #x13C0 #x1000 #x9100 #x217C #x1000 #x9100 #x0020 #x7001 #x2140 #x0024 #x4268
+    #x002C #x42A8 #x000C #xA403 #x4CDF #x0206 #x4E75 #x48E7
+    #x6040 #x4AB8 #x029E #x6600 #x000E #x41FA #x0074 #x21C8 #x029E #x21C8 #x02A2
+    #x41F9 #x1000 #x9080 #x317C #x0002 #x001A #x42A8 #x001C #xA005 #x4AA8 #x001C
+    #x6600 #x0030 #x41F9 #x1000 #x9110 #x4250 #x7028 #xA031 #x3039 #x1000 #x9110
+    #x0C40 #x0003 #x6700 #x000A #x0C40 #x0005 #x6600 #xFFC6 #x7000 #x1039 #x1000
+    #x9115 #x6000 #x001E #x217C #x1000 #x9102 #x0020 #x7001 #x2140 #x0024 #x4268
+    #x002C #xA002 #x7000 #x1039 #x1000 #x9102 #x4CDF #x0206 #x4E75 #x48E7 #x6080
+    #x7000 #x0242 #x007F #x0C42 #x0040 #x6400 #x0032 #x41FA #x0034 #x0801 #x0000
+    #x6700 #x0006 #x41FA #x0068 #x1030 #x2000 #x0801 #x0001 #x6700 #x0016 #x0C00
+    #x0061 #x6500 #x000E #x0C00 #x007A #x6200 #x0006 #x0400 #x0020 #x4CDF #x0106
+    #x4E75 #x6173 #x6466 #x6867 #x7A78 #x6376 #x0062 #x7177 #x6572 #x7974 #x3132
+    #x3334 #x3635 #x3D39 #x372D #x3830 #x5D6F #x755B #x6970 #x0D6C #x6A27 #x6B3B
+    #x5C2C #x2F6E #x6D2E #x0920 #x6008 #x031B #x0000 #x0000 #x0000 #x0000 #x0000
+    #x4153 #x4446 #x4847 #x5A58 #x4356 #x0042 #x5157 #x4552 #x5954 #x2140 #x2324
+    #x5E25 #x2B28 #x265F #x2A29 #x7D4F #x557B #x4950 #x0D4C #x4A22 #x4B3A #x7C3C
+    #x3F4E #x4D3E #x0920 #x7E08 #x031B #x0000 #x0000 #x0000 #x0000 #x0000)
+  "The bare Mac's console, assembled (m68k-linux-gnu-as -m68040):
+
+   putc:   movem.l d1-d2/a1,-(sp)       ; D0.B -> serial port A
+           tst.b   $1000910C             ; the port never drained: no serial
+           bne     pout
+           lea     $10009000,a0          ; .AOut's parameter block
+           move.l  $16A,d1               ; Ticks + 3: wait at most ~50 ms
+           addq.l  #3,d1
+   pwait:  tst.w   16(a0)                ; ioResult > 0: the last byte is
+           ble     pgo                   ;   still going out
+           cmp.l   $16A,d1
+           bhi     pwait
+           st      $1000910C             ; it never finished: give the port up
+           bra     pout
+   pgo:    move.b  d0,$10009100
+           move.l  #$10009100,32(a0)     ; ioBuffer
+           moveq   #1,d0
+           move.l  d0,36(a0)             ; ioReqCount
+           clr.w   44(a0)                ; ioPosMode
+           clr.l   12(a0)                ; ioCompletion: none
+           _Write  ,ASYNC                ; A403
+   pout:   movem.l (sp)+,d1-d2/a1
+           rts
+
+   The write is ASYNCHRONOUS and waits for the previous byte with a limit.  It
+   was a synchronous _Write, and a port that never finishes a write -- MAME's
+   SE/30, IIci and Quadra, which have no serial ports wired -- hung the REPL
+   in the Device Manager's wait for its first byte.  A real port sends a byte
+   in ~1 ms at 9600 baud; one that has taken 3 ticks is given up and the
+   console is the screen alone.  The boot stub clears $1000910C.  ioCompletion
+   is cleared every time: a synchronous call ignores it, an asynchronous one
+   CALLS it, and the block comes from a saved core (MAME's Quadra 950 ran into
+   the ROM's interrupt code until the stack was gone).
+   getc:   movem.l d1-d2/a1,-(sp)       ; -> D0.L: a key, or a byte from port A
+           tst.l   $29E                  ; Key1Trans: none (a Mac Plus ROM
+           bne     wait                  ;   without a System) -> install KTRANS
+           lea     ktrans(pc),a0         ;   there and at Key2Trans, or the ROM
+           move.l  a0,$29E               ;   keeps KeyMap and posts no keyDown
+           move.l  a0,$2A2
+   wait:   lea     $10009080,a0          ; .AIn: bytes waiting?
+           move.w  #2,26(a0)             ;   csCode 2
+           clr.l   28(a0)
+           _Status                       ; A005
+           tst.l   28(a0)
+           bne     serial
+           lea     $10009110,a0          ; an EventRecord
+           clr.w   (a0)
+           moveq   #$28,d0               ; keyDownMask | autoKeyMask
+           _GetOSEvent                   ; A031
+           move.w  $10009110,d0          ; what
+           cmp.w   #3,d0                 ; keyDown
+           beq     key
+           cmp.w   #5,d0                 ; autoKey
+           bne     wait
+   key:    moveq   #0,d0
+           move.b  $10009115,d0          ; the message's low byte: the character
+           bra     done
+   serial: move.l  #$10009102,32(a0)
+           moveq   #1,d0
+           move.l  d0,36(a0)
+           clr.w   44(a0)
+           _Read                         ; A002
+           moveq   #0,d0
+           move.b  $10009102,d0
+   done:   movem.l (sp)+,d1-d2/a1
+           rts
+   ktrans: movem.l d1-d2/a0,-(sp)       ; D2.W key code, D1.W modifiers -> D0.B
+           moveq   #0,d0                 ; the ROM enters it with RTS (its
+           and.w   #$7F,d2               ;   keyboard routine at $269C pushes
+           cmp.w   #64,d2                ;   Key1Trans) and builds the event's
+           bcc     kout                  ;   message from code << 8 | D0.B
+           lea     klow(pc),a0
+           btst    #0,d1                 ; shift (KeyMap byte 7 bit 0)
+           beq     k1
+           lea     khigh(pc),a0
+   k1:     move.b  (0,a0,d2.w),d0
+           btst    #1,d1                 ; caps lock: letters upper case
+           beq     kout
+           cmp.b   #'a',d0 / bcs kout / cmp.b #'z',d0 / bhi kout / sub.b #32,d0
+   kout:   movem.l (sp)+,d1-d2/a0
+           rts
+   klow / khigh: the US keyboard's 64 key codes, unshifted and shifted
+
+   The ROM's .AIn/.AOut drivers, opened by the boot stub into the parameter
+   blocks at #x10009080 / #x10009000 (the low block's argv area, unused on a
+   Mac), and its event queue, which its keyboard driver fills; Basilisk II
+   routes the serial port to a host device, a real Mac to its modem port.
+   Both routines keep every register but D0/A0.")
+
+(defconstant +68k-mac-getc-word+ 40
+  "Where getc starts in +68K-MAC-CONSOLE-CODE+, in words.")
+
+(defun m68k-emit-mac-console (buf)
+  "Emit +68K-MAC-CONSOLE-CODE+: putc at *68K-MAC-CONSOLE-LABEL*, getc (word
+   +68K-MAC-GETC-WORD+) at *68K-MAC-GETC-LABEL*."
+  (m68k-emit-label buf *68k-mac-console-label*)
+  (m68k-emit-mac-host-jump buf 0)
+  (let ((code (copy-seq +68k-mac-console-code+)))
+    ;; every absolute operand is a $1000_9xxx long: move it with the
+    ;; runtime-data region (CONV-REAL)
+    (loop for i from 0 below (1- (length code))
+          when (and (= (aref code i) #x1000) (= (logand (aref code (1+ i)) #xF000) #x9000))
+            do (let ((a (conv-real (logior #x10000000 (aref code (1+ i))))))
+                 (setf (aref code i) (ash a -16) (aref code (1+ i)) (logand a #xFFFF))))
+    (loop for w across code for i from 0
+          do (when (= i +68k-mac-getc-word+)
+               (m68k-emit-label buf *68k-mac-getc-label*)
+               (m68k-emit-mac-host-jump buf 4))
+             (m68k-emit-word buf w))))
+
+(defun m68k-emit-mac-host-jump (buf slot)
+  "Running as a Mac OS application (+68K-MAC-HOST+ set): jump through the host
+   table's SLOT (0 putc, 4 getc) instead -- the return address is the caller's.
+       tst.l   host           ; 4AB9 abs.l
+       beq.s   1f             ; skip the 10 or 12 bytes below
+       movea.l host,a0        ; 2079 abs.l
+       movea.l SLOT(a0),a0    ; 2050 / 2068 SLOT
+       jmp     (a0)           ; 4ED0
+   1:"
+  (let* ((a (conv-real +68k-mac-host+)) (hi (ash a -16)) (lo (logand a #xFFFF)))
+    (m68k-emit-word buf #x4AB9) (m68k-emit-word buf hi) (m68k-emit-word buf lo)
+    (m68k-emit-word buf (if (zerop slot) #x670A #x670C))
+    (m68k-emit-word buf #x2079) (m68k-emit-word buf hi) (m68k-emit-word buf lo)
+    (if (zerop slot)
+        (m68k-emit-word buf #x2050)
+        (progn (m68k-emit-word buf #x2068) (m68k-emit-word buf slot)))
+    (m68k-emit-word buf #x4ED0)))
+
+(defun m68k-emit-mac-service (buf)
+  "The bare Mac's disk service, at *68K-MAC-SERVICE-LABEL*, D0 the service:
+     1  read D2 bytes from byte D1 of the BOOT drive into D3 (the code loader's
+        and COLD-ENTER's: the boot drive's drive-queue element -- BootDrive
+        $210, DrvQHdr $30A -- then _Read from the start; launched from Mac OS,
+        the open file instead)
+     5  select drive D1 (its dQDrive) for 6 and 7; 0 is the boot drive again
+     6  read D2 bytes from byte D1 of the selected drive into D3
+     7  write D2 bytes from D3 to byte D1 of the selected drive (_Write)
+     8  the word at byte D3 of the D1-th drive-queue element (6 its drive
+        number, 8 its driver's refNum), or 0 past the queue's end
+   (a floppy's driver takes whole 512-byte blocks).  D2 = 0, or the _Read /
+   _Write error, or -1 when there is no such drive or service; 8: the word.
+   Keeps D4-D7 and every address register; the traps may clobber D0-D2."
+  (flet ((ws (&rest words) (dolist (w words) (m68k-emit-word buf w))))
+    (let ((dq (mvm-make-label)) (found (mvm-make-label)) (zl (mvm-make-label))
+          (fail (mvm-make-label)) (done (mvm-make-label)) (pb (mvm-make-label))
+          (drive (mvm-make-label)) (have (mvm-make-label)) (common (mvm-make-label))
+          (sel (mvm-make-label)) (n5 (mvm-make-label)) (n8 (mvm-make-label))
+          (walk (mvm-make-label)) (got (mvm-make-label)) (past (mvm-make-label))
+          (n6 (mvm-make-label)) (wr (mvm-make-label)) (trapped (mvm-make-label))
+          (boot (mvm-make-label)))
+      (m68k-emit-label buf *68k-mac-service-label*)
+      (ws #x48E7 #x0FFA)                                 ; MOVEM.L D4-D7/A0-A4/A6,-(SP)
+      (ws #x7A00 #x7800)                                 ; MOVEQ #0,D5 (read); MOVEQ #0,D4 (boot drive)
+      (m68k-emit-cmpi buf +68k-d0+ 1) (m68k-emit-beq buf common)
+      ;; 5: select
+      (m68k-emit-cmpi buf +68k-d0+ 5) (m68k-emit-bne buf n5)
+      (m68k-emit-lea-label buf sel +68k-a0+)
+      (ws #x3081)                                        ; MOVE.W D1,(A0)
+      (ws #x7400) (m68k-emit-bra buf done)               ; MOVEQ #0,D2
+      (m68k-emit-label buf n5)
+      ;; 8: a drive-queue element's word
+      (m68k-emit-cmpi buf +68k-d0+ 8) (m68k-emit-bne buf n8)
+      (ws #x2078 #x030A #x2C01)                          ; MOVEA.L $30A,A0; MOVE.L D1,D6
+      (m68k-emit-label buf walk)
+      (ws #x2E08) (m68k-emit-beq buf past)               ; MOVE.L A0,D7: the end
+      (ws #x4A86) (m68k-emit-beq buf got)                ; TST.L D6
+      (ws #x5386 #x2050) (m68k-emit-bra buf walk)        ; SUBQ.L #1,D6; MOVEA.L (A0),A0
+      (m68k-emit-label buf got)
+      (ws #x3430 #x3000 #x48C2) (m68k-emit-bra buf done) ; MOVE.W (0,A0,D3.W),D2; EXT.L D2
+      (m68k-emit-label buf past)
+      (ws #x7400) (m68k-emit-bra buf done)               ; MOVEQ #0,D2
+      (m68k-emit-label buf n8)
+      ;; 6 and 7: the selected drive, reading or writing
+      (m68k-emit-cmpi buf +68k-d0+ 7) (m68k-emit-bne buf n6)
+      (ws #x7A01)                                        ; MOVEQ #1,D5: write
+      (m68k-emit-label buf n6)
+      (m68k-emit-cmpi buf +68k-d0+ 6) (m68k-emit-bcc-word buf +68k-cc-cs+ fail)
+      (m68k-emit-cmpi buf +68k-d0+ 7) (m68k-emit-bcc-word buf +68k-cc-hi+ fail)
+      (m68k-emit-lea-label buf sel +68k-a0+)
+      (ws #x3810)                                        ; MOVE.W (A0),D4
+      (m68k-emit-label buf common)
+      (m68k-emit-lea-label buf pb +68k-a0+)
+      (ws #x7013)                                        ; MOVEQ #19,D0
+      (m68k-emit-label buf zl)
+      (ws #x4298)                                        ; CLR.L (A0)+
+      (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
+      (m68k-emit-lea-label buf pb +68k-a0+)
+      ;; the boot drive (D4 = 0) launched from Mac OS (scripts/mac68k-chain.py):
+      ;; the disk is a file
+      (ws #x4A44) (m68k-emit-bne buf drive)              ; TST.W D4
+      (let ((a (conv-real +68k-mac-file-refnum+)))
+        (ws #x2039 (ash a -16) (logand a #xFFFF)))       ; MOVE.L slot,D0
+      (m68k-emit-beq buf boot)
+      (ws #x3140 #x0018)                                 ; ioRefNum = the file's
+      (m68k-emit-bra buf have)
+      (m68k-emit-label buf boot)
+      (ws #x3838 #x0210)                                 ; D4 = BootDrive
+      (m68k-emit-label buf drive)
+      (ws #x2678 #x030A)                                 ; A3 = DrvQHdr.qHead
+      (m68k-emit-label buf dq)
+      (ws #x200B) (m68k-emit-beq buf fail)               ; end of the queue
+      (ws #xB86B #x0006) (m68k-emit-beq buf found)       ; CMP.W 6(A3),D4: dQDrive
+      (ws #x2653) (m68k-emit-bra buf dq)                 ; A3 = qLink
+      (m68k-emit-label buf found)
+      (ws #x316B #x0006 #x0016)                          ; ioVRefNum = dQDrive
+      (ws #x316B #x0008 #x0018)                          ; ioRefNum = dQRefNum
+      (m68k-emit-label buf have)
+      (ws #x2143 #x0020)                                 ; ioBuffer = D3
+      (ws #x2142 #x0024)                                 ; ioReqCount = D2
+      (ws #x317C #x0001 #x002C)                          ; ioPosMode = fsFromStart
+      (ws #x2141 #x002E)                                 ; ioPosOffset = D1
+      (ws #x4A85) (m68k-emit-bne buf wr)                 ; TST.L D5
+      (ws #xA002)                                        ; _Read
+      (m68k-emit-bra buf trapped)
+      (m68k-emit-label buf wr)
+      (ws #xA003)                                        ; _Write
+      (m68k-emit-label buf trapped)
+      (ws #x48C0 #x2400)                                 ; EXT.L D0; D2 = the result
+      (m68k-emit-bra buf done)
+      (m68k-emit-label buf fail)
+      (ws #x74FF)                                        ; MOVEQ #-1,D2
+      (m68k-emit-label buf done)
+      (ws #x4CDF #x5FF0)                                 ; MOVEM.L (SP)+,D4-D7/A0-A4/A6
+      (ws #x4E75)                                        ; RTS
+      (m68k-emit-label buf sel)                          ; the selected drive (0: the boot drive)
+      (ws 0 0)
+      (m68k-emit-label buf pb)                           ; the parameter block (80 bytes)
+      (dotimes (i 40) (ws 0)))))
+
+(defun m68k-emit-mac-putc (buf)
+  "D0.B to the Mac's serial console (D0/A0 clobbered)."
+  (m68k-emit-bsr-long buf *68k-mac-console-label*))
 
 (defvar *68k-gc-label* nil
   "Label of the hosted collector while translating a hosted module, else NIL
@@ -3130,9 +4252,35 @@
                               (ash +ea-mode-dn+ 3) (logand dn 7)))
   (m68k-emit-word buf (logand imm8 #xFF)))
 
+(defun m68k-emit-lea-label (buf label-id an)
+  "An = the address of LABEL-ID: LEA (bd.l,PC),An -- the 68020 full extension
+   word (#x0170: base PC, index suppressed, 32-bit displacement), whose PC is
+   the extension word's address, so the fixup's reference is set by hand -- or,
+   on a 68000, LEA abs.L,An with the address filled in after layout."
+  (cond
+    ((or *68k-cpu-68000* *68k-long-absolute*)                   ; (a moved region: absolute)
+     (m68k-emit-word buf (logior #x41F9 (ash (logand an 7) 9)))   ; LEA abs.L,An
+     (m68k-emit-abs32 buf label-id))
+    (t
+     (m68k-emit-word buf (logior #x41FB (ash (logand an 7) 9)))   ; LEA (bd.l,PC),An
+     (let ((ext-pos (m68k-buffer-position buf)))
+       (m68k-emit-word buf #x0170)
+       (m68k-emit-word buf 0)
+       (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ ext-pos 2))
+             (m68k-buffer-fixups buf))
+       (m68k-emit-word buf 0)))))
+
 (defun m68k-emit-bsr-long (buf label-id)
   "BSR.L target -- 68020+, 32-bit displacement, so a gc-check anywhere in an
    image of any size reaches the collector emitted after the last function."
+  (let ((via (m68k-via-island label-id)))
+    (unless (eq via label-id)                     ; a call island has it
+      (m68k-emit-bsr buf label-id)
+      (return-from m68k-emit-bsr-long nil)))
+  (when (or *68k-cpu-68000* *68k-long-absolute*)        ; (*68K-LONG-ABSOLUTE*: a moved region)
+    (m68k-emit-word buf #x4EB9)                          ; JSR abs.L
+    (m68k-emit-abs32 buf label-id)
+    (return-from m68k-emit-bsr-long nil))
   (m68k-emit-word buf #x61FF)
   (let ((disp-pos (m68k-buffer-position buf)))
     (m68k-emit-word buf 0)
@@ -3178,7 +4326,16 @@
 ;;; GC-CHECK the compiler puts right before each one.
 
 (defvar *68k-shared-sequences* nil
-  "When T, CONS (with the GC-CHECK before it) is a call to one shared copy.")
+  "When T, CONS (with the GC-CHECK before it) is a call to one shared copy, and
+   so are SUBTAG, CAR / CDR, ARRAY-LEN and ALLOC-OBJ.  A LIST of keywords
+   (:CONS :SUBTAG :CAR :ARRAY-LEN :ALLOC-OBJ) shares only those: allocation
+   costs enough that a call is cheap beside it, while CAR, CDR and the subtag
+   test stay inline where speed matters (MODUS_68K_SHARED=cons,alloc-obj).")
+
+(defun m68k-shared-p (which)
+  "Whether the shared copy of sequence WHICH (a keyword) is in use."
+  (or (eq *68k-shared-sequences* t)
+      (and (consp *68k-shared-sequences*) (member which *68k-shared-sequences*) t)))
 (defvar *68k-cons-label* nil
   "Label of the shared CONS sequence while translating, else NIL.")
 (defvar *68k-bytecode* nil
@@ -3367,7 +4524,7 @@
       (dotimes (i 3)
         (when (or (>= pc (length bc)) (gethash pc *68k-label-map*))
           (return-from m68k-range-guard-at nil))
-        (let ((d (decode-instruction bc pc)))
+        (let ((d (m68k-insn-at pc)))
           (push (cons (car d) (cadr d)) ops)
           (setq pc (cddr d))))
       (destructuring-bind (bne cmp sar) ops
@@ -3376,12 +4533,37 @@
                    (eql (car bne) +op-bne+))
           (values pc (+ pc (second bne))))))))
 
+(defun m68k-next-op-in (next-pc ops)
+  "True when the instruction at NEXT-PC is one of OPS and no branch lands on it
+   (native translation only: a handler has no bytecode to look at)."
+  (and *68k-bytecode* *68k-label-map*
+       (< next-pc (length *68k-bytecode*))
+       (null (gethash next-pc *68k-label-map*))
+       (member (car (m68k-insn-at next-pc)) ops)))
+
+(defun m68k-nargs-check-at (next-pc vd)
+  "When GET-NARGS VD is followed by LI vB IMM / CMP VD vB / BEQ, none a branch
+   target: (values UNTAGGED-COUNT TARGET-PC)."
+  (when (and *68k-bytecode* *68k-label-map*)
+    (let ((bc *68k-bytecode*) (pc next-pc) (ops nil))
+      (dotimes (i 3)
+        (when (or (>= pc (length bc)) (gethash pc *68k-label-map*))
+          (return-from m68k-nargs-check-at nil))
+        (let ((d (m68k-insn-at pc)))
+          (push (cons (car d) (cadr d)) ops)
+          (setq pc (cddr d))))
+      (destructuring-bind (beq cmp li) ops
+        (when (and (eql (car li) +op-li+) (eql (car cmp) +op-cmp+) (eql (car beq) +op-beq+)
+                   (equal (cdr cmp) (list vd (second li)))
+                   (integerp (third li)) (evenp (third li)) (<= 0 (third li) 510))
+          (values (ash (third li) -1) (+ pc (second beq))))))))
+
 (defun m68k-next-is-unlabelled-cons-p (next-pc)
   "True when the instruction at NEXT-PC is a CONS that no branch lands on."
   (and *68k-cons-label* *68k-bytecode*
        (< next-pc (length *68k-bytecode*))
        (null (gethash next-pc *68k-label-map*))
-       (eql (car (decode-instruction *68k-bytecode* next-pc)) +op-cons+)))
+       (eql (car (m68k-insn-at next-pc)) +op-cons+)))
 
 (defun m68k-emit-gc-check (buf)
   "Room while VA (A2) < VL (A3); else call the collector (hosted) or ILLEGAL."
@@ -3396,7 +4578,13 @@
 (defun m68k-emit-die (buf message status)
   "write(2, MESSAGE) then exit(STATUS).  The text is pushed onto the stack a
    longword at a time, so it needs no data section and no PC-relative address.
-   Does not return."
+   Does not return.  On a bare Mac: MESSAGE to the serial console, then halt."
+  (when *68k-mac-mode*
+    (loop for c across message
+          do (m68k-emit-moveq buf +68k-d0+ (char-code c))
+             (m68k-emit-mac-putc buf))
+    (m68k-emit-word buf #x60FE)                         ; BRA.S *
+    (return-from m68k-emit-die nil))
   (let* ((bytes (map 'list #'char-code message))
          (padded (append bytes (make-list (mod (- (length bytes)) 4) :initial-element 0))))
     (loop for i from (- (length padded) 4) downto 0 by 4
@@ -3457,14 +4645,17 @@
    in the static span [lo, lo + span) its card's mark is set.  Before the
    freeze (and when the span was too big for the mark table) span is 0 and
    nothing is marked; the collector then walks the whole static heap."
-  (let ((out (mvm-make-label)) (blk +68k-gc-static-block+))
+  (let ((out (mvm-make-label)) (blk (conv-real +68k-gc-static-block+)))
+    (when *68k-barrier-a0-label*
+      (m68k-emit-label buf *68k-barrier-a0-label*)
+      (m68k-emit-move-an-dn buf +68k-a0+ +68k-d0+))
     (m68k-emit-label buf *68k-barrier-label*)
     (m68k-emit-word buf #x90B9) (m68k-emit-long buf (+ blk #x18))   ; SUB.L lo,D0
     (m68k-emit-word buf #xB0B9) (m68k-emit-long buf (+ blk #x1C))   ; CMP.L span,D0
     (m68k-emit-bcc-word buf +68k-cc-cc+ out)                         ; outside the span
     (m68k-emit-word buf #x2239) (m68k-emit-long buf (+ blk #x20))   ; MOVE.L shift,D1
     (m68k-emit-word buf #xE2A8)                                     ; LSR.L D1,D0
-    (m68k-emit-move-imm-an buf +68k-card-marks+ +68k-a0+)           ; 6 bytes
+    (m68k-emit-move-imm-an buf (conv-real +68k-card-marks+) +68k-a0+)           ; 6 bytes
     (m68k-emit-word buf #x50F0) (m68k-emit-word buf #x0800)         ; ST (0,A0,D0.L)
     (m68k-emit-label buf out)
     (m68k-emit-rts buf)))
@@ -3476,7 +4667,7 @@
    marked again when a slot still points into to-space afterwards, so a static
    object keeps being scanned while it refers to the young space.  Uses D7
    (card), A5 (cursor), A4, D3, D1, D0 and the scratch longword at blk+#x24."
-  (let* ((blk +68k-gc-static-block+)
+  (let* ((blk (conv-real +68k-gc-static-block+))
          (cl (mvm-make-label)) (cdone (mvm-make-label)) (cnext (mvm-make-label))
          (conses (mvm-make-label)) (olp (mvm-make-label)) (odone (mvm-make-label))
          (sl (mvm-make-label)) (leaf (mvm-make-label)) (keep (mvm-make-label))
@@ -3489,7 +4680,7 @@
              ;; flag |= (to_start <= (slot) < to_start + size)
              (let ((no (mvm-make-label)))
                (m68k-emit-move-an-ind-dn buf slot-an +68k-d0+)
-               (m68k-emit-move-imm-an buf +68k-gc-meta+ +68k-a0+)
+               (m68k-emit-move-imm-an buf (conv-real +68k-gc-meta+) +68k-a0+)
                (m68k-emit-move-disp-dn buf +68k-a0+ #x08 +68k-d1+)   ; to_start
                (m68k-emit-sub-dn-dn buf +68k-d1+ +68k-d0+)           ; v - to_start
                (m68k-emit-move-disp-dn buf +68k-a0+ #x10 +68k-d1+)   ; size
@@ -3507,7 +4698,7 @@
       (m68k-emit-word buf #xE2A8)                           ; LSR.L D1,D0
       (m68k-emit-cmp-dn-dn buf +68k-d0+ +68k-d7+)            ; card - ncards
       (m68k-emit-bcc-word buf +68k-cc-cc+ cdone)
-      (m68k-emit-move-imm-an buf +68k-card-marks+ +68k-a0+)
+      (m68k-emit-move-imm-an buf (conv-real +68k-card-marks+) +68k-a0+)
       (m68k-emit-word buf #x4A30) (m68k-emit-word buf #x7800) ; TST.B (0,A0,D7.L)
       (m68k-emit-beq buf cnext)
       (m68k-emit-word buf #x4230) (m68k-emit-word buf #x7800) ; CLR.B (0,A0,D7.L)
@@ -3530,7 +4721,7 @@
       (m68k-emit-cmpa buf +68k-a5+ +68k-d0+)                 ; A5 - ohi
       (m68k-emit-bcc-word buf +68k-cc-cc+ conses)
       ;; A5 += crossing[card] * 16 (255: nothing starts here)
-      (m68k-emit-move-imm-an buf +68k-card-crossing+ +68k-a0+)
+      (m68k-emit-move-imm-an buf (conv-real *68k-card-crossing*) +68k-a0+)
       (m68k-emit-moveq buf +68k-d0+ 0)
       (m68k-emit-word buf #x1030) (m68k-emit-word buf #x7800) ; MOVE.B (0,A0,D7.L),D0
       (m68k-emit-cmpi buf +68k-d0+ 255)
@@ -3604,7 +4795,7 @@
       (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
       (m68k-emit-tst buf +68k-d0+)
       (m68k-emit-beq buf cnext)
-      (m68k-emit-move-imm-an buf +68k-card-marks+ +68k-a0+)
+      (m68k-emit-move-imm-an buf (conv-real +68k-card-marks+) +68k-a0+)
       (m68k-emit-word buf #x50F0) (m68k-emit-word buf #x7800) ; ST (0,A0,D7.L)
       (here cnext)
       (m68k-emit-addq buf +68k-d7+ 1)
@@ -3618,7 +4809,7 @@
    Uses A5, A4, D7, D3, D1, D0 (all saved by the collector's entry)."
   (let ((ol (mvm-make-label)) (od (mvm-make-label)) (sl (mvm-make-label))
         (leaf (mvm-make-label)) (cl (mvm-make-label)) (cd (mvm-make-label))
-        (blk +68k-gc-static-block+))
+        (blk (conv-real +68k-gc-static-block+)))
     (flet ((here (l) (m68k-emit-label buf l)))
       ;; -- objects: A5 = cursor, [blk+8] = end --
       (m68k-emit-move-imm-an buf blk +68k-a0+)
@@ -3678,7 +4869,7 @@
    yet, keep [from, A2) and [A3, from + size) as the static ranges and continue
    on semispaces of size A3 - A2: the gap [A2, A3) and the start of the
    evacuated one.  Clears the request.  Clobbers D0, D1, A0."
-  (let ((skip (mvm-make-label)) (blk +68k-gc-static-block+))
+  (let ((skip (mvm-make-label)) (blk (conv-real +68k-gc-static-block+)))
     (m68k-emit-move-imm-an buf blk +68k-a0+)
     (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)          ; request
     (m68k-emit-tst buf +68k-d0+)
@@ -3706,7 +4897,7 @@
   "Emit the hosted collector at *68K-GC-LABEL*.  Entered by BSR.L from
    :gc-check; every register is preserved except the new VA/VL it installs."
   (let ((scan (mvm-make-label))
-        (meta +68k-gc-meta+)
+        (meta (conv-real +68k-gc-meta+))
         (save #xFFFE)                     ; D0-D7/A0-A6, predecrement order
         (restore #x7FFF))
     (flet ((lbl () (mvm-make-label))
@@ -3739,7 +4930,7 @@
       (m68k-emit-move-an-an buf +68k-a7+ +68k-a5+)
       (m68k-emit-move-disp-dn buf +68k-a1+ #x18 +68k-d7+)        ; stack_base
       (root-range)
-      (m68k-emit-move-imm-an buf #x10000000 +68k-a5+)
+      (m68k-emit-move-imm-an buf (conv-real #x10000000) +68k-a5+)
       ;; the low block ends where the FIRST semispace starts, whichever one is
       ;; from-space now: min(from_start, to_start).  TO_START FROM THE BLOCK,
       ;; NOT A2: the stack roots above have already copied objects, so A2 is
@@ -3754,7 +4945,7 @@
       ;; heap's FIXED start, as on arm32 -- a typed range must never be read
       ;; as conservative roots.
       (if *68k-gc-static*
-          (m68k-emit-move-imm-dn buf +68k-gc-heap-start+ +68k-d7+)
+          (m68k-emit-move-imm-dn buf (conv-real *68k-gc-heap-start*) +68k-d7+)
           (let ((have (lbl)))
             (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d7+)
             (m68k-emit-move-imm-an buf meta +68k-a0+)
@@ -3764,10 +4955,29 @@
             (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d7+)
             (here have)))
       (root-range)
+      ;; ---- the handler frames in the extension (live ones only) ----
+      ;; A saved jmpbuf holds D4..D7, which a LONGJMP puts back: frames are
+      ;; roots.  The fixed area is in the low block above; frames 46.. are
+      ;; [ext, ext + (depth - 46) * 32).  See THE HANDLER-FRAME STACK.
+      (let ((none (lbl)))
+        (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a0+)
+        (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
+        (m68k-emit-subi buf +68k-d0+ *68k-hstack-max-depth*)
+        (m68k-emit-ble buf none)
+        ;; the low block's word, wherever the region is (a Mac's: zero, no extension)
+        (m68k-emit-move-imm-an buf (conv-real +68k-hstack-ext-addr+) +68k-a0+)
+        (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d7+)
+        (m68k-emit-tst buf +68k-d7+)
+        (m68k-emit-beq buf none)
+        (m68k-emit-move-dn-an buf +68k-d7+ +68k-a5+)
+        (m68k-emit-lsl-imm buf +68k-d0+ 5)
+        (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d7+)
+        (root-range)
+        (here none))
       ;; ---- the static ranges, typed (empty until a freeze) ----
       (when *68k-gc-static*
         (let ((full (mvm-make-label)) (done (mvm-make-label)))
-          (m68k-emit-move-imm-an buf (+ +68k-gc-static-block+ #x1C) +68k-a0+)
+          (m68k-emit-move-imm-an buf (conv-real (+ +68k-gc-static-block+ #x1C)) +68k-a0+)
           (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
           (m68k-emit-tst buf +68k-d0+)
           (m68k-emit-beq buf full)
@@ -3862,7 +5072,7 @@
       ;; memory is then what lives plus what is being allocated into, not every
       ;; page either semispace ever touched -- at the freeze, the whole of the
       ;; semispace boot filled.  Not with poison, which wants the pages written.
-      (when (and *68k-gc-static* (not *68k-gc-poison*))
+      (when (and *68k-gc-static* (not *68k-gc-poison*) *68k-linux-mode*)
         (let ((none (lbl)))
           (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d1+)
           (m68k-emit-addi buf +68k-d1+ 4095)
@@ -3889,6 +5099,28 @@
           (m68k-emit-moveq buf +68k-d3+ 4)
           (m68k-emit-word buf #x4E40)
           (here none)))
+      ;; MODUS_68K_GC_PEAK=1 (a measurement): the most bytes any collection
+      ;; kept -- objects [to_start, A2) plus conses [A3, to_end) -- at
+      ;; #x10006080, and the latest at #x10006084: what an old space that is
+      ;; never copied (generational promotion) would have to hold.
+      (when (equal (sb-ext:posix-getenv "MODUS_68K_GC_PEAK") "1")
+        (let ((no (lbl)))
+          (m68k-emit-move-imm-an buf meta +68k-a1+)
+          (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+          (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d1+)
+          (m68k-emit-sub-dn-dn buf +68k-d1+ +68k-d0+)             ; objects
+          (m68k-emit-move-disp-dn buf +68k-a1+ #x10 +68k-d2+)
+          (m68k-emit-add-dn-dn buf +68k-d2+ +68k-d1+)             ; to_end
+          (m68k-emit-move-an-dn buf +68k-a3+ +68k-d2+)
+          (m68k-emit-sub-dn-dn buf +68k-d2+ +68k-d1+)             ; conses
+          (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+          (m68k-emit-move-imm-an buf (conv-real #x10006080) +68k-a0+)
+          (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 4)
+          (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d1+)
+          (m68k-emit-cmp-dn-dn buf +68k-d1+ +68k-d0+)             ; kept - peak
+          (m68k-emit-bcc-word buf +68k-cc-ls+ no)
+          (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)
+          (here no)))
       ;; ---- swap the semispaces, count the collection ----
       (m68k-emit-move-imm-an buf meta +68k-a1+)
       (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d0+)
@@ -3919,7 +5151,10 @@
         (m68k-emit-movem-from-postinc buf restore)
         (m68k-emit-rts buf)
         (here exhausted)
-        (m68k-emit-die buf (format nil "modus: heap exhausted (raise --dynamic-space-size)~%") 3))
+        (m68k-emit-die buf (if *68k-mac-mode*
+                               (format nil "Modus: out of memory (Get Info: give it a bigger partition)~%")
+                               (format nil "modus: heap exhausted (raise --dynamic-space-size)~%"))
+                       3))
       ;; ================= SCAN (A0 = slot address) =================
       (let ((ret (lbl)) (isptr (lbl)) (kobj (lbl)) (kok (lbl)) (notfwd (lbl))
             (obj (lbl)) (ovf (lbl)) (cl (lbl)))
@@ -4083,6 +5318,82 @@
             (sort (copy-list *68k-unimpl-opcodes*) #'<)))
   *68k-unimpl-opcodes*)
 
+;;; ============================================================
+;;; W32: native 32-bit words (docs/w32.md, spec 4.4)
+;;; ============================================================
+;;; A W32 operand is the raw word in a 32-bit data register.  Scratch D0/D1/A0,
+;;; as every arm here uses them; results go through D0.  IMMEDIATE shifts on
+;;; 68k encode counts 1..8 only (M68K-EMIT-LSR-IMM masks the count with 7 --
+;;; MUL26HI's `lsr #26' is in fact `lsr #2', a latent bug in a now-unused
+;;; opcode, see docs/w32.md), so every W32 shift takes its count through MOVEQ
+;;; into D1 and shifts by register.  The multiplies call M68K-EMIT-MULU-64 in
+;;; its D1 -> D1:D0 shape, which on a 68000 is the BSR to the existing helper.
+(defun m68k-translate-w32 (buf op o0 o1 o2)
+  (let ((d0 +68k-d0+) (d1 +68k-d1+) (a0 +68k-a0+))
+    (flet ((done () (m68k-store-vreg buf o0 d0))
+           (two () (m68k-load-vreg buf d0 o1) (m68k-load-vreg buf d1 o2)))
+      (cond
+        ((= op +op-w32-li+) (m68k-emit-move-imm-dn buf o1 d0) (done))
+        ((= op +op-w32-load+)
+         (m68k-load-vreg-to-an buf a0 o1)
+         (m68k-emit-move-disp-dn buf a0 o2 d0) (done))
+        ((= op +op-w32-store+)
+         ;; (w32-store Vaddr Vs off), Vaddr a RAW address
+         (m68k-load-vreg-to-an buf a0 o0)
+         (m68k-load-vreg buf d0 o1)
+         (m68k-emit-move-dn-disp buf d0 a0 o2))
+        ((or (= op +op-w32-mul+) (= op +op-w32-mulhu+))
+         (two)
+         (m68k-emit-mulu-64 buf d1 d0 d1)              ; D1:D0 = D0 * D1
+         (when (= op +op-w32-mulhu+) (m68k-emit-move-dn-dn buf d1 d0))
+         (done))
+        ((or (= op +op-w32-shl+) (= op +op-w32-shr+) (= op +op-w32-sar+)
+             (= op +op-w32-rotl+))
+         (m68k-load-vreg buf d0 o1)
+         (unless (= o2 0)
+           (m68k-emit-moveq buf d1 o2)
+           (cond ((= op +op-w32-shl+) (m68k-emit-lsl-dn buf d1 d0))
+                 ((= op +op-w32-shr+) (m68k-emit-lsr-dn buf d1 d0))
+                 ((= op +op-w32-sar+) (m68k-emit-asr-dn buf d1 d0))
+                 (t                   (m68k-emit-rol-dn buf d1 d0))))
+         (done))
+        ((= op +op-w32-not+)      (m68k-load-vreg buf d0 o1) (m68k-emit-not-l buf d0) (done))
+        ((= op +op-w32-from-fix+) (m68k-load-vreg buf d0 o1) (m68k-emit-asr-imm buf d0 1) (done))
+        ((= op +op-w32-hi16+)
+         (m68k-load-vreg buf d0 o1)
+         (m68k-emit-swap buf d0)
+         (m68k-emit-andi buf d0 #xFFFF)
+         (m68k-emit-add-dn-dn buf d0 d0) (done))        ; tag
+        ((= op +op-w32-lo16+)
+         (m68k-load-vreg buf d0 o1)
+         (m68k-emit-andi buf d0 #xFFFF)
+         (m68k-emit-add-dn-dn buf d0 d0) (done))
+        ((= op +op-w32-join+)
+         ;; o1, o2 tagged fixnums 0..65535: (hi<<1)<<15 | (lo<<1)>>1
+         (m68k-load-vreg buf d0 o1)
+         (m68k-emit-moveq buf d1 15)
+         (m68k-emit-lsl-dn buf d1 d0)
+         (m68k-load-vreg buf d1 o2)
+         (m68k-emit-lsr-imm buf d1 1)
+         (m68k-emit-or-dn-dn buf d1 d0) (done))
+        ((or (= op +op-w32-ltu+) (= op +op-w32-lts+) (= op +op-w32-eq+))
+         (two)
+         (m68k-emit-cmp-dn-dn buf d1 d0)               ; CCR = D0 - D1
+         (m68k-emit-scc buf (cond ((= op +op-w32-ltu+) #x5)   ; CS
+                                  ((= op +op-w32-lts+) #xD)   ; LT
+                                  (t #x7))                    ; EQ
+                        d0)
+         (m68k-emit-andi buf d0 2)                      ; #xFF -> 2 = tagged 1
+         (done))
+        (t
+         (two)
+         (cond ((= op +op-w32-add+) (m68k-emit-add-dn-dn buf d1 d0))
+               ((= op +op-w32-sub+) (m68k-emit-sub-dn-dn buf d1 d0))
+               ((= op +op-w32-and+) (m68k-emit-and-dn-dn buf d1 d0))
+               ((= op +op-w32-or+)  (m68k-emit-or-dn-dn buf d1 d0))
+               (t                   (m68k-emit-eor-dn-dn buf d1 d0)))
+         (done))))))
+
 (defun translate-mvm-to-68k (bytecode function-table)
   (if *68k-relax-branches*
       (let ((plan nil))
@@ -4107,19 +5418,281 @@
               *68k-unimpl-opcodes* nil)
         (translate-mvm-to-68k-1 bytecode function-table))))
 
+(defun m68k-emit-routines (buf function-table)
+  "The shared routines after the functions -- the collector, the console, the
+   shared sequences, the handler helpers, the barrier, the native tier's
+   export table, the 68000's multiply / divide.  Before the boot tail when
+   there is one (*68K-BOOT-TAIL-POS*): they stay resident."
+  (declare (ignorable function-table))
+    (when *68k-gc-label*
+      (m68k-emit-gc-collector buf))
+    (when *68k-mac-console-label*
+      (m68k-emit-mac-console buf))
+    (when *68k-mac-service-label*
+      (m68k-emit-mac-service buf))
+    (when *68k-cons-label*
+      (m68k-emit-cons-helper buf))
+    (when *68k-hpush-shared-label*
+      (m68k-emit-handler-helpers buf))
+    ;; the handler stack's out-of-line half (the slow push, the extension,
+    ;; the loud overflow): every push reaches it, the shared one above and any
+    ;; translated after this point (cold bodies, the boot tail)
+    (when *68k-hpush-label*
+      (m68k-emit-hstack-stubs buf))
+    (when *68k-subtag-label*
+      (m68k-emit-subtag-helper buf))
+    (when *68k-car-label*
+      (m68k-emit-car-cdr-helpers buf))
+    (when *68k-barrier-label*
+      (m68k-emit-barrier-helper buf))
+    (when *68k-cold-fns*
+      (m68k-emit-thread-dispatch buf function-table))
+    ;; An all-native image with the runtime JIT has no dispatcher to put the
+    ;; native tier's export table after: it goes here, found by its magic.
+    (when (and *68k-jit-shapes* (not *68k-cold-fns*))
+      (m68k-emit-native-exports buf))
+    (when *68k-array-len-label*
+      (m68k-emit-array-len-helper buf))
+    (when *68k-alloc-obj-label*
+      (m68k-emit-alloc-obj-helper buf))
+    (when *68k-mul32-label*
+      (m68k-emit-68000-helpers buf)))
+
+(defun m68k-emit-cold-native-resident (buf function-table label-map)
+  "Cold native code, at the resident boundary: a stub for each cold function
+   (at its label), COLD-ENTER, the descriptor and the external relocations'
+   index (filled by scripts/mac68k-reloc-disk.py).  Fills *68K-COLD-NATIVE*."
+  (let ((offs nil) (i 0) (first-stub (mvm-make-label)))
+    (maphash (lambda (idx off) (declare (ignore idx))
+               (when (>= off *68k-cold-pc*) (pushnew off offs)))
+             function-table)
+    (setq offs (sort offs #'<))
+    (dolist (off offs)
+      (m68k-word-align buf)
+      (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-nop buf))
+      (let ((label (or (gethash off label-map) (error "68k cold: no label for ~D" off)))
+            (body (mvm-make-label)))
+        (when (zerop i) (m68k-emit-label buf first-stub))
+        (m68k-emit-label buf label)
+        (m68k-emit-word buf #x4EB9)                          ; JSR cold-enter.L
+        (m68k-emit-abs32 buf *68k-cold-enter2-label*)
+        (setf (gethash (m68k-buffer-word-count buf) *68k-cold-stub-homes*) t)
+        (m68k-emit-abs32 buf body)                           ; HOME
+        (let ((tw (m68k-buffer-word-count buf)))
+          (m68k-emit-word buf 0) (m68k-emit-word buf 0)      ; T (M68K-COLD-CLOSE)
+          (m68k-emit-word buf i)                             ; I
+          (setf (gethash off *68k-cold-native*) (list i tw body))))
+      (incf i))
+    (m68k-emit-cold-enter buf)
+    ;; the descriptor: "modusCLD", the disk BIAS (a body's disk byte is HOME -
+    ;; BIAS: the build's disk has the image at byte 1024; mac68k-core.py
+    ;; rewrites it for the disk it makes), the cold section, the count, the
+    ;; external relocations' index, the first stub (the I-th is 16 I on), and
+    ;; the resident functions' end (*68K-ROUTINES-LABEL*)
+    (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-nop buf))
+    (dolist (w '(#x6D6F #x6475 #x7343 #x4C44)) (m68k-emit-word buf w))
+    (m68k-emit-label buf *68k-cold-desc-label*)
+    (m68k-emit-long buf (- (third *68k-cold-area*) 1024))
+    (setf (gethash (m68k-buffer-word-count buf) *68k-cold-stub-homes*) t)
+    (m68k-emit-abs32 buf *68k-cold-start-label*)
+    (m68k-emit-long buf i)
+    (m68k-emit-abs32 buf *68k-cold-xindex-label*)
+    (m68k-emit-abs32 buf first-stub)
+    (m68k-emit-abs32 buf *68k-routines-label*)
+    (m68k-emit-label buf *68k-cold-xindex-label*)
+    (dotimes (k i) (m68k-emit-long buf 0))))
+
+(defun m68k-emit-cold-enter (buf)
+  "COLD-ENTER (see *68K-COLD-AREA*): (SP) = a stub + 6, every register the
+   caller's.  Reads the body into the code area under the cold floor, applies
+   its trailer, rewrites the stub to JMP to it, flushes the caches, and goes
+   there."
+  (destructuring-bind (alo ahi load) *68k-cold-area*
+    (declare (ignore load))
+    (let ((f1 (mvm-make-label)) (f2 (mvm-make-label)) (full (mvm-make-label))
+          (rfail (mvm-make-label)) (xfail (mvm-make-label)) (lp (mvm-make-label))
+          (test (mvm-make-label)) (noext (mvm-make-label)) (xg (mvm-make-label))
+          (xg7 (mvm-make-label)))
+      (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
+             (l32 (v) (m68k-emit-long buf v)))
+        (m68k-word-align buf)
+        (m68k-emit-label buf *68k-cold-enter2-label*)
+        (ws #x48E7 #xFFFA)                                   ; MOVEM.L D0-D7/A0-A4/A6,-(SP)
+        (ws #x226F #x0038)                                   ; A1 = the stub + 6
+        (ws #x2C11 #x2E29 #x0004)                            ; D6 = HOME, D7 = T
+        (ws #x2206 #x92B9) (m68k-emit-abs32 buf *68k-cold-desc-label*) ; D1 = HOME - BIAS
+        (ws #x2601 #x0283) (l32 511)                         ; D3 = skip
+        (ws #x9283 #x2443)                                   ; D1 = its block; A2 = skip
+        (ws #x2403 #xD487 #x0682) (l32 511)
+        (ws #x0282) (l32 #xFFFFFE00)                         ; D2 = bytes to read
+        ;; the floor: the cold floor, else the area's top
+        (ws #x2839) (l32 (conv-real +68k-cold-floor+)) (m68k-emit-bne buf f1)
+        (ws #x2839) (l32 (conv-real #x10006064)) (m68k-emit-bne buf f1)
+        (ws #x283C) (l32 ahi)
+        (m68k-emit-label buf f1)
+        ;; the limit: the JIT's top, else the area's bottom
+        (ws #x2A39) (l32 (conv-real +68k-jit-top+)) (m68k-emit-bne buf f2)
+        (ws #x2A39) (l32 (conv-real #x10006060)) (m68k-emit-bne buf f2)
+        (ws #x2A3C) (l32 alo)
+        (m68k-emit-label buf f2)
+        (ws #x2845)                                          ; A4 = the limit
+        (ws #x9882 #x0284) (l32 #xFFFFFFF0)                  ; D4 = (floor - D2) & -16
+        (ws #xB885) (m68k-emit-bcc-word buf +68k-cc-cs+ full) ; under the JIT's top
+        (ws #x23C4) (l32 (conv-real +68k-cold-floor+))       ; the new floor
+        (ws #x2604)                                          ; D3 = the buffer
+        (ws #x7001)                                          ; MOVEQ #1,D0: service 1
+        (m68k-emit-bsr buf *68k-mac-service-label*)
+        (ws #x4A82) (m68k-emit-bne buf rfail)
+        (ws #x2044 #xD1CA)                                   ; A0 = the body
+        ;; the trailer: count at T - 2, the offsets (/2) before it
+        (ws #x2007 #x7200 #x3230 #x08FE)                     ; D1 = count
+        (ws #x47F0 #x08FE #x97C1 #x97C1)                     ; A3 = the offsets
+        (ws #x2A08 #x9A86)                                   ; D5 = A0 - HOME
+        (m68k-emit-bra buf test)
+        (m68k-emit-label buf lp)
+        (ws #x7000 #x301B #xD080)                            ; D0 = offset
+        (ws #xDBB0 #x0800)                                   ; ADD.L D5,(A0,D0.L)
+        (m68k-emit-label buf test)
+        (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf lp :disp16) ; DBRA D1
+        ;; a relocated application: the body's EXTERNAL relocations, as the
+        ;; application's loader applies its own (scripts/mac68k-chain.s
+        ;; RELOCATE), from the list the index names (mac68k-reloc-disk.py):
+        ;; entry = blocks << 25 | disk byte; the list = n8 n16 n7, then the
+        ;; offsets (/2) of each kind
+        (ws #x2A39) (l32 (conv-real +68k-reloc-delta+))      ; D5 = DELTA
+        (ws #x2C39) (l32 (conv-real +68k-reloc-kmap+))       ; D6 = HEXTRA
+        (ws #x2005 #x8086) (m68k-emit-beq buf noext)
+        (ws #x7000 #x3029 #x0008 #xD080 #xD080)              ; D0 = I * 4
+        (ws #x47F9) (m68k-emit-abs32 buf *68k-cold-xindex-label*)
+        (ws #x2033 #x0800) (m68k-emit-beq buf xfail)         ; no list: the build is wrong
+        (ws #x2400 #xEF9A #x0282) (l32 #x7F)                 ; D2 = blocks
+        (ws #xE18A #xD482)                                   ;   * 512
+        (ws #x2200 #x0281) (l32 #x1FFFFFF)                   ; D1 = disk byte
+        (ws #x2001 #x0280) (l32 511) (ws #x2640 #x9280)      ; A3 = skip; D1 = its block
+        (ws #x2604 #x9682 #x0283) (l32 #xFFFFFFF0)           ; D3 = under the floor
+        (ws #x200C #xB680) (m68k-emit-bcc-word buf +68k-cc-cs+ full)
+        (ws #x7001)                                          ; MOVEQ #1,D0: service 1
+        (m68k-emit-bsr buf *68k-mac-service-label*)
+        (ws #x4A82) (m68k-emit-bne buf rfail)
+        (ws #xD7C3 #x49EB #x0006)                            ; A3 = the list; A4 = its offsets
+        ;; kind 7 (a kind-map bias, a 32-bit immediate): 7 DELTA / 8 + HEXTRA
+        ;; to the whole long -- DELTA is only 64 KB-aligned (mac68k-chain.s)
+        (ws #x2E05 #xE78F #x9E85 #xE687 #xDE86)              ; D7 = 7 D5 / 8 + D6
+        (ws #x4845)                                          ; DELTA >> 16
+        (ws #x3213 #x3405) (m68k-emit-bsr buf xg)            ; kind 8
+        (ws #x322B #x0002 #x3405 #xD442) (m68k-emit-bsr buf xg) ; kind 16
+        (ws #x322B #x0004) (m68k-emit-bsr buf xg7)           ; kind 7
+        (m68k-emit-label buf noext)
+        ;; the stub: JMP body; and the return address: the body
+        (ws #x337C #x4EF9 #xFFFA #x2348 #xFFFC)
+        (ws #x2F48 #x0038)
+        ;; written as data: flush (_HWPriv 1) where CPUFlag says there are caches
+        (ws #x0C38 #x0002 #x012F #x650C)
+        (ws #x48E7 #xE0C0 #x7001 #xA198 #x4CDF #x0307)
+        (ws #x4CDF #x5FFF #x4E75)                            ; MOVEM.L (SP)+; RTS: the body
+        ;; XG: add D2.W at the D1.W word offsets (/2) at A4 into the body at A0
+        (let ((xl (mvm-make-label)) (xt (mvm-make-label)))
+          (m68k-emit-label buf xg)
+          (m68k-emit-bra buf xt)
+          (m68k-emit-label buf xl)
+          (ws #x7000 #x301C #xD080 #xD570 #x0800)            ; ADD.W D2,(A0,D0.L)
+          (m68k-emit-label buf xt)
+          (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf xl :disp16)
+          (ws #x4E75))
+        ;; XG7: add D7.L at the D1.W word offsets (/2) at A4 into the body at A0
+        (let ((xl (mvm-make-label)) (xt (mvm-make-label)))
+          (m68k-emit-label buf xg7)
+          (m68k-emit-bra buf xt)
+          (m68k-emit-label buf xl)
+          (ws #x7000 #x301C #xD080 #xDFB0 #x0800)            ; ADD.L D7,(A0,D0.L)
+          (m68k-emit-label buf xt)
+          (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf xl :disp16)
+          (ws #x4E75))
+        (loop for (label text) in (list (list full "!COLD-FULL") (list rfail "!COLD-READ")
+                                        (list xfail "!COLD-RELOC"))
+              do (m68k-emit-label buf label)
+                 (loop for ch across text
+                       do (m68k-emit-moveq buf +68k-d0+ (char-code ch))
+                          (m68k-emit-bsr buf *68k-mac-console-label*))
+                 (m68k-emit-moveq buf +68k-d0+ 10)
+                 (m68k-emit-bsr buf *68k-mac-console-label*)
+                 (let ((spin (mvm-make-label)))
+                   (m68k-emit-label buf spin)
+                   (m68k-emit-bra buf spin)))))))
+
+(defun m68k-cold-close (buf start entry mark)
+  "End the cold body that started at native position START (its stub's
+   *68K-COLD-NATIVE* ENTRY; MARK the fixup list when it began): the trailer --
+   the offsets of its absolute references to itself, then their count -- and
+   the stub's T.  Returns (START . END)."
+  (let ((labels (m68k-buffer-labels buf)) (here (m68k-buffer-position buf)) (offs nil))
+    (loop for c on (m68k-buffer-fixups buf) until (eq c mark)
+          do (destructuring-bind (widx label type &rest r) (car c)
+               (declare (ignore r))
+               (when (eq type :abs32)
+                 (let ((tp (gethash label labels)))
+                   (when (and tp (>= tp start) (< tp here))
+                     (push (- widx (ash start -1)) offs))))))
+    (setq offs (sort offs #'<))
+    (when (and offs (>= (car (last offs)) 65536))
+      (error "68k cold: a body of ~D bytes is too big to be cold (keep it)" (- here start)))
+    (dolist (o offs) (m68k-emit-word buf o))
+    (m68k-emit-word buf (length offs))
+    (let* ((end (m68k-buffer-position buf)) (n (- end start)) (tw (second entry))
+           (words (m68k-buffer-words buf)))
+      (setf (aref words tw) (ldb (byte 16 16) n)
+            (aref words (1+ tw)) (ldb (byte 16 0) n))
+      (cons start end))))
+
 (defun translate-mvm-to-68k-1 (bytecode function-table)
   "Translate MVM bytecode to Motorola 68000 native code.
    BYTECODE is a (vector (unsigned-byte 8)).
    FUNCTION-TABLE maps function indices to bytecode offsets.
    Returns a byte vector of 68k big-endian machine code."
-  (let* ((*68k-gc-label* (and *68k-linux-mode* (mvm-make-label)))
-         (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-subtag-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-car-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-barrier-label* (and *68k-gc-static* *68k-linux-mode* (mvm-make-label)))
-         (*68k-cdr-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-array-len-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-alloc-obj-label* (and *68k-shared-sequences* (mvm-make-label)))
+  (setf *68k-abs-patches* nil)
+  (setf *68k-paged-layout* nil *68k-paged-table-refs* nil)
+  (setf *68k-boot-tail-pos* nil *68k-boot-tail* nil *68k-cold-bodies* nil)
+  (let* ((*68k-native-p* t)
+         (*68k-cold-pc* (and *68k-cold-area* *68k-mac-mode* function-table
+                             (boundp '*cold-pc*) *cold-pc*))
+         (*68k-cold-native* (and *68k-cold-pc* (make-hash-table)))
+         (*68k-cold-enter2-label* (and *68k-cold-pc* (mvm-make-label)))
+         (*68k-cold-desc-label* (and *68k-cold-pc* (mvm-make-label)))
+         (*68k-cold-start-label* (and *68k-cold-pc* (mvm-make-label)))
+         (*68k-cold-xindex-label* (and *68k-cold-pc* (mvm-make-label)))
+         (*68k-cold-stub-homes* (make-hash-table))
+         (*68k-long-absolute* (or (and (boundp '*boot-tail-pc*) *boot-tail-pc* t)
+                                  (and *68k-cold-pc* t)))
+         (cold-open nil)                ; (START ENTRY MARK) of the body being emitted
+         (cold-bodies nil)
+         (*68k-paged-fns* nil)
+         (*68k-cold-enter-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-reload-label* (and *68k-paged* *68k-mac-mode* (mvm-make-label)))
+         (*68k-stream-table-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-stream-section-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-stream-home-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-stream-end-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-mul32-label* (and *68k-cpu-68000* (mvm-make-label)))
+         (*68k-mulu64-label* (and *68k-cpu-68000* (mvm-make-label)))
+         (*68k-divs32-label* (and *68k-cpu-68000* (mvm-make-label)))
+         (*68k-gc-label* (and (m68k-hosted-layout-p) (mvm-make-label)))
+         (*68k-mac-console-label* (and *68k-mac-mode* (mvm-make-label)))
+         (*68k-mac-getc-label* (and *68k-mac-mode* (mvm-make-label)))
+         (*68k-mac-service-label* (and *68k-mac-mode* (mvm-make-label)))
+         (*68k-cons-label* (and (m68k-shared-p :cons) (mvm-make-label)))
+         (*68k-subtag-label* (and (m68k-shared-p :subtag) (mvm-make-label)))
+         (*68k-car-label* (and (m68k-shared-p :car) (mvm-make-label)))
+         (*68k-barrier-label* (and *68k-gc-static* (m68k-hosted-layout-p) (mvm-make-label)))
+         (*68k-barrier-a0-label* (and *68k-barrier-label* (mvm-make-label)))
+         (*68k-hpush-shared-label* (and *68k-call-islands* (mvm-make-label)))
+         (*68k-hpush-label* (mvm-make-label))   ; the overflow stub (M68K-EMIT-HSTACK-STUBS)
+         (*68k-hext-addr-label* (and *68k-linux-mode* (mvm-make-label)))
+         (*68k-hstack-used* nil)
+         (*68k-hpop-label* (and *68k-call-islands* (mvm-make-label)))
+         (*68k-longjmp-label* (and *68k-call-islands* (mvm-make-label)))
+         (*68k-cdr-label* (and (m68k-shared-p :car) (mvm-make-label)))
+         (*68k-array-len-label* (and (m68k-shared-p :array-len) (mvm-make-label)))
+         (*68k-alloc-obj-label* (and (m68k-shared-p :alloc-obj) (mvm-make-label)))
          (*68k-bytecode* bytecode)
          (buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))
@@ -4140,7 +5713,12 @@
                             (list (make-hash-table :test 'equal) (make-hash-table :test 'equal)
                                   (vector 0 0 0) (make-hash-table :test 'equal))))
          (li-stats (make-hash-table :test 'equal))
-         (li-imms (make-hash-table :test 'eql)))
+         (li-imms (make-hash-table :test 'eql))
+         (call-counts (make-hash-table :test 'eql))
+         (island-targets nil) (island-pc 0)   ; none before the first 24 KB
+         (boot-tail-pc (and (boundp '*boot-tail-pc*) *boot-tail-pc*))
+         (tail-done nil)
+         (*68k-island-map* nil))
 
     ;; First pass: scan for branch targets
     (loop while (< pc len)
@@ -4148,6 +5726,8 @@
                     (opcode (car decoded))
                     (operands (cadr decoded))
                     (new-pc (cddr decoded)))
+               (when (and *68k-call-islands* (eql opcode +op-call+))
+                 (incf (gethash (first operands) call-counts 0)))
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
                    (let ((op-types (opcode-info-operands info)))
@@ -4204,10 +5784,42 @@
                  (setf (gethash mvm-offset fn-entries) t))
                function-table))
 
+    ;; CALL ISLANDS (*68K-CALL-ISLANDS*): the routines, and the eight Lisp
+    ;; functions CALLed most often in the bytecode
+    (when *68k-call-islands*
+      (let ((top nil))
+        (maphash (lambda (off n) (push (cons off n) top)) call-counts)
+        (setq top (subseq (sort top #'> :key #'cdr) 0 (min 8 (length top))))
+        (setq island-targets
+              (append (list *68k-barrier-a0-label* *68k-barrier-label* *68k-cons-label*
+                            *68k-alloc-obj-label* *68k-gc-label* *68k-array-len-label*
+                            *68k-subtag-label*)
+                      (loop for (off . nil) in top
+                            for l = (gethash off label-map) when l collect l)))))
+
     ;; Second pass: translate
     (setf pc 0)
     (loop while (< pc len)
           do (progn
+               (when (and (not tail-done)
+                          (or (and boot-tail-pc (eql pc boot-tail-pc))
+                              (and *68k-cold-pc* (eql pc *68k-cold-pc*))))
+                 ;; the boot tail: the shared routines first (resident), then
+                 ;; no more islands -- everything after here moves.  And the
+                 ;; cold functions' stubs and their loader, resident too.
+                 (setq *68k-routines-label* (mvm-make-label))
+                 (m68k-emit-label buf *68k-routines-label*)
+                 (m68k-emit-routines buf function-table)
+                 (when *68k-cold-pc*
+                   (m68k-emit-cold-native-resident buf function-table label-map))
+                 (m68k-word-align buf)
+                 (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-nop buf))
+                 (setq tail-done t island-targets nil *68k-island-map* nil
+                       *68k-boot-tail-pos* (m68k-buffer-position buf)))
+               (when (and island-targets (gethash pc fn-entries)
+                          (> (- pc island-pc) 24000))
+                 (m68k-emit-island buf island-targets)
+                 (setq island-pc pc))
                ;; FUNCTION ENTRIES ARE 16-ALIGNED.  +op-fn-addr+ ORs the function
                ;; tag 3 into an entry address, and everything that classifies a
                ;; value reads the low FOUR bits: an entry at 4/8/12 mod 16 tags
@@ -4217,16 +5829,27 @@
                ;; allocation marks moved it and FUNCALL took an ILLEGAL.  ARM32,
                ;; x64, i386 and RISC-V align to 16 for the same reason.  Pad with
                ;; NOP -- harmless, a function never falls through (RTS/branch).
+               (when (and cold-open *68k-cold-native* (gethash pc *68k-cold-native*))
+                 (push (apply #'m68k-cold-close buf cold-open) cold-bodies)
+                 (setq cold-open nil))
                (when (and function-table (gethash pc fn-entries))
                  (m68k-word-align buf)
                  (loop while (/= 0 (mod (m68k-buffer-position buf) 16))
                        do (m68k-emit-nop buf))
                  (when *68k-branch-distances*
                    (push (m68k-buffer-position buf) *68k-fn-entry-positions*)))
-               ;; Emit label at current PC before translating
-               (let ((label (gethash pc label-map)))
-                 (when label
-                   (m68k-emit-label buf label)))
+               ;; Emit label at current PC before translating -- a cold
+               ;; function's is at its stub: here its body starts
+               (let ((label (gethash pc label-map))
+                     (cold (and *68k-cold-native* (gethash pc *68k-cold-native*))))
+                 (cond (cold
+                        (when (eql pc *68k-cold-pc*)
+                          (m68k-emit-label buf *68k-cold-start-label*))
+                        (m68k-emit-label buf (third cold))
+                        (setq cold-open (list (m68k-buffer-position buf) cold
+                                              (m68k-buffer-fixups buf))))
+                       (label
+                        (m68k-emit-label buf label))))
                (when (and *68k-profile* function-table
                           (or (gethash pc fn-entries) (gethash pc loop-heads)))
                  (when (gethash pc fn-entries) (incf prof-index))
@@ -4292,27 +5915,45 @@
           (format t ";;   LI imms:~{ ~X:~D~}~%"
                   (loop for (k . n) in (subseq ir 0 (min 24 (length ir))) append (list k n))))))
 
-    (when *68k-gc-label*
-      (m68k-emit-gc-collector buf))
-    (when *68k-cons-label*
-      (m68k-emit-cons-helper buf))
-    (when *68k-subtag-label*
-      (m68k-emit-subtag-helper buf))
-    (when *68k-car-label*
-      (m68k-emit-car-cdr-helpers buf))
-    (when *68k-barrier-label*
-      (m68k-emit-barrier-helper buf))
-    (when *68k-cold-fns*
-      (m68k-emit-thread-dispatch buf function-table))
-    (when *68k-array-len-label*
-      (m68k-emit-array-len-helper buf))
-    (when *68k-alloc-obj-label*
-      (m68k-emit-alloc-obj-helper buf))
+    (when cold-open
+      (push (apply #'m68k-cold-close buf cold-open) cold-bodies)
+      (setq cold-open nil))
+    (setq *68k-cold-bodies* (and cold-bodies (coerce (reverse cold-bodies) 'vector)))
+    (when cold-bodies
+      (format t "~&;; 68k cold native code: ~D bodies, ~D bytes from #x~X~%"
+              (length cold-bodies) (- (cdr (first cold-bodies)) (car (car (last cold-bodies))))
+              (car (car (last cold-bodies)))))
+    (unless tail-done (m68k-emit-routines buf function-table))
+    (setq *68k-boot-tail* (and tail-done *68k-boot-tail-pos*
+                               (list *68k-boot-tail-pos* (m68k-buffer-position buf))))
+    ;; paged: the stream section LAST, so it is the native code's tail
+    (when (and *68k-paged* *68k-paged-fns*)
+      (m68k-emit-paged-section buf))
 
     ;; Resolve labels
     (m68k-fixup-labels buf)
     (when *68k-cold-fns*
       (m68k-resolve-stream-fixups buf))
+    (when (and *68k-paged* *68k-paged-fns*)
+      (m68k-paged-finish buf))
+    ;; where the shared native regions start, for a profile (MODUS_68K_REGIONS=FILE:
+    ;; name and native offset a line; the functions come before all of them)
+    (let ((f (sb-ext:posix-getenv "MODUS_68K_REGIONS")))
+      (when (and f (plusp (length f)))
+        (with-open-file (o f :direction :output :if-exists :supersede)
+          (loop for (name label) in
+                (list (list "gc-collector" *68k-gc-label*) (list "mac-console" *68k-mac-console-label*)
+                      (list "cons-helper" *68k-cons-label*) (list "subtag-helper" *68k-subtag-label*)
+                      (list "car-cdr-helpers" *68k-car-label*) (list "barrier" *68k-barrier-label*)
+                      (list "thread-dispatch" *68k-thread-next-label*)
+                      (list "array-len-helper" *68k-array-len-label*)
+                      (list "alloc-obj-helper" *68k-alloc-obj-label*)
+                      (list "68000-mul-div" *68k-mul32-label*)
+                      (list "paged-loader" *68k-cold-enter-label*)
+                      (list "stream-table" *68k-stream-table-label*)
+                      (list "stream-section" *68k-stream-section-label*))
+                for pos = (and label (gethash label (m68k-buffer-labels buf)))
+                when pos do (format o "~A ~D~%" name pos)))))
     (m68k-unimplemented-report)
 
     ;; Report where each function actually LANDED — see the same change in
@@ -4499,6 +6140,34 @@
       ;; index 255 is the escape, so shapes skip it
       (loop for (k . n) in rows for j from 0
             do (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) n k)))
+      ;; the runtime JIT's own shapes, after every counted one
+      (when *68k-jit-shapes*
+        (let ((j (length rows)))
+          (flet ((add (k)
+                   (unless (gethash k shapes)
+                     (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) 0 k))
+                     (incf j))))
+            ;; the census (mvm/68k-jit-repl-shapes.txt): what runtime code asks
+            ;; for.  The table indexes each key the image has, or an equivalent
+            ;; it has; a key with neither gets a handler of its own
+            (let ((n (hash-table-count shapes)) (idx (make-hash-table :test 'equal)))
+              (loop for r from 0 to 16 do (add (list :li-cell r)) (setf (gethash (list :li-cell r) idx) t))
+              (dolist (k (m68k-jit-census))
+                (let ((have (if (gethash k shapes) k
+                                (find-if (lambda (e) (gethash e shapes)) (m68k-jit-equivalents k)))))
+                  (unless have (add k) (setq have k))
+                  (setf (gethash have idx) t)
+                  ;; a LOAD / STORE the census saw (hosted) may be spelled here
+                  ;; with the convention-region bit (+WIDTH-CONV-BIT+, 8): the
+                  ;; Mac's compiler sets it.  Indexed when this image has it,
+                  ;; never added (a build without the bit cannot emit it)
+                  (when (and (member (first k) '(112 113)) (= (length k) 4)
+                             (integerp (fourth k)) (< (fourth k) 8))
+                    (let ((v (list (first k) (second k) (third k) (+ (fourth k) 8))))
+                      (when (gethash v shapes) (setf (gethash v idx) t))))))
+              (setq *68k-jit-indexed* idx)
+              (format t "~&;; 68k JIT: ~D shapes for runtime code, ~D indexed~%"
+                      (- (hash-table-count shapes) n) (hash-table-count idx))))))
       (setq *68k-cold-fns* cold *68k-thread-shapes* shapes)
       ;; MODUS_68K_THREAD_STATS: stream bytes, and the commonest adjacent
       ;; token pairs (superinstruction candidates), by bytes they would save.
@@ -4527,17 +6196,26 @@
       (format t "~&;; 68k threaded: ~D of ~D functions cold, ~D shapes~%"
               (hash-table-count cold) (length starts) (hash-table-count shapes)))))
 
-(defun m68k-emit-stream-param (buf param w)
+(defun m68k-emit-stream-param (buf param w &optional br-label)
+  "BR-LABEL: a :BR's target label in place of its pc's (a chunk's trampoline)."
   (destructuring-bind (kind a &optional b) param
     (ecase kind
       (:i (let ((v (logand b #xFFFFFFFF)))
             (loop for i from (1- a) downto 0 do (m68k-emit-byte buf (ldb (byte 8 (* 8 i)) v)))))
       (:lic (push (cons (- (m68k-buffer-position buf) 2) a) *68k-li-const-patches*)
        (dotimes (i 4) (m68k-emit-byte buf 0)))
-      ((:br :rel)
+      (:rel
+       (let ((pos (m68k-buffer-position buf))
+             (label (or (gethash a *68k-label-map*)
+                        (error "68k threaded: no label for pc ~D" a))))
+         ;; paged: the target entry's ABSOLUTE address (patched after layout)
+         (push (list pos label 4 (if (and *68k-paged* (not *68k-paged-control*)) :abs (+ pos 4)))
+               *68k-stream-fixups*)
+         (dotimes (i 4) (m68k-emit-byte buf 0))))
+      (:br
        (let* ((size (if (eq kind :rel) 4 w))
               (pos (m68k-buffer-position buf))
-              (label (or (gethash a *68k-label-map*)
+              (label (or br-label (gethash a *68k-label-map*)
                          (error "68k threaded: no label for pc ~D" a))))
          (push (list pos label size (+ pos size)) *68k-stream-fixups*)
          (dotimes (i size) (m68k-emit-byte buf 0)))))))
@@ -4546,6 +6224,18 @@
   "Emit cold function START (already aligned, its label placed): the stub,
    then its tokens.  Returns the pc after it."
   (destructuring-bind (end . w) (gethash start *68k-cold-fns*)
+    (when *68k-paged*
+      (let ((i (length *68k-paged-fns*)))
+        (dolist (c (m68k-chunk-plan start end w))
+          (let ((j (length *68k-paged-fns*)))
+            (when (> j 32767) (error "68k paged: more than 32767 streams"))
+            (push (list j start (mvm-make-label) (car c) (cdr c)) *68k-paged-fns*)))
+        (m68k-emit-word buf #x224D)                  ; MOVEA.L A5,A1 (caller's A5)
+        (m68k-emit-word buf #x303C)                  ; MOVE.W #i,D0
+        (m68k-emit-word buf i)
+        (m68k-emit-bra buf *68k-cold-enter-label*)
+        (m68k-word-align buf)
+        (return-from m68k-emit-cold-function end)))
     (let ((stream (mvm-make-label)))
       (m68k-emit-word buf #x224D)                    ; MOVEA.L A5,A1 (caller's A5)
       (m68k-emit-word buf #x4BFA)                    ; LEA (d16,PC),A5
@@ -4569,12 +6259,717 @@
       (m68k-word-align buf)
       end)))
 
+(defun m68k-emit-stream-body (buf start end w)
+  "The tokens of cold function START..END (branch width W), with its labels."
+  (m68k-thread-walk start end w
+                    (lambda (pc k params npc)
+                      (declare (ignore npc))
+                      (unless (= pc start)
+                        (let ((l (gethash pc *68k-label-map*)))
+                          (when l (m68k-emit-label buf l))))
+                      (let ((i (svref (gethash k *68k-thread-shapes*) 0)))
+                        (if (< i 255)
+                            (m68k-emit-byte buf i)
+                            (progn (m68k-emit-byte buf 255)
+                                   (m68k-emit-byte buf (ash i -8))
+                                   (m68k-emit-byte buf (logand i #xFF)))))
+                      (dolist (p params) (m68k-emit-stream-param buf p w)))))
+
+;;; CHUNKED STREAMS.  A cold function's tokens are one stream, and the cache
+;;; must hold a whole stream to run any of it: the bytecode interpreter's is
+;;; 176 KB, so the cache could not be smaller than that and the interpreter
+;;; thrashed every other stream out.  A stream over the chunk size
+;;; (MODUS_68K_CHUNK_KB, default 4; Mac paged only) is cut at token boundaries into
+;;; several, each its own index, loaded and evicted alone.  A branch to a
+;;; label in another chunk goes to a TRAMPOLINE at the end of its own chunk,
+;;; and each chunk but the last ends in one to the next (its fall-through):
+;;; an XJUMP, which is the RELOAD token followed, at the next 4-byte boundary,
+;;; by the target's stream index and offset -- a reload record's layout, so
+;;; the RELOAD handler runs it unchanged.  Roots into a chunk are roots into
+;;; its stream; nothing else knows a function was cut.
+(defparameter *68k-chunk-bytes*
+  (let ((v (sb-ext:posix-getenv "MODUS_68K_CHUNK_KB")))
+    (if (and v (string/= v "")) (* 1024 (parse-integer v)) (* 4 1024)))
+  "Paged Mac: a cold function's stream is cut into chunks of about this many
+   bytes (0: never).")
+
+(defun m68k-token-bytes (k params w)
+  (+ (if (< (svref (gethash k *68k-thread-shapes*) 0) 255) 1 3)
+     (loop for p in params sum (ecase (first p) (:i (second p)) (:lic 4) (:rel 4) (:br w)))))
+
+(defun m68k-chunk-plan (start end w)
+  "The chunks of cold function START..END: a list of (CS . CE) pc ranges,
+   one (START . END) when it is not cut."
+  (if (or (null *68k-reload-label*) (<= *68k-chunk-bytes* 0))
+      (list (cons start end))
+      (let ((cuts nil) (acc 0) (limit (- *68k-chunk-bytes* 256)))
+        (m68k-thread-walk start end w
+                          (lambda (pc k params npc)
+                            (declare (ignore npc))
+                            (let ((n (m68k-token-bytes k params w)))
+                              (when (and (> acc 0) (> (+ acc n) limit))
+                                (push pc cuts) (setq acc 0))
+                              (incf acc n))))
+        (let ((bounds (append (list start) (reverse cuts) (list end))))
+          (loop for (a b) on bounds while b collect (cons a b))))))
+
+(defun m68k-emit-xjump (buf idx target-label chunk-label token)
+  "An XJUMP to TARGET-LABEL in stream IDX, which starts at CHUNK-LABEL."
+  (m68k-emit-byte buf 255)
+  (m68k-emit-byte buf (ash token -8))
+  (m68k-emit-byte buf (logand token #xFF))
+  (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-byte buf 0))
+  (m68k-emit-long buf idx)
+  (push (list (m68k-buffer-position buf) target-label 4 (list :from chunk-label))
+        *68k-stream-fixups*)
+  (m68k-emit-long buf 0))
+
+(defun m68k-emit-chunk-body (buf start end w cs ce label siblings)
+  "The tokens of cold function START..END whose pcs are in [CS, CE), a chunk
+   at LABEL; SIBLINGS are all the function's chunks' *68K-PAGED-FNS* entries."
+  (declare (ignore label))
+  (let ((tramps nil) (token (m68k-reload-token-index)))
+    (flet ((home (pc)                    ; the entry of the chunk holding PC
+             (or (find-if (lambda (f) (and (<= (fourth f) pc) (< pc (fifth f)))) siblings)
+                 (error "68k chunks: pc ~D is in no chunk of ~D" pc start))))
+      (m68k-thread-walk start end w
+                        (lambda (pc k params npc)
+                          (declare (ignore npc))
+                          (when (and (<= cs pc) (< pc ce))
+                            (unless (= pc start)
+                              (let ((l (gethash pc *68k-label-map*)))
+                                (when l (m68k-emit-label buf l))))
+                            (let ((i (svref (gethash k *68k-thread-shapes*) 0)))
+                              (if (< i 255)
+                                  (m68k-emit-byte buf i)
+                                  (progn (m68k-emit-byte buf 255)
+                                         (m68k-emit-byte buf (ash i -8))
+                                         (m68k-emit-byte buf (logand i #xFF)))))
+                            (dolist (p params)
+                              (let ((tgt (second p)))
+                                (if (and (eq (first p) :br) (not (and (<= cs tgt) (< tgt ce))))
+                                    (let ((tl (or (cdr (assoc tgt tramps))
+                                                  (let ((l (mvm-make-label)))
+                                                    (push (cons tgt l) tramps) l))))
+                                      (when (= tgt start)
+                                        (error "68k chunks: a branch to ~D's entry" start))
+                                      (m68k-emit-stream-param buf p w tl))
+                                    (m68k-emit-stream-param buf p w)))))))
+      ;; the fall-through, then the trampolines
+      (when (< ce end)
+        (let ((n (home ce)))
+          (m68k-emit-xjump buf (first n) (third n) (third n) token)))
+      (dolist (tr (reverse tramps))
+        (let ((n (home (car tr))))
+          (m68k-emit-label buf (cdr tr))
+          (m68k-emit-xjump buf (first n)
+                           (or (gethash (car tr) *68k-label-map*)
+                               (error "68k chunks: no label for pc ~D" (car tr)))
+                           (third n) token))))))
+
+(defun m68k-emit-paged-section (buf)
+  "Paged: COLD-ENTER, the Mac's loader, the stream table and the home table,
+   the descriptor the disk builder finds, then every stream (the section)."
+  (let ((miss (mvm-make-label)) (ill (mvm-make-label)) (diskbias (mvm-make-label))
+        (alloc (mvm-make-label)) (ca5 (mvm-make-label)) (chk (mvm-make-label))
+        (ill-drive (mvm-make-label)) (ill-read (mvm-make-label)) (ill-full (mvm-make-label))
+        (cacheptr (mvm-make-label)) (lastidx (mvm-make-label)) (pb (mvm-make-label))
+        (force (mvm-make-label)) (recs (mvm-make-label)) (recs-end (mvm-make-label))
+        (roff (mvm-make-label))
+        (fns (reverse *68k-paged-fns*))
+        (mac (and *68k-mac-mode* *68k-paged-cache*)))
+    (m68k-word-align buf)
+    (m68k-emit-label buf *68k-cold-enter-label*)
+    (m68k-emit-word buf #x48C0)                               ; EXT.L D0 (i < 32768)
+    (m68k-emit-word buf #xD080) (m68k-emit-word buf #xD080)   ; D0 *= 4
+    (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a5+)
+    (m68k-emit-word buf #x0835) (m68k-emit-word buf 0) (m68k-emit-word buf #x0803) ; BTST #0,(3,A5,D0.L)
+    (m68k-emit-bne buf miss)                                  ; not loaded
+    (m68k-emit-word buf #x2A75) (m68k-emit-word buf #x0800)   ; MOVEA.L (0,A5,D0.L),A5
+    (m68k-emit-bra buf *68k-thread-next-label*)
+    (m68k-emit-label buf miss)
+    (when mac
+      (destructuring-bind (lo hi staging staging-size load-addr) *68k-paged-cache*
+        (declare (ignore lo hi load-addr staging staging-size))
+        (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
+               (l32 (v) (m68k-emit-long buf v)))
+          (ws #x48E7 #x7FFA)                                   ; MOVEM.L D1-D7/A0-A4/A6,-(SP)
+          (m68k-emit-lea-label buf ca5 +68k-a0+) (ws #x2089)   ; CA5 = A1: the caller's A5
+          (ws #x2E00)                                          ; D7 = i*4
+          (m68k-emit-lea-label buf lastidx +68k-a0+) (ws #x2080)   ; lastidx = D0
+          (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a0+)
+          (ws #x2A30 #x7800)                                   ; D5 = home[i]
+          (ws #x2C30 #x7804)                                   ; D6 = home[i+1]
+          (ws #x9C85)                                          ; D6 = length
+          (ws #x2805)                                          ; D4 = home
+          (m68k-emit-lea-label buf diskbias +68k-a0+)
+          (ws #x9890)                                          ; SUB.L (A0),D4: disk byte
+          (ws #x2604 #x0283) (l32 511)                         ; D3 = skip (D4 mod 512)
+          (ws #x9883)                                          ; D4 = first block's byte
+          (ws #x2403 #xD486 #x0682) (l32 511)
+          (ws #x0282) (l32 #xFFFFFE00)                         ; D2 = bytes to read
+          ;; the blocks go straight into the code cache, at the place the FIFO
+          ;; allocator finds for D2 bytes (A4); the stream is then slid down
+          ;; over the lead-in (D3 bytes)
+          (m68k-emit-bsr buf alloc)
+          (ws #x4A80) (m68k-emit-bne buf ill-full)             ; TST.L D0: no room at all
+          ;; the boot drive's drive-queue element (BootDrive $210, DrvQHdr $30A)
+          (let ((dq (mvm-make-label)) (found (mvm-make-label)) (zl (mvm-make-label))
+                (drive (mvm-make-label)) (have (mvm-make-label)))
+            (m68k-emit-lea-label buf pb +68k-a0+)
+            (ws #x7013)                                        ; MOVEQ #19,D0
+            (m68k-emit-label buf zl)
+            (ws #x4298)                                        ; CLR.L (A0)+
+            (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
+            (m68k-emit-lea-label buf pb +68k-a0+)
+            ;; launched from Mac OS (scripts/mac68k-chain.py): the disk is a
+            ;; file, its reference number in the static block
+            (ws #x2039) (l32 (conv-real +68k-mac-file-refnum+))  ; MOVE.L slot,D0
+            (m68k-emit-beq buf drive)
+            (ws #x3140 #x0018)                                 ; ioRefNum = the file's
+            (m68k-emit-bra buf have)
+            ;; else the boot drive's drive-queue element (BootDrive $210, DrvQHdr $30A)
+            (m68k-emit-label buf drive)
+            (ws #x3238 #x0210 #x2678 #x030A)
+            (m68k-emit-label buf dq)
+            (ws #x200B) (m68k-emit-beq buf ill-drive)
+            (ws #xB26B #x0006) (m68k-emit-beq buf found)
+            (ws #x2653) (m68k-emit-bra buf dq)
+            (m68k-emit-label buf found)
+            (ws #x316B #x0006 #x0016)                          ; ioVRefNum = dQDrive
+            (ws #x316B #x0008 #x0018)                          ; ioRefNum = dQRefNum
+            (m68k-emit-label buf have)
+            (ws #x214C #x0020)                                 ; ioBuffer = A4
+            (ws #x2142 #x0024)                                 ; ioReqCount = D2
+            (ws #x317C #x0001 #x002C)                          ; ioPosMode = fsFromStart
+            (ws #x2144 #x002E)                                 ; ioPosOffset = D4
+            (ws #xA002)                                        ; _Read
+            (ws #x4A40) (m68k-emit-bne buf ill-read))
+          ;; slide the stream down to A4: A2 = A4 + skip, D6 bytes, upward (dest < src),
+          ;; a LONGWORD at a time -- streams are 4-aligned and so are their lengths
+          ;; and the skip (a home address mod 512); a byte at a time was ~40 cycles
+          ;; a byte, measured as 15% of a DEFMACRO on a 1 MB Mac Plus
+          (ws #x244C #xD5C3 #x264C #x2006)                     ; A2, A3, D0 = length
+          (ws #x5680 #xE488)                                   ; ADDQ.L #3,D0; LSR.L #2,D0
+          (ws #x5340 #x6B06)                                   ; SUBQ.W #1,D0; BMI.S done
+          (ws #x26DA #x51C8 #xFFFC)                            ; MOVE.L (A2)+,(A3)+; DBRA D0
+          ;; the stream is code written as data: a 68020 or later must not run
+          ;; it from a stale instruction cache, and a 68040's copyback data
+          ;; cache may not have written it to memory yet.  _HWPriv 1
+          ;; (FlushInstructionCache; on a 68040 it pushes the data cache too),
+          ;; when CPUFlag ($12F) says the CPU has caches -- a 68000 ROM has no
+          ;; _HWPriv.  Registers the trap may use are kept.
+          (ws #x0C38 #x0002 #x012F #x650C)                     ; CMPI.B #2,$12F; BCS.S +12
+          (ws #x48E7 #xE0C0 #x7001 #xA198 #x4CDF #x0307)       ; MOVEM; MOVEQ #1,D0; _HWPriv; MOVEM
+          ;; the owner map: the stream's granules are now index + 1
+          (ws #x200C #x90B9) (l32 (conv-real +68k-cache-map+))   ; D0 = A4 - map base
+          (ws #xEC88 #xD080)                                   ; first granule's word
+          (ws #x220C #xD286 #x92B9) (l32 (conv-real +68k-cache-map+)) ; D1 = end - map base
+          (ws #x0681) (l32 63) (ws #xEC89 #xD281)              ; past the last granule's word
+          (ws #x2407 #xE48A #x5282)                            ; D2 = i + 1
+          (ws #x2079) (l32 (conv-real +68k-cache-map+))        ; A0 = the map
+          (let ((ml (mvm-make-label)) (md (mvm-make-label)))
+            (m68k-emit-label buf ml)
+            (ws #xB280) (m68k-emit-bcc-word buf +68k-cc-ls+ md)
+            (ws #x3182 #x0800 #x5480)                          ; MOVE.W D2,(0,A0,D0.L); next
+            (m68k-emit-bra buf ml)
+            (m68k-emit-label buf md))
+          ;; the allocator's next place: A4 + length, up to the granule
+          (ws #x2006 #x0680) (l32 63) (ws #x0280) (l32 #xFFFFFFC0) (ws #xD08C)
+          (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
+          (ws #x2080)
+          (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a0+)
+          (ws #x218C #x7800)                                   ; table[i] = A4
+          ;; MODUS_68K_PAGED_CHECK=1: every root into the cache must be inside a
+          ;; loaded stream, or an active one was evicted (!LDR-LOST)
+          (when (equal (sb-ext:posix-getenv "MODUS_68K_PAGED_CHECK") "1")
+            (m68k-emit-bsr buf chk))
+          (ws #x4CDF #x5FFE)                                   ; MOVEM.L (SP)+,D1-D7/A0-A4/A6
+          (m68k-emit-lea-label buf lastidx +68k-a5+) (ws #x2015)
+          (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a5+)
+          (ws #x2A75 #x0800)                                   ; A5 = the stream
+          ;; + the RELOAD offset (0 for a call), which is then cleared; and A1
+          ;; again from CA5: FORCE may have rewritten the caller's A5 to a record
+          (ws #xDBF9) (m68k-emit-abs32 buf roff)               ; ADDA.L roff,A5
+          (ws #x42B9) (m68k-emit-abs32 buf roff)               ; CLR.L roff
+          (m68k-emit-lea-label buf ca5 +68k-a1+) (ws #x2251)   ; MOVEA.L (A1),A1
+          (m68k-emit-bra buf *68k-thread-next-label*)
+          ;; a stream that cannot be had: say which way on serial port A, stop
+          (loop for (label text) in (list (list ill-drive "!LDR-DRIVE") (list ill-read "!LDR-READ")
+                                          (list ill-full "!LDR-FULL"))
+                do (m68k-emit-label buf label)
+                   (loop for ch across text
+                         do (m68k-emit-moveq buf +68k-d0+ (char-code ch))
+                            (m68k-emit-bsr buf *68k-mac-console-label*))
+                   (m68k-emit-moveq buf +68k-d0+ 10)
+                   (m68k-emit-bsr buf *68k-mac-console-label*)
+                   (let ((spin (mvm-make-label)))
+                     (m68k-emit-label buf spin)
+                     (m68k-emit-bra buf spin)))
+          (m68k-emit-paged-alloc buf alloc (length fns) ca5 force)
+          (m68k-emit-paged-force buf force ca5 recs recs-end)
+          ;; THE RELOAD TOKEN: A5 = a reload record + the token's 3 bytes.  The
+          ;; record's stream is entered as COLD-ENTER enters one, at the
+          ;; record's offset (ROFF, added where A5 is set), with no caller
+          (m68k-word-align buf)
+          (m68k-emit-label buf *68k-reload-label*)
+          (ws #x200D #x5680 #x0280 #xFFFF #xFFFC #x2A40)       ; A5 = the record + 4
+          (ws #x201D)                                          ; D0 = i
+          (ws #x23D5) (m68k-emit-abs32 buf roff)               ; roff = the offset
+          (ws #x93C9 #xD080 #xD080)                            ; A1 = 0; D0 = i * 4
+          (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a5+)
+          (ws #x0835 #x0000 #x0803)                            ; BTST #0,(3,A5,D0.L)
+          (m68k-emit-bne buf miss)                             ; not loaded: the loader
+          (ws #x2A75 #x0800)                                   ; A5 = the stream
+          (ws #xDBF9) (m68k-emit-abs32 buf roff)               ; + the offset
+          (ws #x42B9) (m68k-emit-abs32 buf roff)
+          (m68k-emit-bra buf *68k-thread-next-label*)
+          (when (equal (sb-ext:posix-getenv "MODUS_68K_PAGED_CHECK") "1")
+            (m68k-emit-paged-check buf chk (length fns) ca5)))))
+    (m68k-emit-label buf ill)
+    (m68k-emit-word buf #x4AFC)                               ; ILLEGAL: not loadable
+    ;; data: the entry being loaded, a parameter block
+    (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-word buf #x4E71))
+    (m68k-emit-label buf cacheptr)
+    (m68k-emit-long buf 0)                                    ; (unused: low-block word now)
+    (m68k-emit-label buf lastidx)
+    (m68k-emit-long buf 0)
+    (m68k-emit-label buf ca5)
+    (m68k-emit-long buf 0)
+    (m68k-emit-label buf roff)                                ; RELOAD's offset (0 between)
+    (m68k-emit-long buf 0)
+    (m68k-emit-label buf pb)
+    (dotimes (i 40) (m68k-emit-word buf 0))
+    ;; the reload records, 16-aligned in memory (FORCE)
+    (when mac
+      ;; (the native buffer starts on a 16-byte boundary in memory: cross.lisp)
+      (loop while (/= 0 (mod (m68k-buffer-position buf) 16))
+            do (m68k-emit-word buf 0))
+      (m68k-emit-label buf recs)
+      (dotimes (i (* 8 +68k-reload-records+)) (m68k-emit-word buf 0))
+      (m68k-emit-label buf recs-end))
+    ;; the descriptor: "modusPGD", the table's address, the count, the
+    ;; section, and the DISK BIAS: home address - bias = the stream's byte on
+    ;; the boot disk (load address - 1024 when the image follows the boot
+    ;; blocks; scripts/mac68k-disk.py rewrites it when the streams go elsewhere)
+    (dolist (w '(#x6D6F #x6475 #x7350 #x4744)) (m68k-emit-word buf w))
+    (m68k-emit-abs32-data buf *68k-stream-table-label*)
+    (m68k-emit-long buf (length fns))
+    (m68k-emit-abs32-data buf *68k-stream-section-label*)
+    (m68k-emit-label buf diskbias)
+    (m68k-emit-long buf (if *68k-paged-cache* (- (fifth *68k-paged-cache*) 1024) 0))
+    ;; the stream table (live: the stream's address; bit 0 = not loaded) and
+    ;; the home table (where each stream is in the image; one more: the end)
+    (m68k-emit-label buf *68k-stream-table-label*)
+    (dolist (f fns) (m68k-emit-abs32-data buf (third f)))
+    (m68k-emit-label buf *68k-stream-home-label*)
+    (dolist (f fns) (m68k-emit-abs32-data buf (third f)))
+    (m68k-emit-abs32-data buf *68k-stream-end-label*)
+    ;; the section
+    (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-word buf #x4E71))
+    (m68k-emit-label buf *68k-stream-section-label*)
+    (let ((chunks (make-hash-table)))      ; function start -> its streams
+      (dolist (f fns) (push f (gethash (second f) chunks)))
+      (dolist (f fns)
+        (destructuring-bind (i start label cs ce) f
+          (declare (ignore i))
+          (destructuring-bind (end . w) (gethash start *68k-cold-fns*)
+            ;; 4-aligned: an XJUMP's operands are found by rounding A5 up to 4
+            (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-word buf #x4E71))
+            (m68k-emit-label buf label)
+            (if (and (= cs start) (= ce end))
+                (m68k-emit-stream-body buf start end w)
+                (m68k-emit-chunk-body buf start end w cs ce label (gethash start chunks)))
+            (m68k-word-align buf)))))
+    (m68k-emit-label buf *68k-stream-end-label*)))
+
+;;; EVICTING ACTIVE STREAMS.  The allocator above never evicts a stream an
+;;; exact root points into, so a call chain whose streams outgrow the cache
+;;; stopped the Mac (!LDR-FULL: a form with three DO-EXTERNAL-SYMBOLS, measured).
+;;; When no place without one exists, FORCE takes the place at the allocation
+;;; pointer anyway, and every root into a stream it overlaps is REWRITTEN to
+;;; point at a RELOAD RECORD -- the roots are exact (the caller's A5, -4 of every
+;;; frame on the A6 chain, the jmpbuf's and every handler frame's A5), so each
+;;; is a location FORCE can store into.  A record is 16 bytes in a resident
+;;; area: the RELOAD token, the stream's index, the root's offset in it, and a
+;;; mark.  Returning to it runs the token: the stream is loaded wherever it fits
+;;; (perhaps evicting others the same way) and the thread continues at the same
+;;; offset.  Records are recycled by marking: before rewriting, every record a
+;;; root still points at is marked, the rest are free.
+(defconstant +68k-reload-records+ 256)
+
+(defun m68k-reload-token-index ()
+  "The RELOAD token's index: one past every shape (M68K-EMIT-THREAD-DISPATCH),
+   so >= 256 and reached through the escape (255, high byte, low byte)."
+  (+ 1 (reduce #'max (let (l) (maphash (lambda (k v) (declare (ignore k)) (push v l))
+                                        *68k-thread-shapes*) l)
+               :key (lambda (v) (svref v 0)) :initial-value 255)))
+
+(defparameter +68k-force-code+
+  #(
+    #x48E7 #x7EF0 #x2C09 #x41F9 #x7EAD #x0009 #x303C #x00FF #x42A8 #x000C #x41E8
+    #x0010 #x51C8 #xFFF6 #x2879 #x7EAD #x0001 #x2E02 #x0687 #x0000 #x003F #x0287
+    #xFFFF #xFFC0 #xDE8C #xBEB9 #x7EAD #x0003 #x6300 #x0022 #x2879 #x7EAD #x0002
+    #x2E02 #x0687 #x0000 #x003F #x0287 #xFFFF #xFFC0 #xDE8C #xBEB9 #x7EAD #x0003
+    #x6200 #x001C #x7800 #x7A00 #x6100 #x001C #x7A01 #x6100 #x0016 #x4A84 #x6600
+    #x0008 #x7000 #x6000 #x0004 #x7001 #x4CDF #x0F7E #x4E75 #x41F9 #x7EAD #x000B
+    #x6100 #x005E #x2246 #x2479 #x7EAD #x0005 #xB3CA #x6400 #x0018 #x41E9 #xFFFC
+    #x6100 #x0048 #x2009 #x2251 #xB3C0 #x6300 #x0006 #x6000 #xFFE6 #x41F9 #x7EAD
+    #x0006 #x6100 #x0030 #x2239 #x7EAD #x0007 #x0C81 #x0000 #x002E #x6300 #x0004
+    #x722E #x41F9 #x7EAD #x0008 #x4A81 #x6700 #x0010 #x6100 #x000E #x41E8 #x0020
+    #x5381 #x6000 #xFFEE #x4E75 #x48E7 #xF2E0 #x2010 #x4A85 #x6600 #x0028 #x0C80
+    #x7EAD #x0009 #x6500 #x00C6 #x0C80 #x7EAD #x000A #x6400 #x00BC #x0280 #xFFFF
+    #xFFF0 #x2240 #x7201 #x2341 #x000C #x6000 #x00AA #xB0B9 #x7EAD #x0002 #x6500
+    #x00A0 #xB0B9 #x7EAD #x0003 #x6400 #x0096 #x2600 #x96B9 #x7EAD #x0004 #xEC8B
+    #xD683 #x3636 #x3800 #x0283 #x0000 #xFFFF #x6700 #x007C #x5383 #xD683 #xD683
+    #x2233 #x3800 #x0801 #x0000 #x6600 #x006A #xB280 #x6200 #x0064 #x2435 #x3804
+    #x94B5 #x3800 #xD481 #xB480 #x6300 #x0054 #xB287 #x6400 #x004E #x0682 #x0000
+    #x003F #x0282 #xFFFF #xFFC0 #xB48C #x6300 #x003C #x43F9 #x7EAD #x0009 #x3C3C
+    #x00FF #x4AA9 #x000C #x6700 #x0010 #x43E9 #x0010 #x51CE #xFFF2 #x7801 #x6000
+    #x001C #x7C01 #x2346 #x000C #x22BC #x7EAD #x000C #xE48B #x2343 #x0004 #x9081
+    #x2340 #x0008 #x2089 #x4CDF #x074F #x4E75)
+  "FORCE, the code cache's forced eviction (see above), assembled from
+   /tmp-free GNU syntax (m68k-linux-gnu-as -m68000); its absolute operands are
+   the placeholder longs #x7EAD00nn, replaced by M68K-EMIT-PAGED-FORCE:
+     1 the allocation pointer's cell   2 the cache's start cell   3 its end cell
+     4 the owner map's cell            5 the stack base's cell    6 the jmpbuf's A5
+     7 the handler depth's cell        8 the first handler frame's A5
+     9 the records    10 their end     11 the caller's-A5 cell   12 the token word
+   In: D2 bytes wanted, A3 the stream table, A5 the home table, A6 the owner
+   map, A1 the caller's A6.  Out: A4 the place, D7 its end, D0 = 0, or D0 = 1
+   (nothing fits, or no free record).  Keeps D1-D6, A0-A3.
+
+   force:  movem.l d1-d6/a0-a3,-(sp) ; d6 = a1
+           unmark every record (+12)
+           a4 = the allocation pointer; d7 = a4 + d2 up to 64; past the end:
+             a4 = the cache's start, again; past the end: fail
+           d4 = 0; d5 = 0: WALK (mark); d5 = 1: WALK (rewrite); d4 set: fail
+   walk:   VISIT the caller's-A5 cell; -4(a1) along the A6 chain from d6 up to
+           the stack base (ascending); the jmpbuf's A5; each handler frame's A5
+           (+28, 32 bytes apart, the depth clamped to 46)
+   visit:  d0 = (a0).  Mode 0: a pointer into the records marks its record.
+           Mode 1: a pointer into the cache, into stream i (the owner map;
+           loaded, start <= d0 < end), whose extent up to 64 overlaps
+           [a4, d7): a free record gets the token word, i, d0 - start, the
+           mark, and (a0) = the record; none free: d4 = 1.")
+
+(defun m68k-emit-paged-force (buf force ca5 recs recs-end)
+  "Emit +68K-FORCE-CODE+ at FORCE, its placeholders filled."
+  (unless (= *68k-hstack-max-depth* 46)
+    (error "68k paged: FORCE clamps the handler depth to 46, not ~D" *68k-hstack-max-depth*))
+  (let* ((hb (m68k-hbase))
+         (r (m68k-reload-token-index))
+         (tokw (logior (ash 255 24) (ash (ldb (byte 8 8) r) 16) (ash (ldb (byte 8 0) r) 8)))
+         (code +68k-force-code+) (i 0) (n (length code)))
+    (m68k-word-align buf)
+    (m68k-emit-label buf force)
+    (loop while (< i n)
+          do (let ((w (aref code i)))
+               (if (and (= w #x7EAD) (< (1+ i) n) (<= 1 (aref code (1+ i)) 12))
+                   (let ((k (aref code (1+ i))))
+                     (case k
+                       (9 (m68k-emit-abs32 buf recs))
+                       (10 (m68k-emit-abs32 buf recs-end))
+                       (11 (m68k-emit-abs32 buf ca5))
+                       (t (m68k-emit-long buf
+                                          (ecase k
+                                            (1 (conv-real +68k-cache-ptr+))
+                                            (2 (conv-real +68k-cache-lo+))
+                                            (3 (conv-real +68k-cache-hi+))
+                                            (4 (conv-real +68k-cache-map+))
+                                            (5 (conv-real #x10000058))
+                                            (6 (+ hb #x180 28))
+                                            (7 (+ hb #x400))
+                                            (8 (+ hb #x408 28))
+                                            (12 tokw)))))
+                     (incf i 2))
+                   (progn (m68k-emit-word buf w) (incf i)))))))
+
+(defun m68k-emit-paged-alloc (buf alloc count ca5 &optional force)
+  "The code cache's FIFO allocator, at ALLOC: D2 = bytes wanted (preserved).
+   Returns A4 = a 64-byte-aligned place and D0 = 0, or D0 = 1 when none
+   exists.  Preserves D2-D7 and A1-A3, A5, A6.
+
+   A place is taken at the allocation pointer, wrapping to the cache's start.
+   It must hold no ACTIVE stream: one an exact root points into (the caller's
+   A5 -- CA5, which the loader keeps -- -4 of every frame on the A6 chain, the
+   jmpbuf's and every stacked handler frame's A5 at +28; every function of a
+   paged image is threaded, so those slots are token pointers).  A root's
+   stream is found through the OWNER MAP in one step, not by searching the
+   stream table (measured on a Mac Classic: the searches were 70-80% of a
+   form's time); it is active when it OVERLAPS the place.  An active stream is
+   skipped; every stream that owns a granule of the place is then marked NOT
+   LOADED (home | 1) and its granules cleared."
+  (let* ((ipno-d1 (mvm-make-label)) (done-l (mvm-make-label)) (top (mvm-make-label)) (wrapped (mvm-make-label)) (roots (mvm-make-label))
+        (chain (mvm-make-label)) (cdone (mvm-make-label)) (frames (mvm-make-label))
+        (fdone (mvm-make-label)) (evict (mvm-make-label)) (enext (mvm-make-label))
+        (ekeep (mvm-make-label)) (eclr (mvm-make-label)) (ok (mvm-make-label))
+        (fail (mvm-make-label)) (inplace (mvm-make-label)) (ipno (mvm-make-label))
+        (moved (mvm-make-label)) (hb (m68k-hbase)) (gs +68k-cache-granule-shift+)
+        (forcing (and force (mvm-make-label))))
+    (declare (ignore count))
+    (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
+           (l32 (v) (m68k-emit-long buf v)))
+      (m68k-emit-label buf alloc)
+      (ws #x48E7 #x3F76)                         ; MOVEM.L D2-D7/A1-A3/A5/A6,-(SP)
+      (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a3+)
+      (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a5+)
+      (ws #x2C79) (l32 (conv-real +68k-cache-map+))            ; A6 = the owner map
+      (ws #x7C00)                                ; D6 = 0: wraps
+      (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
+      (ws #x2850)                                ; A4 = the allocation pointer
+      ;; ---- try [A4, D7 = A4 + D2 rounded up to the granule) ----
+      (m68k-emit-label buf top)
+      (ws #x2E02 #x0687) (l32 63) (ws #x0287) (l32 #xFFFFFFC0)  ; D7 = D2 up to 64
+      (ws #xDE8C)                                ; D7 += A4
+      (ws #xBEB9) (l32 (conv-real +68k-cache-hi+))               ; CMP.L hi,D7
+      (m68k-emit-bcc-word buf +68k-cc-ls+ roots)
+      (m68k-emit-label buf wrapped)
+      (ws #x5286 #x0C86) (l32 2)                 ; ++wraps > 2: nothing fits
+      (m68k-emit-bcc-word buf +68k-cc-gt+ (or forcing fail))
+      (ws #x2879) (l32 (conv-real +68k-cache-lo+)) ; A4 = the streams' start
+      (m68k-emit-bra buf top)
+      ;; ---- the roots ----
+      (m68k-emit-label buf roots)
+      (m68k-emit-lea-label buf ca5 +68k-a0+)
+      (ws #x2010) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)   ; the caller's A5
+      ;; the A6 chain starts at the caller's A6, which MOVEM saved last:
+      ;; D2-D7 A1-A3 A5 A6 = eleven longwords, A6 at 40(SP)
+      (ws #x206F #x0028)                         ; MOVEA.L 40(SP),A0
+      (ws #x2479) (l32 (conv-real #x10000058))   ; A2 = the stack base
+      (m68k-emit-label buf chain)
+      (ws #xB1CA) (m68k-emit-bcc-word buf +68k-cc-cc+ cdone)
+      (ws #x2028 #xFFFC) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)
+      (ws #x2248 #x2050)                         ; A1 = A0; A0 = (A0)
+      (ws #xB1C9) (m68k-emit-bcc-word buf +68k-cc-ls+ cdone)
+      (m68k-emit-bra buf chain)
+      (m68k-emit-label buf cdone)
+      (m68k-emit-move-imm-an buf (+ hb #x180) +68k-a0+)
+      (ws #x2028 #x001C) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)
+      (ws #x2239) (l32 (+ hb #x400))             ; D1 = depth
+      (ws #x0C81) (l32 *68k-hstack-max-depth*)
+      (m68k-emit-bcc-word buf +68k-cc-ls+ frames)
+      (ws #x7200 #xD2BC) (l32 *68k-hstack-max-depth*)
+      (m68k-emit-label buf frames)
+      (m68k-emit-move-imm-an buf (+ hb #x408) +68k-a0+)
+      (let ((fl (mvm-make-label)))
+        (m68k-emit-label buf fl)
+        (ws #x4A81) (m68k-emit-beq buf fdone)
+        (ws #x2028 #x001C) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)
+        (ws #x41E8 #x0020 #x5381)
+        (m68k-emit-bra buf fl))
+      (m68k-emit-label buf fdone)
+      (m68k-emit-bra buf evict)
+      (m68k-emit-label buf moved)
+      (m68k-emit-bra buf top)
+      ;; ---- INPLACE: D0 a root's value.  Its stream, from the owner map, when it
+      ;; is loaded, holds D0, and overlaps [A4, D7): A4 = its end rounded up to
+      ;; the granule, Z clear.  Else Z set.  Uses D3, D4; keeps D1, A0-A2 ----
+      (m68k-emit-label buf inplace)
+      (ws #xB0B9) (l32 (conv-real +68k-cache-lo+)) (m68k-emit-bcc-word buf +68k-cc-cs+ ipno)
+      (ws #xB0B9) (l32 (conv-real +68k-cache-hi+)) (m68k-emit-bcc-word buf +68k-cc-cc+ ipno)
+      (ws #x2600 #x96B9) (l32 (conv-real +68k-cache-map+))       ; D3 = D0 - map base
+      (ws #xEC8B)                                ; LSR.L #6,D3: the granule
+      (ws #xD683)                                ; D3 *= 2: its word
+      (ws #x3636 #x3800)                         ; MOVE.W (0,A6,D3.L),D3: owner + 1
+      (ws #x0283) (l32 #xFFFF)
+      (m68k-emit-beq buf ipno)                   ; nobody
+      (ws #x5383 #xE58B)                         ; D3 = index * 4
+      (ws #x2833 #x3800)                         ; D4 = table[i]
+      (ws #x0804 #x0000) (m68k-emit-bne buf ipno)                     ; not loaded
+      (ws #xB880) (m68k-emit-bcc-word buf +68k-cc-hi+ ipno)           ; starts after D0
+      (ws #x2F01)                                ; keep D1
+      (ws #x2235 #x3804 #x92B5 #x3800 #xD284)    ; D1 = home[i+1] - home[i] + start: the end
+      (ws #xB280) (m68k-emit-bcc-word buf +68k-cc-ls+ ipno-d1)
+      (ws #x0681) (l32 63) (ws #x0281) (l32 #xFFFFFFC0)               ; end up to 64
+      (ws #xB28C) (m68k-emit-bcc-word buf +68k-cc-ls+ ipno-d1)        ; ends by A4
+      (ws #xB887) (m68k-emit-bcc-word buf +68k-cc-cc+ ipno-d1)        ; starts at/after D7
+      (ws #x2841 #x221F)                         ; A4 = its end; D1 back
+      (ws #x7601 #x4E75)                         ; Z clear; RTS
+      (m68k-emit-label buf ipno-d1)
+      (ws #x221F)                                ; D1 back
+      (m68k-emit-label buf ipno)
+      (ws #x7600 #x4E75)                         ; Z set; RTS
+      ;; ---- the place holds no active stream: evict the owners of its granules ----
+      (m68k-emit-label buf evict)
+      (ws #x200C #x90B9) (l32 (conv-real +68k-cache-map+))       ; D0 = A4 - map base
+      (ws #xEC88 #xD080)                         ; its first granule's word offset
+      (ws #x2207 #x92B9) (l32 (conv-real +68k-cache-map+))       ; D1 = D7 - map base
+      (ws #xEC89 #xD281)                         ; the place's end, as a word offset
+      (m68k-emit-label buf enext)
+      (ws #xB280) (m68k-emit-bcc-word buf +68k-cc-ls+ ok)        ; done
+      (ws #x3636 #x0800)                         ; D3 = owner + 1 (MOVE.W (0,A6,D0.L))
+      (ws #x0283) (l32 #xFFFF)
+      (m68k-emit-beq buf eclr)
+      (ws #x5383 #xE58B)                         ; i * 4
+      (ws #x2833 #x3800)                         ; D4 = table[i]
+      (ws #x0804 #x0000) (m68k-emit-bne buf eclr)                ; not loaded: stale
+      ;; does stream i hold THIS granule?  start <= its address < end
+      (ws #x2F00)                                ; keep D0
+      (ws #xEB88)                                ; LSL.L #5: word offset -> byte offset
+      (ws #xD0B9) (l32 (conv-real +68k-cache-map+))              ; + map base: the granule
+      (ws #xB880) (m68k-emit-bcc-word buf +68k-cc-hi+ ekeep)     ; starts after it
+      (ws #x2275 #x3804 #x93F5 #x3800 #xD3C4)    ; A1 = home[i+1] - home[i] + start: its end
+      (ws #xB3C0) (m68k-emit-bcc-word buf +68k-cc-ls+ ekeep)     ; CMPA.L D0,A1: ends by it
+      (ws #x2835 #x3800 #x08C4 #x0000 #x2784 #x3800)   ; table[i] = home[i] | 1
+      (m68k-emit-label buf ekeep)
+      (ws #x201F)                                ; D0 back
+      (m68k-emit-label buf eclr)
+      (ws #x4276 #x0800)                         ; CLR.W (0,A6,D0.L)
+      (ws #x5480)                                ; next granule's word
+      (m68k-emit-bra buf enext)
+      ;; ---- no place without an active stream: FORCE one (see above) ----
+      (when forcing
+        (m68k-emit-label buf forcing)
+        (ws #x226F #x0028)                       ; MOVEA.L 40(SP),A1: the caller's A6
+        (m68k-emit-bsr buf force)                ; FORCE: A4, D7 = the place
+        (ws #x4A80) (m68k-emit-bne buf fail)     ; TST.L D0
+        (m68k-emit-bra buf evict))
+      (m68k-emit-label buf fail)
+      (ws #x7001)                                ; D0 = 1
+      (m68k-emit-bra buf done-l)
+      (m68k-emit-label buf ok)
+      (ws #x7000)                                ; D0 = 0
+      (m68k-emit-label buf done-l)
+      (ws #x4CDF #x6EFC)                         ; MOVEM.L (SP)+,D2-D7/A1-A3/A5/A6
+      (ws #x4E75))))
+
+(defun m68k-emit-paged-check (buf chk count ca5)
+  "MODUS_68K_PAGED_CHECK: at CHK, walk the allocator's roots; one pointing into
+   the cache but into no loaded stream prints !LDR-LOST, the root's kind (C
+   caller, F frame chain, J jmpbuf, H handler frame), its value and the root's
+   address, and stops.  Uses D0-D7, A0-A5."
+  (let ((one (mvm-make-label)) (scan (mvm-make-label)) (found (mvm-make-label))
+        (lost (mvm-make-label)) (hex (mvm-make-label)) (hb (m68k-hbase)))
+    (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
+           (l32 (v) (m68k-emit-long buf v))
+           (putc () (m68k-emit-bsr buf *68k-mac-console-label*)))
+      (m68k-emit-label buf chk)
+      (m68k-emit-lea-label buf ca5 +68k-a0+)
+      (ws #x7C43) (ws #x2010) (m68k-emit-bsr buf one)            ; 'C'
+      (ws #x7C46 #x204E)                                         ; 'F', A0 = A6
+      (ws #x2479) (l32 (conv-real #x10000058))
+      (let ((cl (mvm-make-label)) (cd (mvm-make-label)))
+        (m68k-emit-label buf cl)
+        (ws #xB1CA) (m68k-emit-bcc-word buf +68k-cc-cc+ cd)
+        (ws #x2028 #xFFFC) (m68k-emit-bsr buf one)
+        (ws #x2248 #x2050 #xB1C9) (m68k-emit-bcc-word buf +68k-cc-ls+ cd)
+        (m68k-emit-bra buf cl)
+        (m68k-emit-label buf cd))
+      (ws #x7C4A) (m68k-emit-move-imm-an buf (+ hb #x180) +68k-a0+)   ; 'J'
+      (ws #x2028 #x001C) (m68k-emit-bsr buf one)
+      (ws #x7C48 #x2239) (l32 (+ hb #x400))                      ; 'H', D1 = depth
+      (m68k-emit-move-imm-an buf (+ hb #x408) +68k-a0+)
+      (let ((fl (mvm-make-label)) (fd (mvm-make-label)))
+        (m68k-emit-label buf fl)
+        (ws #x4A81) (m68k-emit-beq buf fd)
+        (ws #x0C81) (l32 *68k-hstack-max-depth*) (m68k-emit-bcc-word buf +68k-cc-hi+ fd)
+        (ws #x2028 #x001C) (m68k-emit-bsr buf one)
+        (ws #x41E8 #x0020 #x5381)
+        (m68k-emit-bra buf fl)
+        (m68k-emit-label buf fd))
+      (ws #x4E75)
+      ;; ONE: D0 = a root's value, A0 = where (A0-4 for the chain), D6 = kind
+      (m68k-emit-label buf one)
+      (ws #xB0B9) (l32 (conv-real +68k-cache-lo+)) (m68k-emit-bcc-word buf +68k-cc-cs+ found)
+      (ws #xB0B9) (l32 (conv-real +68k-cache-hi+)) (m68k-emit-bcc-word buf +68k-cc-cc+ found)
+      (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a3+)
+      (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a5+)
+      (m68k-emit-move-imm-dn buf (1- count) +68k-d5+)
+      (m68k-emit-label buf scan)
+      (let ((skip (mvm-make-label)))
+        (ws #x2613 #x0803 #x0000) (m68k-emit-bne buf skip)
+        (ws #xB680) (m68k-emit-bcc-word buf +68k-cc-hi+ skip)
+        (ws #x282D #x0004 #x9895 #xD883)
+        (ws #xB880) (m68k-emit-bcc-word buf +68k-cc-ls+ skip)
+        (m68k-emit-bra buf found)
+        (m68k-emit-label buf skip)
+        (ws #x588B #x588D)
+        (ws #x51CD) (m68k-emit-word buf 0) (m68k-emit-fixup buf scan :disp16))
+      (m68k-emit-label buf lost)
+      (ws #x2E00 #x2A08)                         ; D7 = value, D5 = where
+      (loop for ch across "!LDR-LOST " do (m68k-emit-moveq buf +68k-d0+ (char-code ch)) (putc))
+      (ws #x2006) (putc)                         ; the kind
+      (m68k-emit-moveq buf +68k-d0+ 32) (putc)
+      (ws #x2607) (m68k-emit-bsr buf hex)        ; the value
+      (m68k-emit-moveq buf +68k-d0+ 32) (putc)
+      (ws #x2605) (m68k-emit-bsr buf hex)        ; where
+      (m68k-emit-moveq buf +68k-d0+ 10) (putc)
+      (let ((spin (mvm-make-label))) (m68k-emit-label buf spin) (m68k-emit-bra buf spin))
+      (m68k-emit-label buf found)
+      (ws #x4E75)
+      ;; HEX: D3 as eight digits.  Uses D0, D4.
+      (m68k-emit-label buf hex)
+      (ws #x7807)                                ; D4 = 7
+      (let ((hl (mvm-make-label)) (digit (mvm-make-label)))
+        (m68k-emit-label buf hl)
+        (ws #xE99B)                              ; ROL.L #4,D3
+        (ws #x7000 #x1003 #x0200 #x000F)         ; D0 = D3 & 15 (byte)
+        (ws #x0C00 #x0009) (m68k-emit-bcc-word buf +68k-cc-ls+ digit)
+        (ws #x5E00)                              ; + 7 ('A' - '9' - 1)
+        (m68k-emit-label buf digit)
+        (ws #x0600 #x0030) (putc)                ; + '0'
+        (ws #x51CC) (m68k-emit-word buf 0) (m68k-emit-fixup buf hl :disp16))
+      (ws #x4E75))))
+
+(defun m68k-emit-abs32-data (buf label)
+  "A longword holding LABEL's absolute address (patched after layout)."
+  (m68k-emit-word buf 0) (m68k-emit-word buf 0)
+  (push (cons (- (m68k-buffer-position buf) 4) label) *68k-paged-table-refs*))
+
+(defvar *68k-paged-table-refs* nil
+  "Paged: (TABLE-SLOT-POS . STREAM-LABEL), resolved into *68K-ABS-PATCHES*.")
+
+(defun m68k-paged-finish (buf)
+  "Paged, after every fixup: the table's patches, the layout, and the
+   MODUS_68K_PAGED_SHIFT test move."
+  (let* ((labels (m68k-buffer-labels buf))
+         (sec (gethash *68k-stream-section-label* labels))
+         (table (gethash *68k-stream-table-label* labels))
+         (shift (let ((v (sb-ext:posix-getenv "MODUS_68K_PAGED_SHIFT")))
+                  (if (and v (string/= v "")) (logand (parse-integer v) (lognot 15)) 0))))
+    (dolist (r *68k-paged-table-refs*)
+      (push (cons (car r) (gethash (cdr r) labels)) *68k-abs-patches*))
+    (unless (zerop shift)
+      ;; MOVE the section SHIFT bytes on: words in, positions after it moved,
+      ;; and ONLY the patches pointing into it follow
+      (let* ((w (m68k-buffer-words buf)) (n (m68k-buffer-word-count buf))
+             (k (ash sec -1)) (dw (ash shift -1))
+             (new (make-array (+ n dw 16) :initial-element 0)))
+        (replace new w :end2 k)
+        (fill new #x4E71 :start k :end (+ k dw))
+        (replace new w :start1 (+ k dw) :start2 k :end2 n)
+        (setf (m68k-buffer-words buf) new
+              (m68k-buffer-word-count buf) (+ n dw))
+        (incf (m68k-buffer-position buf) shift)
+        (flet ((mv (x) (if (>= x sec) (+ x shift) x)))
+          (setf *68k-abs-patches*
+                (mapcar (lambda (p) (cons (mv (car p)) (mv (cdr p)))) *68k-abs-patches*)
+                *68k-li-const-patches*
+                (mapcar (lambda (p) (cons (mv (car p)) (cdr p))) *68k-li-const-patches*))
+          (maphash (lambda (k v) (setf (gethash k labels) (mv v))) labels))
+        (format t "~&;; 68k paged: stream section MOVED ~D bytes (the position test)~%" shift)
+        (incf sec shift)))
+    (setf *68k-paged-layout*
+          (list :table table :section sec :end (m68k-buffer-position buf)
+                :count (length *68k-paged-fns*)))
+    (format t "~&;; 68k paged: ~D cold functions, stream table at ~D, section ~D..~D (~D bytes)~%"
+            (length *68k-paged-fns*) table sec (m68k-buffer-position buf)
+            (- (m68k-buffer-position buf) sec))))
+
 (defun m68k-resolve-stream-fixups (buf)
   (dolist (f *68k-stream-fixups*)
     (destructuring-bind (pos label size base) f
       (let* ((target (or (gethash label (m68k-buffer-labels buf))
                          (error "68k threaded: undefined label ~D" label)))
-             (v (- target base)))
+             (v (cond ((eq base :abs) 0)
+                      ;; (:from L): TARGET's offset from label L (a chunk's start)
+                      ((consp base)
+                       (- target (or (gethash (second base) (m68k-buffer-labels buf))
+                                     (error "68k threaded: undefined label ~D" (second base)))))
+                      (t (- target base)))))
+        (when (eq base :abs)
+          (push (cons pos target) *68k-abs-patches*))
         (when (and (= size 2) (not (<= -32768 v 32767)))
           (error "68k threaded: branch of ~D bytes in a 16-bit stream operand" v))
         (dotimes (i size)
@@ -4584,6 +6979,21 @@
 
 (defun m68k-emit-fetch (buf size dn)
   "Dn = the next SIZE-byte signed stream operand, sign-extended; A5 advances."
+  (when *68k-cpu-68000*
+    ;; byte at a time: a stream operand may be at an odd address
+    (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))       ; MOVE.B (A5)+,Dn
+    (ecase size
+      (1 (m68k-emit-word buf (logior #x4880 dn)))                            ; EXT.W Dn
+      (2 (m68k-emit-word buf (logior #xE148 dn))                             ; LSL.W #8,Dn
+         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5)))
+      (4 (m68k-emit-word buf (logior #xE148 dn))
+         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))
+         (m68k-emit-word buf (logior #x4840 dn))                             ; SWAP Dn
+         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))
+         (m68k-emit-word buf (logior #xE148 dn))
+         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))))
+    (unless (= size 4) (m68k-emit-word buf (logior #x48C0 dn)))              ; EXT.L Dn
+    (return-from m68k-emit-fetch nil))
   (ecase size
     (1 (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))   ; MOVE.B (A5)+,Dn
        (m68k-emit-word buf (logior #x49C0 dn)))                               ; EXTB.L Dn
@@ -4594,12 +7004,37 @@
 (defun m68k-emit-fetch-target (buf)
   "A0 = the address a 32-bit relative stream operand names (target - its end)."
   (m68k-emit-fetch buf 4 +68k-d0+)
+  (when (and *68k-paged* (not *68k-paged-control*))
+    (m68k-emit-word buf #x2040)                   ; MOVEA.L D0,A0: an absolute address
+    (return-from m68k-emit-fetch-target nil))
   (m68k-emit-word buf #x41F5)                     ; LEA (0,A5,D0.L),A0
   (m68k-emit-word buf #x0800))
 
 (defun m68k-emit-stream-branch (buf cc w)
   "Take the stream branch whose offset follows when CC holds (CC NIL: always).
    MOVEA and ADDA leave the condition codes alone."
+  (when *68k-cpu-68000*
+    ;; a byte-wise read sets the condition codes, so test first: B!cc.S over
+    ;; the taken arm to ADDQ #W,A5; the taken arm builds the offset on the stack
+    (let ((taken (if (= w 2)
+                     (list (m68k-encode-move-word 1 4 7 3 5)                 ; MOVE.B (A5)+,-(SP)
+                           (m68k-encode-move-word 1 5 7 3 5) 1               ; MOVE.B (A5)+,1(SP)
+                           #x305F)                                           ; MOVEA.W (SP)+,A0
+                     (list #x598F                                            ; SUBQ.L #4,SP
+                           (m68k-encode-move-word 1 2 7 3 5)                 ; MOVE.B (A5)+,(SP)
+                           (m68k-encode-move-word 1 5 7 3 5) 1
+                           (m68k-encode-move-word 1 5 7 3 5) 2
+                           (m68k-encode-move-word 1 5 7 3 5) 3
+                           #x205F))))                                        ; MOVEA.L (SP)+,A0
+      (setq taken (append taken (list #xDBC8)))                              ; ADDA.L A0,A5
+      (when cc
+        (m68k-emit-word buf (logior #x6000 (ash (logxor cc 1) 8)
+                                    (+ (* 2 (length taken)) 2))))            ; B!cc.S skip
+      (dolist (x taken) (m68k-emit-word buf x))
+      (when cc
+        (m68k-emit-word buf #x6002)                                          ; BRA.S over
+        (m68k-emit-word buf (if (= w 2) #x548D #x588D))))                    ; skip: ADDQ.L #W,A5
+    (return-from m68k-emit-stream-branch nil))
   (m68k-emit-word buf (if (= w 2) #x305D #x205D)) ; MOVEA.W / MOVEA.L (A5)+,A0
   (when cc
     (m68k-emit-word buf (logior #x6002 (ash (logxor cc 1) 8))))  ; B!cc.S over the ADDA
@@ -4617,6 +7052,10 @@
         (:li (m68k-emit-fetch buf (third key) +68k-d0+)
          (m68k-store-vreg buf (second key) +68k-d0+) nil)
         (:li-const (m68k-emit-fetch buf 4 +68k-d0+)
+         (m68k-store-vreg buf (second key) +68k-d0+) nil)
+        (:li-cell (m68k-emit-fetch buf 4 +68k-d0+)         ; the cell's address
+         (m68k-emit-word buf #x2040)                        ; MOVEA.L D0,A0
+         (m68k-emit-word buf #x2010)                        ; MOVE.L (A0),D0
          (m68k-store-vreg buf (second key) +68k-d0+) nil)
         (:br (m68k-emit-stream-branch buf nil (second key)) nil)
         (:ret (m68k-emit-move-disp-an buf +68k-a6+ -4 +68k-a5+)
@@ -4674,6 +7113,173 @@
            (m68k-emit-tst buf +68k-d0+))
           (t (funcall native op (rest fk))))))
 
+(defparameter *68k-key-keywords*
+  '((:li . 1) (:li-const . 2) (:br . 3) (:ret . 4) (:enter . 5) (:fused . 6) (:nil . 7) (:li-cell . 8))
+  "Shape-key keywords and their codes in M68K-KEY-BYTES.")
+
+(defun m68k-key-bytes (key)
+  "Shape KEY as bytes: a list #xD0+length then its elements, an integer below
+   128 one byte, a larger one #x81 and three bytes, a keyword #xC0+code.  The
+   runtime JIT (mvm/jit-68k.lisp %T68-KEY-BYTES) encodes its keys the same way
+   to look them up in the table M68K-EMIT-SHAPE-TABLE writes."
+  (let ((out nil))
+    (labels ((enc (x)
+               (cond ((consp x)
+                      (when (>= (length x) 16) (error "68k shape key too long: ~S" key))
+                      (push (+ #xD0 (length x)) out)
+                      (dolist (e x) (enc e)))
+                     ((and (integerp x) (<= 0 x 127)) (push x out))
+                     ((and (integerp x) (<= 0 x #xFFFFFF))
+                      (push #x81 out) (push (ldb (byte 8 16) x) out)
+                      (push (ldb (byte 8 8) x) out) (push (ldb (byte 8 0) x) out))
+                     ((and (keywordp x) (assoc x *68k-key-keywords*))
+                      (push (+ #xC0 (cdr (assoc x *68k-key-keywords*))) out))
+                     (t (error "68k shape key element ~S in ~S" x key)))))
+      (enc key))
+    (coerce (nreverse out) '(vector (unsigned-byte 8)))))
+
+(defun m68k-emit-shape-table (buf shapes)
+  "MODUS_68K_JIT: the indexed shapes' keys and token indices (*68K-JIT-INDEXED*),
+   for the runtime JIT, after the dispatch table: \"modusSHP\", how far back
+   NEXT is (4 bytes: the runtime's way to NEXT on a paged image, whose stubs go
+   to the loader), a count, the entries' offsets (2 bytes each, from the magic)
+   sorted by key bytes, then each
+   entry -- its index (2 bytes), its key's length (1) and bytes.  4-aligned, so
+   the runtime can scan for the magic."
+  (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-byte buf 0))
+  (let* ((rows (sort (mapcar (lambda (v) (cons (m68k-key-bytes (svref v 3)) (svref v 0)))
+                             (if *68k-jit-indexed*
+                                 (remove-if-not (lambda (v) (gethash (svref v 3) *68k-jit-indexed*)) shapes)
+                                 shapes))
+                     (lambda (a b) (let ((x (car a)) (y (car b)))
+                                     (loop for i from 0
+                                           do (cond ((>= i (length x)) (return (< i (length y))))
+                                                    ((>= i (length y)) (return nil))
+                                                    ((/= (aref x i) (aref y i))
+                                                     (return (< (aref x i) (aref y i))))))))))
+         (n (length rows))
+         (head (+ 8 4 4 (* 2 n)))
+         (back (- (m68k-buffer-position buf)
+                  (or (gethash *68k-thread-next-label* (m68k-buffer-labels buf))
+                      (error "68k JIT shape table: NEXT is not placed"))))
+         (offs nil) (pos head))
+    (dolist (r rows) (push pos offs) (incf pos (+ 3 (length (car r)))))
+    (flet ((u32 (v) (loop for sh from 24 downto 0 by 8 do (m68k-emit-byte buf (ldb (byte 8 sh) v)))))
+      (loop for c across "modusSHP" do (m68k-emit-byte buf (char-code c)))
+      (u32 back)
+      (u32 n)
+      (when (> pos #xFFFF) (error "68k JIT shape table: ~D bytes, over 64 KB" pos))
+      (dolist (o (nreverse offs)) (m68k-emit-byte buf (ash o -8)) (m68k-emit-byte buf (logand o #xFF)))
+      (dolist (r rows)
+        (m68k-emit-byte buf (ash (cdr r) -8)) (m68k-emit-byte buf (logand (cdr r) #xFF))
+        (m68k-emit-byte buf (length (car r)))
+        (loop for b across (car r) do (m68k-emit-byte buf b))))
+    (m68k-word-align buf)
+    (format t "~&;; 68k JIT shape table: ~D shapes, ~D bytes~%" n pos)))
+
+;;; THE NATIVE REPL TIER's view of the image (mvm/jit-68k-native.lisp).  A
+;;; function defined at the REPL is translated by this file's own emitter
+;;; (M68K-TRANSLATE-INSN), baked into the image, into a code area.  What it
+;;; emits calls a few routines that live once in the image -- the collector, the
+;;; write barrier, the shared CONS/CAR/... sequences, the 68000's multiply and
+;;; divide, the Mac's console traps.  Their addresses are written here, after
+;;; the shape table, behind "modusJXL": a count, then one 32-bit offset per
+;;; label in M68K-NATIVE-EXPORT-NAMES' order, from the magic to the label
+;;; (#x7FFFFFFF: this image has no such routine).  The runtime reads the order
+;;; from the same function, so the two cannot disagree.
+(defun m68k-native-export-labels ()
+  "The image routines native REPL code may call, in the export table's order."
+  (list *68k-gc-label* *68k-barrier-label* *68k-cons-label* *68k-subtag-label*
+        *68k-car-label* *68k-cdr-label* *68k-array-len-label* *68k-alloc-obj-label*
+        *68k-mul32-label* *68k-mulu64-label* *68k-divs32-label*
+        *68k-mac-console-label* *68k-mac-getc-label* *68k-mac-service-label*
+        *68k-thread-next-label* *68k-barrier-a0-label*
+        ;; the handler stack's slow push and extension frames (M68K-EMIT-HSTACK-STUBS)
+        *68k-hpush-label* *68k-hext-addr-label*))
+
+(defun m68k-native-state-name-p (name)
+  "Per-translation state, not configuration: the native tier binds these itself."
+  (or (search "-LABEL*" name)
+      (member name '("*68K-ABS-PATCHES*" "*68K-LI-CONST-PATCHES*" "*68K-STREAM-FIXUPS*"
+                     "*68K-BRANCH-PLAN*" "*68K-BRANCH-ORDINAL*" "*68K-BRANCH-DISTANCES*"
+                     "*68K-FN-ENTRY-POSITIONS*" "*68K-COLD-FNS*" "*68K-PAGED-FNS*"
+                     "*68K-PAGED-LAYOUT*" "*68K-PAGED-TABLE-REFS*" "*68K-BYTECODE*"
+                     "*68K-LABEL-MAP*" "*68K-SKIP-TO*" "*68K-UNIMPL-OPCODES*" "*68K-THREAD-WHY*"
+                     "*68K-JIT-SHAPES*" "*68K-JIT-INDEXED*" "*68K-THREAD-SHAPES*"
+                     "*68K-HOT-NAMES*" "*68K-NATIVE-P*" "*68K-PROFILE*")
+              :test #'string=)))
+
+(defun m68k-native-dumpable-p (v)
+  (typecase v
+    ((or number character string symbol) t)
+    (cons (and (m68k-native-dumpable-p (car v)) (m68k-native-dumpable-p (cdr v))))
+    (simple-vector (every #'m68k-native-dumpable-p v))
+    (t nil)))
+
+(defun m68k-native-value-form (v)
+  "Source text evaluating to V in the image, or NIL.  Data is quoted; the
+   register map (a vector of M68K-REG) is rebuilt by its constructor."
+  (cond ((m68k-native-dumpable-p v) (format nil "'~S" v))
+        ((and (simple-vector-p v) (every (lambda (r) (or (null r) (m68k-reg-p r))) v))
+         ;; a spilled vreg's entry is NIL
+         (format nil "(vector~{ ~A~})"
+                 (map 'list (lambda (r) (if r
+                                            (format nil "(make-m68k-reg :type ~S :number ~D)"
+                                                    (m68k-reg-type r) (m68k-reg-number r))
+                                            "nil"))
+                      v)))
+        (t nil)))
+
+(defun m68k-native-coinit-text ()
+  "Source text for jit-68k-native.lisp's %N68-COINIT body: SETQs giving the
+   image's emitter the configuration this image was translated with.  A DEFVAR's
+   initial value never runs in the image (CLAUDE.md), and the host's values are
+   final only once BUILD-IMAGE compiles, so cross.lisp's LATE-SOURCE-FILL calls
+   this then.  Every bound *68K-* / *CONV-* special that is configuration and
+   readable data; skipped ones are listed in the build log."
+  (let ((forms nil) (skipped nil) (pkg (find-package :modus.mvm)))
+    (do-symbols (s pkg)
+      (let ((n (symbol-name s)))
+        (when (and (eq (symbol-package s) pkg) (boundp s)
+                   (or (eql 0 (search "*68K-" n)) (eql 0 (search "*CONV-" n))
+                       ;; the compiler's, but M68K-RANGE-GUARD-AT reads it
+                       (string= n "*ARITH-RANGE-BY-SHIFT*"))
+                   (char= (char n (1- (length n))) #\*)
+                   (not (m68k-native-state-name-p n)))
+          (let ((f (if (string= n "*68K-THREADED*")
+                       ;; a hash of the functions kept native; the emitter asks
+                       ;; only WHETHER the image is threaded (a handler frame
+                       ;; then holds the token pointer too: 8 words, not 7)
+                       (if (symbol-value s) "':all" "'nil")
+                       (let ((*package* pkg)) (m68k-native-value-form (symbol-value s))))))
+            (if f (push (cons n f) forms) (push n skipped))))))
+    (setq forms (sort forms #'string< :key #'car))
+    (format t "~&;; 68k native tier: ~D emitter settings carried into the image~@[; not data: ~{~A~^ ~}~]~%"
+            (length forms) (sort skipped #'string<))
+    (with-output-to-string (o)
+      (let ((*package* pkg) (*print-readably* nil) (*print-pretty* nil) (*print-base* 10)
+            (*print-radix* nil) (*print-circle* nil))
+        (format o "(progn")
+        (dolist (f forms)
+          (format o "~%    (setq ~A ~A)" (string-downcase (car f)) (cdr f)))
+        (format o "~%    t)")))))
+
+(defun m68k-emit-native-exports (buf)
+  (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-byte buf 0))
+  (let ((magic (m68k-buffer-position buf)) (labels (m68k-native-export-labels)) (n 0))
+    (loop for c across "modusJXL" do (m68k-emit-byte buf (char-code c)))
+    (m68k-emit-long buf (length labels))
+    (dolist (l labels)
+      (if l                             ; placed later (the collector is last); the fixup resolves it
+          (progn
+            ;; :DISP32 is target - (ref - 2); ref = magic + 2 makes it target - magic
+            (m68k-emit-word buf 0) (m68k-emit-word buf 0)
+            (push (list (- (m68k-buffer-word-count buf) 2) l :disp32 (+ magic 2))
+                  (m68k-buffer-fixups buf))
+            (incf n))
+          (m68k-emit-long buf #x7FFFFFFF)))
+    (format t "~&;; 68k native-tier exports: ~D of ~D image routines~%" n (length labels))))
+
 (defun m68k-emit-thread-dispatch (buf function-table)
   "The escape, NEXT, the table (32-bit handler offsets from its own start),
    then every handler."
@@ -4681,8 +7287,13 @@
                                    *68k-thread-shapes*)
                    (sort l #'< :key (lambda (v) (svref v 0)))))
          (n (1+ (reduce #'max shapes :key (lambda (v) (svref v 0)) :initial-value 255)))
+         ;; paged Mac: one more entry, the RELOAD token (M68K-RELOAD-TOKEN-INDEX)
+         (n (if *68k-reload-label* (1+ n) n))
          (by-index (let ((a (make-array n :initial-element nil)))
-                     (dolist (v shapes a) (setf (aref a (svref v 0)) v))))
+                     (dolist (v shapes a) (setf (aref a (svref v 0)) v))
+                     (when *68k-reload-label*
+                       (setf (aref a (1- n)) (vector (1- n) *68k-reload-label*)))
+                     a))
          (tpos 0)
          (table (mvm-make-label))
          (escape (mvm-make-label)))
@@ -4697,14 +7308,25 @@
       ;; escape: D0 = the 16-bit index after 255
       (m68k-emit-label buf escape)
       (m68k-emit-moveq buf +68k-d0+ 0)
-      (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-dn+ 0 3 5))   ; MOVE.W (A5)+,D0
-      (let ((e1 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3) #x0400)) ; MOVE.L (d8,PC,D0.W*4),D0
+      (if *68k-cpu-68000*
+          (progn
+            (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ 0 3 5)) ; MOVE.B (A5)+,D0
+            (m68k-emit-word buf #xE148)                                        ; LSL.W #8,D0
+            (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ 0 3 5)))
+          (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-dn+ 0 3 5)))  ; MOVE.W (A5)+,D0
+      (when *68k-cpu-68000*
+        (m68k-emit-word buf #xD040) (m68k-emit-word buf #xD040))             ; D0 *= 4
+      (let ((e1 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3)
+                             (if *68k-cpu-68000* #x0000 #x0400)))              ; MOVE.L (d8,PC,D0.W*4),D0
             (e2 (d8-to-table #x4EFB #x0800)))                                       ; JMP (d8,PC,D0.L)
         ;; NEXT
         (m68k-emit-label buf *68k-thread-next-label*)
         (m68k-emit-moveq buf +68k-d0+ 0)
         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ 0 3 5))   ; MOVE.B (A5)+,D0
-        (let ((e3 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3) #x0400))
+        (when *68k-cpu-68000*
+          (m68k-emit-word buf #xD040) (m68k-emit-word buf #xD040))           ; D0 *= 4
+        (let ((e3 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3)
+                               (if *68k-cpu-68000* #x0000 #x0400)))
               (e4 (d8-to-table #x4EFB #x0800)))
           (m68k-emit-label buf table)
           (setq tpos (m68k-buffer-position buf))
@@ -4723,7 +7345,18 @@
                     (m68k-buffer-fixups buf))))
           ;; shapes at index >= 255 are reached through the escape: their
           ;; table entry is at index I as well (the escape reads I itself).
-          )))
+          ;; the runtime JIT's copy of the shapes, right after the table
+          (when *68k-jit-shapes*
+            (m68k-emit-shape-table buf shapes)
+            (m68k-emit-native-exports buf)))))
+    ;; MODUS_68K_SHAPES_OUT=FILE: every shape's token index and key, one a line
+    ;; ("INDEX KEY", the key as READ prints it), for the runtime threaded JIT
+    ;; (docs/68k-threaded-jit.md) to number its own instructions with
+    (let ((out (sb-ext:posix-getenv "MODUS_68K_SHAPES_OUT")))
+      (when (and out (plusp (length out)))
+        (with-open-file (o out :direction :output :if-exists :supersede)
+          (let ((*package* (find-package :modus.mvm)) (*print-base* 10))
+            (dolist (v shapes) (format o "~D ~S~%" (svref v 0) (svref v 3)))))))
     ;; the handlers
     (dolist (v shapes)
       (m68k-emit-label buf (svref v 1))
@@ -4833,34 +7466,68 @@
   (m68k-emit-lea-disp buf +68k-a2+ 32 +68k-a2+))
 
 ;;; ============================================================
+(defun m68k-emit-handler-helpers (buf)
+  "The shared handler push / pop (each + RTS) and LONGJMP: ~170-310 bytes of
+   68k inline at each of ~1,100 handler-case sites before."
+  (m68k-emit-label buf *68k-hpush-shared-label*)
+  (m68k-emit-handler-push buf)
+  (m68k-emit-rts buf)
+  (m68k-emit-label buf *68k-hpop-label*)
+  (m68k-emit-handler-pop buf)
+  (m68k-emit-rts buf)
+  (m68k-emit-label buf *68k-longjmp-label*)
+  (m68k-emit-longjmp buf (lambda () (m68k-emit-illegal buf))))
+
 ;;; handler-case: SETJMP (#x0510) / LONGJMP (#x0511) / CLEAR-HANDLER (#x0512)
 ;;; ============================================================
 ;;;
 ;;; The protocol of translate-riscv / translate-ppc: one live jmpbuf, a stack of
-;;; saved outer jmpbufs so handler-cases NEST, a depth cap (21) past which a
-;;; push stores nothing and its matching pop is ABSORBED, and LONGJMP copying the
-;;; jmpbuf aside before the pop overwrites it.
+;;; saved outer jmpbufs so handler-cases NEST, and LONGJMP copying the jmpbuf
+;;; aside before the pop overwrites it.
 ;;;
 ;;; JMPBUF = 7 longwords: A7, A6 (VFP), resume address, D4..D7 -- V2..V5, the
 ;;; callee-saved V-registers the prologue's MOVEM saves and whose epilogues a
 ;;; LONGJMP skips.  VA/VL/VN (A2..A4) deliberately absent; V0/V1 (D2/D3) are
-;;; caller-saved.  Frames are 8 longwords (32 bytes, one spare) so a frame
-;;; address is a shift.  Temporaries: D0, D1, A0, A1.
+;;; caller-saved.  (Threaded images add A5, the token pointer, as word 8.)
+;;; Frames are 8 longwords (32 bytes, one spare) so a frame address is a shift.
+;;; Temporaries: D0, D1, A0, A1.
 ;;;
-;;; WHERE: hosted, the shared contract block at the heap base (jmpbuf
-;;; #x10000180 ... frames from #x10000408; 46 frames end at #x100009C8, clear of
-;;; the globals at #x10000A00); bare, the same offsets in *68k-globals-base*'s
-;;; block, which otherwise uses only #x00-#x0F.  Computed at translate time.
+;;; THE HANDLER-FRAME STACK (NO SILENT CEILING).  Frames 0..45 live in the
+;;; fixed area -- hosted, the shared contract block at the heap base (jmpbuf
+;;; #x10000180 ... frames from #x10000408; 46 frames end at #x100009C8, clear
+;;; of the globals at #x10000A00); bare, the same offsets in
+;;; *68k-globals-base*'s block.  That is the FAST PATH: the old inline code
+;;; plus one compare.  A push at depth 46 or more calls ONE out-of-line stub
+;;; (*68K-HPUSH-LABEL*, emitted once after the last function: a 68k image
+;;; would otherwise carry it at every SETJMP):
+;;;   * HOSTED: frames 46.. go to an EXTENSION the stub reserves itself on
+;;;     first use -- mmap2(0, 16 MB, RW, PRIVATE|ANONYMOUS|NORESERVE), 512K
+;;;     frames of address space, pages touched on demand -- its address in
+;;;     the word at #x10005600 (+68K-HSTACK-EXT-ADDR+, the same word x86-64
+;;;     and AArch64 use, free on 68k).  No 68k image has threads, so one
+;;;     process-global extension is the whole design.
+;;;   * A push that still cannot be stored -- past the extension, past the
+;;;     test-only limit at #x10005608, the reservation refused, or any push
+;;;     past frame 45 on BARE METAL, which has no mmap -- is LOUD: it records
+;;;     #x0F0F at #x10000CB0 for %TAKE-PENDING-FAULT (HANDLER-STACK-EXHAUSTED)
+;;;     and LONGJMPs to the frame that is armed now, exactly as TRAP #x0511
+;;;     does.  The failed frame was never stored, so the stack stays balanced
+;;;     and every enclosing cleanup runs.  Nothing armed: hosted, a message on
+;;;     stderr and exit status 4; bare, ILLEGAL (LONGJMP's own answer).
+;;; The pop follows frames into the extension (*68K-HEXT-ADDR-LABEL*), and the
+;;; hosted collector scans the live extension frames as roots: a saved jmpbuf
+;;; holds D4..D7, heap pointers a LONGJMP puts back.  (The fixed frames are in
+;;; the low block, which the collector scans whole.)  68k hosted has no signal
+;;; stub (#x0520 is a no-op), so nothing else walks the frames.
+;;;
+;;; This replaced BALANCED-CAP: a push past frame 45 stored nothing, the setjmp
+;;; site skipped arming and the matching pop absorbed it, so a LONGJMP from
+;;; below the cap went straight to the deepest STORED frame and every cleanup
+;;; past the cap was silently skipped (r36: 45 of 301 cleanups ran).
 
-(defconstant +68k-jmpbuf-words+ 7)
-(defparameter *68k-hstack-max-depth* 46
-  "As many 32-byte frames as fit below the hosted globals at #x10000A00 (they
-   end at #x100009C8).  21 overflowed under a real library load on ARM32, the
-   same protocol -- see *ARM32-HSTACK-MAX-DEPTH*.")
-(defun m68k-hbase ()           (if *68k-linux-mode* #x10000000 *68k-globals-base*))
+(defun m68k-hbase ()           (if (m68k-hosted-layout-p) (conv-real #x10000000) *68k-globals-base*))
 (defun m68k-jmpbuf-addr ()     (+ (m68k-hbase) #x180))
 (defun m68k-lj-scratch-addr () (+ (m68k-hbase) #x300))
-(defun m68k-hcapped-addr ()    (+ (m68k-hbase) #x360))
 (defun m68k-hdepth-addr ()     (+ (m68k-hbase) #x400))
 (defun m68k-hframes-addr ()    (+ (m68k-hbase) #x408))
 
@@ -4878,51 +7545,52 @@
   (m68k-emit-move-dn-an buf +68k-d1+ dst-an))
 
 (defun m68k-emit-handler-push (buf)
-  "Stack the CURRENT jmpbuf.  Leaves D0 = 0 if a frame was stored, 1 if the
-   push was CAPPED.  Clobbers D0, D1, A0, A1."
-  (let ((capped (mvm-make-label))
+  "Stack the CURRENT jmpbuf.  Frames in the fixed area inline; deeper ones,
+   and the loud overflow (which does not return), in the out-of-line stub.
+   Clobbers D0, D1, A0, A1."
+  (let ((slow (mvm-make-label))
         (done (mvm-make-label)))
+    (setf *68k-hstack-used* t)
     (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
     (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)        ; D0 = depth
     (m68k-emit-cmpi buf +68k-d0+ *68k-hstack-max-depth*)
-    (m68k-emit-bge buf capped)
+    (m68k-emit-bge buf slow)
     (m68k-emit-frame-addr buf +68k-a0+ +68k-d0+)
     (m68k-emit-addi buf +68k-d0+ 1)
     (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)        ; depth++
     (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
     (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
-    (m68k-emit-move-imm-dn buf 0 +68k-d0+)                  ; stored
     (m68k-emit-bra buf done)
-    (m68k-emit-label buf capped)
-    (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
-    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
-    (m68k-emit-addi buf +68k-d0+ 1)
-    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
-    (m68k-emit-move-imm-dn buf 1 +68k-d0+)                  ; capped
+    (m68k-emit-label buf slow)
+    (if *68k-hpush-label*
+        (m68k-emit-bsr-long buf *68k-hpush-label*)
+        (m68k-emit-illegal buf))                            ; no stub to reach: loud
     (m68k-emit-label buf done)))
 
 (defun m68k-emit-handler-pop (buf)
-  "Absorb a capped push, restore the top stacked frame into the jmpbuf, or ZERO
-   the jmpbuf when the stack is empty.  Never touches D2 (V0), which holds the
-   handler-case's result at a CLEAR-HANDLER.  Clobbers D0, D1, A0, A1."
-  (let ((not-capped (mvm-make-label))
+  "Restore the top stacked frame into the jmpbuf (from the fixed area or the
+   hosted extension), or ZERO the jmpbuf when the stack is empty.  Never
+   touches D2 (V0), which holds the handler-case's result at a CLEAR-HANDLER.
+   Clobbers D0, D1, A0, A1."
+  (let ((have (mvm-make-label))
+        (fixed (mvm-make-label))
         (empty (mvm-make-label))
         (done (mvm-make-label)))
-    (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
-    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
-    (m68k-emit-tst buf +68k-d0+)
-    (m68k-emit-beq buf not-capped)
-    (m68k-emit-subq buf +68k-d0+ 1)
-    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
-    (m68k-emit-bra buf done)
-    (m68k-emit-label buf not-capped)
+    (setf *68k-hstack-used* t)
     (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
     (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
     (m68k-emit-tst buf +68k-d0+)
     (m68k-emit-beq buf empty)
     (m68k-emit-subq buf +68k-d0+ 1)
     (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)        ; depth--
+    (when *68k-hext-addr-label*
+      (m68k-emit-cmpi buf +68k-d0+ *68k-hstack-max-depth*)
+      (m68k-emit-blt buf fixed)
+      (m68k-emit-bsr-long buf *68k-hext-addr-label*)        ; A0 = extension frame
+      (m68k-emit-bra buf have))
+    (m68k-emit-label buf fixed)
     (m68k-emit-frame-addr buf +68k-a0+ +68k-d0+)
+    (m68k-emit-label buf have)
     (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
     (m68k-emit-copy-words buf +68k-a0+ +68k-a1+)
     (m68k-emit-bra buf done)
@@ -4933,6 +7601,117 @@
       (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a1+ (* 4 i)))
     (m68k-emit-label buf done)))
 
+(defun m68k-emit-longjmp (buf nohandler-fn)
+  "LONGJMP to the armed frame: copy the jmpbuf aside, pop, restore and JMP
+   with D2 = T.  Nothing armed (word 0 = 0): NOHANDLER-FN emits what happens
+   instead -- never a jump to address zero."
+  (let ((nohandler (mvm-make-label)))
+    (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-beq buf nohandler)
+    (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a0+)
+    (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
+    (m68k-emit-handler-pop buf)
+    (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a1+)
+    (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
+          for i from 3
+          do (m68k-emit-move-disp-dn buf +68k-a1+ (* 4 i) d))
+    (m68k-emit-move-disp-an buf +68k-a1+ 8 +68k-a0+)  ; resume
+    (when *68k-threaded*
+      (m68k-emit-move-disp-an buf +68k-a1+ 28 +68k-a5+))
+    (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
+    (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
+    (m68k-emit-move-imm-dn buf +t-value+ +68k-d2+)  ; second return: T
+    (m68k-emit-jmp-an-ind buf +68k-a0+)
+    (m68k-emit-label buf nohandler)
+    (funcall nohandler-fn)))
+
+(defun m68k-emit-hstack-stubs (buf)
+  "The out-of-line half of the handler-frame stack, emitted once after the
+   last function (see THE HANDLER-FRAME STACK above).
+
+   SLOW PUSH, entered by BSR.L from a push with D0 = depth >= 46: hosted,
+   store the jmpbuf as extension frame depth-46 (reserving the extension on
+   first use) and return; past the extension or the test limit, the mmap
+   refused, or bare metal: the loud overflow, which does not return.  Clobbers
+   D0, D1, A0, A1; saves D2..D5 (mmap2's argument registers) itself.
+
+   EXTENSION FRAME ADDRESS (hosted), for the pop: D0 = depth >= 46 in, A0 =
+   the extension frame's address out.  Clobbers D1."
+  (let ((loud (mvm-make-label)))
+    (m68k-emit-label buf *68k-hpush-label*)
+    (when *68k-linux-mode*
+      (let ((nolimit (mvm-make-label)) (have (mvm-make-label))
+            (refused (mvm-make-label)))
+        (m68k-emit-movem-to-predec buf #x3C00)                ; D2-D5
+        (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
+        (m68k-emit-subi buf +68k-d2+ *68k-hstack-max-depth*)  ; D2 = k
+        (m68k-emit-move-imm-an buf +68k-hstack-ext-limit-addr+ +68k-a0+)
+        (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d1+)
+        (m68k-emit-tst buf +68k-d1+)
+        (m68k-emit-beq buf nolimit)
+        (m68k-emit-cmp-dn-dn buf +68k-d1+ +68k-d2+)           ; k - limit
+        (m68k-emit-bcc-word buf +68k-cc-cc+ refused)          ; k >= limit
+        (m68k-emit-label buf nolimit)
+        (m68k-emit-cmpi buf +68k-d2+ +68k-hstack-ext-frames+)
+        (m68k-emit-bcc-word buf +68k-cc-cc+ refused)          ; k >= capacity
+        (m68k-emit-move-imm-an buf +68k-hstack-ext-addr+ +68k-a0+)
+        (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d1+)
+        (m68k-emit-tst buf +68k-d1+)
+        (m68k-emit-bne buf have)
+        ;; mmap2(0, size, PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS|NORESERVE, -1, 0):
+        ;; d1..d5 then a0, number in d0, result in d0 (-4095..-1 = -errno).
+        (m68k-emit-push-dn buf +68k-d2+)
+        (m68k-emit-moveq buf +68k-d1+ 0)
+        (m68k-emit-move-imm-dn buf (* 32 +68k-hstack-ext-frames+) +68k-d2+)
+        (m68k-emit-moveq buf +68k-d3+ 3)
+        (m68k-emit-move-imm-dn buf #x4022 +68k-d4+)
+        (m68k-emit-moveq buf +68k-d5+ -1)
+        (m68k-emit-move-imm-an buf 0 +68k-a0+)
+        (m68k-emit-move-imm-dn buf +68k-linux-sys-mmap2+ +68k-d0+)
+        (m68k-emit-trap buf 0)
+        (m68k-emit-pop-dn buf +68k-d2+)
+        (m68k-emit-cmpi buf +68k-d0+ #xFFFFF001)
+        (m68k-emit-bcc-word buf +68k-cc-cc+ refused)          ; an errno
+        (m68k-emit-move-imm-an buf +68k-hstack-ext-addr+ +68k-a0+)
+        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)
+        (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
+        (m68k-emit-label buf have)                            ; D1 = ext, D2 = k
+        (m68k-emit-lsl-imm buf +68k-d2+ 5)
+        (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d2+)
+        (m68k-emit-move-dn-an buf +68k-d2+ +68k-a0+)          ; A0 = the frame
+        (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
+        (m68k-emit-move-an-ind-dn buf +68k-a1+ +68k-d0+)
+        (m68k-emit-addq buf +68k-d0+ 1)
+        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)      ; depth++
+        (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+        (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
+        (m68k-emit-movem-from-postinc buf #x003C)             ; D2-D5
+        (m68k-emit-rts buf)
+        (m68k-emit-label buf refused)
+        (m68k-emit-movem-from-postinc buf #x003C)
+        (m68k-emit-bra buf loud)))
+    ;; ---- the loud overflow: record, then LONGJMP to the armed frame ----
+    (m68k-emit-label buf loud)
+    (m68k-emit-move-imm-an buf (conv-real +68k-pending-fault-addr+) +68k-a0+)
+    (m68k-emit-move-imm-dn buf +68k-hstack-overflow-code+ +68k-d0+)
+    (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)
+    (m68k-emit-longjmp buf
+                       (lambda ()
+                         (if *68k-linux-mode*
+                             (m68k-emit-die buf (format nil "modus: handler stack exhausted with no handler armed~%") 4)
+                             (m68k-emit-illegal buf)))))
+  (when *68k-hext-addr-label*
+    (m68k-emit-label buf *68k-hext-addr-label*)
+    (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
+    (m68k-emit-subi buf +68k-d1+ *68k-hstack-max-depth*)
+    (m68k-emit-lsl-imm buf +68k-d1+ 5)
+    (m68k-emit-move-imm-an buf +68k-hstack-ext-addr+ +68k-a0+)
+    (m68k-emit-move-disp-an buf +68k-a0+ 0 +68k-a0+)
+    (m68k-emit-adda-dn buf +68k-d1+ +68k-a0+)
+    (m68k-emit-rts buf)))
+
 (defun m68k-set-linux-mode (on)
   "Turn hosted mode on or off, moving the convention slots with it.  One
    function so the two cannot drift apart: an unmapped slot base is a SIGSEGV on
@@ -4940,6 +7719,13 @@
    the image dies rather than something subtle later."
   (setf *68k-linux-mode* (and on t))
   (setf *68k-globals-base* (if on *68k-hosted-globals-base* #x00600000)))
+
+(defun m68k-set-mac-mode (on)
+  "Turn the bare-Macintosh mode on or off (*68K-MAC-MODE*): the hosted memory
+   map and convention slots, with the Mac's service traps.  Linux mode off."
+  (setf *68k-linux-mode* nil)
+  (setf *68k-mac-mode* (and on t))
+  (setf *68k-globals-base* (if on (conv-real *68k-hosted-globals-base*) #x00600000)))
 
 (defun install-68k-translator ()
   "Install the 68k translator into the target descriptor."

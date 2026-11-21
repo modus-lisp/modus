@@ -152,6 +152,10 @@
   "Offset from heap base to the first allocatable byte.  The low 512 bytes
    mirror argc/argv the way the 64-bit ports do.")
 
+(defparameter *linux-i386-vl-offset-explicit* nil
+  "T when MODUS_I386_VL fixed *LINUX-I386-VL-OFFSET*; NIL: VL follows the heap
+   size chosen at startup.")
+
 (defparameter *linux-i386-vl-offset* (- #x10000000 #x1000000)
   "Offset from heap base for VL (the alloc limit).  With GC OFF this is set
    just short of the mapping end so :gc-check never fires.  A GC-on build
@@ -263,6 +267,150 @@
    wrapped jump target is the worst possible boot bug to debug."
   (assert (<= -128 d 127) (d) "rel8 displacement ~D out of range" d)
   (list (logand d #xFF)))
+
+;;; ---- The heap's size, chosen at startup ---------------------------------
+;;; arm32's and 68k's rule (emit-linux-arm32-choose-heap-size): SBCL's
+;;; --dynamic-space-size N[K|M|G] (MB without a suffix) is the heap's TOTAL --
+;;; two semispaces of half each -- clamped to [2 MB, 512 MB] and rounded down
+;;; to 128 KB.  Without the flag it is 512 MB, the size this port always had.
+;;; The collector's VL margin (*I386-GC-VL-MARGIN*, the room :gc-check's
+;;; unsized test needs) and the guard past the heap are min(16 MB, a quarter of
+;;; a semispace), page-aligned: 16 MB of a 4 MB semispace is no heap at all.
+;;; The stub leaves both in the BSS, where the collector reads the margin
+;;; (*I386-GC-MARGIN-ADDR*).
+(defconstant +linux-i386-heap-total-addr+ #x100002A0 "Heap total in bytes (both semispaces).")
+(defconstant +linux-i386-heap-margin-addr+ #x100002A4 "VL margin = guard, bytes.")
+(defconstant +linux-i386-heap-max-kb+ (* 512 1024))
+(defconstant +linux-i386-heap-min-kb+ 2048)
+
+(defun i386l-assemble (buf items)
+  "Emit ITEMS: byte lists, (:LABEL name), (:J8 opcode name) -- a short jump to
+   a label (errors past +-127) -- (:JCC32 opcode name) -- the near form of
+   short Jcc OPCODE (0F 80+cc rel32) -- (:JMP32 0 name) and (:CALL 0 name).
+   Displacements are computed here.  An item (:SPLICE . ITEMS) is ITEMS in
+   its place (a conditional part); NIL items vanish."
+  (setq items (loop for it in items
+                    if (and (consp it) (eq (car it) :splice)) append (cdr it)
+                    else if it collect it))
+  (flet ((size (it) (cond ((and (consp it) (eq (car it) :label)) 0)
+                          ((and (consp it) (eq (car it) :j8)) 2)
+                          ((and (consp it) (eq (car it) :jcc32)) 6)
+                          ((and (consp it) (eq (car it) :jmp32)) 5)
+                          ((and (consp it) (eq (car it) :call)) 5)
+                          (t (length it)))))
+    (let ((pos 0) (labels nil))
+      (dolist (it items)                ; pass 1: positions
+        (when (and (consp it) (eq (car it) :label)) (push (cons (cadr it) pos) labels))
+        (incf pos (size it)))
+      (setq pos 0)
+      (dolist (it items)
+        (let ((target (and (consp it) (member (car it) '(:j8 :jcc32 :jmp32 :call))
+                           (or (cdr (assoc (caddr it) labels))
+                               (error "i386l-assemble: no label ~S" (caddr it))))))
+          (cond ((and (consp it) (eq (car it) :label)) nil)
+                ((and (consp it) (eq (car it) :j8))
+                 (apply #'i386l-bytes buf (cadr it) (i386l-rel8 (- target (+ pos 2)))))
+                ((and (consp it) (eq (car it) :jcc32))
+                 (i386l-bytes buf #x0F (+ #x10 (cadr it)))      ; 7x -> 0F 8x
+                 (i386l-le32 buf (- target (+ pos 6))))
+                ((and (consp it) (eq (car it) :jmp32))
+                 (i386l-bytes buf #xE9)                         ; jmp rel32
+                 (i386l-le32 buf (- target (+ pos 5))))
+                ((and (consp it) (eq (car it) :call))
+                 (i386l-bytes buf #xE8)                         ; call rel32
+                 (i386l-le32 buf (- target (+ pos 5))))
+                (t (apply #'i386l-bytes buf it))))
+        (incf pos (size it))))))
+
+(defun emit-i386-bitmap-length (buf)
+  "ECX = one bitmap's length for the chosen heap: 1 bit per 16-byte granule
+   over total + guard, page-rounded."
+  (i386l-bytes buf #x8B #x0D) (i386l-le32 buf +linux-i386-heap-total-addr+)   ; mov ecx, [total]
+  (i386l-bytes buf #x03 #x0D) (i386l-le32 buf +linux-i386-heap-margin-addr+)  ; add ecx, [margin]
+  (i386l-bytes buf #xC1 #xE9 #x07)                                            ; shr ecx, 7
+  (i386l-bytes buf #x81 #xC1) (i386l-le32 buf #xFFF)                          ; add ecx, 4095
+  (i386l-bytes buf #x81 #xE1) (i386l-le32 buf #xFFFFF000))                    ; and ecx, ~4095
+
+(defun emit-i386-choose-heap-size (buf)
+  "On the incoming stack ([ESP] argc, [ESP+4+4i] argv[i]): the heap total and
+   margin into +LINUX-I386-HEAP-TOTAL-ADDR+ / -MARGIN-ADDR+.  Leaves ESP as it
+   was; clobbers EAX, EBX, ECX, EDX, ESI, EDI (the stub sets what it needs
+   after)."
+  (let ((flag "--dynamic-space-size"))
+    (i386l-assemble
+     buf
+     (append
+      (list '(#x8B #x0C #x24)                          ; mov ecx, [esp]   argc
+            '(#xBE 1 0 0 0)                            ; mov esi, 1       i
+            '(:label top)
+            '(#x39 #xCE)                               ; cmp esi, ecx
+            '(:jcc32 #x73 no-flag)                     ; jae
+            '(#x8B #x7C #xB4 #x04))                    ; mov edi, [esp+4*esi+4]
+      ;; argv[i] = "--dynamic-space-size" exactly: each byte, then the NUL
+      (loop for c across flag for k from 0
+            append (list (list #x80 #x7F k (char-code c))   ; cmp byte [edi+k], c
+                         '(:jcc32 #x75 next)))              ; jne (near: past 127 bytes)
+      (list (list #x80 #x7F (length flag) 0)           ; cmp byte [edi+20], 0
+            '(:jcc32 #x75 next)
+            '(#x46)                                    ; inc esi
+            '(#x39 #xCE)                               ; cmp esi, ecx
+            '(:jcc32 #x73 no-flag)                     ; no value after it
+            '(#x8B #x7C #xB4 #x04)                     ; mov edi, argv[i+1]
+            ;; digits, saturating at 2^20 (MB, KB or GB alike: clamped below)
+            '(#x31 #xC0)                               ; xor eax, eax
+            '(:label digit)
+            '(#x0F #xB6 #x17)                          ; movzx edx, byte [edi]
+            '(#x83 #xEA #x30)                          ; sub edx, '0'
+            '(#x83 #xFA #x09)                          ; cmp edx, 9
+            '(:j8 #x77 suffix)                         ; ja  (unsigned: not a digit)
+            '(#x6B #xC0 #x0A)                          ; imul eax, eax, 10
+            '(#x01 #xD0)                               ; add eax, edx
+            '(#x3D #x00 #x00 #x10 #x00)                ; cmp eax, #x100000
+            '(:j8 #x76 digit-ok)                       ; jbe
+            '(#xB8 #x00 #x00 #x10 #x00)                ; mov eax, #x100000
+            '(:label digit-ok)
+            '(#x47)                                    ; inc edi
+            '(:j8 #xEB digit)
+            '(:label suffix)
+            '(#x0F #xB6 #x17)                          ; movzx edx, byte [edi]
+            '(#x83 #xE2 #xDF)                          ; and edx, ~#x20  (upper-case)
+            '(#x83 #xFA #x4B)                          ; cmp edx, 'K'
+            '(:j8 #x74 have)                           ; KB already
+            '(#x83 #xFA #x47)                          ; cmp edx, 'G'
+            '(:j8 #x75 mb)
+            ;; any whole GB is past the maximum (and GB -> KB could wrap 32 bits)
+            (cons #xB8 (i386l-le32-list +linux-i386-heap-max-kb+))
+            '(:j8 #xEB have)
+            '(:label mb)
+            '(#xC1 #xE0 #x0A)                          ; shl eax, 10   MB -> KB
+            '(:j8 #xEB have)
+            '(:label next)
+            '(#x46)                                    ; inc esi
+            '(:jmp32 0 top)
+            '(:label no-flag))
+      (list (cons #xB8 (i386l-le32-list +linux-i386-heap-max-kb+))   ; mov eax, default KB
+            '(:label have)
+            ;; clamp to [min, max] KB, round down to 128 KB, to bytes
+            (append '(#x3D) (i386l-le32-list +linux-i386-heap-min-kb+))  ; cmp eax, min
+            '(:j8 #x73 not-low)
+            (cons #xB8 (i386l-le32-list +linux-i386-heap-min-kb+))
+            '(:label not-low)
+            (append '(#x3D) (i386l-le32-list +linux-i386-heap-max-kb+))  ; cmp eax, max
+            '(:j8 #x76 not-high)
+            (cons #xB8 (i386l-le32-list +linux-i386-heap-max-kb+))
+            '(:label not-high)
+            '(#x83 #xE0 #x80)                          ; and eax, ~127
+            '(#xC1 #xE0 #x0A)                          ; shl eax, 10   bytes
+            (append '(#xA3) (i386l-le32-list +linux-i386-heap-total-addr+))  ; mov [total], eax
+            ;; margin = min(16 MB, total / 8) -- a quarter of a semispace -- page-aligned
+            '(#x89 #xC2)                               ; mov edx, eax
+            '(#xC1 #xEA #x03)                          ; shr edx, 3
+            (append '(#x81 #xFA) (i386l-le32-list +linux-i386-gc-guard+))  ; cmp edx, 16 MB
+            '(:j8 #x76 margin-ok)
+            (cons #xBA (i386l-le32-list +linux-i386-gc-guard+))
+            '(:label margin-ok)
+            '(#x81 #xE2 #x00 #xF0 #xFF #xFF)           ; and edx, ~#xFFF
+            (append '(#x89 #x15) (i386l-le32-list +linux-i386-heap-margin-addr+)))))))  ; mov [margin], edx
 
 (defun emit-i386-stage-argv (buf)
   "Copy the kernel's argv AND envp — pointers and the strings themselves —
@@ -458,6 +606,8 @@
       (i386l-bytes buf #x68 #x7F #x02 #x00 #x00)    ; push #x027F
       (i386l-bytes buf #xD9 #x2C #x24)              ; fldcw [esp]
       (i386l-bytes buf #x83 #xC4 #x04)))            ; add esp, 4
+  ;; --- the heap's size, from --dynamic-space-size (the incoming stack) ---
+  (emit-i386-choose-heap-size buf)
   ;; --- argc / argv[1] / argv[2] off the incoming stack ---
   (i386l-bytes buf #x8B #x1C #x24)              ; mov ebx, [esp]      (argc)
   (i386l-bytes buf #x8B #x44 #x24 #x08)         ; mov eax, [esp+8]    (argv[1])
@@ -536,7 +686,9 @@
   ;; takes a struct pointer; mmap2(192) is the clean register form.  Its 6th
   ;; argument (page offset) goes in EBP, so EBP is stacked around the call.
   (i386l-mov-reg-imm buf 3 +linux-i386-heap-hint+)   ; mov ebx, hint
-  (i386l-mov-reg-imm buf 1 +linux-i386-heap-size+)   ; mov ecx, length
+  ;; length = the chosen total + its guard (EMIT-I386-CHOOSE-HEAP-SIZE)
+  (i386l-bytes buf #x8B #x0D) (i386l-le32 buf +linux-i386-heap-total-addr+)  ; mov ecx, [total]
+  (i386l-bytes buf #x03 #x0D) (i386l-le32 buf +linux-i386-heap-margin-addr+) ; add ecx, [margin]
   (i386l-mov-reg-imm buf 2 3)                        ; mov edx, PROT_READ|PROT_WRITE
   (i386l-mov-reg-imm buf 6 #x100022)                 ; mov esi, PRIVATE|ANON|FIXED_NOREPLACE
   (i386l-mov-reg-imm buf 7 #xFFFFFFFF)               ; mov edi, -1 (fd)
@@ -558,8 +710,17 @@
   (i386l-mov-abs-reg buf (+ +linux-i386-globals+ #x00) 1)   ; mov [VA], ecx
 
   ;; --- VL = heap + vl-offset (alloc limit / GC trigger) ---
-  (i386l-bytes buf #x89 #xC1)                        ; mov ecx, eax
-  (i386l-bytes buf #x81 #xC1) (i386l-le32 buf *linux-i386-vl-offset*)
+  ;; Chosen: heap + total/2 - margin, the collector's own rule after a flip.
+  ;; MODUS_I386_VL (dev only) puts it at a fixed offset instead.
+  (if *linux-i386-vl-offset-explicit*
+      (progn
+        (i386l-bytes buf #x89 #xC1)                  ; mov ecx, eax
+        (i386l-bytes buf #x81 #xC1) (i386l-le32 buf *linux-i386-vl-offset*))
+      (progn
+        (i386l-bytes buf #x8B #x0D) (i386l-le32 buf +linux-i386-heap-total-addr+) ; mov ecx, [total]
+        (i386l-bytes buf #xD1 #xE9)                  ; shr ecx, 1
+        (i386l-bytes buf #x01 #xC1)                  ; add ecx, eax
+        (i386l-bytes buf #x2B #x0D) (i386l-le32 buf +linux-i386-heap-margin-addr+))) ; sub ecx, [margin]
   (i386l-mov-abs-reg buf (+ +linux-i386-globals+ #x04) 1)   ; mov [VL], ecx
 
   ;; --- VN = NIL ---
@@ -579,13 +740,16 @@
   (i386l-bytes buf #x89 #xC1)
   (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-heap-alloc-start+)
   (i386l-mov-abs-reg buf +gc-from-start-addr+ 1)
-  ;; [0x10000048] to_start = heap + midpoint
-  (i386l-bytes buf #x89 #xC1)
-  (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-gc-midpoint+)
+  ;; [0x10000048] to_start = heap + total/2 (the midpoint, chosen at startup)
+  (i386l-bytes buf #x8B #x0D) (i386l-le32 buf +linux-i386-heap-total-addr+)   ; mov ecx, [total]
+  (i386l-bytes buf #xD1 #xE9)                        ; shr ecx, 1
+  (i386l-bytes buf #x01 #xC1)                        ; add ecx, eax
   (i386l-mov-abs-reg buf +gc-to-start-addr+ 1)
-  ;; [0x10000050] space_size
-  (i386l-mov-abs-imm buf +gc-space-size-addr+
-                     (- +linux-i386-gc-midpoint+ +linux-i386-heap-alloc-start+))
+  ;; [0x10000050] space_size = total/2 - alloc_start
+  (i386l-bytes buf #x8B #x0D) (i386l-le32 buf +linux-i386-heap-total-addr+)
+  (i386l-bytes buf #xD1 #xE9)
+  (i386l-bytes buf #x81 #xE9) (i386l-le32 buf +linux-i386-heap-alloc-start+) ; sub ecx, alloc_start
+  (i386l-mov-abs-reg buf +gc-space-size-addr+ 1)
   ;; [0x10000058] stack_base = our RELOCATED stack top
   (i386l-mov-reg-imm buf 1 (- (+ +linux-i386-stack-addr+ +linux-i386-stack-size+) 16))
   (i386l-mov-abs-reg buf +gc-stack-base-addr+ 1)
@@ -609,7 +773,7 @@
 
   ;; object-start bitmap
   (i386l-mov-reg-imm buf 3 0)                         ; addr = NULL (any)
-  (i386l-mov-reg-imm buf 1 +linux-i386-bitmap-size+)
+  (emit-i386-bitmap-length buf)                       ; ecx = the heap's bitmap size
   (i386l-mov-reg-imm buf 2 3)                         ; PROT_READ|WRITE
   (i386l-mov-reg-imm buf 6 #x22)                      ; PRIVATE|ANON
   (i386l-mov-reg-imm buf 7 #xFFFFFFFF)
@@ -621,7 +785,7 @@
 
   ;; cons-kind bitmap
   (i386l-mov-reg-imm buf 3 0)
-  (i386l-mov-reg-imm buf 1 +linux-i386-bitmap-size+)
+  (emit-i386-bitmap-length buf)                       ; ecx = the heap's bitmap size
   (i386l-mov-reg-imm buf 2 3)
   (i386l-mov-reg-imm buf 6 #x22)
   (i386l-mov-reg-imm buf 7 #xFFFFFFFF)

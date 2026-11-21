@@ -21,3 +21,4 @@ modus-aa64
 /gate-*.out.shard.*
 /tmp.dat
 /shards-*/
+__pycache__/

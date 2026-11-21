@@ -300,7 +300,14 @@
 ;; is emitted as a separate section, so native code starts at offset 0.
 (setf modus.mvm.i386::*i386-fn-tag-3* t)
 (setf modus.mvm.i386::*i386-fn-align* 16)
+;; MODUS_I386_JIT=1: the native tier (mvm/jit-i386-native.lisp) -- the image
+;; carries the export table and the constant root it needs.
+(setf modus.mvm.i386::*i386-native-tier*
+      (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1"))
 (setf modus.mvm.i386::*i386-native-code-offset* 0)
+;; The heap's size is chosen at startup (--dynamic-space-size, boot-linux-i386
+;; EMIT-I386-CHOOSE-HEAP-SIZE); the collector reads the margin it chose.
+(setf modus.mvm.i386::*i386-gc-margin-addr* modus.mvm::+linux-i386-heap-margin-addr+)
 (setf modus.mvm.i386::*i386-checked-arith-slowpath*
       (let ((v (sb-ext:posix-getenv "MODUS_I386_NO_CHECKED")))
         (not (and v (plusp (length v))))))
@@ -339,7 +346,8 @@
             modus.mvm.i386::*i386-gc-stress-limit*)))
 (let ((v (sb-ext:posix-getenv "MODUS_I386_VL")))
   (when (and v (plusp (length v)))
-    (setf modus.mvm::*linux-i386-vl-offset* (parse-integer v))
+    (setf modus.mvm::*linux-i386-vl-offset* (parse-integer v)
+          modus.mvm::*linux-i386-vl-offset-explicit* t)
     (format t "~&  VL offset overridden: ~D~%" modus.mvm::*linux-i386-vl-offset*)))
 ;; The NATIVE i386 Cheney collector is ON by default — the third arch arm,
 ;; alongside x64's emit-gc-trampoline and aarch64's native MCGC — with BOTH

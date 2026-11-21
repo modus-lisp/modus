@@ -38,7 +38,9 @@ cd "$(dirname "$0")/.."
 JOBS=${ARCH_LADDER_JOBS:-8}
 ALL_ARCHES="i386 x64 aarch64 arm32 riscv64 ppc64 ppc32 68k"
 ARCHES="${*:-$ALL_ARCHES}"
-RUNGS_DIR=test/arch-rungs
+# ARCH_LADDER_RUNGS=DIR: another rung directory -- test/w32-rungs holds the W32
+# rungs, which must only run on the W32-capable ports (docs/w32.md).
+RUNGS_DIR=${ARCH_LADDER_RUNGS:-test/arch-rungs}
 OUT=$(mktemp -d)/results
 : > "$OUT"
 
@@ -53,13 +55,17 @@ expected_for() {
 
 # ---- positive control: the gate must be able to fail -----------------------
 CONTROL_ARCH=$(echo "$ARCHES" | tr ' ' '\n' | head -1)
-echo "positive control: $CONTROL_ARCH r01-call expecting the WRONG answer (43)"
+# The control is the directory's first rung against its answer + 1 (r01-call's
+# 42 -> 43, as it always was).
+CONTROL_RUNG=$(ls "$RUNGS_DIR"/*.lisp | head -1)
+CONTROL_WANT=$(( $(expected_for "$CONTROL_RUNG") + 1 ))
+echo "positive control: $CONTROL_ARCH $(basename "$CONTROL_RUNG" .lisp) expecting the WRONG answer ($CONTROL_WANT)"
 # THE CONTROL MUST FAIL FOR THE RIGHT REASON.  Exit 3 means the image BUILT, it
 # RAN, and the comparison rejected the value.  Accepting any non-zero exit is
 # not a control: a broken build makes every cell BUILD-FAIL and exits 1, and
 # this line then printed "the gate can fail" above 14 of them — certifying a
 # harness in which nothing worked at all.  Measured, not hypothetical.
-scripts/arch-ladder.py "$CONTROL_ARCH" "$RUNGS_DIR/r01-call.lisp" --expect=43 >/dev/null 2>&1
+scripts/arch-ladder.py "$CONTROL_ARCH" "$CONTROL_RUNG" --expect="$CONTROL_WANT" >/dev/null 2>&1
 control_rc=$?
 if [ "$control_rc" -eq 0 ]; then
   echo "GATE BROKEN: the positive control PASSED with a wrong expected value."
@@ -102,7 +108,7 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 if [ "$skip" -ne 0 ]; then
-  echo "PASS (with $skip skipped — install the missing qemu-system-* to cover them)"
+  echo "PASS (with $skip skipped — see the SKIP lines: a missing qemu-system-*, or a cell a rung names as ungradable)"
 else
   echo "PASS"
 fi

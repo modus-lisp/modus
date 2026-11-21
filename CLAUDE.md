@@ -1976,7 +1976,10 @@ Making region 0 collectable under threads needs a stop-the-world handshake with
 per-thread root windows.  **Done, on AArch64 and x86-64** (docs/macos-hosting.md,
 "Stop the world"; `test/hosted-stw.lisp`).  Threads park only at an
 allocation, never at a loop back-edge: the interpreter holds raw object words
-between allocations.
+between allocations.  **Except (x86-64 and AArch64, 2026-11):** a JIT-compiled function
+with no raw primitive parks at its back-edges too (`*PARK-SAFEPOINTS*`,
+`:SAFEPOINT`), or a worker spinning in a non-allocating loop hung every
+region-0 collection (`test/stw-spinning-worker.lisp`).
 
 **ORDERING TRAP:** `%RT-LEAVE-LOCKED` must not decrement the depth to zero until
 **after** the region is restored.  `%GC-REGION-ENTER` is ordinary compiled Lisp;
@@ -4281,6 +4284,8 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
   env, and checks-on vs checks-off.
 - **`compile-call` warns on list-headed non-lambda fn**: The old fallback silently emitted `CALL-INDIRECT` on whatever the "function expression" evaluated to, which routed every downstream cond clause through T/NIL indirection for the `~( ~)` paren bug. Now any `((test) body)`-shaped fn (other than `(lambda …)` or `(setf NAME)`) prints `;; WARN compile-call: …` to stderr with the source location. The code still emits the indirect call so ANSI tests that deliberately construct bad callables keep compiling.
 - **`check-global-inits` at build time (#243)**: `mvm/build-checks.lisp` (host-only, loaded by `lib/load-mvm.lisp`, never baked) encapsulates `build-image` and audits the assembled blob **per build script** for globals whose initialisation never runs in *that* image — Active Limitation #7 below. Two checks: `ORPHANED-INITFORM` (non-NIL defvar initform in an image whose `kernel-main` never reaches `init-all-globals`, with no reachable assignment) and `ORPHANED-INITIALISER` (an `INIT-*`/`%INIT-*` defun that sets a global but is unreachable from `kernel-main` — the #242 shape, where the initialiser was correct and simply not called by 3 of 10 build scripts). It fails the build and names the variable. Every build prints a one-line summary. Known-unfixed instances live in `*GLOBAL-CHECK-BASELINE*` (printed, never fatal) so new ones still fail; knobs `MODUS_GLOBAL_CHECK=0|warn|force|dump`. Blobs over 8 MB (only the 4 ANSI gate runners) are skipped by default — the re-read costs ~20 min there.
+
+- **Fixed runtime addresses are REGISTERED, not claimed in comments** (`mvm/fixed-addresses.lisp`, CHECK H; how-to in `docs/fixed-addresses.md`).  Every low-block word, per-thread window slot (`+0x5600`, `+0x5610..`), per-port extension word (`#x1001FF00`, `#x10021FF0`, `#x100009D0`, `#x10026000`, `#x10005600`), thread-table offset (`+0xC0/+0xC8`) and bare-board region is a `DEFINE-FIXED-WORD` with its size, its memory maps (`:x64-hosted` ... `:68k-bare`, groups `:low-block`/`:threads`/...), its space (`:global`/`:window`/`:block`) and its owner.  The build fails, naming both owners, when two entries overlap in one map; when a translator constant drifts from its entry; when a window word falls outside its worker block; and (the ratchet) when code uses a `#x1000xxxx`-`#x1002xxxx` literal or a `(+ (%tls-self-base) #xOFF)`-shaped offset that no entry covers -- `mvm/fixed-address-allowlist.lisp` may only shrink.  **Before claiming a word, register it; `MODUS_FIXED_ADDR_CHECK=report` prints every map.**  Host-only, never baked, byte-neutral.  Deliberate overlaps are `:shares` + `:reason` and are printed on every build (the near-miss list is in the doc).
 
 ## MVM Compiler — Active Limitations
 

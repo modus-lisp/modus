@@ -1329,6 +1329,78 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
             (return-from check-no-host-gensym nil))
           (%gck-fail "check-no-host-gensym failed")))))
 
+;;; ============================================================
+;;; CHECK H. COMPILE-COMPOUND'S DISPATCH NAMES ARE ALL LISTED
+;;; ============================================================
+;;; COMPILE-COMPOUND sends an operator whose name hash is in neither
+;;; *HASH-DISPATCH-NAMES* nor *COMPOUND-DISPATCH-MORE-HASHES* straight to
+;;; COMPILE-CALL, without walking its 300 clauses (%COMPOUND-DISPATCH-OP-P).
+;;; That is only right while the two lists hold every name a clause tests for:
+;;; a clause added without its name would never be reached, and its form would
+;;; compile, silently, as a call to a function of that name.  So the function
+;;; is READ here and every hash in its clauses' tests is looked up.
+(defvar *gck-compound-dispatch-done* nil
+  "Tree-wide like CHECK E — once per SBCL process, not once per BUILD-IMAGE.")
+
+(defun %gck-test-hashes (test acc)
+  "The name hashes TEST, a COND clause's test, compares OP-NAME with: its
+   integers of hash size, and its (COMPUTE-NAME-HASH \"NAME\") calls."
+  (cond ((integerp test)
+         (if (and (> test 65535) (< test (ash 1 +name-hash-bits+))) (cons test acc) acc))
+        ((atom test) acc)
+        ((and (symbolp (car test)) (string= (symbol-name (car test)) "COMPUTE-NAME-HASH")
+              (stringp (cadr test)))
+         (cons (compute-name-hash (cadr test)) acc))
+        (t (let ((x test))
+             (loop while (consp x)
+                   do (setq acc (%gck-test-hashes (car x) acc)) (setq x (cdr x)))
+             acc))))
+
+(defun check-compound-dispatch-names ()
+  "CHECK H.  Every name hash a clause of COMPILE-COMPOUND tests for is in
+   *HASH-DISPATCH-NAMES* or *COMPOUND-DISPATCH-MORE-HASHES*."
+  (let ((mode (%gck-mode)))
+    (when (or (eq mode :off) *gck-compound-dispatch-done* (null *gck-parse-sweep-root*))
+      (return-from check-compound-dispatch-names nil))
+    (setf *gck-compound-dispatch-done* t)
+    (let ((path (merge-pathnames "mvm/compiler.lisp" *gck-parse-sweep-root*)))
+      (when (probe-file path)
+        (let* ((text (with-open-file (s path :direction :input)
+                       (let* ((buf (make-string (file-length s))) (n (read-sequence buf s)))
+                         (subseq buf 0 n))))
+               (at (search "(defun compile-compound (form env dest)" text)))
+          (unless at
+            (%gck-fail "check-compound-dispatch-names: no COMPILE-COMPOUND in mvm/compiler.lisp"))
+          (let* ((form (let ((*package* (find-package :modus.mvm)))
+                         (read-from-string text t nil :start at)))
+                 (dispatch nil) (missing nil) (clauses 0))
+            ;; the dispatch is the function's longest COND
+            (labels ((walk (x)
+                       (when (consp x)
+                         (when (and (eq (car x) 'cond)
+                                    (or (null dispatch) (> (length x) (length dispatch))))
+                           (setq dispatch x))
+                         (let ((y x))
+                           (loop while (consp y) do (walk (car y)) (setq y (cdr y)))))))
+              (walk form))
+            (dolist (clause (cdr dispatch))
+              (incf clauses)
+              (dolist (h (%gck-test-hashes (car clause) nil))
+                (unless (%compound-dispatch-op-p h) (pushnew h missing))))
+            (when (< clauses 100)
+              (%gck-fail "check-compound-dispatch-names: COMPILE-COMPOUND's dispatch has ~D clauses -- not the COND this check knows"
+                         clauses))
+            (when missing
+              (format t "~&*** check-compound-dispatch-names: ~D name hash~:P COMPILE-COMPOUND tests for ~
+that no list has ***~%" (length missing))
+              (dolist (h missing) (format t "  - ~D~%" h))
+              (format t "  Add each to *COMPOUND-DISPATCH-MORE-HASHES* (mvm/compiler.lisp): an operator~%")
+              (format t "  whose hash is in no list goes straight to COMPILE-CALL, so the new~%")
+              (format t "  clause would never run.~%")
+              (when (eq mode :warn)
+                (return-from check-compound-dispatch-names nil))
+              (%gck-fail "check-compound-dispatch-names failed"))))))))
+
 (defun %gck-pre-checks (src)
   "Read the blob ONCE and run every source-level check on it."
   (let ((mode (%gck-mode)))
@@ -1338,6 +1410,8 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     (%gck-guard "check-source-parses" (check-source-parses))
     ;; F is tree-wide too, and costs one 1 MB file read once per process.
     (%gck-guard "check-no-host-gensym" (check-no-host-gensym))
+    ;; H is tree-wide: one form read from compiler.lisp, once per process.
+    (%gck-guard "check-compound-dispatch-names" (check-compound-dispatch-names))
     ;; check-global-inits owns the =dump / size-cap policy; let it run first
     ;; and only pre-read when it would not have skipped anyway.
     (if (or (eq mode :dump)
@@ -1636,6 +1710,14 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                   (setq args (list* :source-text fin
                                     (loop for (k v) on args by #'cddr
                                           unless (eq k :source-text) append (list k v))))))))
+          ;; CHECK H (mvm/fixed-addresses.lisp, loaded after this file): the
+          ;; fixed-address registry -- overlaps, drifted constants, window
+          ;; extents -- re-run now that the build's boot descriptors are
+          ;; loaded, and the once-per-process tree ratchet.  Before the
+          ;; compile, so a collision leaves no binary behind.
+          (when (fboundp 'check-fixed-addresses)
+            (%gck-guard "check-fixed-addresses"
+              (funcall 'check-fixed-addresses :where (%gck-build-label))))
           (setf *gck-defun-log* nil)
           (setf *undeclared-redefinitions* nil)
           (when *gck-fallback-census* (clrhash *gck-fallback-census*))
@@ -1781,6 +1863,188 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
 
 (check-gc-region-literals)
 
+;;; ------------------------------------------------------------------
+;;; CHECK I. COMPILER-SIDE CODE READS THE COMPILATION'S TARGET (W32 M1)
+;;; ------------------------------------------------------------------
+;;; The width names (+FIXNUM-BITS+ ... +NIL-VALUE+, *TARGET-HAS-FPD-P*) mean
+;;; RUNNING-ON in an image: they are folded literals of the image's own target.
+;;; Code that decides what to EMIT must instead read the compilation's target
+;;; through the CT- functions (target.lisp, "THE COMPILATION'S TARGET"), or a
+;;; self-hosted compiler emits its own widths for every target -- and nothing
+;;; fails until the child image runs.  So the files whose code is the compiler
+;;; in the self-hosted image may not name one bare.  READ, not grepped, so
+;;; comments and docstrings are free to talk about them.  The CT- readers
+;;; themselves live in target.lisp, which is not listed: it defines both sides.
+(defparameter *gck-compiler-side-files*
+  '("mvm/compiler.lisp" "mvm/cross.lisp"
+    "mvm/translate-riscv.lisp" "mvm/translate-aarch64.lisp" "mvm/translate-x64.lisp")
+  "Files whose code, baked into modus-sh, decides what a compilation emits.")
+
+(defparameter *gck-running-on-names*
+  '("+FIXNUM-BITS+" "+FIXNUM-MAX+" "+FIXNUM-MIN+" "+FIXNUM-LIMIT+" "+FIXNUM-NEG-LIMIT+"
+    "+FIXNUM-HALF+" "+FIXNUM-NEG-HALF+" "+FIXNUM-HALF-MAX+" "+FIXNUM-SIGNED-BITS+"
+    "+FIXNUM-BITS-1+" "+LIMB-BITS+" "+LIMB-BITS-1+" "+LIMB-SPLIT-BITS+" "+NEG-LIMB-BITS+"
+    "+NEG-LIMB-BITS-1+" "+FIXNUM-READ-GUARD+" "+SMALL-BIGNUM-BITS+" "+HALF-LIMB-BITS+"
+    "+NEG-HALF-LIMB-BITS+" "+HALF-LIMB-MASK+" "+TARGET-BIG-ENDIAN+" "+TARGET-SOFT-FLOAT+" "+TARGET-W32+"
+    "*TARGET-HAS-FPD-P*" "*TARGET-BIG-ENDIAN-P*" "*TARGET-FIXNUM-BITS*"
+    "+MV-COUNT-ADDR+" "+MV-VALUES-ADDR+" "+TAG-CONS+" "+TAG-FUNCTION+" "+TAG-OBJECT+"
+    "+TAG-IMMEDIATE+" "+TAG-FORWARD+" "+T-VALUE+" "+NIL-VALUE+")
+  "Names that mean the machine the code RUNS on; see CHECK I.")
+
+(defun %gck-running-on-uses (path)
+  "List of (NAME . TOPLEVEL-HEAD) for every running-on name READ in PATH,
+   outside the DEFVAR / DEFPARAMETER that defines that very name."
+  (let ((found nil)
+        (*package* (find-package :modus.mvm)))
+    (labels ((walk (x top)
+               (cond ((symbolp x)
+                      (when (and x (member (symbol-name x) *gck-running-on-names*
+                                           :test #'string=))
+                        (push (cons (symbol-name x) top) found)))
+                     ((consp x)
+                      (loop for c on x
+                            do (walk (car c) top)
+                               (unless (listp (cdr c)) (walk (cdr c) top)))))))
+      (with-open-file (s path :direction :input)
+        (loop for form = (read s nil s)
+              until (eq form s)
+              do (let ((head (and (consp form) (consp (cdr form))
+                                  (list (car form) (cadr form)))))
+                   (unless (and head (symbolp (cadr head))
+                                (or ;; the definition of the name itself
+                                    (and (member (symbol-name (car head)) '("DEFVAR" "DEFPARAMETER")
+                                                 :test #'string=)
+                                         (member (symbol-name (cadr head)) *gck-running-on-names*
+                                                 :test #'string=))
+                                    ;; a CT- reader: the sanctioned fallback (compiler.lisp)
+                                    (and (string= (symbol-name (car head)) "DEFUN")
+                                         (let ((n (symbol-name (cadr head))))
+                                           (and (> (length n) 3) (string= "CT-" n :end2 3))))))
+                     (walk form head))))))
+    (nreverse found)))
+
+(defun check-compiler-side-target-names ()
+  "CHECK I.  No compiler-side file names a running-on width constant."
+  (let ((problems nil))
+    (dolist (rel *gck-compiler-side-files*)
+      (let ((path (merge-pathnames rel cl-user::*modus-base*)))
+        (when (probe-file path)
+          (dolist (u (%gck-running-on-uses path))
+            (push (format nil "~A: ~A in ~{~(~A~)~^ ~} -- use its CT- reader (target.lisp)"
+                          rel (car u) (cdr u))
+                  problems)))))
+    (when problems
+      (error "~&CHECK I (compiler-side code names a RUNNING-ON width constant) FAILED:~
+              ~{~%  - ~A~}~%" (nreverse problems)))
+    t))
+
+(check-compiler-side-target-names)
+
+;;; CHECK K. A BAKED FILE DEFINES EACH CONSTANT BEFORE USING IT (W32 M1)
+;;; On the host a whole file is loaded before any of it runs, so a DEFCONSTANT
+;;; at the end of a file is in force for every function above it.  The image's
+;;; own compiler folds a constant only once its DEFCONSTANT has been COMPILED;
+;;; a reference above it compiles as a global read and yields garbage.
+;;; Measured: translate-riscv.lisp defined +RV-LINUX-SYS-WRITE+ & co. at the
+;;; end, so modus-sh --compile-riscv32 emitted `lui a7,0x6f568' where SBCL
+;;; emitted `li a7,64', and every hosted RV32 write trap it compiled
+;;; segfaulted.  Checked over the compiler-side files (CHECK I's list).
+(defun %gck-constants-used-before-defined (path)
+  (let ((forms nil) (*package* (find-package :modus.mvm)))
+    (with-open-file (s path :direction :input)
+      (loop for form = (read s nil s) until (eq form s) do (push form forms)))
+    (setf forms (coerce (nreverse forms) 'vector))
+    (let ((def-at (make-hash-table :test 'eq)) (found nil))
+      (loop for i below (length forms)
+            for f = (aref forms i)
+            when (and (consp f) (symbolp (car f)) (string= (symbol-name (car f)) "DEFCONSTANT")
+                      (consp (cdr f)) (symbolp (cadr f)))
+              do (unless (gethash (cadr f) def-at) (setf (gethash (cadr f) def-at) i)))
+      (labels ((walk (x i head)
+                 (cond ((symbolp x)
+                        (let ((d (gethash x def-at)))
+                          (when (and d (< i d))
+                            (pushnew (list (symbol-name x) head) found :test #'equal))))
+                       ((consp x)
+                        (loop for c on x do (walk (car c) i head)
+                                            (unless (listp (cdr c)) (walk (cdr c) i head)))))))
+        (loop for i below (length forms)
+              for f = (aref forms i)
+              do (walk f i (and (consp f) (consp (cdr f)) (list (car f) (cadr f))))))
+      (nreverse found))))
+
+(defun check-constants-defined-before-use ()
+  "CHECK K.  See above."
+  (let ((problems nil))
+    (dolist (rel *gck-compiler-side-files*)
+      (let ((path (merge-pathnames rel cl-user::*modus-base*)))
+        (when (probe-file path)
+          (dolist (u (%gck-constants-used-before-defined path))
+            (push (format nil "~A: ~A used in ~{~(~A~)~^ ~} before its DEFCONSTANT"
+                          rel (first u) (second u))
+                  problems)))))
+    (when problems
+      (error "~&CHECK K (a baked file uses a constant before defining it) FAILED:~{~%  - ~A~}~%"
+             (nreverse problems)))
+    t))
+
+(check-constants-defined-before-use)
+
+;;; CHECK J. THE HOST WIDTH PARAMETERS ARE THE DESCRIPTOR (W32 M1)
+;;; SET-TARGET-FIXNUM-BITS-FOR sets the host DEFPARAMETERs from
+;;; MAKE-COMPILE-TARGET-FOR's descriptor, but SET-TARGET-FIXNUM-BITS still
+;;; recomputes the derived ones by its own formulas, so for every registered
+;;; target the two must agree field for field.  Host-only: in an image the
+;;; names are folded constants (see the comment in SET-TARGET-FIXNUM-BITS-FOR).
+;;; The host's parameters are put back afterwards.
+(defun %gck-ct-w32-01 (ct) (if (compile-target-w32-capable ct) 1 0))
+(defun check-host-widths-match-descriptor ()
+  (let ((problems nil)
+        (saved (list +fixnum-bits+ +tag-object+ +nil-value+ +t-value+ +target-big-endian+
+                     +mv-count-addr+ +mv-values-addr+ *target-has-fpd-p* +target-w32+))
+        (fields '((+fixnum-bits+ . compile-target-fixnum-bits) (+fixnum-max+ . compile-target-fixnum-max)
+                  (+fixnum-min+ . compile-target-fixnum-min) (+fixnum-limit+ . compile-target-fixnum-limit)
+                  (+fixnum-neg-limit+ . compile-target-fixnum-neg-limit)
+                  (+fixnum-half+ . compile-target-fixnum-half) (+fixnum-neg-half+ . compile-target-fixnum-neg-half)
+                  (+fixnum-half-max+ . compile-target-fixnum-half-max)
+                  (+fixnum-signed-bits+ . compile-target-fixnum-signed-bits)
+                  (+fixnum-bits-1+ . compile-target-fixnum-bits-1) (+limb-bits+ . compile-target-limb-bits)
+                  (+limb-bits-1+ . compile-target-limb-bits-1) (+limb-split-bits+ . compile-target-limb-split-bits)
+                  (+neg-limb-bits+ . compile-target-neg-limb-bits) (+neg-limb-bits-1+ . compile-target-neg-limb-bits-1)
+                  (+fixnum-read-guard+ . compile-target-fixnum-read-guard)
+                  (+small-bignum-bits+ . compile-target-small-bignum-bits)
+                  (+half-limb-bits+ . compile-target-half-limb-bits)
+                  (+neg-half-limb-bits+ . compile-target-neg-half-limb-bits)
+                  (+half-limb-mask+ . compile-target-half-limb-mask)
+                  (+target-big-endian+ . compile-target-big-endian) (*target-has-fpd-p* . compile-target-has-fpd)
+                  (+mv-count-addr+ . compile-target-mv-count-addr) (+mv-values-addr+ . compile-target-mv-values-addr)
+                  (+tag-cons+ . compile-target-tag-cons) (+tag-function+ . compile-target-tag-function)
+                  (+tag-object+ . compile-target-tag-object) (+tag-immediate+ . compile-target-tag-immediate)
+                  (+tag-forward+ . compile-target-tag-forward) (+t-value+ . compile-target-t-value)
+                  (+nil-value+ . compile-target-nil-value)
+                  (+target-w32+ . %gck-ct-w32-01))))
+    (unwind-protect
+         (loop for target being the hash-values of *targets*
+               do (let ((ct (set-target-fixnum-bits-for target)))
+                    (dolist (f fields)
+                      (unless (eql (symbol-value (car f)) (funcall (cdr f) ct))
+                        (push (format nil "~A: ~A = ~S, descriptor says ~S" (target-name target)
+                                      (car f) (symbol-value (car f)) (funcall (cdr f) ct))
+                              problems)))))
+      ;; put the host back where it was (the build sets it again per image)
+      (destructuring-bind (fb to nv tv be mvc mvv fpd w32) saved
+        (setf +target-w32+ w32)
+        (set-target-fixnum-bits fb)
+        (setf +tag-object+ to +nil-value+ nv +t-value+ tv +target-big-endian+ be
+              *target-big-endian-p* (= be 1)
+              +mv-count-addr+ mvc +mv-values-addr+ mvv *target-has-fpd-p* fpd)))
+    (when problems
+      (error "~&CHECK J (host width parameters vs COMPILE-TARGET) FAILED:~{~%  - ~A~}~%"
+             (nreverse problems)))
+    t))
+
+(check-host-widths-match-descriptor)
+
 ;;; ============================================================
 ;;; IR DUMP (MODUS_IR_DUMP=path): the compiler's per-function IR, normalised
 ;;; so two builds whose sources differ only in WHERE a definition sits can be
@@ -1850,4 +2114,15 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
               (ignore-errors (%ir-dump-result form r))
               (finish-output *ir-dump-stream*))
             r))))
+    ;; The global-variable cache slots are numbered in source order, so a
+    ;; global reference added anywhere earlier renumbers every later one.
+    ;; Write the build's whole map (slot -> name key) at exit, so the
+    ;; comparing script (scripts/irdiff.py) can read slot operands as names.
+    (push (lambda ()
+            (when (and *ir-dump-stream* (hash-table-p *gv-cache-index*))
+              (maphash (lambda (key slot)
+                         (format *ir-dump-stream* "~&@GVMAP ~D ~D~%" slot key))
+                       *gv-cache-index*)
+              (finish-output *ir-dump-stream*)))
+          sb-ext:*exit-hooks*)
     (format t "~&;; MODUS_IR_DUMP -> ~A~%" path)))

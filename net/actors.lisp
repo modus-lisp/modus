@@ -271,6 +271,9 @@
 ;;; SMP initialization (single CPU, parameterized addresses)
 ;;; ============================================================
 
+;; Overridable: a hosted image has ONE scheduler lock word and its neighbours
+;; belong to the runtime (net/hosted-actors-post.lisp, SMP-INIT).
+(declaim (overridable smp-init))
 (defun smp-init ()
   ;; TPIDR_EL1 already set by boot code
   ;; Initialize per-CPU data for BSP (CPU 0)

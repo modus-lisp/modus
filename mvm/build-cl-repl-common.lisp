@@ -106,9 +106,9 @@
 ;;; file; there is deliberately no default, so a new wrapper that forgets it
 ;;; fails loudly here instead of silently building a Pi image.
 (declaim (special *cl-repl-platform*))
-(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32))
+(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32 :mac68k))
   (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI, :VIRT, ~
-          :X64, :I386 or :ARM32."
+          :X64, :I386, :ARM32 or :MAC68K."
          *cl-repl-platform*))
 (defvar *cl-repl-rpi-p*  (eq *cl-repl-platform* :rpi))
 (defvar *cl-repl-virt-p* (eq *cl-repl-platform* :virt))
@@ -132,8 +132,14 @@
 ;; onto virt's RAM with the MMU, and the translator runs bare traps over the
 ;; hosted layout (translate-arm32.lisp *ARM32-CL-BARE*).  Console: the PL011.
 (defvar *cl-repl-arm32-p* (eq *cl-repl-platform* :arm32))
-;; The two 32-bit images: 30-bit fixnums, 4-byte object headers.
-(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p*))
+;; :MAC68K — a bare 68k Macintosh (mvm/build-mac68k-cl-repl.lisp): booted from
+;; its own disk's boot blocks by the Mac ROM (boot/boot-mac68k.lisp), the hosted
+;; 68k layout kept in RAM, the translator in *68K-MAC-MODE* (bare traps over the
+;; hosted layout, arm32's shape).  Console: the ROM's serial driver.  Soft float:
+;; the 68LC040 has no FPU.
+(defvar *cl-repl-mac68k-p* (eq *cl-repl-platform* :mac68k))
+;; The 32-bit images: 30-bit fixnums, 4-byte object headers.
+(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p* *cl-repl-mac68k-p*))
 (defvar *cl-repl-pc-p* (or *cl-repl-x64-p* *cl-repl-i386-p*)
   "T for the PC machines, 64- and 32-bit: no actor scheduler in the net image
    (the SSH server is ip.lisp's synchronous poll loop) and no USB NIC.")
@@ -188,15 +194,17 @@
   (let ((v (sb-ext:posix-getenv "MODUS_PC_CONSOLE")))
     (cond ((and v (string= v "0")) nil)
           ((and v (plusp (length v))) t)
-          ;; default: the UEFI image (the T420 boots it from USB and needs its
-          ;; screen and keyboard), but not in SEV-SNP mode, whose guest must
-          ;; not touch the PS/2 ports
+          ;; default: the bare i386 image (a PC without a serial port -- a
+          ;; T420 has none -- is its screen and keyboard), and the UEFI image
+          ;; (the T420 boots it from USB), but not in SEV-SNP mode, whose guest
+          ;; must not touch the PS/2 ports
+          (*cl-repl-i386-p* t)
           (t (and *cl-repl-uefi-p*
                   (let ((snp (sb-ext:posix-getenv "MODUS_UEFI_SNP")))
                     (or (null snp) (string= snp "") (string= snp "0")))))))
-  "Bake net/pc-console.lisp into a bare x86-64 image: VGA text + (UEFI) GOP
+  "Bake net/pc-console.lisp into a bare x86 image: VGA text + (UEFI) GOP
    output, PS/2 keyboard input, beside COM1.  MODUS_PC_CONSOLE=1 / =0
-   overrides the default (on for UEFI unless SEV-SNP).")
+   overrides the default (on for bare i386, and for UEFI unless SEV-SNP).")
 
 (defun %pc-console-text ()
   "net/pc-console.lisp with the data it reads: boot/boot-uefi-x64.lisp's 8x8
@@ -213,6 +221,15 @@
             (coerce (symbol-value (find-symbol "*PS2-SCANCODE-SHIFTED*" :modus.mvm)) 'list)
             (if *cl-repl-uefi-p* "t" "nil")
             (%rpi-net-text "pc-console.lisp"))))
+
+(defun %mac-console-text ()
+  "mac/mac-console.lisp (vessel) with the 8x8 font it draws in: the bare Mac's
+   screen console.  Its keyboard is the translator's getc."
+  (let ((bytes nil))
+    (dolist (qw (symbol-value (find-symbol "*FONT-8X8-QWORDS*" :modus.mvm)))
+      (dotimes (i 8) (push (ldb (byte 8 (* 8 i)) qw) bytes)))
+    (format nil "~%(defun macc-font-bytes () '~S)~%~A~%"
+            (nreverse bytes) (mvm-text "mac/mac-console.lisp"))))
 
 (defun %rpi-hcon-font-text ()
   "HCON-FONT-BYTES for net/hdmi-console.lisp: boot/boot-uefi-x64.lisp's 8x8
@@ -231,7 +248,14 @@
 ;; (machine-type) answered "aarch64" and %JIT-BOOT-INIT carried aarch64's
 ;; layout co-init (*conv-relative*, *a64-x18-base*) into a 32-bit x86 image.
 (defvar *cli-arch* (cond (*cl-repl-x64-p* :x64) (*cl-repl-i386-p* :i386)
-                         (*cl-repl-arm32-p* :arm32) (t :aarch64)))
+                         (*cl-repl-arm32-p* :arm32) (*cl-repl-mac68k-p* :68k)
+                         (t :aarch64)))
+(defvar *cli-soft-float*
+  (or *cl-repl-mac68k-p*
+      ;; i386 on an FPU-less 486SX / 386 (build-i386-cli's MODUS_I386_SOFT_FLOAT)
+      (and *cl-repl-i386-p*
+           (let ((v (sb-ext:posix-getenv "MODUS_I386_SOFT_FLOAT")))
+             (and v (plusp (length v)) (not (string= v "0")))))))
 
 ;;; BARE-METAL SEAM.  No OS: no Linux syscalls, no fds, no argv, no
 ;;; cli-toplevel.  The tarball pipeline is kept (untar -> parse .asd ->
@@ -318,6 +342,8 @@
     (*cl-repl-i386-p* nil)
     ;; :ARM32 — no in-image JIT on 32-bit ARM either (build-cli-common).
     (*cl-repl-arm32-p* nil)
+    ;; :MAC68K — no 68k JIT.
+    (*cl-repl-mac68k-p* nil)
     ;; :X64 bare metal: JIT OFF by default (translate-x64's exec pages come
     ;; from mmap(2) in linux mode; the bare-metal bump allocator the aarch64
     ;; arm has is not ported yet).  MODUS_X64_JIT=1 opts in for the port work.
@@ -379,7 +405,10 @@
   (let ((v (sb-ext:posix-getenv var)))
     (and v (plusp (length v)) (not (string= v "0")))))
 (defvar *rpi-source-blob* (%rpi-cull-p "MODUS_SOURCE_BLOB"))
-(defvar *cli-omit-ansi-test-aux* (%rpi-cull-p "MODUS_RPI_NO_TEST_AUX"))
+(defvar *cli-omit-ansi-test-aux*
+  (or (%rpi-cull-p "MODUS_RPI_NO_TEST_AUX")
+      ;; the Mac runs no ANSI tests (MODUS_MAC68K_TEST_AUX=1 keeps them)
+      (and *cl-repl-mac68k-p* (not (%rpi-cull-p "MODUS_MAC68K_TEST_AUX")))))
 (when *rpi-source-blob*
   (setf modus.mvm::*embed-source-blob* t)
   (format t "~&;; MODUS_SOURCE_BLOB: embedded source blob kept~%"))
@@ -445,6 +474,19 @@
     ;; The message log (kmsg / kmsg-dump): a ring per core, appends that never
     ;; allocate.  An image keeps one where its board names a region below.
     (mvm-text "lib/bare-log.lisp")
+    ;; i386: SLEEP on the clock the image has (the PIT's ticks, translate-i386
+    ;; *I386-PIT-CLOCK*) -- bare-sync's %SLEEP-MS is a busy loop sized for one
+    ;; board, which a 486 and a modern PC are not.
+    (if *cl-repl-i386-p*
+        "
+(defun %sleep-ms (ms)
+  (let ((end (+ (rdtsc) (ceiling (* (max ms 0) (cntfrq)) 1000))))
+    (loop (when (>= (rdtsc) end) (return nil))))
+  nil)
+(defun %monotonic-ns ()
+  (floor (* (rdtsc) 1000000000) (cntfrq)))
+"
+        "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
     ;; HDMI console's state and font.  Zeroed by the kernel prologue.
     ;; The Pi's log: 384 KB of the same window, which a board reset does not
@@ -551,7 +593,8 @@
         "")
     ;; The PC console (x86-64): after serial-repl, whose console seams it
     ;; replaces by last-defun-wins.
-    (if (and *cl-repl-x64-p* *pc-console-p*) (%pc-console-text) "")
+    (if (and (or *cl-repl-x64-p* *cl-repl-i386-p*) *pc-console-p*) (%pc-console-text) "")
+    (if *cl-repl-mac68k-p* (%mac-console-text) "")
     ;; A board net build carries net/usb-hid-split.lisp, which is spliced
     ;; BEFORE this text: its console must be bound HERE, after serial-repl's
     ;; seam defaults, or the defaults win (last-defun-wins).  Read off the
@@ -842,6 +885,59 @@
         ""))))
 
 (defvar *cli-arch-override-source*
+  (if *cl-repl-mac68k-p*
+      ;; THE 68k MAC: no device tree and nothing to read MODUS_* knobs from;
+      ;; the clock is the same text as the boards below, over #x0310/#x0311,
+      ;; which the Mac translator answers with the ROM's Ticks (60 Hz).
+      (concatenate 'string "
+(defun %cli-getenv (name) nil)
+;;; THE CLOCK ON BARE METAL.  cl-fileio.lisp's GET-INTERNAL-REAL-TIME and
+;;; GET-UNIVERSAL-TIME wrap a Linux syscall in a handler-case, expecting the
+;;; bare-metal case to fall through to a counter.  It cannot: an SVC with no
+;;; OS is a synchronous exception, and on a Pi that is the silent `!!FAULT'
+;;; spin (ESR 0x56000000 = EC 0x15, SVC from AArch64) -- the fault was
+;;; measured at GET-INTERNAL-REAL-TIME+0xbc inside a restored quicklisp core.
+;;; Nothing on the board may reach syscall3; route both to the CNTVCT
+;;; counter, exactly as %timer-universal-time's docstring says a bare-metal
+;;; build must select explicitly.  MICROSECONDS: the boot init below sets
+;;; internal-time-units-per-second to 1000000 (the hosted definition), and
+;;; this used to return milliseconds against it — every bare-metal timing
+;;; read 1000× too small (a 20 s reel decode on the Zero 2 W reported as
+;;; 20 ms, 2026-09-10).  Split the division so the product never leaves
+;;; the fixnum range: CNTVCT at 19.2/54 MHz × 10^6 overflows 62 bits in days.
+(defun get-internal-real-time ()
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0))
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000)
+             (floor (* (mod ticks hz) 1000000) hz)))
+        0)))
+;;; THE DATE is not the machine's to know: no RTC, so the counter is seconds since boot.
+;;; SET-UNIVERSAL-TIME is how something that does know (an SNTP answer, net/bare-sockets.lisp
+;;; BARE-NTP-TIME) tells it; the offset is a global SET at run time (a DEFVAR initform does not
+;;; run here), unbound -- 0 -- in a core saved before anybody did, which is right: the counter
+;;; restarts with every boot.
+(defun get-universal-time ()
+  (+ (%timer-universal-time)
+     (if (boundp '*universal-time-offset*) (symbol-value '*universal-time-offset*) 0)))
+(defun set-universal-time (ut)
+  \"Tell a board with no clock that it is UT (seconds since 1900) now.  UT.\"
+  (setf (symbol-value '*universal-time-offset*) (- ut (%timer-universal-time)))
+  ut)
+;;; ... and the nanosecond seams under them, which the hot-function JIT calls
+;;; directly to time interpreted calls: cl-fileio.lisp's defaults are the same
+;;; clock_gettime SVC, so the first DEFUN trampoline on the board faulted
+;;; (ESR 0x56000000, during the boot-time eval of the baked compat source).
+;;; One core and no scheduler, so run time is real time.
+(defun %irt-ns ()
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0))
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000000)
+             (floor (* (mod ticks hz) 1000000000) hz)))
+        0)))
+(defun %irun-ns () (%irt-ns))
+")
   (if *cl-repl-x64-p*
       ;; x86 QEMU-pc: no device tree; nothing to read MODUS_* knobs from yet.
       ;; SAVE-AND-DIE rides along: the same RAM-range core as the Pi, at
@@ -925,7 +1021,7 @@
         ;; whose compilers do not set *U32-VECTORS-P*
         (if *cl-repl-rpi-p* (format nil "~%(defun %u32-vectors-p () t)~%") "")
         ;; GPIO / system timer / activity LED (what the mini-Lisp rpi-periph image had).
-        (if *cl-repl-rpi-p* (%rpi-net-text "bcm2835-gpio.lisp") ""))))
+        (if *cl-repl-rpi-p* (%rpi-net-text "bcm2835-gpio.lisp") "")))))
 
 
 
@@ -1271,8 +1367,8 @@
                        (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
 
 (defvar *cli-arch-io-scratch-source*
-  (if *cl-repl-x64-p*
-      "  (setq *cstr-scratch* #x0FE00000)
+  (if (or *cl-repl-x64-p* *cl-repl-mac68k-p*)   ; no device tree to probe
+      (concatenate 'string "  (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)
   (setq *scratch-mmapped* nil)
   (setq *filesystem* nil)
@@ -1282,12 +1378,14 @@
   (setq internal-time-units-per-second 1000000)
   (setq most-positive-fixnum  4611686018427387903)
   (setq most-negative-fixnum -4611686018427387903)
-  (%init-standard-chars)
-  (%init-boole-constants)
+"
+      (if *cli-omit-ansi-test-aux* "" "  (%init-standard-chars)
+")
+      "  (%init-boole-constants)
   (setq *serial-repl-buf* nil)
   (setq *serial-repl-len* 0)
   (setq *serial-repl-cap* 0)
-"
+")
       "  (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)
   (setq *scratch-mmapped* nil)
@@ -1327,8 +1425,10 @@
   (dolist (pair (append
                  ;; :ARM32's scratch at #x0FE00000.. is mapped DRAM above its
                  ;; stack and L1 table; only i386's heap covers those addresses.
-                 (if *cl-repl-i386-p* '(("#x0FE00000" . "#x03B00000")
-                                        ("#x0FF00000" . "#x03C00000")) nil)
+                 ;; i386 runs the hosted picture: the hosted CLI's scratch pages
+                 ;; in the fixed block (build-i386-cli.lisp)
+                 (if *cl-repl-i386-p* '(("#x0FE00000" . "#x10004000")
+                                        ("#x0FF00000" . "#x10008000")) nil)
                  '(("4611686018427387903" . "536870911")
                   ("-4611686018427387903" . "-536870911"))))
     (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
@@ -2034,8 +2134,13 @@
                                      (format nil "  (%bind-isolated-ssh-seams)~%") ""))
                          ""))))
 
+;; The Mac console draws every WRITE-CHAR-SERIAL on the Mac's screen too.
+(when *cl-repl-mac68k-p*
+  (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char)
+  (format t "~&;; CONSOLE: the Mac's screen, 8x8 font, beside serial port A (mac/mac-console.lisp)~%"))
+
 ;; The PC console draws every WRITE-CHAR-SERIAL on the screen too.
-(when (and *cl-repl-x64-p* *pc-console-p*)
+(when (and (or *cl-repl-x64-p* *cl-repl-i386-p*) *pc-console-p*)
   (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char)
   (format t "~&;; CONSOLE: VGA text~A + PS/2 keyboard, beside COM1 (net/pc-console.lisp)~%"
           (if *cl-repl-uefi-p* " + GOP framebuffer" "")))
@@ -3063,9 +3168,613 @@
   (halt))
 "))
 
+;;; :MAC68K: its boot files now (their layout is needed by the texts below):
+;;; the image's first act is to set the runtime-data region's delta for the
+;;; compiler it carries (boot-mac68k MAC68K-COINIT-TEXT), and its I/O scratch
+;;; pages are real addresses in the Mac's RAM.
+(when *cl-repl-mac68k-p*
+  (mvm-load "boot/boot-linux-68k.lisp")
+  (mvm-load "boot/boot-mac68k.lisp")
+  ;; in the scratch text, not the prologue: that runs AFTER INIT-ALL-GLOBALS,
+  ;; which would put *CONV-DELTA* back to its initform 0 (measured: runtime
+  ;; code then stored to the virtual MV count)
+  (setq *cli-arch-io-scratch-source*
+        (concatenate 'string (funcall (find-symbol "MAC68K-COINIT-TEXT" "MODUS.MVM"))
+                     *cli-arch-io-scratch-source*))
+  (let ((scr (symbol-value (find-symbol "+MAC68K-SCRATCH+" "MODUS.MVM")))
+        ;; the I/O buffer: the layout's :IO-BUF where it names one (the Classic's
+        ;; 4 MB has no room for 256 KB of it), else 256 KB past the scratch page
+        (iob (or (getf (cdr (assoc (symbol-value (find-symbol "*MAC68K-MACHINE*" "MODUS.MVM"))
+                                   (symbol-value (find-symbol "*MAC68K-LAYOUTS*" "MODUS.MVM"))))
+                       :io-buf)
+                 (+ (symbol-value (find-symbol "+MAC68K-SCRATCH+" "MODUS.MVM")) #x40000))))
+    (dolist (pair (list (cons "#x0FE00000" (format nil "#x~8,'0X" scr))
+                        (cons "#x0FF00000" (format nil "#x~8,'0X" iob))))
+      (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
+        (unless at (error "mac68k: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
+        (setq *cli-arch-io-scratch-source*
+              (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
+                           (subseq *cli-arch-io-scratch-source* (+ at (length (car pair))))))))))
+
+;;; :MAC68K: the 68k REPL's size switches, as mvm/build-68k-cli.lisp reads them.
+;;; MODUS_NARROW_STRINGS=1: the reader and the name tables make one-byte
+;;; strings, and pooled literals are narrow (set below, once MODUS.MVM exists).
+;;; MODUS_SMALL_IMAGE is build-cli-common's own.  Bare i386 the same: its
+;;; collector sizes #x13 as bytes (translate-i386's copy_object and typed walk).
+(when (and (or *cl-repl-mac68k-p* *cl-repl-i386-p*)
+           (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS")))
+             (and v (> (length v) 0) (string/= v "0"))))
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source*
+                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)
+                     ;; but not 32-bit strings: compiler.lisp *STRING32-P*
+                     "(defun %string32-strings-p () nil)" (string #\Newline)
+                     ;; and SUBSEQ of a narrow string is narrow (prelude)
+                     "(defun %base-subseq-p () t)" (string #\Newline)
+                     ;; and every fresh string is narrow (compiler.lisp *BASE-STRINGS-ONLY*)
+                     (if (or (equal (sb-ext:posix-getenv "MODUS_68K_WIDE_STRINGS") "1")
+                             (and *cl-repl-i386-p*
+                                  (equal (sb-ext:posix-getenv "MODUS_WIDE_STRINGS") "1")))
+                         ""
+                         "(defun %base-strings-only-p () t)")
+                     (string #\Newline)))
+  (defparameter cl-user::*68k-pool-narrow* t))
+
+;;; :MAC68K'S KERNEL PROLOGUE: the banner only.  The 32-bit prologue it shared
+;;; (*CL-REPL-I386-KERNEL-PROLOGUE*) zeroes the global table, the symbol table,
+;;; the MV slots and the fault slots -- BSS-equivalent init that the Mac's boot
+;;; stub already does for the whole low block on a boot from scratch, and that
+;;; runs BEFORE kernel-main's core check: on a boot from a saved core it wiped
+;;; the core's global and symbol tables (measured: TYPE-OF of a condition was
+;;; NIL, and the first form typed faulted).
+(when *cl-repl-mac68k-p*
+  (setq *cli-arch-kernel-prologue* "  (write-string-serial \"MODUS-CL\")
+  (write-char-serial 10)
+"))
+
+;;; :MAC68K: THE STATIC HEAP AND THE SAVED CORE (MODUS_68K_GC_STATIC, which
+;;; follows MODUS_SMALL_IMAGE as on the hosted 68k CLI).  After boot the heap is
+;;; frozen (mvm/68k-gc-static.lisp, as mvm/build-68k-cli.lisp does).  On the
+;;; Classic layout a boot whose stub found the SAVE flag (the build's core run,
+;;; scripts/mac68k-core.py) then sends its core over serial port A -- "MCOR",
+;;; the low block's address and the static ranges, the low block, the static
+;;; objects and conses -- and stops; a boot whose stub found a CORE (the low
+;;; block's #x10006014 set, as the core was saved) skips boot init and goes
+;;; straight to the REPL.
+(defun %mac68k-small-image-env-p ()
+  "MODUS_SMALL_IMAGE's rule, read before build-cli-common defines *SMALL-IMAGE*."
+  (let ((s (sb-ext:posix-getenv "MODUS_SMALL_IMAGE")))
+    (and s (plusp (length s)) (not (string= s "0")))))
+;;; :MAC68K: COLD NAMES (mvm/mac68k-cold.lisp): with the saved core, the names
+;;; *SYM-NAME-TABLE* holds are also written to IMAGE.cold, which mac68k-core.py
+;;; puts on the core's disk, and the core run drops the table (430 KB of a
+;;; Classic's static heap).  Follows the static heap; MODUS_MAC68K_COLD_NAMES=0
+;;; keeps the table.
+(defvar *mac-cold-names-out*
+  (and *cl-repl-mac68k-p*
+       (let ((v (sb-ext:posix-getenv "MODUS_MAC68K_COLD_NAMES"))
+             (gs (sb-ext:posix-getenv "MODUS_68K_GC_STATIC")))
+         (and (not (equal v "0"))
+              (cond ((null gs) (%mac68k-small-image-env-p)) ((string= gs "0") nil) (t t))
+              (concatenate 'string (or (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
+                                       "/tmp/modus-mac68k-cl-repl.bin")
+                           ".cold")))))
+
+;;; :MAC68K: INIT-ONLY TEXT (cross.lisp *POOL-INIT-ONLY*), with the saved core:
+;;; the boot tables' packed text (symbol, function and global names) goes last
+;;; in the resident image, where mac68k-core.py starts the static heap over it.
+;;; MODUS_MAC68K_INIT_ONLY=0 keeps it in the pool.
+(defvar *mac-init-only*
+  (and *mac-cold-names-out*
+       (not (equal (sb-ext:posix-getenv "MODUS_MAC68K_INIT_ONLY") "0"))
+       (make-hash-table :test 'equal)))
+;;; ... and so is CL's runtime macro source (mvm/runtime-cl-macros.lisp's
+;;; *MODUS-RUNTIME-MACROS*, a list of DEFMACRO strings boot READs and EVALs):
+;;; ~30 KB of the pool.  The freeze drops the list, so nothing points there.
+(when *mac-init-only*
+  (with-open-file (in (merge-pathnames "runtime-cl-macros.lisp" *load-truename*))
+    (let ((*package* (make-package (gensym "RTM") :use '(:cl))) (n 0))
+      (loop for form = (read in nil in)
+            until (eq form in)
+            when (and (consp form) (eq (car form) 'defvar)
+                      (string= (symbol-name (second form)) "*MODUS-RUNTIME-MACROS*"))
+              do (dolist (x (cdr (third form)))
+                   (when (stringp x) (setf (gethash x *mac-init-only*) t) (incf n)))
+                 (return))
+      (when (zerop n) (error "mac68k: no *MODUS-RUNTIME-MACROS* strings in runtime-cl-macros.lisp"))
+      (format t "~&;; mac68k: ~D runtime macro texts init-only~%" n))))
+;;; ... and the name lists only package setup reads (%INIT-PACKAGES, at boot):
+;;; CL's 978 exported names and MODUS-INT's exports to the runtime, ~18 KB.
+(when *mac-init-only*
+  (dolist (site '(("cl-conditions.lisp" "(defun %standard-cl-symbol-names")
+                  ("kernel-packages.lisp" "(defun %modus-int-runtime-exports")))
+    (let* ((text (with-open-file (in (merge-pathnames (first site) *load-truename*))
+                   (let ((s (make-string (file-length in))))
+                     (subseq s 0 (read-sequence s in)))))
+           (at (search (second site) text))
+           (q (and at (search "(let ((text \"" text :start2 at)))
+           (str (and q (read-from-string text t nil :start (+ q 12)))))
+      (unless (and (stringp str) (> (length str) 1000))
+        (error "mac68k: no name list after ~A in ~A" (second site) (first site)))
+      (setf (gethash str *mac-init-only*) t))))
+
+;;; COMPILE-COMPOUND SPLIT (mvm/split-dispatch.lisp), MODUS_SPLIT_COMPOUND=1.  The
+;;; image's copy of the compiler gets COMPILE-COMPOUND's ~300-clause COND as a
+;;; binary search over the operator's name hash, short clauses in its leaves and
+;;; 69 handler functions for the rest, so compiling a form runs the code for its
+;;; own operator, not the whole 96 KB function.  OFF by default: measured on the
+;;; 1 MB Plus (DEFMACRO's stream loads), it cut COMPILE-COMPOUND's own paging
+;;; 1,259 -> 485 KB but the form's total only 13,848 -> 13,540 loads, and no form
+;;; got faster -- the small leaves (GETHASH, STRING= ...) thrash because a form's
+;;; ~740 KB of code does not fit a 136 KB cache, not because of this walk -- and
+;;; it costs 3.4 KB resident (handler stubs) on a map with 1.6 KB to spare.
+(let ((v (sb-ext:posix-getenv "MODUS_SPLIT_COMPOUND")))
+  (when (and v (string= v "1"))
+    (load (merge-pathnames "split-dispatch.lisp" *load-truename*))
+    (multiple-value-bind (text handlers keys)
+        (funcall 'split-cond-dispatch (mvm-text "mvm/compiler.lisp")
+                 :head "(defun compile-compound (form env dest)"
+                 :cond-marker (format nil "~%    (cond~%")
+                 :lambda-list "(form env dest op op-name)"
+                 :block "compile-compound" :prefix "%cc-split")
+      (when (boundp 'cl-user::*compiler-source*)
+        (error "split-dispatch: *COMPILER-SOURCE* is already set"))
+      (defvar cl-user::*compiler-source* text)   ; build-cli-common's (in CL-USER)
+      (format t "~&;; split-dispatch: COMPILE-COMPOUND -> ~D handlers over ~D keys~%"
+              handlers keys))))
+
+;;; :MAC68K + MODUS_68K_JIT=1: the runtime threaded JIT (mvm/jit-68k.lisp) in
+;;; build-cli-common's late arch slot, with the layout's :JIT-AREA as its code
+;;; area (a Mac has no mmap).  Layouts without one get no JIT.
+(when (and *cl-repl-mac68k-p* (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+           (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
+  (let ((lo (let ((v (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-lo)))
+              (and v (+ v modus.mvm::*mac68k-shift*))))   ; MODUS_MAC68K_SHIFT
+        (hi (let ((v (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-hi)))
+              (and v (+ v modus.mvm::*mac68k-shift*))))
+        (cap (or (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-max-bytecode)
+                 2048))
+        (auto (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-on-defun t)))
+    (unless (and lo hi)
+      (error "MODUS_68K_JIT=1: the ~S map has no :JIT-AREA (use classicos)" modus.mvm::*mac68k-machine*))
+    ;; The seams are REPLACED in the text (one DEFUN each, nothing for a
+    ;; redefinition to get wrong).  The variable is CL-USER's: build-cli-common
+    ;; reads in CL-USER (its one IN-PACKAGE is inside a string), and binding
+    ;; MODUS.MVM's instead left the image with the hosted defaults -- the core
+    ;; run then translated E2SMOKE's DEFUN and went to mmap a code area.
+    (flet ((swap (text head old new)
+             (let* ((i (or (search head text) (error "jit-68k.lisp: no ~A" head)))
+                    (j (or (search old text :start2 i) (error "jit-68k.lisp: ~A body" head))))
+               (concatenate 'string (subseq text 0 j) new (subseq text (+ j (length old)))))))
+      ;; THE NATIVE TIER (the translator + mvm/jit-68k-native.lisp) is baked by
+      ;; build-cli-common's *CLI-ARCH-JIT-TRANSLATOR-SOURCE*, for every 68k JIT
+      ;; image, hosted or Mac.
+      (defvar cl-user::*cli-arch-late-source*   ; build-cli-common's (in CL-USER)
+        (swap (swap (swap (swap (swap (swap (swap (mvm-text "mvm/jit-68k.lisp")
+                    "(defun %t68-fixed-area ()" (format nil "~%  nil)")
+                    ;; the loader's words (+MAC68K-HEAP-SLOT+ +8/+12: an
+                    ;; application's area from its partition), else the
+                    ;; layout's.  Fixed-width hex: the relocating pair's two
+                    ;; builds must spell every address in as many characters.
+                    (format nil "~%  (let ((lo (+ (* (mem-ref #x10006060 :u16) 65536) (mem-ref #x10006062 :u16))))~
+                                 ~%    (if (zerop lo) (cons #x~8,'0X #x~8,'0X)~
+                                 ~%        (cons lo (+ (* (mem-ref #x10006064 :u16) 65536) (mem-ref #x10006066 :u16))))))"
+                            lo hi))
+              "(defun %t68-allowed-p ()" (format nil "~%  t)")
+              (format nil "~%  (%core-requested-p))"))
+              ;; cold native code shares the area: its floor is the JIT's end,
+              ;; and what the JIT reserves is the loader's limit (translate-68k
+              ;; +68K-COLD-FLOOR+ / +68K-JIT-TOP+)
+              "(defun %t68-limit ()" (format nil "~%  *t68-end*)")
+              (format nil "~%  (let ((f (+ (* (mem-ref #x10006068 :u16) 65536) (mem-ref #x1000606A :u16))))~
+                           ~%    (if (and (> f 0) (< f *t68-end*)) f *t68-end*)))"))
+              "(defun %t68-reserve (top)" (format nil "~%  top)")
+              (format nil "~%  (setf (mem-ref #x1000606C :u16) (ash top -16))~
+                           ~%  (setf (mem-ref #x1000606E :u16) (logand top #xFFFF))~
+                           ~%  top)"))
+              ;; big modules stay interpreted (see its docstring)
+              "(defun %t68-max-bytecode ()" (format nil "~%  nil)") (format nil "~%  ~D)" cap))
+              ;; translate at DEFUN, or only at (compile 'f)
+              "(defun %t68-on-defun-p ()" (format nil "~%  t)") (format nil "~%  ~A)" (if auto "t" "nil")))
+              ;; a 68020 or later must not run the new code from a stale cache
+              "(defun %t68-flush-code ()" (format nil "~%  nil)") (format nil "~%  (syscall3 3 0 0 0))"))))
+    (format t "~&;; mac68k: the threaded JIT, its code at #x~X-#x~X, modules to ~D bytes, ~A~%"
+            lo hi cap (if auto "at each DEFUN" "at (compile 'f)"))))
+
+;;; :MAC68K: AOT RUNTIME MACROS.  mvm/runtime-cl-macros.lisp keeps CL's runtime
+;;; macros (WHEN, DOTIMES, PUSH, CASE ...) as DEFMACRO strings that boot READs
+;;; and EVALs: each expander became an interpreted closure, 56 KB of bytecode in a
+;;; Classic's saved heap, and every expansion ran in the bytecode interpreter.
+;;; Here each string becomes an image function instead -- %RTM-k of the whole
+;;; form, binding the macro's (required + &REST) lambda list from its CDR -- that
+;;; the build compiles like any other, and %INSTALL-AOT-RUNTIME-MACROS registers
+;;; them as a runtime DEFMACRO would (%DEFINE-COMPILE-TIME-MACRO).  Its string in
+;;; the list becomes NIL, which the installer skips.  MODUS_MAC68K_AOT_MACROS=0
+;;; keeps the strings.
+(when (and *cl-repl-mac68k-p* (not (equal (sb-ext:posix-getenv "MODUS_MAC68K_AOT_MACROS") "0")))
+  (let* ((text (mvm-text "mvm/runtime-cl-macros.lisp"))
+         (at (or (search "(defvar *modus-runtime-macros*" text)
+                 (error "mac68k: no *MODUS-RUNTIME-MACROS* in runtime-cl-macros.lisp")))
+         (spans nil) (defs nil) (regs nil) (k 0)
+         (rt (copy-readtable nil))
+         (string-reader (get-macro-character #\" rt)))
+    ;; read the list, noting where each string literal starts and ends
+    (set-macro-character #\"
+                         (lambda (stream ch)
+                           (let ((start (1- (file-position stream)))
+                                 (str (funcall string-reader stream ch)))
+                             (push (list start (file-position stream) str) spans)
+                             str))
+                         nil rt)
+    (with-input-from-string (in text :start at)
+      (let ((*readtable* rt) (*package* (make-package (gensym "RTM") :use '(:cl))))
+        (read in)))
+    (setq spans (reverse spans))
+    (dolist (sp spans)
+      (let ((src (third sp)))
+        (unless (and (> (length src) 10) (string-equal (subseq src 0 10) "(defmacro "))
+          (error "mac68k: ~S in *MODUS-RUNTIME-MACROS* is not a DEFMACRO" (subseq src 0 (min 40 (length src)))))
+        (let ((*package* (make-package (gensym "RTM") :use '(:cl))))
+          (multiple-value-bind (name p1) (read-from-string src t nil :start 10)
+            (multiple-value-bind (params p2) (read-from-string src t nil :start p1)
+              (let ((req nil) (rest nil) (body (subseq src p2 (position #\) src :from-end t))))
+                ;; compiled in MODUS-INT, where boot read the strings; the
+                ;; runtime's own helpers they call are named as such
+                (dolist (h '("%correctable-case-form" "%rmw-place"
+                             "%apply-setf-expander" "%find-setf-expander"))
+                  (loop for i = (search (format nil "(~A " h) body) while i
+                        do (setq body (concatenate 'string (subseq body 0 (1+ i)) "modus.runtime::"
+                                                   (subseq body (1+ i))))))
+                (loop for (x . more) on params
+                      do (cond ((string= (symbol-name x) "&REST") (setq rest (car more)) (return))
+                               ((char= (char (symbol-name x) 0) #\&)
+                                (error "mac68k: ~A's lambda list ~S" name params))
+                               (t (push x req))))
+                (setq req (nreverse req))
+                (push (format nil "(defun %rtm-~D (%rtm-form)~%  (let* ((%rtm-args (cdr %rtm-form))~{~%         ~A~})~%    %rtm-args~%~A))~%"
+                              k
+                              (append (loop for r in req for i from 0
+                                            collect (format nil "(~A (nth ~D %rtm-args))" (symbol-name r) i))
+                                      (when rest
+                                        (list (format nil "(~A (nthcdr ~D %rtm-args))" (symbol-name rest) (length req)))))
+                              body)
+                      defs)
+                (push (format nil "    (funcall def (intern ~S int) (function %rtm-~D))~%"
+                              (symbol-name name) k)
+                      regs)
+                (incf k)))))))
+    ;; the strings out of the list (from the end, so earlier spans stay put)
+    (dolist (sp (reverse spans))
+      (setq text (concatenate 'string (subseq text 0 (+ at (first sp))) "nil"
+                              (subseq text (+ at (second sp))))))
+    ;; ... and the expanders in their place, in the runtime's own package (the
+    ;; bodies call its internals, %RMW-PLACE and the like)
+    (let* ((default "(defun %install-aot-runtime-macros () nil)")
+           (d (or (search default text)
+                  (error "mac68k: no default %INSTALL-AOT-RUNTIME-MACROS in runtime-cl-macros.lisp"))))
+      (setq text (concatenate 'string (subseq text 0 d)
+                              ;; registered as a runtime DEFMACRO registers its
+                              ;; expander; the compiler's function by name, since it
+                              ;; is MODUS-INT's and this is the runtime's package
+                              (format nil "~{~A~}(defun %install-aot-runtime-macros ()~%  (let* ((int (find-package \"MODUS-INT\"))~%         (def (fdefinition (intern \"%DEFINE-COMPILE-TIME-MACRO\" int)))~%         (old *package*))~%    ;; in MODUS-INT, as %RT-INSTALL-ONE read and evaluated the strings~%    (setq *package* int)~%~{~A~}    (setq *package* old))~%  t)"
+                                      (reverse defs) (reverse regs))
+                              (subseq text (+ d (length default))))))
+    (when (boundp 'cl-user::*rt-macros-source*)
+      (error "mac68k: *RT-MACROS-SOURCE* is already set; the AOT macros would be lost"))
+    (defvar cl-user::*rt-macros-source* text)   ; build-cli-common's (in CL-USER)
+    (format t "~&;; mac68k: ~D runtime macros compiled into the image~%" k)))
+
+;;; :MAC68K: FLOPPY FILES (mvm/mac68k-files.lisp): fs-fat's lib/fat32.lisp
+;;; compiled INTO the image as kernel code -- its DEFPACKAGE, IN-PACKAGE and
+;;; DECLAIM left out, nothing else touched -- with mvm/mac68k-disk-io.lisp and
+;;; mvm/mac68k-files.lisp, whose %MAC-FILES-INSTALL the core run calls to make
+;;; the package FLOPPY.  (LOADed as text in the core run instead, it stayed
+;;; bytecode: a Mac translates at DEFUN and the core run cannot.)  On for
+;;; MODUS_MAC68K_MACHINE=floppy (the 8 MB floppy set: its second disk is
+;;; FAT12); MODUS_MAC68K_FILES=1 / 0 says otherwise.  fs-fat is FS_FAT, else a
+;;; checkout beside this one.  Its names do not collide with the kernel's
+;;; (checked when this went in: 115 DEFUNs and DEFVARs, none defined here).
+(defun %mac68k-drop-forms (text heads)
+  "TEXT without its top-level forms whose first symbol is one of HEADS."
+  (let ((out (make-string-output-stream)) (pos 0) (n (length text)))
+    (loop
+      (let ((k (loop for i from pos below n
+                     when (and (char= (char text i) #\()
+                               (or (= i 0) (char= (char text (1- i)) #\Newline))
+                               (some (lambda (h) (let ((e (+ i 1 (length h))))
+                                                   (and (<= e n) (string-equal h text :start2 (1+ i) :end2 e)
+                                                        (member (char text e) '(#\Space #\Newline)))))
+                                     heads))
+                       return i)))
+        (unless k (write-string text out :start pos) (return (get-output-stream-string out)))
+        (write-string text out :start pos :end k)
+        (setq pos (let ((*read-suppress* t)) (nth-value 1 (read-from-string text t nil :start k))))))))
+
+(defvar *mac68k-files-text*
+  (let ((on (sb-ext:posix-getenv "MODUS_MAC68K_FILES")))
+    (when (and *cl-repl-mac68k-p*
+               (if (and on (plusp (length on)))
+                   (string/= on "0")
+                   (string-equal (or (sb-ext:posix-getenv "MODUS_MAC68K_MACHINE") "") "floppy")))
+      (let* ((e (sb-ext:posix-getenv "FS_FAT"))
+             (lib (if (and e (plusp (length e)))
+                      (merge-pathnames "lib/fat32.lisp"
+                                       (if (char= (char e (1- (length e))) #\/) e (concatenate 'string e "/")))
+                      (merge-pathnames "../fs-fat/lib/fat32.lisp" *modus-base*))))
+        (unless (probe-file lib)
+          (error "mac68k: floppy files need fs-fat: set FS_FAT (no ~A)" lib))
+        (format t "~&;; mac68k: floppy files: ~A compiled in, with mvm/mac68k-files.lisp~%" lib)
+        (concatenate 'string
+                     (%mac68k-drop-forms (read-file-text lib) '("defpackage" "in-package" "declaim"))
+                     (string #\Newline) (mvm-text "mvm/mac68k-disk-io.lisp")
+                     (string #\Newline) (mvm-text "mvm/mac68k-files.lisp"))))))
+
+;;; :MAC68K: no Genera / SB-* / ASDF surface source (build-cli-common's
+;;; MODUS_NO_SURFACES), following MODUS_SMALL_IMAGE: a Mac has no environment
+;;; to switch them off in, no sockets or threads for them to wrap, and the text
+;;; was 440 KB of the image's constant pool.  MODUS_NO_SURFACES=0 keeps them.
+(defvar *no-surfaces*
+  (let ((v (sb-ext:posix-getenv "MODUS_NO_SURFACES")))
+    (cond ((null v) (and *cl-repl-mac68k-p* (%mac68k-small-image-env-p)))
+          ((string= v "0") nil) (t t))))
+(defvar *mac68k-gc-static*
+  (and *cl-repl-mac68k-p*
+       (let ((v (sb-ext:posix-getenv "MODUS_68K_GC_STATIC")))
+         (cond ((null v) (%mac68k-small-image-env-p)) ((string= v "0") nil) (t t)))))
+(when *mac68k-gc-static*
+  (let* ((tags3 (let ((v (sb-ext:posix-getenv "MODUS_68K_TAGS3")))
+                  (cond ((null v) (%mac68k-small-image-env-p)) ((string= v "0") nil) (t t))))
+         (text (mvm-text "mvm/68k-gc-static.lisp"))
+         ;; the low block's size (boot-mac68k MAC68K-ALLOC-START): the crossing
+         ;; table is its last 8 KB, and the core sends all of it
+         (low (let ((f (find-symbol "MAC68K-ALLOC-START" "MODUS.MVM")))
+                (if (and f (fboundp f)) (funcall f) #x20000))))
+    (dolist (p (if tags3
+                   '(("GRAN-1" . "7") ("MINUS-GRAN" . "-8") ("MAX-SHIFT" . "10") ("MINUS-KSHIFT" . "-3"))
+                   '(("GRAN-1" . "15") ("MINUS-GRAN" . "-16") ("MAX-SHIFT" . "11") ("MINUS-KSHIFT" . "-4"))))
+      (loop for i = (search (car p) text) while i
+            do (setq text (concatenate 'string (subseq text 0 i) (cdr p)
+                                       (subseq text (+ i (length (car p))))))))
+    (let ((cross (format nil "#x~X" (+ #x10000000 low -8192))))
+      (loop with start = 0
+            for i = (search "#x1001E000" text :start2 start) while i
+            do (setq text (concatenate 'string (subseq text 0 i) cross
+                                       (subseq text (+ i (length "#x1001E000"))))
+                     start (+ i (length cross)))))
+    (when *mac-cold-names-out*
+      (setq text (concatenate 'string text (string #\Newline) (mvm-text "mvm/mac68k-cold.lisp"))))
+    ;; FLOPPY FILES: fs-fat and the FLOPPY package's functions, native
+    (when *mac68k-files-text*
+      (setq text (concatenate 'string text (string #\Newline) *mac68k-files-text*)))
+    ;; THE CORE RUN PROMOTES BY COUNT ALONE: a runtime DEFUN's trampoline also
+    ;; goes native after 10 ms interpreted (mvm-eval %JIT-HOT-NS), and under an
+    ;; emulator that is the host's timing -- measured, two core runs of one
+    ;; build (Basilisk II) saved different heaps (a closure where the other had
+    ;; garbage), so the shift pair a relocatable image is made from
+    ;; (mac68k-reloc-disk.py) no longer differed by relocations alone.
+    (setq text (concatenate 'string text "
+(defun %jit-hot-ns ()
+  (if (eql (mem-ref #x1000602C :u32) 1) 1099511627776 10000000))
+"))
+    (setq *cli-arch-override-source*
+          (concatenate 'string *cli-arch-override-source* (string #\Newline) text
+                       "
+;; THE MAC'S SAVED CORE (boot/boot-mac68k.lisp, scripts/mac68k-core.py).
+(defun %core-requested-p () (eql (mem-ref #x10006014 :u32) 1))
+(defun %core-pre-restore () t)
+(defun %restore-image () nil)
+(defun %core-post-restore () nil)
+(defun %mac-send-u32 (v)
+  (write-char-serial (logand (ash v -24) 255)) (write-char-serial (logand (ash v -16) 255))
+  (write-char-serial (logand (ash v -8) 255)) (write-char-serial (logand v 255)))
+(defun %mac-send-range (a n)
+  (let ((i 0))
+    (loop (when (>= i n) (return nil))
+          (write-char-serial (mem-ref (+ a i) :u8))
+          (setq i (+ i 1)))))
+(defun %mac-send-core ()
+  \"Send this boot's core on serial port A and stop: right after the freeze,
+   allocating nothing (no saved word may point at the young space, which a
+   core does not carry), the low block made as a core boot must find it.\"
+  (setf (mem-ref #x1000921C :u32) 0)             ; the screen console off: bytes only
+  (let ((olo (mem-ref #x10006004 :u32)) (ohi (mem-ref #x10006008 :u32))
+        (clo (mem-ref #x1000600C :u32)) (chi (mem-ref #x10006010 :u32))
+        (base (%conv-addr #x10000000)))
+    (setf (mem-ref #x10006014 :u32) 1)           ; a core
+    (setf (mem-ref #x10006000 :u32) 0)           ; no freeze request
+    (setf (mem-ref #x1000601C :u32) 0)           ; cards off until %GC-CARDS-INIT
+    (setf (mem-ref #x10000400 :u32) 0)           ; handler depth
+    (setf (mem-ref #x10000180 :u32) 0)           ; armed jmpbuf
+    (setf (mem-ref #x10000360 :u32) 0)           ; capped pushes
+    (write-char-serial 77) (write-char-serial 67) (write-char-serial 79) (write-char-serial 82)
+    (%mac-send-u32 base) (%mac-send-u32 olo) (%mac-send-u32 ohi)
+    (%mac-send-u32 clo) (%mac-send-u32 chi)
+    (%mac-send-range base "
+            (princ-to-string low) ")
+    (%mac-send-range olo (- ohi olo))
+    (%mac-send-range clo (- chi clo))
+    (halt)))
+")))
+  ;; after the boot self-check: freeze, then (the core run) send the core
+  (let* ((k "(write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
+")
+         (at (search k *cli-arch-kernel-epilogue*)))
+    (unless at (error "mac68k: E2SMOKE-END moved out of *CLI-ARCH-KERNEL-EPILOGUE*"))
+    (setq *cli-arch-kernel-epilogue*
+          (concatenate 'string (subseq *cli-arch-kernel-epilogue* 0 (+ at (length k)))
+                       (if *mac68k-files-text* "  (%mac-files-install)
+" "")
+                       "  ;; boot's own compiled forms (E2SMOKE) are not worth 66 KB of a
+  ;; Classic's static heap: the cache refills from the REPL's forms
+  (setq *mvm-eval-cache* nil)
+  ;; the runtime macros' source texts are init-only (installed at boot)
+  (setq *modus-runtime-macros* nil)
+  ;; one string per name across the function and name tables (mvm-eval.lisp)
+  (compact-names)
+"
+                       (if *mac-cold-names-out* "  (%cold-names-drop)
+  ;; the pinned globals table's buckets at one per two entries, and the dicts
+  ;; that never grow at their counts.  NOT a table a session adds to (the
+  ;; function and symbol tables): measured, a right-sized symbol table full
+  ;; after 256 new symbols doubles in one allocation the Classic's 128 KB young
+  ;; semispace cannot hold (heap exhausted).
+  (%mac-shrink-buckets (modus.runtime::%globals-table))
+  ;; the image's functions go to disk (mac68k-cold.lisp COLD FUNCTIONS); the
+  ;; table keeps what boot defined, with room for a session's
+  (%cold-fns-cut)
+  (%mac-right-size *symbol-function-table* 256)
+  (%mac-right-size *kernel-fn-names* 0)
+  (%mac-right-size *kernel-global-names* 0)
+" "")
+                       (if (and (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+                                (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
+                           "  ;; the threaded JIT's tables (the shape index, the constant cells, the area
+  ;; pointer) made HERE,
+  ;; so they are frozen into the core: on a Classic they cost minutes at the
+  ;; first DEFUN.  Nothing is translated (%T68-ALLOWED-P), so the code area,
+  ;; which the core does not carry, is still empty.
+  (handler-case (%t68-init)
+    (error (c) (write-string-serial \"T68-INIT-FAILED\") (write-char-serial 10)))
+"
+                           "")
+                       ;; ... and the native tier's: its export table found HERE
+                       ;; (in an all-native image a scan of the code, measured
+                       ;; 21 s on a Quadra 950 at the first DEFUN), saved with the core
+                       (if (and (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+                                (not (equal (sb-ext:posix-getenv "MODUS_68K_NATIVE") "0"))
+                                (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
+                           "  (handler-case (%n68-init)
+    (error (c) (write-string-serial \"N68-INIT-FAILED\") (write-char-serial 10)))
+"
+                           "")
+                       "  ;; the closure-environment slot (translate-68k M68K-CENV-ADDR, the
+  ;; hosted convention block at #x10000A00) still holds the LAST closure's
+  ;; environment -- COMPACT-NAMES' MAPHASH lambda, over its 12,000-name table:
+  ;; measured, 400 KB the freeze kept.  No closure runs here.
+  (setf (mem-ref #x10000A08 :u32) 0)
+  (%gc-static-freeze)
+"
+                       (if *mac-cold-names-out* "  (%cold-fns-hand-over)
+" "")
+                       "  (when (eql (mem-ref #x1000602C :u32) 1) (%mac-send-core))
+"
+                       (subseq *cli-arch-kernel-epilogue* (+ at (length k))))))
+  ;; a core boot: the cards (the core's are for where its heap was), then the REPL
+  (setq *cli-arch-core-resume* "    (%gc-cards-init)
+    (setq *jit-bridge-on* t)
+    (setq *%arith-strict* t)
+    ;; MODUS_MAC_CORE_PROBES: which subsystem a resumed core breaks in
+    (when (eql (mem-ref #x10006030 :u32) 1)
+      (write-string-serial \"P1 eval=\")
+      (print-dec (handler-case (mvm-eval (quote (+ 1 2)))
+                   (t (c) (write-string-serial \"ERR \")
+                          (handler-case (write-object (type-of c)) (t (c2) (write-string-serial \"?type\")))
+                          (write-char-serial 32)
+                          (handler-case (write-object c) (t (c2) (write-string-serial \"?print\")))
+                          (write-char-serial 32) -1)))
+      (write-char-serial 10)
+      (write-string-serial \"P2 read=\")
+      (print-dec (handler-case (read-from-string \"42\") (t (c) -1))) (write-char-serial 10)
+      (write-string-serial \"P3 typep=\")
+      (print-dec (handler-case (if (typep (list 1) (quote list)) 1 0) (t (c) -1))) (write-char-serial 10)
+      (write-string-serial \"P4 print=\")
+      (handler-case (write-object 7) (t (c) (write-string-serial \"ERR\"))) (write-char-serial 10)
+      (write-string-serial \"P5 eval-read=\")
+      (print-dec (handler-case (mvm-eval (read-from-string \"(+ 1 2)\")) (t (c) -1))) (write-char-serial 10))
+    (handler-case (cl-serial-repl)
+      (t (c) (write-string-serial \"REPL-DIED\") (write-char-serial 10)))
+    (halt)
+"))
+
+;;; THE i386 SAVED CORE (boot/boot-i386-cl.lisp, scripts/dos386-core.py).
+;;; Boot init -- the symbol, package and function tables, the defvar thunks,
+;;; the runtime macros and the shims compiled from source -- is the same work
+;;; on every boot: about 5 s of QEMU, 60 s on a 486DX2-66, three minutes on a
+;;; 486SX-25.  So the build boots the image once under QEMU with SAVECORE in
+;;; its Multiboot command line, collects until the live data is at the bottom of the lower
+;;; semispace, and stops before the REPL; the harness reads the low block, the
+;;; heap and the bitmap slices out of the guest and appends them to the image.
+;;; A later boot's entry stub copies them back (#x8024 says it did) and
+;;; kernel-main goes straight to the REPL.  The heap is at a fixed virtual
+;;; address on every machine, so nothing is relocated; only the words the stub
+;;; computes from the machine's RAM (semispace size, limit, bitmap bases) are
+;;; this machine's.
+(when *cl-repl-i386-p*
+  ;; the roots the prologue zeroes are the restored core's on a core boot (the
+  ;; stub zeroed the whole block on a cold one)
+  (let ((at (search "  (write-string-serial \"MODUS-CL\")" *cli-arch-kernel-prologue*)))
+    (unless at (error "i386 core: the prologue's banner moved"))
+    (setq *cli-arch-kernel-prologue*
+          (concatenate 'string "  (unless (eql (mem-ref #x8024 :u32) 1)
+" (subseq *cli-arch-kernel-prologue* 0 at) "  )
+" (subseq *cli-arch-kernel-prologue* at))))
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source* "
+(defun %core-requested-p () (eql (mem-ref #x8024 :u32) 1))
+(defun %core-pre-restore () t)
+(defun %restore-image () nil)
+(defun %core-post-restore () nil)
+(defun %i386-core-save-requested-p ()
+  ;; SAVECORE in the Multiboot command line (QEMU -append), which the entry
+  ;; stub copied to #x8200 (boot-i386-cl.lisp +I386-CL-CMDLINE+).
+  (let ((i 0) (hit nil))
+    (loop
+      (when (or hit (>= i 248) (eql (mem-ref (+ #x8200 i) :u8) 0)) (return nil))
+      (when (and (eql (mem-ref (+ #x8200 i) :u8) 83) (eql (mem-ref (+ #x8201 i) :u8) 65)
+                 (eql (mem-ref (+ #x8202 i) :u8) 86) (eql (mem-ref (+ #x8203 i) :u8) 69)
+                 (eql (mem-ref (+ #x8204 i) :u8) 67) (eql (mem-ref (+ #x8205 i) :u8) 79)
+                 (eql (mem-ref (+ #x8206 i) :u8) 82) (eql (mem-ref (+ #x8207 i) :u8) 69))
+        (setq hit t))
+      (setq i (+ i 1)))
+    hit))
+(defun %i386-core-save ()
+  \"Collect until the live data is at the bottom of the lower semispace, say
+   where it ends, and stop: scripts/dos386-core.py reads the guest from here.
+   Nothing may allocate after the allocation pointer is read.\"
+  (%gc-force-to-space-0)
+  (let ((free (get-alloc-ptr)))
+    (write-string-serial \"CORE-SAVE free=\")
+    (print-dec free)
+    (write-string-serial \" bm1=\")
+    (print-dec (mem-ref #x10000E18 :u32))
+    (write-string-serial \" bm2=\")
+    (print-dec (mem-ref #x10000E40 :u32))
+    (write-string-serial \" page=\")
+    (print-dec (mem-ref #x10000E00 :u32))
+    (write-string-serial \" handlers=\")
+    (print-dec (mem-ref #x10000400 :u32))
+    (write-char-serial 10)
+    (halt)))
+"))
+  ;; save just before the REPL, after the last boot-time setq
+  (let* ((k "  (handler-case (cl-serial-repl)
+    (t (c) (write-string-serial \"REPL-DIED: \")")
+         (at (search k *cli-arch-kernel-epilogue*)))
+    (unless at (error "i386 core: the epilogue's REPL call moved"))
+    (setq *cli-arch-kernel-epilogue*
+          (concatenate 'string (subseq *cli-arch-kernel-epilogue* 0 at)
+                       "  (when (%i386-core-save-requested-p) (%i386-core-save))
+"
+                       (subseq *cli-arch-kernel-epilogue* at))))
+  (setq *cli-arch-core-resume* "    (write-string-serial \"MODUS-CORE\")
+    (write-char-serial 10)
+    (handler-case (cl-serial-repl)
+      (t (c) (write-string-serial \"REPL-DIED: \")
+             (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+             (write-char-serial 10)))
+    (halt)
+"))
+
 ;;; ============================================================
 ;;; THE SHARED ASSEMBLY
 ;;; ============================================================
+
+;;; :MAC68K: no stage-1 / stage-2 diagnostic probes (%S1-*, %S2-*, %WS1-*, ...:
+;;; 106 functions build-cli-common bakes for the self-host checks, which a Mac
+;;; never runs).  DEFVAR before the load keeps these values.
+(when (and *cl-repl-mac68k-p* (not (%rpi-cull-p "MODUS_MAC68K_TEST_AUX")))
+  (defvar cl-user::*stage1-test-source* "")   ; build-cli-common's (in CL-USER)
+  (defvar cl-user::*stage2-test-source* ""))
 
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
@@ -3108,6 +3817,31 @@
 ;; Narrow AOT string literals (compiler.lisp *NARROW-LITERALS-P*) wherever
 ;; *CL-REPL-RPI-CORE-SOURCE* turns %NARROW-STRINGS-P on.
 (when cl-user::*cl-repl-rpi-p* (setq *narrow-literals-p* t))
+;; i386: AOT string literals POOLED (compiler.lisp *NARROW-LITERALS-P*), each
+;; evaluation a %FRESH-STRING copy of the pooled one -- wide here, i386 has no
+;; narrow strings -- instead of one LI and one OBJ-SET per character: 919 KB of
+;; the bare image's 8.9 MB of native code.  MODUS_I386_POOL_LITERALS=0: the old
+;; way.  Mutable strings stay #x31, as on the 68k: %MAKE-STRING32 and
+;; %C32-ADDRESS assume the 64-bit layout (data at +16), so with *STRING32-P* on
+;; every 32-bit string wrote 12 bytes past its end -- harmless until a
+;; collection, which copies only the real size (compiler.lisp *STRING32-P*).
+(when (and cl-user::*cl-repl-i386-p*
+           (not (equal (sb-ext:posix-getenv "MODUS_I386_POOL_LITERALS") "0")))
+  (setq *narrow-literals-p* t
+        *string32-p* nil))
+;; ... and with MODUS_NARROW_STRINGS=1, the 68k Mac's narrow strings: pooled
+;; literals one byte a character (they were 4: 535 K characters, 2.1 MB of the
+;; resident image), every fresh string narrow (MODUS_WIDE_STRINGS=1 keeps wide
+;; ones), and with MODUS_SMALL_IMAGE one pooled object per distinct string and
+;; no NFN table, which nothing reads at run time.
+(when (and cl-user::*cl-repl-i386-p*
+           (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
+  (setq *pool-narrow-strings* t)
+  (unless (equal (sb-ext:posix-getenv "MODUS_WIDE_STRINGS") "1")
+    (setq *base-strings-only* t))
+  (when cl-user::*small-image*
+    (setq *pool-coalesce* t
+          *nfn-table-p* nil)))
 ;; ... and packed u32 vectors' arms (compiler.lisp *U32-VECTORS-P*), with them.
 (when cl-user::*cl-repl-rpi-p* (setq *u32-vectors-p* t))
 
@@ -3124,75 +3858,69 @@
 ;;; hosted i386 CLI build sets it to T in the same image-building process and a
 ;;; default is a poor thing to rely on across two builds in one session.
 (when cl-user::*cl-repl-i386-p*
-  ;; LAYOUT.  The default i386 map puts the stack top at 4 MB and cons space at
-  ;; 8 MB; this image is ~37 MB at load address 1 MB, so both would sit INSIDE
-  ;; it.  Measured before these overrides existed: the banner printed and the
-  ;; image died before the REPL.  Mirrors the :X64 arm, which moves its stack to
-  ;; 512 MB for the same reason.  Needs -m 512.
-  ;; NO COLLECTOR ON BARE i386 YET, so VL is headroom rather than a semispace
-  ;; boundary.  translate-i386.lisp: *I386-GC-COLLECT-LABEL* is
-  ;; (and *i386-gc-enabled* *i386-linux-mode* ...), so every :gc-check on bare
-  ;; metal compiles to `int $0x31' with no IDT entry behind it.  Measured: the
-  ;; first build reached the banner and then v=31 -> #GP -> double -> triple
-  ;; fault.  Until the collector is wired (its own job — GC metadata, the two
-  ;; bitmaps, a stack base below 2^30), the image must simply never exhaust VL
-  ;; during boot.  128 MB of cons space for an image that interns a few tens of
-  ;; thousands of symbols; -m 512 gives room for all of it.
-  ;; MEASURED, not guessed: with VL at 192 MB the image died with VA =
-  ;; 0x0BFFFFF1, fifteen bytes short of the limit — it really does consume more
-  ;; than 128 MB of cons space before it reaches the prompt.  x64's heap is
-  ;; 224 MB for the same payload.  448 MB here, and the image wants -m 1024.
-  ;; Every address stays below 2^30 because gc.lisp's metadata convention and
-  ;; the 30-bit fixnum tagging both require it.
-  ;;
-  ;; WITH THAT HEADROOM THE GC TRAP IS GONE AND THE NEXT BLOCKER APPEARS:
-  ;; handler-case.  Traps #x0510 SETJMP, #x0511 LONGJMP and #x0512
-  ;; CLEAR-HANDLER are hosted-only (the jmp_buf and handler stack live in the
-  ;; hosted BSS), and translate-i386.lisp lists all three as deliberately NOT
-  ;; safe to no-op because each either produces a value or transfers control.
-  ;; The real CL uses handler-case pervasively — reader, eval and the REPL loop
-  ;; all wrap in it — so the image reaches one immediately and takes the
-  ;; unimplemented-trap reporter (INT3 on bare metal; measured as v=03 at
-  ;; IP 0x0195f6f5, about 6.5 MB further into the code than the GC trap was).
-  ;;
-  ;; So a bare i386 CL REPL needs, in order: (1) this headroom, done; (2)
-  ;; setjmp/longjmp/clear-handler against a jmp_buf and handler stack at fixed
-  ;; bare-metal addresses; (3) eventually the collector, for sustained use
-  ;; rather than boot.  `strings' on the image lists every trap it still cannot
-  ;; service: #x0310 #x0311 #x0500 #x0502 #x0510 #x0511 #x0512 #x0531.
-  ;; THE HEAP STARTS ABOVE THE RUNTIME'S FIXED BLOCK at #x10000000.. (globals
-  ;; table, symbol table, MV buffer, the static-symbol root #x10000FB0, GC
-  ;; region words): it used to run from 64 MB to 512 MB, straight across it,
-  ;; and boot allocates more than the 192 MB below it -- the bump allocator
-  ;; wrote over those words, and the image died in a %STATIC-SYMBOL-REF /
-  ;; %AREF-INDEX-ERROR recursion that moved with every layout change.
-  (setf (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")) #x10100000)    ; 257 MB
-  ;; The heap is two 240 MB semispaces from 257 MB with the collector's two
-  ;; bitmaps after them (boot-i386.lisp I386-CL-GC-LAYOUT); "general base"
-  ;; here is their end, which the layout asserts below hold under the stack.
-  (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x2EA00000) ; 746 MB
-  ;; THE COLLECTOR, on bare metal: boot-i386 sets up what boot-linux-i386 does.
-  (setf (symbol-value (intern "*I386-BARE-GC*" "MODUS.MVM.I386")) t)
-  ;; ... and a clock: RDTSC behind traps #x0310/#x0311.
-  (setf (symbol-value (intern "*I386-BARE-CLOCK*" "MODUS.MVM.I386")) t)
-  (setf (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")) #x3C000000)    ; 960 MB
-  ;; The handler-case block (jmp_buf + handler stack): its bare default,
-  ;; #x5C0000, is inside this image.  56 MB: above the image, below the heap.
-  (setf (symbol-value (intern "*I386-BARE-HANDLER-BASE*" "MODUS.MVM.I386")) #x03800000)
-  ;; NIL = #xDEAD0001 (the CL runtime's), with paging so NIL's page is RAM.
-  ;; Needs -m 1024 (stack top 960 MB, NIL frame at 964 MB).
-  (setf (symbol-value (intern "*I386-CL-BOOT*" "MODUS.MVM")) t)
+  ;; THE HOSTED PICTURE ON BARE METAL -- arm32's design (boot-arm32-cl.lisp).
+  ;; boot/boot-i386-cl.lisp maps boot-linux-i386.lisp's layout (fixed block and
+  ;; globals at #x10000000, heap at #x19000000 sized from the RAM the Multiboot
+  ;; loader reports, stack below #x18800000, NIL's page) over the PC's RAM with
+  ;; 386 paging; I386-SET-CL-BARE-MODE translates with bare traps (COM1 port
+  ;; I/O, RDTSC) over that layout and the native collector with its geometry.
+  ;; This replaced the old fixed bare map (two 240 MB semispaces, a 1 GB
+  ;; identity map, -m 1024): the image now runs in what it is given -- QEMU
+  ;; -kernel, or DOS through MODUS.COM (scripts/dos386-chain.s).
+  (cl-user::mvm-load "boot/boot-linux-i386.lisp")
+  (cl-user::mvm-load "boot/boot-i386-cl.lisp")
   (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
-  (setf (symbol-value (intern "*I386-LINUX-MODE*" "MODUS.MVM.I386")) nil)
-  (setf (symbol-value (intern "*I386-NATIVE-CODE-OFFSET*" "MODUS.MVM.I386")) 0)
-  ;; Function entries 16-byte aligned and OR-3 tagged, as in the hosted i386
-  ;; CLI: the CL runtime's funcall dispatch reads the low nibble.  Without it
-  ;; a function that happened to start at ...1 was taken for a cons --
-  ;; (mapcar (lambda (s) (normalize-name s)) names) returned (NIL NIL) and
-  ;; DEFSTRUCT's keyword constructor died in %INSTALL-SB-SHIMS.
-  (setf (symbol-value (intern "*I386-FN-TAG-3*" "MODUS.MVM.I386")) t)
-  (setf (symbol-value (intern "*I386-FN-ALIGN*" "MODUS.MVM.I386")) 16)
-  (format t "~&;; CONSOLE: COM1 via port I/O (i386 QEMU-pc)~%"))
+  (funcall (intern "I386-SET-CL-BARE-MODE" "MODUS.MVM.I386")
+           (symbol-value (intern "+LINUX-I386-GLOBALS+" "MODUS.MVM"))
+           (symbol-value (intern "+LINUX-I386-HEAP-MARGIN-ADDR+" "MODUS.MVM"))
+           ;; the clock: the PIT's ticks (a 486 has no RDTSC)
+           (symbol-value (intern "+I386-CL-TICK-ADDR+" "MODUS.MVM")))
+  ;; MODUS_I386_FP=x87: floats on the x87 (a 486DX has no SSE2, nor a CR4 to
+  ;; enable it with), as build-i386-cli.lisp reads it
+  (let ((v (sb-ext:posix-getenv "MODUS_I386_FP")))
+    (setf (symbol-value (intern "*I386-X87*" "MODUS.MVM.I386"))
+          (and v (string-equal v "x87"))))
+  ;; A call to a fixed-arity function stores no argument count (the 68k's
+  ;; pass, compiler.lisp *ELIDE-FIXED-NARGS*): sound here for the 68k's
+  ;; reason, i386 images have no call pads, so a run-time redefinition never
+  ;; reaches the image's own callers.  ~88,000 sites, 10 bytes each.
+  ;; MODUS_I386_FIXED_NARGS=1 keeps every store.
+  (setf *elide-fixed-nargs*
+        (not (equal (sb-ext:posix-getenv "MODUS_I386_FIXED_NARGS") "1")))
+  ;; Live temps are not saved around a call (the 68k's *CALL-TEMPS-SURVIVE*):
+  ;; on i386 V4 is EBX, which every prologue saves, and V5.. are slots in the
+  ;; caller's own frame, so a callee cannot clobber them.  ~170,000 PUSH/POP
+  ;; pairs.  MODUS_I386_CALL_TEMPS=save keeps them.
+  (setf *call-temps-survive*
+        (not (equal (sb-ext:posix-getenv "MODUS_I386_CALL_TEMPS") "save")))
+  ;; and the 68k's two other compiler-side savings: a type-error arm passes its
+  ;; type as a small integer, a quoted symbol's miss arm its slot index alone
+  ;; (MODUS_TYPE_ERROR_CODES=0 / MODUS_STATIC_SYMBOL_SHORT_MISS=0 turn them off)
+  (unless (equal (sb-ext:posix-getenv "MODUS_TYPE_ERROR_CODES") "0")
+    (setf *type-error-codes* (make-hash-table :test 'equal)))
+  (unless (equal (sb-ext:posix-getenv "MODUS_STATIC_SYMBOL_SHORT_MISS") "0")
+    (setf *static-symbol-short-miss* t))
+  ;; The functions only boot runs go last (compiler.lisp *BOOT-TAIL-LAST*),
+  ;; behind the collector and shared routines (translate-i386
+  ;; *I386-BOOT-TAIL*): a restored core lays its heap over them.  The range
+  ;; goes to OUT.tail for scripts/dos386-core.py.  MODUS_BOOT_TAIL=0: off.
+  (setf *boot-tail-last* (not (equal (sb-ext:posix-getenv "MODUS_BOOT_TAIL") "0")))
+  ;; MODUS_I386_COLD_KEEP=FILE (scripts/dos386-coverage.py's output): the
+  ;; functions a REPL session entered are translated first, the rest after
+  ;; them (compiler.lisp *COLD-KEEP*), so a demand-paged image's working set
+  ;; is a few pages (scripts/dos386-core.py, boot-i386-cl.lisp).
+  (let ((f (sb-ext:posix-getenv "MODUS_I386_COLD_KEEP")))
+    (when (and f (plusp (length f)))
+      (let ((h (make-hash-table :test 'equal)))
+        (with-open-file (in f)
+          (loop for line = (read-line in nil) while line
+                do (let ((n (string-trim " " line)))
+                     (when (and (plusp (length n)) (char/= (char n 0) #\;))
+                       (setf (gethash (string-upcase n) h) t)))))
+        (format t "~&;; i386 hot functions: ~D (~A)~%" (hash-table-count h) f)
+        (setf *cold-keep* h))))
+  (format t "~&;; CONSOLE: COM1 via port I/O (i386, paged over the hosted picture)~@[; x87~]~%"
+          (symbol-value (intern "*I386-X87*" "MODUS.MVM.I386"))))
 
 ;;; DIVERGENCE 6/7 (:ARM32 arm) — the ARMv7 QEMU-virt boot descriptor and console.
 ;;;
@@ -3200,6 +3928,138 @@
 ;;; boot-linux-arm32.lisp's heap geometry (the collector reads the same
 ;;; constants), so both load here rather than in lib/load-mvm.lisp.  The
 ;;; console is translate-arm32's bare PL011 arm, at the VA the stub maps it to.
+;;; DIVERGENCE 6/7 (:MAC68K arm) — the bare 68k Mac.  boot/boot-mac68k.lisp
+;;; needs the 68k translator's emitters and boot-linux-68k.lisp's heap geometry.
+;;; MAC68K-CONFIGURE puts the translator in *68K-MAC-MODE* and moves NIL's page
+;;; and the kind map into the Mac's RAM.  Console: the ROM's serial driver.
+(when cl-user::*cl-repl-mac68k-p*
+  (funcall (intern "INSTALL-68K-TRANSLATOR" "MODUS.MVM"))
+  (funcall (intern "MAC68K-CONFIGURE" "MODUS.MVM"))
+  (format t "~&;; CONSOLE: the Mac ROM's serial driver, port A (.AIn/.AOut)~%")
+  ;; MODUS_CONV_VALUE_AUDIT=1 (host only; the image is unchanged): every integer
+  ;; literal compiled in the VIRTUAL low block [#x10000000, #x10020000) -- after
+  ;; the region moved, an address used as a VALUE that is not written
+  ;; (%CONV-ADDR K), or a number that only looks like one.  Listed after the build.
+  (when (let ((v (sb-ext:posix-getenv "MODUS_CONV_VALUE_AUDIT"))) (and v (string/= v "0")))
+    (defparameter cl-user::*conv-value-hits* (make-hash-table :test 'equal))
+    (sb-int:encapsulate (intern "COMPILE-INTEGER" "MODUS.MVM") 'conv-value-audit
+      (lambda (f value dest)
+        (when (and (integerp value) (<= #x10000000 value #x1001FFFF))
+          (push value (gethash (symbol-value (intern "*CURRENT-FUNCTION-NAME*" "MODUS.MVM"))
+                               cl-user::*conv-value-hits*)))
+        (funcall f value dest))))
+  ;; THE SIZE SWITCHES, as mvm/build-68k-cli.lisp sets them: each 1 = on, 0 =
+  ;; off, unset follows MODUS_SMALL_IMAGE.  MODUS_68K_THREADED=1 (with
+  ;; MODUS_68K_HOT=FILE) makes cold functions threaded code.  (No static heap
+  ;; or saved core: those are the Linux image's.)
+  (flet ((knob (name)
+           (let ((v (sb-ext:posix-getenv name)))
+             (cond ((null v) (and cl-user::*small-image* t))
+                   ((string= v "0") nil)
+                   (t t))))
+         (sym (name) (intern name "MODUS.MVM")))
+    (setf (symbol-value (sym "*68K-RELAX-BRANCHES*")) (knob "MODUS_68K_RELAX_BRANCHES")
+          (symbol-value (sym "*68K-SHARED-SEQUENCES*"))
+          (let ((v (sb-ext:posix-getenv "MODUS_68K_SHARED")))
+            ;; a comma list shares only those sequences (cons,alloc-obj)
+            (if (and v (find-if #'alpha-char-p v))
+                (loop for start = 0 then (1+ end)
+                      for end = (or (position #\, v :start start) (length v))
+                      collect (intern (string-upcase (string-trim " " (subseq v start end))) "KEYWORD")
+                      while (< end (length v)))
+                (knob "MODUS_68K_SHARED")))
+          (symbol-value (sym "*68K-LI-SHIFT*")) (and cl-user::*small-image* t)
+          (symbol-value (sym "*68K-A5-GLOBALS*")) (knob "MODUS_68K_A5_GLOBALS")
+          (symbol-value (sym "*68K-TAGS3*")) (knob "MODUS_68K_TAGS3")
+          (symbol-value (sym "*68K-GC-STATIC*")) (and cl-user::*mac68k-gc-static* t))
+    (when cl-user::*mac-init-only*
+      (setf (symbol-value (sym "*POOL-INIT-ONLY*")) cl-user::*mac-init-only*))
+    ;; the NFN table (name hash -> native offset, cross.lisp) is read by nothing
+    ;; at run time, and was 52 KB of a Classic's resident image
+    (when cl-user::*small-image*
+      (setf (symbol-value (sym "*NFN-TABLE-P*")) nil
+            (symbol-value (sym "*POOL-COALESCE*")) t))
+    (when (symbol-value (sym "*68K-TAGS3*"))
+      (setf (symbol-value (sym "*POOL-ALIGN*")) 8))
+    (when (and (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
+      (setf (symbol-value (sym "*POOL-NARROW-STRINGS*")) t)
+      ;; ... and its AOT string literals narrow, as MODUS_NARROW_STRINGS does on
+      ;; the x64 CLI (compiler.lisp *NARROW-LITERALS-P*): a literal is pooled
+      ;; once, narrow, and each evaluation is a %FRESH-STRING of it.  Without it
+      ;; every literal under 256 characters was built a character at a time in
+      ;; native code, and came out a wide (#x31) string -- most of the static
+      ;; heap's 155 KB of them.  The 68k collector sizes #x13 as bytes.
+      ;; MODUS_68K_NARROW_LITERALS=0 is the old way.
+      (let ((v (sb-ext:posix-getenv "MODUS_68K_NARROW_LITERALS")))
+        (unless (and v (string= v "0"))
+          (setf (symbol-value (sym "*NARROW-LITERALS-P*")) t)
+          (setf (symbol-value (sym "*STRING32-P*")) nil)
+          ;; no wide strings at all: a Mac's text is 8-bit (MODUS_68K_WIDE_STRINGS=1 keeps them)
+          (let ((w (sb-ext:posix-getenv "MODUS_68K_WIDE_STRINGS")))
+            (unless (and w (string= w "1"))
+              (setf (symbol-value (sym "*BASE-STRINGS-ONLY*")) t))))))
+    (let ((v (sb-ext:posix-getenv "MODUS_68K_THREADED")))
+      (when (and v (string/= v "0"))
+        (setf (symbol-value (sym "*68K-THREADED*")) :all
+              (symbol-value (sym "*68K-A5-GLOBALS*")) nil)
+        (let ((f (sb-ext:posix-getenv "MODUS_68K_HOT")))
+          (when (and f (plusp (length f)))
+            (let ((h (make-hash-table :test 'equal)))
+              (with-open-file (in f)
+                (loop for l = (read-line in nil) while l
+                      do (let ((n (string-trim " " l)))
+                           (when (and (plusp (length n)) (char/= (char n 0) #\;))
+                             (setf (gethash n h) t)))))
+              (setf (symbol-value (sym "*68K-HOT-NAMES*")) h))))))
+    ;; MODUS_68K_CALL_SAVES=1: image calls save live temps as elsewhere; else,
+    ;; with no threaded code, they do not (compiler.lisp *CALL-TEMPS-SURVIVE*)
+    (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_SAVES")))
+      (setf (symbol-value (sym "*CALL-TEMPS-SURVIVE*"))
+            (and (not (symbol-value (sym "*68K-THREADED*"))) (not (and v (string= v "1"))))))
+    ;; MODUS_BOOT_TAIL=0: the boot-only functions where they fall (compiler.lisp
+    ;; *BOOT-TAIL-LAST*); otherwise last, past the pool, under the static heap
+    (let ((v (sb-ext:posix-getenv "MODUS_BOOT_TAIL")))
+      (setf (symbol-value (sym "*BOOT-TAIL-LAST*"))
+            (and (not (symbol-value (sym "*68K-THREADED*"))) (not (symbol-value (sym "*68K-PAGED*")))
+                 (not (and v (string= v "0"))))))
+    ;; MODUS_68K_COLD_KEEP=FILE: COLD NATIVE CODE (compiler.lisp *COLD-KEEP*):
+    ;; the functions FILE names (one a line, as the symbol map spells them) stay
+    ;; resident, every other one is read from disk at its first call
+    (let ((f (sb-ext:posix-getenv "MODUS_68K_COLD_KEEP")))
+      (when (and f (plusp (length f)))
+        (let ((h (make-hash-table :test 'equal)))
+          (with-open-file (in f)
+            (loop for l = (read-line in nil) while l
+                  do (let ((n (string-trim " " (subseq l (1+ (or (position #\Tab l) -1))))))
+                       (when (and (plusp (length n)) (char/= (char n 0) #\;))
+                         (setf (gethash (string-upcase n) h) t)))))
+          (format t "~&;; 68k cold native code: ~D functions kept resident (~A)~%"
+                  (hash-table-count h) f)
+          (setf (symbol-value (sym "*COLD-KEEP*")) h))))
+    ;; MODUS_68K_CALL_ISLANDS=0: no call islands (translate-68k *68K-CALL-ISLANDS*)
+    (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_ISLANDS")))
+      (setf (symbol-value (sym "*68K-CALL-ISLANDS*"))
+            (and (not (symbol-value (sym "*68K-THREADED*"))) (not (symbol-value (sym "*68K-PAGED*")))
+                 (not (and v (string= v "0"))))))
+    ;; MODUS_68K_FIXED_NARGS=1: calls to fixed-arity functions store the count too
+    (let ((v (sb-ext:posix-getenv "MODUS_68K_FIXED_NARGS")))
+      (setf (symbol-value (sym "*ELIDE-FIXED-NARGS*"))
+            (and (not (symbol-value (sym "*68K-THREADED*"))) (not (and v (string= v "1"))))))
+    ;; MODUS_TYPE_ERROR_CODES=0: type-error arms load the quoted type as before
+    (let ((v (sb-ext:posix-getenv "MODUS_TYPE_ERROR_CODES")))
+      (unless (and v (string= v "0"))
+        (setf (symbol-value (sym "*TYPE-ERROR-CODES*")) (make-hash-table :test 'equal))))
+    ;; MODUS_STATIC_SYMBOL_SHORT_MISS=0: a quoted symbol's miss arm loads both hashes
+    (let ((v (sb-ext:posix-getenv "MODUS_STATIC_SYMBOL_SHORT_MISS")))
+      (unless (and v (string= v "0"))
+        (setf (symbol-value (sym "*STATIC-SYMBOL-SHORT-MISS*")) t)))
+    (format t "~&;; mac68k:~@[ gc-static~*~]~@[ tags3~*~]~@[ threaded~*~]~@[ a5-globals~*~]~@[ relaxed~*~]~@[ narrow-pool~*~]~@[ narrow-literals~*~]~%"
+            (symbol-value (sym "*68K-GC-STATIC*"))
+            (symbol-value (sym "*68K-TAGS3*")) (symbol-value (sym "*68K-THREADED*"))
+            (symbol-value (sym "*68K-A5-GLOBALS*")) (symbol-value (sym "*68K-RELAX-BRANCHES*"))
+            (symbol-value (sym "*POOL-NARROW-STRINGS*"))
+            (symbol-value (sym "*NARROW-LITERALS-P*")))))
+
 (when cl-user::*cl-repl-arm32-p*
   (cl-user::mvm-load "boot/boot-linux-arm32.lisp")
   (cl-user::mvm-load "boot/boot-arm32-cl.lisp")
@@ -3359,7 +4219,8 @@
 ;; BCM2835 mini-UART base on an x86 image.  The build printed both
 ;; "CONSOLE: COM1 via port I/O" and "CONSOLE: PL011 UART0 0x3F201000", which is
 ;; how it was caught — two consoles for one image is always a fall-through.
-(if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p* cl-user::*cl-repl-arm32-p*)
+(if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p* cl-user::*cl-repl-arm32-p*
+        cl-user::*cl-repl-mac68k-p*)
     nil
  (if cl-user::*cl-repl-virt-p*
     (format t "~&;; CONSOLE: PL011 via the fixpoint boot descriptor, VA 20000000 ~
@@ -3740,7 +4601,8 @@
            cl-user::*full-source*
            (cond (cl-user::*cl-repl-virt-p* :fixpoint) (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                  (cl-user::*cl-repl-x64-p* :x86-64) (cl-user::*cl-repl-i386-p* :i386)
-                 (cl-user::*cl-repl-arm32-p* :armv7-cl) (t :rpi))))
+                 (cl-user::*cl-repl-arm32-p* :armv7-cl)
+                 (cl-user::*cl-repl-mac68k-p* :mac68k) (t :rpi))))
     (with-open-file (o p :direction :output :if-exists :supersede)
       (write-string cl-user::*full-source* o))
     (format t "~&;; DDC: full source text (~D chars) written to ~A~%"
@@ -3748,8 +4610,9 @@
 (let ((image (build-image :target (cond (cl-user::*cl-repl-virt-p* :fixpoint)
                                         (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                                         (cl-user::*cl-repl-x64-p* :x86-64)
-                                        (cl-user::*cl-repl-i386-p* :i386)
+                                        (cl-user::*cl-repl-i386-p* :i386-cl)
                                         (cl-user::*cl-repl-arm32-p* :armv7-cl)
+                                        (cl-user::*cl-repl-mac68k-p* :mac68k)
                                         (t :rpi))
                           :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
@@ -3758,6 +4621,7 @@
                         (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
                         (cl-user::*cl-repl-i386-p* "/tmp/modus-i386-cl-repl.bin")
                         (cl-user::*cl-repl-arm32-p* "/tmp/modus-arm32-cl-repl.bin")
+                        (cl-user::*cl-repl-mac68k-p* "/tmp/modus-mac68k-cl-repl.bin")
                         (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)
     (with-open-file (out path :direction :output
@@ -3766,6 +4630,29 @@
       (write-sequence (kernel-image-image-bytes image) out))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
+    ;; i386: the entry stub places its page tables after the image, which it
+    ;; finds through its own Multiboot header's load_end_addr
+    (when cl-user::*cl-repl-i386-p*
+      (format t "~&;; i386: load_end_addr = #x~X~%"
+              (funcall (intern "I386-CL-PATCH-LOAD-END" "MODUS.MVM") path))
+      ;; the boot-only tail's addresses, for scripts/dos386-core.py
+      (let ((tail (symbol-value (intern "*I386-BOOT-TAIL*" "MODUS.MVM.I386")))
+            (tail-file (concatenate 'string (namestring path) ".tail")))
+        (if (and tail (cdr tail))
+            (let ((base (+ #x100000 (or (kernel-image-native-image-offset image) 0))))
+              (with-open-file (o tail-file :direction :output :if-exists :supersede)
+                (format o "~D ~D~%" (+ base (car tail)) (+ base (cdr tail))))
+              (format t "~&;; i386 boot-only tail: #x~X..#x~X (~D bytes) -> ~A~%"
+                      (+ base (car tail)) (+ base (cdr tail)) (- (cdr tail) (car tail)) tail-file))
+            (when (probe-file tail-file) (delete-file tail-file))))
+      ;; the code a restored image may demand-page: native byte 0 to the tail
+      (let ((base (+ #x100000 (or (kernel-image-native-image-offset image) 0)))
+            (tail (symbol-value (intern "*I386-BOOT-TAIL*" "MODUS.MVM.I386"))))
+        (with-open-file (o (concatenate 'string (namestring path) ".paged")
+                           :direction :output :if-exists :supersede)
+          (format o "~D ~D~%" base
+                  (+ base (if tail (car tail)
+                              (length (kernel-image-native-code image))))))))
     (let ((n (length modus.mvm::*redefinition-log*)))
       (when (> n 0)
         (format t "~%REDEFINITIONS: ~D total (grep the build log for \"NOTE: redefining\")~%" n)))
@@ -3786,44 +4673,49 @@
       ;; COM1 and died before reaching the REPL.  That is a build-time fact and
       ;; belongs in a build-time assert, not in a boot log.
       (cl-user::*cl-repl-i386-p*
-       (let* ((image-bytes (length (kernel-image-image-bytes image)))
-              (load-addr   #x100000)
-              (image-end   (+ load-addr image-bytes))
-              (stack-top   (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")))
-              (cons-base   (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")))
-              (general     (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")))
-              (stack-top   (or stack-top #x400000))
-              (cons-base   (or cons-base #x800000))
-              (general     (or general  #x7800000)))
-         (format t "~&;; i386 map: image ~,1F MB (1 MB .. ~,1F MB), cons ~,1F MB, ~
-                   general ~,1F MB, stack top ~,1F MB~%"
-                 (/ image-bytes 1048576.0) (/ image-end 1048576.0)
-                 (/ cons-base 1048576.0) (/ general 1048576.0)
-                 (/ stack-top 1048576.0))
-         (when (and (< cons-base #x10010000) (> general #x10000000))
-           (error "i386 layout: the heap ~:D..~:D covers the runtime's fixed block ~
-                   at #x10000000..#x1000FFFF (globals, symbol table, static-symbol ~
-                   root); the allocator would write over it." cons-base general))
-         (when (< cons-base image-end)
-           (error "i386 layout: cons base ~:D is INSIDE the image (1 MB .. ~:D). ~
-                   The allocator would write over the running code.  Raise ~
-                   *I386-CONS-BASE-OVERRIDE*." cons-base image-end))
-         (when (< general cons-base)
-           (error "i386 layout: general heap ~:D is below cons base ~:D."
-                  general cons-base))
-         (let ((hb (symbol-value (intern "*I386-BARE-HANDLER-BASE*" "MODUS.MVM.I386"))))
-           (when (or (< hb image-end) (> (+ hb #x1000) cons-base))
-             (error "i386 layout: the handler-case block ~:D..~:D is not between the ~
-                     image end ~:D and the cons base ~:D.  Move ~
-                     *I386-BARE-HANDLER-BASE*." hb (+ hb #x1000) image-end cons-base)))
-         (when (< stack-top image-end)
-           (error "i386 layout: stack top ~:D is INSIDE the image (1 MB .. ~:D). ~
-                   Pushes would shred native code.  Raise ~
-                   *I386-STACK-TOP-OVERRIDE*." stack-top image-end))
-         (when (<= stack-top general)
-           (error "i386 layout: stack top ~:D is not above the general heap ~:D; ~
-                   the stack grows DOWN into it." stack-top general))))
+       ;; The stub builds the map at boot from the RAM it is given
+       ;; (boot/boot-i386-cl.lisp); the image itself must end below the low
+       ;; block it identity-maps under.
+       (let ((image-end (+ #x100000 (length (kernel-image-image-bytes image)))))
+         (format t "~&;; i386 map: image ~,1F MB (1 MB .. ~,1F MB); the rest is paged at boot~%"
+                 (/ (length (kernel-image-image-bytes image)) 1048576.0) (/ image-end 1048576.0))
+         (when (> image-end #x10000000)
+           (error "i386 layout: the image (to #x~X) reaches the fixed block at #x10000000"
+                  image-end))))
       (cl-user::*cl-repl-x64-p* (%x64-memory-map-asserts image))
+      ;; ---- the 68k Mac (boot-mac68k.lisp's map) ------------------------
+      ;; The image loads at #x0D000000 and must end below the stack's floor;
+      ;; the stack grows down from +MAC68K-STACK-TOP+.
+      (cl-user::*cl-repl-mac68k-p*
+       (let ((gaps (symbol-value (intern "*68K-UNIMPL-OPCODES*" "MODUS.MVM"))))
+         (format t "~&;; mac68k TRANSLATOR GAPS (ILLEGAL if run): ~{#x~X~^ ~}~%"
+                 (sort (copy-list gaps) #'<)))
+       (let* ((load (symbol-value (intern "+MAC68K-LOAD-ADDR+" "MODUS.MVM")))
+              ;; a paged image: only the part before its stream section is in RAM
+              (tail (symbol-value (intern "*68K-TAIL-MOVE*" "MODUS.MVM")))
+              (end (+ load (if (and tail (cddr tail)) (cddr tail)
+                               (length (kernel-image-image-bytes image)))))
+              (top (symbol-value (intern "+MAC68K-STACK-TOP+" "MODUS.MVM"))))
+         (format t "~&;; mac68k map: image #x~X .. #x~X (~,1F MB), stack top #x~X, ~
+                    region #x~X~%"
+                 load end (/ (- end load) 1048576.0) top
+                 (symbol-value (intern "+MAC68K-REGION+" "MODUS.MVM")))
+         (when (boundp 'cl-user::*conv-value-hits*)
+           (format t "~&;; mac68k CONV VALUE AUDIT: ~D functions load a virtual low-block ~
+                      literal~%" (hash-table-count cl-user::*conv-value-hits*))
+           (maphash (lambda (fn vals)
+                      (format t ";;   ~A~{ #x~X~}~%" fn (remove-duplicates vals)))
+                    cl-user::*conv-value-hits*))
+         (let ((static-lo (getf (cdr (assoc (symbol-value (intern "*MAC68K-MACHINE*" "MODUS.MVM"))
+                                            (symbol-value (intern "*MAC68K-LAYOUTS*" "MODUS.MVM"))))
+                                :static-lo)))
+           (if static-lo
+               (format t "~&;; mac68k Classic: resident image ends at #x~X, ~:[OVER~;under~] the ~
+                          static heap's #x~X by ~D bytes~%"
+                       end (<= end static-lo) static-lo (abs (- static-lo end)))
+               (when (> (+ end #x200000) top)
+                 (error "mac68k layout: the image ends at #x~X, within 2 MB of the stack top ~
+                         #x~X." end top))))))
       ;; ---- ARMv7 QEMU virt (boot-arm32-cl.lisp's map) -----------------
       ;; The image runs at VA #x10000 and grows up; the stack grows DOWN from
       ;; +ARM32-CL-STACK-TOP+, and the L1 table sits above it.  Everything
@@ -3920,6 +4812,8 @@
       (t (%rpi-memory-map-asserts image)))
     (format t "~%Run: ~A~%"
             (cond
+              (cl-user::*cl-repl-mac68k-p*
+                (format nil "scripts/mac68k-disk.py ~A DISK, then Basilisk II with it (serial port A is the console)" path))
               (cl-user::*cl-repl-arm32-p*
                 (format nil "qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 -kernel ~A -display none -serial stdio -no-reboot" path))
               (cl-user::*cl-repl-x64-p*

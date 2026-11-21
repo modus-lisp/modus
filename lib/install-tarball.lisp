@@ -747,14 +747,25 @@
     (let ((entries (tar-extract tarbytes)))
       (write-string-serial "  extracted ") (print-dec (length entries))
       (write-string-serial " files") (write-char-serial 10)
-      ;; 3. locate the .asd (prefer one matching SYSNAME)
-      (let ((asd-entry nil))
+      ;; 3. locate the .asd (prefer one matching SYSNAME).  A slash names a
+      ;; SECONDARY system, which ASDF finds in its PRIMARY's .asd: glass/fb is
+      ;; in glass.asd.  Matched by its full name instead, it matched nothing,
+      ;; and the first .asd in the archive won -- for glass, mcclim-glass.asd,
+      ;; whose first system is the McCLIM backend, so installing glass/fb
+      ;; loaded src/backend/wm.lisp.
+      (let ((asd-entry nil)
+            (want (and sysname
+                       (concatenate 'string
+                                    (let ((slash (position #\/ sysname)))
+                                      (if slash (subseq sysname 0 slash) sysname))
+                                    ".asd"))))
         (dolist (e entries)
           (let ((base (%it-basename (car e))))
             (when (%it-suffix-p base ".asd")
               (when (or (null asd-entry)
-                        (and sysname
-                             (string= base (concatenate 'string sysname ".asd"))))
+                        (and want
+                             (string= base want)
+                             (not (string= (%it-basename (car asd-entry)) want))))
                 (setq asd-entry e)))))
         (when (null asd-entry)
           (error "install-tarball: no .asd file found in archive"))

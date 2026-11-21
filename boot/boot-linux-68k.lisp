@@ -342,7 +342,7 @@
     (m68k-emit-move-dn-an buf +68k-d0+ +68k-a1+)          ; a1 = heap base
     ;; --- the kind map, at its FIXED address, only as long as THIS heap needs:
     ;;     mmap2(+68K-GC-KIND-MAP+, S/16, ...)
-    (m68k-emit-move-imm-dn buf +68k-gc-kind-map+ +68k-d1+)
+    (m68k-emit-move-imm-dn buf *68k-gc-kind-map* +68k-d1+)
     (m68k-emit-move-an-dn buf +68k-a5+ +68k-d2+)
     (m68k-emit-lsr-imm buf +68k-d2+ (m68k-kind-shift))
     (m68k-emit-move-imm-dn buf 3 +68k-d3+)
@@ -450,7 +450,7 @@
     (m68k-emit-add-dn-dn buf +68k-d6+ +68k-d2+)
     (m68k-emit-addi buf +68k-d2+ (- +linux-68k-gc-guard+ +linux-68k-heap-addr+))
     (m68k-emit-lsr-imm buf +68k-d2+ (m68k-kind-shift))
-    (m68k-emit-move-imm-dn buf +68k-gc-kind-map+ +68k-d1+)
+    (m68k-emit-move-imm-dn buf *68k-gc-kind-map* +68k-d1+)
     (m68k-emit-move-imm-dn buf 3 +68k-d3+)
     (m68k-emit-move-imm-dn buf #x32 +68k-d4+)
     (m68k-emit-move-imm-dn buf -1 +68k-d5+)

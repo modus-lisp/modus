@@ -57,7 +57,7 @@
    #:+op-call+ #:+op-call-ind+ #:+op-ret+ #:+op-tailcall+
    #:+op-alloc-cons+ #:+op-gc-check+ #:+op-gc-check-n+ #:+op-gc-check-r+
    #:+op-write-barrier+ #:+op-mcgc-collect+
-   #:+op-save-ctx+ #:+op-restore-ctx+ #:+op-yield+ #:+op-atomic-xchg+
+   #:+op-save-ctx+ #:+op-restore-ctx+ #:+op-yield+ #:+op-safepoint+ #:+op-atomic-xchg+
    #:+op-io-read+ #:+op-io-write+ #:+op-halt+
    #:+op-cli+ #:+op-sti+ #:+op-percpu-ref+ #:+op-percpu-set+
    #:+op-fn-addr+
@@ -65,6 +65,7 @@
    #:frame-enter-code-p #:frame-enter-nparams #:frame-enter-slots
    #:encode-frame-enter #:function-frame-slots
    #:+op-mul26lo+ #:+op-mul26hi+
+   #:+op-w32-li+ #:+op-w32-add+ #:+op-w32-sub+ #:+op-w32-mul+ #:+op-w32-mulhu+ #:+op-w32-and+ #:+op-w32-or+ #:+op-w32-xor+ #:+op-w32-not+ #:+op-w32-shl+ #:+op-w32-shr+ #:+op-w32-sar+ #:+op-w32-rotl+ #:+op-w32-ltu+ #:+op-w32-lts+ #:+op-w32-eq+ #:+op-w32-from-fix+ #:+op-w32-hi16+ #:+op-w32-lo16+ #:+op-w32-join+ #:+op-w32-load+ #:+op-w32-store+
    #:+op-mulsplit-lo+ #:+op-mulsplit-hi+
    #:+op-mul64lo+ #:+op-mul64hi+ #:+op-acc128+
    #:+op-sap-new+ #:+op-sap-ref8+ #:+op-sap-ref32+ #:+op-sap-ref64+
@@ -135,12 +136,13 @@
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
    #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n #:mvm-gc-check-r
    #:mvm-write-barrier #:mvm-mcgc-collect
-   #:mvm-save-ctx #:mvm-restore-ctx #:mvm-yield #:mvm-atomic-xchg
+   #:mvm-save-ctx #:mvm-restore-ctx #:mvm-yield #:mvm-safepoint #:mvm-atomic-xchg
    #:mvm-io-read #:mvm-io-write #:mvm-halt
    #:mvm-cli #:mvm-sti #:mvm-percpu-ref #:mvm-percpu-set
    #:mvm-fn-addr
    #:mvm-trap #:mvm-rdtsc
    #:mvm-mul26lo #:mvm-mul26hi
+   #:mvm-w32-li #:mvm-w32-add #:mvm-w32-sub #:mvm-w32-mul #:mvm-w32-mulhu #:mvm-w32-and #:mvm-w32-or #:mvm-w32-xor #:mvm-w32-not #:mvm-w32-shl #:mvm-w32-shr #:mvm-w32-sar #:mvm-w32-rotl #:mvm-w32-ltu #:mvm-w32-lts #:mvm-w32-eq #:mvm-w32-from-fix #:mvm-w32-hi16 #:mvm-w32-lo16 #:mvm-w32-join #:mvm-w32-load #:mvm-w32-store
    #:mvm-mulsplit-lo #:mvm-mulsplit-hi
    #:mvm-mul64lo #:mvm-mul64hi #:mvm-acc128
    #:mvm-sap-new #:mvm-sap-ref8 #:mvm-sap-ref32 #:mvm-sap-ref64
@@ -427,6 +429,7 @@
 (defconstant +op-save-ctx+    #x90)  ; (save-ctx) - no operands
 (defconstant +op-restore-ctx+ #x91)  ; (restore-ctx) - no operands
 (defconstant +op-yield+       #x92)  ; (yield) - no operands
+(defconstant +op-safepoint+   #x97)  ; (safepoint) - a YIELD that may also PARK
 (defconstant +op-atomic-xchg+ #x93)  ; (atomic-xchg Vd Vaddr Vs) - 3 reg
 
 ;; System/platform
@@ -438,6 +441,34 @@
 (defconstant +op-percpu-ref+ #xA5)  ; (percpu-ref Vd offset:imm16) - reg + imm16
 (defconstant +op-percpu-set+ #xA6)  ; (percpu-set offset:imm16 Vs) - imm16 + reg
 (defconstant +op-fn-addr+   #xA7)  ; (fn-addr Vd target:imm32) - load tagged function address
+
+;; W32: native 32-bit words on the 30-bit targets (docs/w32.md, spec 4.4).
+;; A W32 operand is an UNTAGGED 32-bit machine word in an ordinary GPR vreg.
+;; Emitted only when the compilation's target is w32-capable (CT-W32-CAPABLE-P)
+;; -- never on a 64-bit target -- and only where no GC point separates a raw
+;; word from its last use (spec C3).  Semantics: interp.lisp, %W32-BINOP & co.
+(defconstant +op-w32-li+ #x69)  ; Vd = imm32 (raw word)
+(defconstant +op-w32-add+ #x6A)  ; (a + b) mod 2^32
+(defconstant +op-w32-sub+ #x6B)  ; (a - b) mod 2^32
+(defconstant +op-w32-mul+ #x6C)  ; (a * b) mod 2^32
+(defconstant +op-w32-mulhu+ #x6D)  ; floor(a*b / 2^32), unsigned
+(defconstant +op-w32-and+ #x6E)  ; a AND b
+(defconstant +op-w32-or+ #x6F)  ; a OR b
+(defconstant +op-w32-xor+ #x73)  ; a XOR b
+(defconstant +op-w32-not+ #x74)  ; NOT a
+(defconstant +op-w32-shl+ #x75)  ; (a << n) mod 2^32, n 0..31
+(defconstant +op-w32-shr+ #x76)  ; a >> n logical, n 0..31
+(defconstant +op-w32-sar+ #x77)  ; a >> n arithmetic, n 0..31
+(defconstant +op-w32-rotl+ #x78)  ; rotate left by n, n 0..31
+(defconstant +op-w32-ltu+ #x79)  ; tagged fixnum 1/0: a < b unsigned
+(defconstant +op-w32-lts+ #x7A)  ; tagged fixnum 1/0: a < b signed
+(defconstant +op-w32-eq+ #x7B)  ; tagged fixnum 1/0: a = b
+(defconstant +op-w32-from-fix+ #x7C)  ; tagged fixnum Vs -> its value mod 2^32
+(defconstant +op-w32-hi16+ #x7D)  ; tagged fixnum of bits 31..16
+(defconstant +op-w32-lo16+ #x7E)  ; tagged fixnum of bits 15..0
+(defconstant +op-w32-join+ #x7F)  ; Vhi, Vlo tagged fixnums 0..65535 -> hi*2^16+lo
+(defconstant +op-w32-load+ #x84)  ; 32 bits at raw Vaddr+off, CPU order, raw
+(defconstant +op-w32-store+ #x85)  ; (w32-store Vaddr Vs off): 32 raw bits at raw Vaddr+off
 
 ;; Wide multiply with 26-bit split (for crypto field arithmetic on 32-bit targets)
 (defconstant +op-mul26lo+  #xA8)  ; (mul26lo Vd Va Vb) - low 26 bits of untag(Va)*untag(Vb), tagged
@@ -737,6 +768,7 @@
 (defopcode :save-ctx    #x90 (:reg)           "Save actor context (addr in reg, result in reg)")
 (defopcode :restore-ctx #x91 (:reg)           "Restore actor context (addr in reg, never returns)")
 (defopcode :yield       #x92 ()               "Preemption check point")
+(defopcode :safepoint   #x97 ()               "Loop back-edge that may park for stop-the-world (a YIELD where no raw word is live)")
 (defopcode :atomic-xchg #x93 (:reg :reg :reg) "Atomic exchange for spinlocks")
 
 ;; System
@@ -748,6 +780,30 @@
 (defopcode :percpu-ref #xA5 (:reg :imm16)         "Per-CPU data read")
 (defopcode :percpu-set #xA6 (:imm16 :reg)         "Per-CPU data write")
 (defopcode :fn-addr   #xA7 (:reg :imm32)          "Load tagged function address")
+
+;; W32 (docs/w32.md)
+(defopcode :w32-li #x69 (:reg :imm32) "W32: Vd = imm32 (raw word)")
+(defopcode :w32-add #x6A (:reg :reg :reg) "W32: (a + b) mod 2^32")
+(defopcode :w32-sub #x6B (:reg :reg :reg) "W32: (a - b) mod 2^32")
+(defopcode :w32-mul #x6C (:reg :reg :reg) "W32: (a * b) mod 2^32")
+(defopcode :w32-mulhu #x6D (:reg :reg :reg) "W32: floor(a*b / 2^32), unsigned")
+(defopcode :w32-and #x6E (:reg :reg :reg) "W32: a AND b")
+(defopcode :w32-or #x6F (:reg :reg :reg) "W32: a OR b")
+(defopcode :w32-xor #x73 (:reg :reg :reg) "W32: a XOR b")
+(defopcode :w32-not #x74 (:reg :reg) "W32: NOT a")
+(defopcode :w32-shl #x75 (:reg :reg :imm8) "W32: (a << n) mod 2^32, n 0..31")
+(defopcode :w32-shr #x76 (:reg :reg :imm8) "W32: a >> n logical, n 0..31")
+(defopcode :w32-sar #x77 (:reg :reg :imm8) "W32: a >> n arithmetic, n 0..31")
+(defopcode :w32-rotl #x78 (:reg :reg :imm8) "W32: rotate left by n, n 0..31")
+(defopcode :w32-ltu #x79 (:reg :reg :reg) "W32: tagged fixnum 1/0: a < b unsigned")
+(defopcode :w32-lts #x7A (:reg :reg :reg) "W32: tagged fixnum 1/0: a < b signed")
+(defopcode :w32-eq #x7B (:reg :reg :reg) "W32: tagged fixnum 1/0: a = b")
+(defopcode :w32-from-fix #x7C (:reg :reg) "W32: tagged fixnum Vs -> its value mod 2^32")
+(defopcode :w32-hi16 #x7D (:reg :reg) "W32: tagged fixnum of bits 31..16")
+(defopcode :w32-lo16 #x7E (:reg :reg) "W32: tagged fixnum of bits 15..0")
+(defopcode :w32-join #x7F (:reg :reg :reg) "W32: Vhi, Vlo tagged fixnums 0..65535 -> hi*2^16+lo")
+(defopcode :w32-load #x84 (:reg :reg :imm8) "W32: 32 bits at raw Vaddr+off, CPU order, raw")
+(defopcode :w32-store #x85 (:reg :reg :imm8) "W32: (w32-store Vaddr Vs off): 32 raw bits at raw Vaddr+off")
 
 ;; Wide multiply with 26-bit split (crypto field arithmetic)
 (defopcode :mul26lo  #xA8 (:reg :reg :reg)        "Low 26 bits of wide multiply, tagged")
@@ -951,12 +1007,15 @@
   (mvm-emit-byte buf (logand (ash val -8) #xFF)))
 
 (defun mvm-emit-s16 (buf val)
-  "Emit a 16-bit signed value (little-endian)"
-  (mvm-emit-u16 buf (if (minusp val) (logand val #xFFFF) val)))
+  "Emit a 16-bit signed value (little-endian): its two's-complement bytes,
+   which the byte masks below take straight from a negative VAL."
+  (mvm-emit-u16 buf val))
 
 (defun mvm-emit-s32 (buf val)
-  "Emit a 32-bit signed value (little-endian)"
-  (mvm-emit-u32 buf (if (minusp val) (logand val #xFFFFFFFF) val)))
+  "Emit a 32-bit signed value (little-endian).  Not through (logand val
+   #xFFFFFFFF): that mask is a bignum on a 30-bit tower, and the image's own
+   compiler emits immediates on one."
+  (mvm-emit-u32 buf val))
 
 (defun mvm-emit-u32 (buf val)
   "Emit a 32-bit value (little-endian)"
@@ -966,9 +1025,11 @@
   (mvm-emit-byte buf (logand (ash val -24) #xFF)))
 
 (defun mvm-emit-u64 (buf val)
-  "Emit a 64-bit value (little-endian)"
-  (mvm-emit-u32 buf (logand val #xFFFFFFFF))
-  (mvm-emit-u32 buf (logand (ash val -32) #xFFFFFFFF)))
+  "Emit a 64-bit value (little-endian).  MVM-EMIT-U32 takes each byte with a
+   shift and #xFF, so no #xFFFFFFFF mask -- a bignum on a 30-bit tower, where
+   every LI the image's compiler emitted built several."
+  (mvm-emit-u32 buf val)
+  (mvm-emit-u32 buf (ash val -32)))
 
 ;;; ============================================================
 ;;; Register Encoding
@@ -998,23 +1059,110 @@
 ;;; Instruction Encoding Functions
 ;;; ============================================================
 
+;;; THE INSTRUCTION SINK.  A back end that translates a module as it is compiled
+;;; (the native 68k tier, mvm/jit-68k-native.lisp) needs each instruction as
+;;; DECODE-INSTRUCTION would return it -- (PC OPCODE OPERANDS . NEXT-PC) -- and
+;;; decoding the bytecode the compiler has just encoded is pure overhead, with
+;;; bignums on a 30-bit tower for every 32- and 64-bit immediate.  While
+;;; *INSN-SINK* is a cons, ENCODE-INSTRUCTION and MVM-LI-HALVES also push each
+;;; instruction onto its CDR as (PC OPCODE OPERANDS NEXT-PC), operands
+;;; normalised as the decoder reads them back.  NIL (the default, and every build): no cost but the test.
+(defvar *insn-sink* nil)
+
+(defun %insn-norm (type v)
+  "V as DECODE-INSTRUCTION-MV returns an operand of TYPE once encoded."
+  (case type
+    (:reg (logand v #x1F))
+    ((:imm8 :width) (logand v #xFF))
+    (:imm16 (logand v #xFFFF))
+    ;; the common case first: already in range, no arithmetic (no bignum)
+    (:imm32 (if (and (>= v 0) (< v 536870912)) v (mod v 4294967296)))
+    (:imm64 (if (and (>= v 0) (< v 536870912)) v (mod v 18446744073709551616)))
+    (t v)))                                ; :off32 -- the decoder's signed value
+
+(defun %insn-sink-add (pos opcode spec operands next)
+  (let ((norm nil))
+    (loop for op-type in spec for op-val in operands
+          do (push (%insn-norm op-type op-val) norm))
+    (rplacd *insn-sink* (cons (list pos opcode (nreverse norm) next) (cdr *insn-sink*)))))
+
+(defvar *insn-no-bytes* nil
+  "T while the sink is on: ENCODE-INSTRUCTION and MVM-LI-HALVES record each
+   instruction and advance the position, but write NO bytes.  mvm-eval sets it
+   for a DEFUN module the native 68k tier translates from the captured
+   instructions; the bytes are made from those instructions only if something
+   needs them (%BC-FILL-FROM-INSNS, mvm-eval's %BC-ENSURE-BYTES).")
+
+(defvar *opcode-spec-vec* nil
+  "OPCODE -> its operand types, a vector over 0..255 built from *OPCODE-TABLE*
+   on first use: ENCODE-INSTRUCTION's lookup ran once per instruction, and on
+   the Mac a GETHASH there was ~4% of a DEFUN.  (A DEFVAR's value never runs
+   in-image: built lazily, as *E2-CONST-POOL* is.)")
+(defvar *opcode-size-vec* nil "OPCODE -> its encoded size in bytes.")
+
+(defun %operand-size (ty)
+  (case ty ((:reg :imm8 :width) 1) (:imm16 2) ((:imm32 :off32) 4) (:imm64 8) (t 0)))
+
+(defun %opcode-vecs ()
+  (let ((specs (make-array 256 :initial-element nil))
+        (sizes (make-array 256 :initial-element 1)))
+    (maphash (lambda (code info)
+               (when (and (integerp code) (>= code 0) (< code 256))
+                 (let ((spec (opcode-info-operands info)) (n 1))
+                   (dolist (ty spec) (setq n (+ n (%operand-size ty))))
+                   (setf (aref specs code) spec)
+                   (setf (aref sizes code) n))))
+             *opcode-table*)
+    (setq *opcode-size-vec* sizes)
+    (setq *opcode-spec-vec* specs)))
+
+(defun %opcode-spec (opcode)
+  (let ((v *opcode-spec-vec*))
+    (aref (if (simple-vector-p v) v (%opcode-vecs)) opcode)))
+
+(defun %opcode-size (opcode)
+  (let ((v *opcode-size-vec*))
+    (unless (simple-vector-p v) (%opcode-vecs) (setq v *opcode-size-vec*))
+    (aref v opcode)))
+
+(defun %encode-operands (buf spec operands)
+  (loop for op-type in spec
+        for op-val in operands
+        do (ecase op-type
+             (:reg    (mvm-emit-reg buf op-val))
+             (:imm8   (mvm-emit-byte buf op-val))
+             (:imm16  (mvm-emit-u16 buf op-val))
+             (:imm32  (mvm-emit-u32 buf op-val))
+             (:imm64  (mvm-emit-u64 buf op-val))
+             (:off32  (mvm-emit-s32 buf op-val))
+             (:width  (mvm-emit-byte buf op-val)))))
+
 (defun encode-instruction (buf opcode &rest operands)
   "Encode an MVM instruction into the bytecode buffer.
    OPCODE is the numeric opcode. OPERANDS are the raw values
    matching the opcode's operand specification."
-  (let* ((info (gethash opcode *opcode-table*))
-         (spec (if info (opcode-info-operands info) nil)))
-    (mvm-emit-byte buf opcode)
-    (loop for op-type in spec
-          for op-val in operands
-          do (ecase op-type
-               (:reg    (mvm-emit-reg buf op-val))
-               (:imm8   (mvm-emit-byte buf op-val))
-               (:imm16  (mvm-emit-u16 buf op-val))
-               (:imm32  (mvm-emit-u32 buf op-val))
-               (:imm64  (mvm-emit-u64 buf op-val))
-               (:off32  (mvm-emit-s32 buf op-val))
-               (:width  (mvm-emit-byte buf op-val))))))
+  (let ((spec (%opcode-spec opcode)))
+    (if *insn-sink*
+        (let* ((pos (mvm-buffer-position buf)) (next (+ pos (%opcode-size opcode))))
+          (%insn-sink-add pos opcode spec operands next)
+          (if *insn-no-bytes*
+              (setf (mvm-buffer-position buf) next)
+              (progn (mvm-emit-byte buf opcode) (%encode-operands buf spec operands))))
+        (progn (mvm-emit-byte buf opcode) (%encode-operands buf spec operands)))))
+
+(defun %bc-fill-from-insns (bc insns start end)
+  "Write into byte vector BC the bytes of each captured instruction (PC OPCODE
+   OPERANDS NEXT-PC) of INSNS whose PC is in [START, END): what encoding them
+   wrote, since a captured instruction's operands are its encoded operands as
+   DECODE-INSTRUCTION reads them back (*INSN-SINK*)."
+  (let ((buf (make-mvm-buffer :bytes bc :labels nil :position 0)))
+    (dolist (i insns)
+      (let ((pc (first i)))
+        (when (and (>= pc start) (< pc end))
+          (setf (mvm-buffer-position buf) pc)
+          (mvm-emit-byte buf (second i))
+          (%encode-operands buf (%opcode-spec (second i)) (third i)))))
+    bc))
 
 ;;; ============================================================
 ;;; Instruction Decoding
@@ -1032,19 +1180,39 @@
         (- val #x10000)
         val)))
 
-(defun decode-u32 (bytes pos)
-  "Decode a 32-bit little-endian value"
+;;; DECODE-S32 branches on the top byte BEFORE it builds the value.
+;;; On a 30-bit fixnum tower (68k, and every 32-bit port) a fixnum is below
+;;; 2^29, so the constants #x80000000 / #x100000000 and any (ash b3 24) with
+;;; b3 >= 32 are bignums -- and the old shape compared every operand against one
+;;; and built every negative offset (b3 = #xFF) through four bignum operations
+;;; to arrive at, say, -12.  Profiled on the Mac, that was ~20% of a DEFUN.
+;;; A signed offset that fits in 30 bits now never touches a bignum; wider
+;;; ones take the general path.  (DECODE-U32 already made a bignum only when
+;;; the value is one: the NIL marker #xFFFFFFF0 as an imm32, 32-bit masks.)
+;;; Results are identical on every target: test/decode-s32.lisp checks every
+;;; top byte against the old definition.
+
+(defun %decode-lo24 (bytes pos)
   (logior (aref bytes pos)
           (ash (aref bytes (+ pos 1)) 8)
-          (ash (aref bytes (+ pos 2)) 16)
-          (ash (aref bytes (+ pos 3)) 24)))
+          (ash (aref bytes (+ pos 2)) 16)))
+
+(defun decode-u32 (bytes pos)
+  "Decode a 32-bit little-endian value"
+  (logior (%decode-lo24 bytes pos) (ash (aref bytes (+ pos 3)) 24)))
 
 (defun decode-s32 (bytes pos)
   "Decode a 32-bit signed little-endian value"
-  (let ((val (decode-u32 bytes pos)))
-    (if (>= val #x80000000)
-        (- val #x100000000)
-        val)))
+  (let ((b3 (aref bytes (+ pos 3))))
+    (cond ((< b3 #x20)
+           (logior (%decode-lo24 bytes pos) (ash b3 24)))
+          ((>= b3 #xE1)                   ; (ash -31 24) > -2^29: a fixnum
+           (+ (%decode-lo24 bytes pos) (ash (- b3 256) 24)))
+          (t
+           (let ((val (logior (%decode-lo24 bytes pos) (ash b3 24))))
+             (if (>= val #x80000000)
+                 (- val #x100000000)
+                 val))))))
 
 (defun decode-u64 (bytes pos)
   "Decode a 64-bit little-endian value"
@@ -1170,10 +1338,22 @@
    integer — which overflows the in-image 62-bit fixnum range (and triggers
    lossy bignum-word arithmetic) for |value| >= 2^61.  See compiler.lisp
    emit-li-tagged."
-  (mvm-emit-byte buf +op-li+)
-  (mvm-emit-reg buf vd)
-  (mvm-emit-u32 buf lo32)
-  (mvm-emit-u32 buf hi32))
+  (when *insn-sink*
+    ;; the decoder's value: lo | hi << 32 -- a bignum only when HI is not 0
+    (let* ((pos (mvm-buffer-position buf))
+           (lo (%insn-norm :imm32 lo32)) (hi (%insn-norm :imm32 hi32)))
+      (rplacd *insn-sink* (cons (list pos +op-li+
+                                      (list (logand vd #x1F)
+                                            (if (eql hi 0) lo (logior lo (ash hi 32))))
+                                      (+ pos 10))
+                                (cdr *insn-sink*)))))
+  (if (and *insn-sink* *insn-no-bytes*)
+      (setf (mvm-buffer-position buf) (+ (mvm-buffer-position buf) 10))
+      (progn
+        (mvm-emit-byte buf +op-li+)
+        (mvm-emit-reg buf vd)
+        (mvm-emit-u32 buf lo32)
+        (mvm-emit-u32 buf hi32))))
 
 (defun mvm-li-const (buf vd idx)
   "Emit a li-const instruction (load tagged addr of constant-pool[idx]).
@@ -1305,7 +1485,9 @@
 
 (defun %imm32-signed (u)
   "The :imm32 operand U of CMP-IMM / TEST-IMM as the signed value it encodes."
-  (if (>= u #x80000000) (- u #x100000000) u))
+  ;; LOGBITP, not (>= u #x80000000): on a 30-bit tower that constant is a
+  ;; bignum and every call compared against it
+  (if (logbitp 31 u) (- u #x100000000) u))
 
 ;; Branch
 (defun mvm-br (buf offset)
@@ -1522,6 +1704,9 @@
 (defun mvm-yield (buf)
   (encode-instruction buf +op-yield+))
 
+(defun mvm-safepoint (buf)
+  (encode-instruction buf +op-safepoint+))
+
 (defun mvm-atomic-xchg (buf vd vaddr vs)
   (encode-instruction buf +op-atomic-xchg+ vd vaddr vs))
 
@@ -1549,6 +1734,72 @@
 
 (defun mvm-fn-addr (buf vd target)
   (encode-instruction buf +op-fn-addr+ vd target))
+
+(defun mvm-w32-li (buf vd imm)
+  (encode-instruction buf +op-w32-li+ vd imm))
+
+(defun mvm-w32-add (buf vd va vb)
+  (encode-instruction buf +op-w32-add+ vd va vb))
+
+(defun mvm-w32-sub (buf vd va vb)
+  (encode-instruction buf +op-w32-sub+ vd va vb))
+
+(defun mvm-w32-mul (buf vd va vb)
+  (encode-instruction buf +op-w32-mul+ vd va vb))
+
+(defun mvm-w32-mulhu (buf vd va vb)
+  (encode-instruction buf +op-w32-mulhu+ vd va vb))
+
+(defun mvm-w32-and (buf vd va vb)
+  (encode-instruction buf +op-w32-and+ vd va vb))
+
+(defun mvm-w32-or (buf vd va vb)
+  (encode-instruction buf +op-w32-or+ vd va vb))
+
+(defun mvm-w32-xor (buf vd va vb)
+  (encode-instruction buf +op-w32-xor+ vd va vb))
+
+(defun mvm-w32-not (buf vd vs)
+  (encode-instruction buf +op-w32-not+ vd vs))
+
+(defun mvm-w32-shl (buf vd vs n)
+  (encode-instruction buf +op-w32-shl+ vd vs n))
+
+(defun mvm-w32-shr (buf vd vs n)
+  (encode-instruction buf +op-w32-shr+ vd vs n))
+
+(defun mvm-w32-sar (buf vd vs n)
+  (encode-instruction buf +op-w32-sar+ vd vs n))
+
+(defun mvm-w32-rotl (buf vd vs n)
+  (encode-instruction buf +op-w32-rotl+ vd vs n))
+
+(defun mvm-w32-ltu (buf vd va vb)
+  (encode-instruction buf +op-w32-ltu+ vd va vb))
+
+(defun mvm-w32-lts (buf vd va vb)
+  (encode-instruction buf +op-w32-lts+ vd va vb))
+
+(defun mvm-w32-eq (buf vd va vb)
+  (encode-instruction buf +op-w32-eq+ vd va vb))
+
+(defun mvm-w32-from-fix (buf vd vs)
+  (encode-instruction buf +op-w32-from-fix+ vd vs))
+
+(defun mvm-w32-hi16 (buf vd vs)
+  (encode-instruction buf +op-w32-hi16+ vd vs))
+
+(defun mvm-w32-lo16 (buf vd vs)
+  (encode-instruction buf +op-w32-lo16+ vd vs))
+
+(defun mvm-w32-join (buf vd va vb)
+  (encode-instruction buf +op-w32-join+ vd va vb))
+
+(defun mvm-w32-load (buf vd vaddr off)
+  (encode-instruction buf +op-w32-load+ vd vaddr off))
+
+(defun mvm-w32-store (buf vaddr vs off)
+  (encode-instruction buf +op-w32-store+ vaddr vs off))
 
 (defun mvm-mul26lo (buf vd va vb)
   (encode-instruction buf +op-mul26lo+ vd va vb))

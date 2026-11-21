@@ -8241,6 +8241,12 @@
     ((and (%mda-p a) (null (%word-aref a 3)) (%prim-simple-vector-p (%word-aref a 6))
           (not (eq (%word-aref a 5) 'bit)))
      (%word-aref (%word-aref a 6) i))
+    ;; AND A NARROW STRING BEHIND ONE -- a fill-pointer or adjustable string on
+    ;; an image whose strings are narrow (the bare Mac's): the reader's token
+    ;; buffer, a string-output stream.  The general MDA arm below took several
+    ;; calls a character.
+    ((and (%mda-p a) (null (%word-aref a 3)) (%prim-base-string-p (%word-aref a 6)))
+     (code-char (%u8-ref (%word-aref a 6) i)))
     ((%prim-simple-string-p a) (code-char (%word-aref a i)))
     ((%prim-simple-vector-p a) (%word-aref a i))
     ((%prim-u8-vector-p a) (%u8-ref a i))
@@ -8285,6 +8291,12 @@
          (if (fixnump c)
              (progn (%c32-set a i c) val)
              (error 'type-error :datum val :expected-type 'character))))
+      ;; a narrow string behind an undisplaced header (see %AREF-SLOW)
+      ((and (%mda-p a) (null (%word-aref a 3)) (%prim-base-string-p (%word-aref a 6)))
+       (let ((c (%ensure-char-code sto)))
+         (if (and (fixnump c) (< c 256))
+             (progn (%u8-set (%word-aref a 6) i c) val)
+             (error "~S cannot be stored in a narrow (base) string" val))))
       ((%mda-p a)
        (let ((disp (%prim-aref a 3)) (d (%prim-aref a 6)))
          (if disp
@@ -8442,6 +8454,12 @@
   "Convert N to a float (CLHS).  With no PROTO: an existing float is
    returned unchanged, otherwise N becomes a SINGLE-FLOAT (the CLHS
    default).  With PROTO: the result has PROTO's float format."
+  ;; (FLOAT fixnum <double>): one :ITOF, as %TO-DOUBLE does inside a double
+  ;; tree.  The general path builds the double from its 32-bit halves, which
+  ;; are bignums on the 30-bit tower: ~29 us a call on i386 (qemu), the
+  ;; whole cost of a declared double loop.
+  (when (and (fixnump n) proto (%ieee-float-p proto) (= (obj-subtag proto) #x60))
+    (return-from float (%float-from-int n)))
   (let ((f (cond
              ((%ieee-float-p n) n)
              ;; %bignum-to-float (cl-types): cvtsi2sd on a bignum POINTER

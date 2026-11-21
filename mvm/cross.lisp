@@ -68,12 +68,27 @@
 ;;; Cross-Compilation Pipeline
 ;;; ============================================================
 
+(defvar *late-source-fills* nil
+  "Alist (PLACEHOLDER . FUNCTION): before a compilation reads its source, each
+   PLACEHOLDER string in it is replaced by FUNCTION's text, called THEN -- after
+   the build script and the target's boot descriptor have set every flag, which
+   is when a value the image must carry about its own translation is final
+   (jit-68k-native.lisp's emitter settings).  NIL: nothing to fill.")
+
+(defun late-source-fill (text)
+  (dolist (f *late-source-fills* text)
+    (let ((p (search (car f) text)))
+      (when p
+        (setq text (concatenate 'string (subseq text 0 p) (funcall (cdr f))
+                                (subseq text (+ p (length (car f))))))))))
+
 (defun compile-source-to-module (source-text &key (name :kernel))
   "Phase 1: Compile Lisp source text to an MVM module.
    This is 100% target-independent.
    Delegates to the MVM compiler (compiler.lisp) for the actual
    compilation, then converts the result to an mvm-module for
    the image building pipeline."
+  (setq source-text (late-source-fill source-text))
   ;; Read source forms with line numbers.  Phase markers (gated on
   ;; *static-build-p*, i.e. the self-host --compile) name the phase a fatal
   ;; came from — read vs compile vs module-conversion — so a bare
@@ -330,6 +345,30 @@
 ;;; target's padding words (none on 68k), a byte per character.
 (defvar *pool-narrow-strings* nil)
 
+;;; INIT-ONLY LITERALS (the bare Mac's saved core): an EQUAL table of strings
+;;; only boot reads -- the boot tables' packed text.  BUILD-CONSTANT-POOL lays
+;;; them out LAST, after an 8-byte "modusINI" marker at *POOL-INIT-START*
+;;; (pool-relative), and the image assembly moves that tail past the NFN table
+;;; and the footer, to the very end of the resident image; mac68k-core.py then
+;;; starts the static heap at the marker, over text a core boot never reads.
+;;; NIL: one pool, as always.
+(defvar *pool-init-only* nil)
+(defvar *pool-align* 16
+  "A pooled object's alignment.  The bare Mac's 8-byte granule (translate-68k
+   *68K-TAGS3*) needs 8: a sixth of its pool was padding.")
+(defvar *pool-coalesce* nil
+  "T: one pooled object per distinct string, however many constants name it --
+   the bare Mac's pool held 4,921 strings, 2,773 distinct (38 KB).  A narrow
+   literal is copied at each evaluation (%FRESH-STRING), so none is mutated in
+   place, and CL lets a compiler coalesce similar literals.")
+(defvar *pool-init-start* nil)
+(defvar *pool-init-base* nil
+  "NIL: the pool's init-only tail is linked where it lies, last in the resident
+   image.  An address: it is LINKED there (16-aligned), though the file still
+   carries it last -- the bare Mac's 1 MB map, whose runtime-data region sits
+   where the tail would; scripts/mac68k-core.py puts the bytes at this address
+   for the core run, and a core boot never reads them.")
+
 (defun build-constant-pool (module target)
   "Build the constant pool for the image.
    Lays out compound constants (currently: strings) as full heap objects
@@ -352,7 +391,8 @@
          (constants (mvm-module-constant-table module))
          (n (length constants))
          (addr-table (make-array n :initial-element 0))
-         (big (target-big-endian-p target)))
+         (big (target-big-endian-p target))
+         (seen (and *pool-coalesce* (make-hash-table :test 'equal))))
     ;; POOL WORDS ARE WRITTEN IN THE TARGET'S BYTE ORDER.  mvm-emit-u32/u64 are
     ;; little-endian, which is right for seven targets and byte-swaps every
     ;; header and character of a pooled string on ppc and 68k -- found when
@@ -376,12 +416,15 @@
           (format t ";; pool string ~8D ~A ~S~%" (car r)
                   (if (every (lambda (c) (< (char-code c) 256)) (cdr r)) "n" "W")
                   (substitute #\Space #\Newline (subseq (cdr r) 0 (min 70 (car r))))))))
-    (loop for constant in constants
-          for idx from 0
-          do (typecase constant
+    (labels ((emit-one (constant idx)
+             (typecase constant
                (string
+                (let ((prev (and seen (gethash constant seen))))
+                  (when prev
+                    (setf (aref addr-table idx) prev)
+                    (return-from emit-one nil)))
                 ;; Each heap object is 16-byte aligned at its header.
-                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                       do (mvm-emit-byte buf 0))
                 (let* ((obj-offset (mvm-buffer-position buf))
                        (len (length constant))
@@ -426,9 +469,10 @@
                         ;; :alloc-string does.
                         (loop for c across constant
                               do (emit-word (ash (char-code c) 1)))))
-                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                         do (mvm-emit-byte buf 0))
-                  (setf (aref addr-table idx) (logior obj-offset tag))))
+                  (setf (aref addr-table idx) (logior obj-offset tag))
+                  (when seen (setf (gethash constant seen) (logior obj-offset tag)))))
                (keyword
                 ;; STATIC KEYWORD (compile-keyword under *static-keywords-p*):
                 ;; the same object :ALLOC-OBJ 1 +SUBTAG-KEYWORD+ builds at
@@ -438,7 +482,7 @@
                 ;; moves it and never needs to scan it (pooled strings rely on
                 ;; the same facts).  Boot seeds the keyword table with it
                 ;; (%seed-static-keywords), so runtime interning returns it.
-                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                       do (mvm-emit-byte buf 0))
                 (let* ((obj-offset (mvm-buffer-position buf))
                        (tag (target-object-tag target))
@@ -448,7 +492,7 @@
                   (dotimes (i pad-words)
                     (emit-word 0))
                   (emit-word (ash (normalize-name constant) 1))
-                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))
                (symbol
@@ -458,7 +502,7 @@
                 ;; and 2 (name) NIL.  NIL lives at a fixed address outside the
                 ;; heap, so the object holds no heap pointer and the collector
                 ;; never needs to see it.
-                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                       do (mvm-emit-byte buf 0))
                 (let* ((obj-offset (mvm-buffer-position buf))
                        (tag (target-object-tag target))
@@ -468,9 +512,9 @@
                   (dotimes (i pad-words)
                     (emit-word 0))
                   (emit-word (ash (normalize-name constant) 1))
-                  (emit-word +nil-value+)
-                  (emit-word +nil-value+)
-                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                  (emit-word (ct-nil-value))
+                  (emit-word (ct-nil-value))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))
                (t
@@ -479,8 +523,23 @@
                 ;; compound types haven't been routed through yet.  Emit a
                 ;; single zero so subsequent layout doesn't drift if such an
                 ;; entry creeps in; addr-table[idx] stays 0.
-                (emit-word 0))))
+                (emit-word 0)))))
+      (setq *pool-init-start* nil)
+      (flet ((init-p (c) (and *pool-init-only* (stringp c) (gethash c *pool-init-only*))))
+        (loop for constant in constants for idx from 0
+              unless (init-p constant) do (emit-one constant idx))
+        (when (some #'init-p constants)
+          (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                do (mvm-emit-byte buf 0))
+          (setq *pool-init-start* (mvm-buffer-position buf))
+          (loop for c across "modusINI" do (mvm-emit-byte buf (char-code c)))
+          (loop for constant in constants for idx from 0
+                when (init-p constant) do (emit-one constant idx)))))
     (values (mvm-buffer-used-bytes buf) addr-table))))
+
+(defvar *nfn-table-p* t
+  "NIL: the NFN table is emitted empty (count 0).  Nothing reads it at run time
+   (NFN-LOOKUP is a stub); the bare Mac sets it, for 52 KB of resident image.")
 
 (defun build-nfn-table (module target)
   "Build the NFN (Name-to-Function-Number) table.
@@ -488,7 +547,7 @@
   (let ((buf (make-mvm-buffer))
         (word-size (target-word-size target)))
     ;; Table format: [count:word] [hash:word addr:word]*
-    (let ((functions (mvm-module-function-table module)))
+    (let ((functions (and *nfn-table-p* (mvm-module-function-table module))))
       (if (= word-size 8)
           (mvm-emit-u64 buf (length functions))
           (mvm-emit-u32 buf (length functions)))
@@ -976,6 +1035,40 @@
     (dotimes (i 4)
       (setf (aref raw-bytes (+ pos i)) (logand (ash w (* i -8)) #xFF)))))
 
+(defvar *68k-tail-move* nil
+  "A paged 68k image (translate-68k *68K-PAGED-LAYOUT*): (SECTION END . RAW)
+   when its stream section [SECTION, END) of the native code was written LAST,
+   at raw offset RAW, after the constant pool, the NFN table and the footer
+   -- so everything a small Mac keeps resident is one contiguous low block
+   and the streams are the image's tail (on disk, loaded on demand).  NIL
+   otherwise.  Native offsets in the section map through NATIVE-RAW-POS.")
+
+(defun native-raw-pos (native-image-offset native-pos)
+  "The raw-file offset of native byte NATIVE-POS (see *68K-TAIL-MOVE*)."
+  (let ((m *68k-tail-move*))
+    (if (and m (cddr m) (>= native-pos (first m)))
+        (+ (cddr m) (- native-pos (first m)))
+        (+ native-image-offset native-pos))))
+
+(defun apply-68k-abs-patches (raw-bytes image boot-descriptor)
+  "Write each 68000 absolute code address (translate-68k *68K-ABS-PATCHES*:
+   native byte offset of the 32-bit word, native offset of its target) as the
+   target's runtime address: load address + wrap header + the native code's
+   image offset + the target's offset, big-endian.  The same address the
+   li-const patches compute for the constant pool."
+  (when (and (eq (getf boot-descriptor :arch) :68k)
+             (boundp 'modus.mvm::*68k-abs-patches*)
+             (symbol-value 'modus.mvm::*68k-abs-patches*))
+    (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
+           (base (or (getf boot-descriptor :code-vaddr-base)
+                     (+ (or (getf boot-descriptor :load-addr) 0)
+                        (wrap-header-size-for-boot boot-descriptor)))))
+      (dolist (p (symbol-value 'modus.mvm::*68k-abs-patches*))
+        (let ((pos (native-raw-pos native-image-offset (car p)))
+              (addr (+ base (native-raw-pos native-image-offset (cdr p)))))
+          (dotimes (i 4)
+            (setf (aref raw-bytes (+ pos i)) (ldb (byte 8 (* 8 (- 3 i))) addr))))))))
+
 (defun apply-li-const-patches (raw-bytes image module boot-descriptor
                                 pool-addr-table native-code)
   "Walk the architecture-specific LI-CONST patch list and write tagged
@@ -1046,7 +1139,7 @@
         (dolist (patch patches)
           (let* ((native-pos (car patch))
                  (idx (cdr patch))
-                 (file-pos (+ native-image-offset native-pos))
+                 (file-pos (native-raw-pos native-image-offset native-pos))
                  (offset (if (and pool-addr-table
                                   (< idx (length pool-addr-table)))
                              (aref pool-addr-table idx)
@@ -1388,17 +1481,26 @@
                ;; 16-byte boundary (the translator 16-aligns every function
                ;; entry relative to it; see translate-mvm-to-arm32).  The
                ;; payload loads at the ELF32 header size past a page boundary.
+               ;; B reaches +-32 MB; past that (a 34 MB arm32 CLI) it wrapped
+               ;; and the image jumped to #xFE012950 at startup.  Then:
+               ;;   LDR ip,[pc,#0] ; ADD pc,pc,ip ; .word OFF
+               ;; ADD reads pc = its own address + 8 = the code start, so OFF
+               ;; is PAD + entry offset.  Images that fit keep the 4-byte B.
                (let* ((hdr (if (eq (getf boot-descriptor :elf-format) :linux-arm32) 84 0))
-                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) 4) 16)) 16))
+                      (long-p (>= (+ entry-native-offset 32) (ash 1 25)))
+                      (jlen (if long-p 12 4))
+                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) jlen) 16)) 16))
                       (byte-offset (+ entry-native-offset pad))
                       (arm-offset (ash (- byte-offset 4) -2))  ; instruction units, adjusted for PC+8
-                      (insn (logior #xEA000000 (logand arm-offset #xFFFFFF))))
-                 (dolist (w (cons insn (make-list (floor pad 4) :initial-element #xE1A00000)))
+                      (words (if long-p
+                                 (list #xE59FC000 #xE08FF00C byte-offset)
+                                 (list (logior #xEA000000 (logand arm-offset #xFFFFFF))))))
+                 (dolist (w (append words (make-list (floor pad 4) :initial-element #xE1A00000)))
                    (mvm-emit-byte final-buf (logand w #xFF))
                    (mvm-emit-byte final-buf (logand (ash w -8) #xFF))
                    (mvm-emit-byte final-buf (logand (ash w -16) #xFF))
                    (mvm-emit-byte final-buf (logand (ash w -24) #xFF)))
-                 (setq jmp-size (+ 4 pad))))
+                 (setq jmp-size (+ jlen pad))))
               ((and (member arch '(:aarch64 :rpi))
                     (not aarch64-unified-p))
                ;; AArch64 B (unconditional branch, 4 bytes)
@@ -1501,13 +1603,17 @@
                (let* ((base (+ (or (getf boot-descriptor :load-addr) 0)
                                (wrap-header-size-for-boot boot-descriptor)))
                       (pad (mod (- 16 (mod (+ base (mvm-buffer-position final-buf) 6) 16)) 16))
-                      (disp (+ entry-native-offset 4 pad)))
-                 (mvm-emit-byte final-buf #x60)
-                 (mvm-emit-byte final-buf #xFF)
-                 (mvm-emit-byte final-buf (logand (ash disp -24) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash disp -16) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash disp -8) #xFF))
-                 (mvm-emit-byte final-buf (logand disp #xFF))
+                      (disp (+ entry-native-offset 4 pad))
+                      ;; a 68000 has no BRA.L: JMP abs.L, the same six bytes
+                      (abs-entry (+ base (mvm-buffer-position final-buf) 6 pad
+                                    entry-native-offset))
+                      (word (if (symbol-value 'modus.mvm::*68k-cpu-68000*) abs-entry disp)))
+                 (mvm-emit-byte final-buf (if (symbol-value 'modus.mvm::*68k-cpu-68000*) #x4E #x60))
+                 (mvm-emit-byte final-buf (if (symbol-value 'modus.mvm::*68k-cpu-68000*) #xF9 #xFF))
+                 (mvm-emit-byte final-buf (logand (ash word -24) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash word -16) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash word -8) #xFF))
+                 (mvm-emit-byte final-buf (logand word #xFF))
                  (dotimes (i (floor pad 2))
                    (mvm-emit-byte final-buf #x4E)
                    (mvm-emit-byte final-buf #x71))
@@ -1515,7 +1621,22 @@
         ;; Native code
         (let ((code-offset (mvm-buffer-position final-buf)))
           (setf (kernel-image-native-image-offset image) code-offset)
+          ;; a paged 68k image: the stream section goes LAST (*68K-TAIL-MOVE*)
+          (setf *68k-tail-move*
+                (let ((l (and (eq (and boot-descriptor (getf boot-descriptor :arch)) :68k)
+                              (boundp 'modus.mvm::*68k-paged-layout*)
+                              (symbol-value 'modus.mvm::*68k-paged-layout*))))
+                  (cond (l (list (getf l :section) (getf l :end)))
+                        ;; the boot-only functions (translate-68k *68K-BOOT-TAIL*):
+                        ;; last, past the pool and the init-only text, where the
+                        ;; static heap is laid over them once the core is saved
+                        ((and (eq (and boot-descriptor (getf boot-descriptor :arch)) :68k)
+                              (boundp 'modus.mvm::*68k-boot-tail*)
+                              (symbol-value 'modus.mvm::*68k-boot-tail*))
+                         (copy-list (symbol-value 'modus.mvm::*68k-boot-tail*))))))
           (loop for b across native-code
+                for i from 0
+                while (or (null *68k-tail-move*) (< i (first *68k-tail-move*)))
                 do (mvm-emit-byte final-buf b))
           ;; Update entry point to absolute offset
           (when (kernel-image-entry-point image)
@@ -1563,8 +1684,9 @@
               (mvm-buffer-position final-buf)))
       (format t "~&;; image sections: native ~D, constant pool ~D, NFN table ~D, source blob ~D bytes~%"
               (length native-code) (length constant-pool) (length nfn-table) (length source-blob))
-      ;; Constant pool
+      ;; Constant pool (without its init-only tail, *POOL-INIT-START*: below)
       (loop for b across constant-pool
+            for i from 0 below (or *pool-init-start* (length constant-pool))
             do (mvm-emit-byte final-buf b))
       ;; NFN table
       (loop for b across nfn-table
@@ -1584,6 +1706,40 @@
                                         (length source-blob) 8))
             (mvm-emit-u32 final-buf (- (mvm-buffer-position final-buf)
                                         (length source-blob) 4))))
+      ;; THE POOL'S INIT-ONLY TAIL (*POOL-INIT-ONLY*): last in the resident
+      ;; image, 16-aligned in memory; its constants' addresses move with it
+      (when *pool-init-start*
+        (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr)) 0))
+               (wrap-header (wrap-header-size-for-boot boot-descriptor)))
+          (loop until (zerop (mod (+ load-addr wrap-header (mvm-buffer-position final-buf)) 16))
+                do (mvm-emit-byte final-buf 0))
+          (let ((delta (if *pool-init-base*
+                           (- *pool-init-base* load-addr wrap-header
+                              (+ (kernel-image-constant-pool-offset image) *pool-init-start*))
+                           (- (mvm-buffer-position final-buf)
+                              (+ (kernel-image-constant-pool-offset image) *pool-init-start*)))))
+            (when (and *pool-init-base* (/= 0 (mod *pool-init-base* 16)))
+              (error "*POOL-INIT-BASE* #x~X is not 16-aligned" *pool-init-base*))
+            (loop for i from 0 below (length pool-addr-table)
+                  for e = (aref pool-addr-table i)
+                  when (and (integerp e) (>= e *pool-init-start*))
+                    do (setf (aref pool-addr-table i) (+ e delta)))
+            (loop for i from *pool-init-start* below (length constant-pool)
+                  do (mvm-emit-byte final-buf (aref constant-pool i)))
+            (format t "~&;; init-only literals: ~D bytes, last in the resident image (moved ~D)~@[, linked at #x~X~]~%"
+                    (- (length constant-pool) *pool-init-start*) delta *pool-init-base*))))
+      ;; a paged 68k image's stream section, last, 16-aligned in memory
+      (when *68k-tail-move*
+        (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr)) 0))
+               (wrap-header (wrap-header-size-for-boot boot-descriptor)))
+          (loop until (zerop (mod (+ load-addr wrap-header (mvm-buffer-position final-buf)) 16))
+                do (mvm-emit-byte final-buf 0))
+          (setf (cddr *68k-tail-move*) (mvm-buffer-position final-buf))
+          (loop for i from (first *68k-tail-move*) below (second *68k-tail-move*)
+                do (mvm-emit-byte final-buf (aref native-code i)))
+          (format t "~&;; 68k paged: resident ~D bytes, then the stream section ~D bytes at raw ~D~%"
+                  (cddr *68k-tail-move*) (- (second *68k-tail-move*) (first *68k-tail-move*))
+                  (cddr *68k-tail-move*))))
       (let ((raw-bytes (mvm-buffer-used-bytes final-buf)))
         ;; LI-CONST patches: walk the per-arch patch list and write
         ;; tagged constant-pool addresses into the placeholder MOVABS
@@ -1593,6 +1749,9 @@
         ;; tagged-addr from pool-vaddr + addr-table[idx].
         (apply-li-const-patches raw-bytes image module boot-descriptor
                                 pool-addr-table native-code)
+        ;; 68000: the absolute native-code addresses its long branches, calls
+        ;; and LEAs carry (translate-68k *68K-ABS-PATCHES*).
+        (apply-68k-abs-patches raw-bytes image boot-descriptor)
         ;; AArch64 fn-addr patches: write the absolute runtime address
         ;; of each target function into the MOVZ + MOVK placeholder
         ;; pair that +op-fn-addr+ emitted.  See translate-aarch64.lisp
@@ -1848,7 +2007,14 @@
             for vaddr = (+ load-addr elf-header nio nat-off)
             do (format out "~16,'0X~C~D~C~D~C~A~%"
                        vaddr #\Tab size #\Tab nat-off #\Tab name))
-      (format t "  Wrote symbol map: ~A~%" path))))
+      (format t "  Wrote symbol map: ~A~%" path))
+    ;; beside it, PATH.bc: each function's MVM bytecode length (name<TAB>bytes),
+    ;; to weigh a function's native code against its bytecode
+    (with-open-file (out (concatenate 'string (namestring path) ".bc") :direction :output
+                         :if-exists :supersede :if-does-not-exist :create)
+      (dolist (fi function-table)
+        (format out "~A~C~D~%" (string (mvm-function-info-name fi)) #\Tab
+                (or (mvm-function-info-bytecode-length fi) 0))))))
 
 ;;; ============================================================
 ;;; Top-Level API
@@ -1872,6 +2038,7 @@
     (:linux-ppc64 :ppc64)
     (:linux-ppc32 :ppc32)
     (:linux-68k :68k)
+    (:mac68k :68k)
     ;; ARMv7, not the ARMv5 :arm32 descriptor: INSTALL-ARMV7-TRANSLATOR is what
     ;; the hosted build installs (movw/movt make 32-bit immediates one pair of
     ;; instructions instead of a literal pool), and it is what qemu-arm and any
@@ -1879,6 +2046,8 @@
     (:linux-arm32 :armv7)
     ;; The bare ARMv7 CL image (QEMU virt, MMU-remapped): same translator.
     (:armv7-cl :armv7)
+    ;; The bare i386 CL image (paging over the hosted picture): same translator.
+    (:i386-cl :i386)
     (:linux-i386 :i386)
     (:x64-console :x86-64)
     (:i386-console :i386)
@@ -1911,7 +2080,16 @@
     ;; 62-bit fixnums on a 64-bit target, 30-bit on a 32-bit one.  i386 gets
     ;; a coherent 30-bit tower automatically from (target-word-size ...) = 4;
     ;; no per-target special-casing anywhere.
-    (set-target-fixnum-bits-for target-desc)
+    ;; W32 M1: the descriptor of THIS compilation, in force for all of it --
+    ;; compile, assemble, translate.  Compiler-side code reads it through the
+    ;; CT- functions (compiler.lisp), so an image building for another target
+    ;; decides by that target, not by its own folded widths.  Lexical save +
+    ;; SETQ + UNWIND-PROTECT, not a special LET: that is unreliable in-image
+    ;; (*MVM-EMIT-HALVES*), and this runs in modus-sh.
+    (let ((saved-ct *compile-target*))
+     (unwind-protect
+      (progn
+       (setq *compile-target* (set-target-fixnum-bits-for target-desc))
     ;; Get source
     (let ((src-text (or source-text
                        (when source
@@ -1938,7 +2116,8 @@
               (setf (kernel-image-metadata %img)
                     (list* :fn-table (mvm-module-function-table module)
                            (kernel-image-metadata %img)))
-              %img)))))))
+              %img))))))
+      (setq *compile-target* saved-ct)))))
 
 (defun get-boot-descriptor (target-name)
   "Get the boot descriptor for the given target architecture.
@@ -1958,6 +2137,8 @@
     ;; boot/boot-arm32-cl.lisp is loaded by its build (it needs the arm32
     ;; translator and boot-linux-arm32's geometry), so resolve it by name.
     (:armv7-cl (funcall 'armv7-cl-boot-descriptor))
+    ;; boot/boot-i386-cl.lisp, loaded by its build, as boot-arm32-cl.lisp is.
+    (:i386-cl (funcall 'i386-cl-boot-descriptor))
     (:rpi     (rpi-boot-descriptor))
     (:fixpoint (aarch64-fixpoint-boot-descriptor))
     (:uefi-x64 (uefi-x64-boot-descriptor))
@@ -1969,6 +2150,7 @@
     (:linux-ppc64 (linux-ppc64-boot-descriptor))
     (:linux-ppc32 (linux-ppc32-boot-descriptor))
     (:linux-68k (linux-68k-boot-descriptor))
+    (:mac68k (funcall 'mac68k-boot-descriptor))
     (:linux-arm32 (linux-arm32-boot-descriptor))
     (:linux-i386 (linux-i386-boot-descriptor))
     (:x64-console (x64-console-boot-descriptor))

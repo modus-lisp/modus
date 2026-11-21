@@ -11,6 +11,33 @@ Macintosh Common Lisp 2.0 (1992): a full Common Lisp with a native compiler,
 CLOS and an IDE, in **4 MB of RAM and 6 MB of disk** on a 68020+ Mac.  Coral /
 Macintosh Allegro CL 1.x ran on a 1 MB Mac Plus (a 68000), slowly.
 
+**Measured 2026-11-14** on MAME's Mac Classic (68000, 4 MB, System 6.0.8), so
+the "68020+" above is not a requirement: MCL 2.0 runs on a 68000.  Its
+application is 1.55 MB and its `SIZE` resource asks for a 3 MB partition (2 MB
+minimum).  Pearl Lisp 1.1, Coral's small CL, is 555 KB and asks for 1 MB (500 KB
+minimum).  MCL 2.0 has 957 of ANSI's 978 CL symbols; the 21 it lacks are
+almost all ANSI's later names for things it has under CLtL2's (`SPECIAL-FORM-P`,
+`DEFINE-SETF-METHOD`, `GET-SETF-METHOD`, `SIMPLE-CONDITION-FORMAT-STRING`), plus
+`READ-SEQUENCE` / `WRITE-SEQUENCE`, `DEFINE-SYMBOL-MACRO`,
+`ENSURE-DIRECTORIES-EXIST`, the `LAMBDA` macro, `COPY-STRUCTURE`.  34 feature
+probes (CLOS with method combination and `PRINT-OBJECT`, conditions, restarts,
+LOOP, FORMAT `~R`/`~{`, bignums, ratios, complexes, `*PRINT-CIRCLE*`,
+`COMPILE`, logical pathnames) all answer as SBCL does.  29-bit fixnums,
+`CHAR-CODE-LIMIT` 256.  Same machine, `TIME` per form:
+
+| form | MCL 2.0 | Pearl 1.1 | modus (classicos image, includes typing) |
+|---|---|---|---|
+| `defun fib` | 0.74 s | 0.25 s | 70 s |
+| `(fib 20)` | 1.26 s | 1.63 s | 17 s |
+| `defmacro` | 0.50 s | 0.27 s | 69 s |
+
+Both compile source straight to 68k code with a compiler that is itself native
+68k code, all of it resident.  modus compiles source to IR to MVM bytecode,
+then translates that to threaded 68k, with a compiler that runs as threaded
+code and pages in from disk.  (Method: a file holding SBCL's list of the 978
+symbols and the probes, LOADed from the MCL volume; results read off the
+Listener, since the boot disk's driver is read-only.)
+
 The goal: a true hosted REPL -- reader, compiler, printer, the whole language --
 on the LC040 inside MCL 2.0's budget.  Below that, images that only run a
 fixed program (a "thunk"): the floor for microcontrollers.
@@ -170,7 +197,8 @@ The core image above, compressed, is 1.57 MB (xz -9e).  On one 1.44 MB disk
     grep -oE '^0x[0-9a-f]+' LOG | sort -u > EXEC
     scripts/68k-floppy-trim.py IMAGE SYMMAP EXEC TRIMMED
     # 2. the loader: LZMA1 decoder in Lisp, no runtime (a ladder rung's build)
-    MODUS_68K_LINUX_OUT=unlzma sbcl --script mvm/build-hosted.lisp 68k mvm/68k-unlzma.lisp
+    MODUS_68K_LINUX_OUT=unlzma sbcl --script mvm/build-hosted.lisp 68k \
+        mvm/68k-unlzma.lisp mvm/unlzma-core.lisp
     # 3. pack (--test: the image writes the unpacked bytes to stdout instead)
     scripts/68k-floppy-pack.py unlzma TRIMMED FLOPPY
 
@@ -179,7 +207,8 @@ The core image above, compressed, is 1.57 MB (xz -9e).  On one 1.44 MB disk
   -> 1.456 MB.  The shim sources stay -- they are evaluated at first use.
   It is a post-link hack; the real version is a build-time shake from the
   core-boot path (see the script's header for the two traps it hit).
-- **The loader** (`mvm/68k-unlzma.lisp`, 14.3 KB) is LzmaSpec.cpp in fixnum
+- **The loader** (`mvm/68k-unlzma.lisp`, the Linux head, + `mvm/unlzma-core.lisp`,
+  the decoder; 13.6 KB) is LzmaSpec.cpp in fixnum
   Lisp: the range coder's 32-bit values are 16-bit halves, the arithmetic the
   raw `%FIXNUM-` ops on declared fixnums, so there are no overflow checks and
   nothing to link (generic arithmetic made it 40 KB).  7.46 MB unpacks in
@@ -194,6 +223,42 @@ The core image above, compressed, is 1.57 MB (xz -9e).  On one 1.44 MB disk
 
 Validated: `validate.sh` and DESCRIBE / APROPOS / DOCUMENTATION / COMPILE
 probes identical to the untrimmed image.  The margin is 625 bytes.
+
+## The same, as a Mac boot floppy
+
+    sbcl --script scripts/mac68k-floppy.lisp MAC-IMAGE DISK        # two 800 KB floppies, DISK-1 and DISK-2
+    sbcl --script scripts/mac68k-floppy.lisp MAC-IMAGE DISK --hd   # or one 1.44 MB floppy
+
+Two 800 KB disks (818,176 + 421,699 bytes; 397 KB free on the second): disk
+1's boot blocks enter a 68000 stage 2 (`scripts/mac68k-disk2.s`) that reads
+block 0 of every drive for disk 2's label; if no drive has it, it ejects disk
+1, writes INSERT MODUS DISK 2 on the screen and polls.  Measured: both disks in
+two drives boot to the prompt (15.7 s, JIT); disk 1 alone ejects and shows the
+message.  NOT measured: a swap in ONE drive -- headless Basilisk cannot insert
+a disk after boot.
+
+A bare-Mac image (`mvm/build-mac68k-cl-repl.lisp`, linked at `#x00100000`)
+goes behind a Mac loader (`scripts/mac68k-unlzma.s`, 68020 assembly since
+2026-11-20; it was this Lisp decoder with a Mac head, ~15 minutes on a real
+68040's clock): the
+boot blocks read loader + stream to `#x01200000`, the loader unpacks to
+`#x00100000`, pushes the 68040's caches (`CPUSHA BC`: the image was written
+as data) and jumps.  No trim needed: the small REPL image (5,557,396 bytes,
+framebuffer console included) is 1,222,613 bytes of LZMA + a 13 KB loader, a
+1.44 MB floppy with 237 KB to spare.  Measured on Basilisk II (LC 475 ROM,
+68LC040, 32 MB), prompt at:
+
+| | interpreted | JIT |
+|---|---|---|
+| uncompressed disk | 85.3 s | 11.5 s |
+| compressed, `--disk` | 143.4 s | -- |
+| compressed, `--floppy` | 142.8 s | 13.6 s |
+
+Unpacking is the difference: ~58 s interpreted, ~2 s under the JIT.  Debian's
+`BasiliskII-jit` crashes before the ROM loads (any disk, System 7.5.3 too): it
+is a PIE and its JIT bakes 32-bit absolute addresses of its globals and heap.
+`scripts/basilisk-unpie.py` relinks it at `#x10000000`; run it with
+`MALLOC_MMAP_MAX_=0` so every `malloc` comes from the (now low) brk heap.
 
 ## Plan
 
@@ -242,3 +307,435 @@ probes identical to the untrimmed image.  The margin is 625 bytes.
 
 The Mac Plus (68000) would also need a 68000 code-generation mode: the
 translator uses 68020+ instructions (long branches and displacements).
+
+## The 68000 (Mac Classic / Plus / SE): `MODUS_68K_CPU=68000`
+
+The translator's 68020 instructions, each replaced (translate-68k, "THE
+68000"): long `BRA` / `BSR` -> `JMP` / `JSR` to an absolute address (the same 6
+bytes), long `Bcc` -> `B!cc.S` over a `JMP`, `LEA (bd.l,PC)` -> `LEA abs.L`
+(absolute native addresses are filled in after layout: `*68K-ABS-PATCHES*`,
+cross.lisp `apply-68k-abs-patches`; a boot stub's long branches are 16-bit
+instead), `MULS.L` / `MULU.L` (64) / `DIVS.L` -> shared subroutines on D0/D1
+(a boot stub gets a private copy), `EXTB.L` -> `EXT.W` + `EXT.L`, the threaded
+dispatcher's scaled index -> two adds, and every token-stream operand read a
+byte at a time (an operand may be at an odd address, a bus error on a 68000;
+the stream branch tests its condition first because a byte read sets the
+flags).  Off, every image is unchanged (a ladder image is byte-identical).
+
+Measured:
+- the hosted ladder on `qemu-m68k -cpu m68000` (which rejects the 68020
+  instructions but does not fault odd addresses): 32 / 35;
+- the Mac ladder on MAME's Mac Classic (a 68000 that does fault them, 4 MB):
+  32 / 35.  The three misses are the FPU rungs (r18 r30 r31): a ladder image
+  has no runtime, so no soft float;
+- the small CL REPL image built `MODUS_68K_CPU=68000 MODUS_68K_SOFT_FLOAT=1`
+  (5.6 MB) on `qemu-m68k -cpu m68000`: bignums, ratios, `sqrt`, `format ~R`,
+  `defun`, hash tables, `handler-case` all answer as on the 68040.
+
+The Mac Classic itself: `MODUS_MAC68K_MACHINE=classic` (boot/boot-mac68k.lisp
+`*MAC68K-LAYOUTS*`, measured in MAME when our boot blocks run) puts the image
+at 64 KB and a 1 MB heap at 2 MB, under the screen at `#x3FA700`.  The REPL
+image does not fit 4 MB yet.  MAME 0.251 (Debian's) runs `macclasc` headless
+with the Classic ROM (`A49F9914`) and the ADB modem's `342s0440-b.bin`; it has
+no serial port there, so `scripts/mac68k-mame-serial.lua` taps the SCC's
+channel A data register (`#xBFFFFF`) for the ladder's oracle:
+
+    MODUS_MAC68K_MACHINE=classic MODUS_68K_CPU=68000 MAC68K_EMULATOR=mame \
+      MAC68K_MAME=mame MAC68K_ROMPATH=ROMS scripts/mac68k-ladder.py
+
+### Boot's live heap, measured (`MODUS_68K_GC_PEAK=1`)
+
+The collector records the most bytes any collection kept (`#x10006080`) and
+the latest (`#x10006084`).  The small 68k REPL image, booted under qemu:
+
+| heap | boots | collections | peak kept |
+|---|---|---|---|
+| 64 MB | yes | 2 | 1,559,744 |
+| 8 MB | yes | 24 | 1,558,672 |
+| 5 MB | yes | 91 | 1,564,512 |
+| 4.5 MB and below | heap exhausted | | |
+
+Boot's live data only GROWS, to exactly what the freeze keeps (1.29 MB of
+objects, 0.27 MB of conses): a never-copied old space (generational
+promotion) would take the boot floor from ~5 MB to that plus a young pair.
+But boot ALLOCATES on the order of 50 MB (24 collections of a 4 MB
+semispace), so on an 8 MHz 68000 a boot from scratch is likely most of an
+hour whatever the collector: a small Mac starts from a saved core, and with
+one the static freeze already gives the small floor.  Promotion is for a long
+session's growth, not for boot.
+
+## A REPL in 4 MB (the Mac Classic map), booting from a saved core
+
+    MODUS_MAC68K_MACHINE=classic MODUS_68K_PAGED=1 MODUS_68K_CPU=68000 \
+      MODUS_SMALL_IMAGE=1 MODUS_NARROW_STRINGS=1 MODUS_68K_THREADED=1 \
+      MODUS_68K_HOT=/dev/null ... sbcl --script mvm/build-mac68k-cl-repl.lisp
+    scripts/mac68k-core.py IMAGE DISK          # boots it once on a 32 MB Mac
+
+Every function threaded and paged: 804 KB resident (stubs, handlers, the
+512 KB constant pool), 3.96 MB of streams on disk.  A Classic cannot boot the
+image from scratch (a 5 MB heap, ~50 MB of allocation), so `mac68k-core.py`
+boots the SAME binary once on Basilisk II with 32 MB -- the stub's :BOOT- heap,
+code cache and stack above 4 MB -- where it freezes and sends its core over
+serial; the static heap (1.28 MB of objects, 0.27 MB of conses) is moved to
+`#x110000` the way a copying collection would move it (89,488 pointers), and
+the disk is the boot blocks, [image, low block end) in one read, then the
+streams.  The Classic map (boot-mac68k.lisp `:classic`): image `#x40000`,
+static heap `#x110000`, low block `#x2B0000`, two 192 KB young semispaces,
+the kind map, a 460 KB CODE CACHE, NIL's page, a 64 KB stack under the screen.
+
+The code cache is a FIFO that never overwrites an ACTIVE stream: one a root
+points into -- the caller's A5, -4(A6) of every frame on the A6 chain (every
+function is threaded, so that slot is always the caller's token pointer), the
+jmpbuf's and every handler frame's A5.  `MODUS_68K_PAGED_CHECK=1` re-walks the
+roots after every load and stops with `!LDR-LOST` if one points into an evicted
+stream; it found the one bug (a root before the place, in a stream overlapping
+it).  The boot blocks first move themselves and the stack 64 KB under the top
+of RAM: the ROM's boot stack is mid-RAM, inside the 2.7 MB they read.
+
+Measured on Basilisk II (LC 475 ROM, `--ramsize 4M`, no JIT -- the relinked JIT
+binary still dies at startup now and then): the core boots to the prompt in
+~23 s; defun, bignums, `format ~R`, `loop` answer, the check silent.
+
+**On a Mac Classic** (MAME's `macclasc`: a 68000 at 7.8 MHz, 4 MB), booting a
+SCSI disk: `sbcl --script scripts/mac68k-hd.lisp VOLUME OUT --chd CHDMAN` puts a driver
+descriptor ('ER') in block 0, our read-only driver (`scripts/mac68k-scsi.s`)
+from block 1 and the boot volume from block 64.  The ROM loads the driver and
+enters it with the SCSI ID in D5; it installs itself (_DrvrInstall, unit 32 +
+ID, marked open), adds a locked, non-ejectable drive, and the ROM boots that
+drive's boot blocks.  PRIME reads through the SCSI Manager (Get, Select, READ(6)
+Cmd, RBlind, Complete).  `_SCSIDispatch` is a Toolbox trap: it may clobber
+D0-D2/A0-A1 under Pascal's convention, which first read as a SCSI error of
+5696.  `scripts/mac68k-mame-repl.lua` types forms when the prompt shows and taps
+the SCC for what the Mac sends.  Measured, in emulated time: the prompt at
+288 s from power-on, `(+ 1 2)` => 3, `(defun sq ...)` => SQ, `(sq 12)` => 144,
+on the Classic's 1-bit screen.
+
+**Where the time went, and goes** (MAME's Lua samples the 68000's PC; the
+translator writes where each shared region starts, `MODUS_68K_REGIONS=FILE`):
+first the stream LOADER, 70-80% of a form -- for every root it searched the
+6,444-entry stream table for the stream holding it, and eviction searched it
+again.  An OWNER MAP (a 16-bit word per 64-byte granule of the cache: the
+stream placed there; streams 64-aligned, so a granule has one) makes both one
+step.  Then the cache was too small for a DEFUN's active streams (the
+interpreter, 176 KB as a stream, and the compiler's biggest pieces): the stack
+and scratch moved below the image ([#x10000, #x40000) is free on a Classic),
+the young semispaces to 2 x 128 KB, the cache to ~796 KB.  Measured, in a
+Classic's own seconds:
+
+| form | before | now | threaded handlers | GC | loader | ROM (SCSI, serial) | barrier |
+|---|---|---|---|---|---|---|---|
+| `(+ 1 2)` | 49 s | 9 s | 45% | -- | 24% | 22% | 7% |
+| `(defun sq ...)` | 178 s | 53 s | 55% | 13% | 10% | 12% | 7% |
+| `(sq 12)` | 177 s | 35 s | 46% | 18% | 14% | 13% | 7% |
+| `format ~R`, bignums | -- | 69 s | 62% | 6% | 8% | 14% | 8% |
+
+Not GC: interpretation.  Boot to the prompt is 262 s, three quarters of it
+threaded code -- the resume's %GC-CARDS-INIT walking the 1.5 MB static heap
+object by object, which the core builder could do instead.  A form still reads
+~450 streams from disk: its working set is about the cache.
+
+## Toward 1 MB: the cheap cuts
+
+What a core-booted Classic holds, before and after (the static heap counted
+object by object in the saved core; the image's sizes from the build):
+
+| | before | now | what went |
+|---|---|---|---|
+| resident image | 805 KB | 711 KB | the surfaces' source (162 KB) out; literals into the pool (+68 KB) |
+| code streams on disk | 3.96 MB | 3.66 MB | literals no longer built a character at a time |
+| static objects | 1.28 MB | 1.04 MB | wide strings 157 KB -> 0; the 64 KB cell cache; two 64 KB buffers |
+| static conses | 267 KB | 254 KB | |
+
+- **`MODUS_NO_SURFACES`** (on for small Mac builds): no Genera / SB-* / gray
+  streams / ASDF source, and `%SURFACE-OFF-P` is T.  A Mac has no environment
+  to switch them off in, and no sockets or threads for them to wrap.
+- **Narrow literals** (`*NARROW-LITERALS-P*`, as the x64 CLI's
+  `MODUS_NARROW_STRINGS`): pooled once, a byte a character, `%FRESH-STRING`'d.
+  Not 32-bit (#x15) strings, whose accessors assume the 64-bit object layout
+  (`*STRING32-P*` / `%STRING32-STRINGS-P`).
+- **`%BASE-SUBSEQ-P`**: `SUBSEQ` of a narrow string is narrow.  Boot cuts every
+  name in the symbol, function and global tables out of narrow packed text.
+- **`MODUS_SMALL_IMAGE`**: the global-cell cache 1024 slots (597 used, of
+  16384), mvm-eval's buffers start at 4 KB (they grow), no opcode descriptions.
+- **No wide strings at all** (`*BASE-STRINGS-ONLY*` / `%BASE-STRINGS-ONLY-P`,
+  on for the Mac; `MODUS_68K_WIDE_STRINGS=1` keeps them): every fresh string
+  is narrow, a byte a character, and a character above 255 cannot be stored in
+  one (it signals; nothing truncates).  Mac text is 8-bit.  The core's wide
+  strings 157 KB -> 0, and a form's strings take a quarter of the young heap.
+
+**What is left, and where the next cuts are.**  The resident image is 219 KB
+of native code (stubs, handlers, the stream table) and ~490 KB of pool, of
+which ~270 KB is the BOOT TABLES' packed text (symbol names 152 KB, function
+names 76 KB, global names 16 KB, keyword lists 12 KB) plus the runtime macros'
+source -- read once, by boot.  A core-booted Mac never reads them: an init-only
+section at the end of the image that the core disk leaves off is the next
+~300 KB.  In the static heap: 21,000 narrow strings (419 KB, names, many
+duplicates), 351 KB of hash-table storage sized for growth (the dict of a
+12,232-entry table is a 64 KB index + 135 KB of entries; a freeze-time compact
+to the live count is ~60 KB), and 254 KB of conses.
+
+## What a session touches, and swapping the rest
+
+**Measured** (MAME's Lua read and write taps over the whole static heap, a
+typical session of eleven forms -- arithmetic, DEFUN and a call, FORMAT ~R,
+DOTIMES, MAPCAR, the printer, HANDLER-CASE, an undefined function, INTERN,
+DEFSTRUCT -- each 8-byte granule mapped back to its object in the saved core):
+the forms touch **170 KB of the 1.29 MB**.  Boot touches every object (the
+resume's %GC-CARDS-INIT reads every header).  Cold, by owner (each global's
+value, keyed by the compiler's name hash): `*SYM-NAME-TABLE*` 430 KB,
+`*KERNEL-FN-NAMES*` 143 KB, the package system 124 KB, the pinned tables
+124 KB, `*MACRO-PKG-TABLE*` 82 KB, `*MVM-EVAL-CACHE*` 66 KB,
+`*KERNEL-GLOBAL-NAMES*` 33 KB.
+
+A 68000 has no MMU, so there is no page fault to catch: data comes off the
+disk where it is ASKED FOR, through a function, as the code streams do.
+**Cold names** (`mvm/mac68k-cold.lisp`) are the first: the build writes the
+12,247 names, sorted by hash, to 512-byte pages (`IMAGE.cold`, 203 KB);
+`mac68k-core.py` puts them on the disk after the streams; the core run drops
+`*SYM-NAME-TABLE*`; and `SYMBOL-NAME`, where the table would have answered,
+asks `%COLD-SYM-NAME` -- a binary search of the pages' first hashes (in the
+image), ONE block read (`SYSCALL3` service 1 on a bare Mac, the code loader's
+`_Read`), the name kept.  The freeze also empties `*MVM-EVAL-CACHE*`, runs
+`COMPACT-NAMES` (5,000 duplicate strings), and clears the closure-environment
+slot, which was holding a 400 KB table live.
+
+| | before | now |
+|---|---|---|
+| static objects | 1.04 MB | 0.89 MB |
+| static conses | 254 KB | 222 KB |
+| prompt on MAME's Classic | 254 s | 224 s |
+
+Next, in both directions: the kernel-name sets and the macro table are
+consulted only at DEFUN / DEFMACRO / global-definition time -- the next cold
+customers, or replaced by a test on what is already resident.
+
+## Shrinking what stays, and a code cache that can evict anything
+
+**The core's own collection** (`mac68k-core.py`): a core boot's only roots are
+the low block's words, so the builder keeps what they reach and compacts it --
+326 KB the freeze had kept live through a stale stack word went.  **Hash
+tables**: the symbol-function table is a compact dict now -- keys and values
+packed -- and a cached `(name . function)` pair is made on demand
+(`%GETHASH-PAIR`'s side table), not three conses an entry for every name;
+pinned bucket vectors are right-sized at the freeze.  **Packages**: a
+package's symbols are an EQUAL hash table, not an alist with a derived index.
+The saved heap: 1.12 MB -> 657 KB.  (A table that grows is NOT right-sized: a
+doubled 2,400-entry dict does not fit the Classic's 128 KB young semispace.)
+
+**Active streams are evictable.**  The code cache used to stop (`!LDR-FULL`)
+when the streams on the call chain outgrew it -- three DO-EXTERNAL-SYMBOLS in
+one form did.  Now FORCE takes a place anyway and rewrites every exact root
+into what it evicts (the caller's A5, -4 of each frame, the jmpbuf's and
+handler frames' A5) to a RELOAD RECORD: a token, the stream, the offset.
+Returning to one reloads the stream wherever it fits and goes on.  So the
+cache's size is now a speed choice, not a ceiling; its floor is the largest
+stream (the interpreter, ~176 KB).  `MODUS_MAC68K_CACHE_KB=N` sets it.
+Measured on MAME's Classic (68000, SCSI):
+
+| | 796 KB cache | 192 KB cache |
+|---|---|---|
+| prompt | 224 s | 179 s |
+| `(+ 1 2)` | 23 s | 28 s |
+| `defmacro` | 207 s | 316 s |
+
+The 4 MB Classic's map now holds ~1.77 MB: image 470 KB, saved heap 657 KB,
+low block 128 KB, young heap 256 KB, cache 192 KB, stack and buffers ~70 KB.
+
+## Toward 1 MB: what the saved core and the image hold now
+
+Measured on MAME's 2 MB Classic (`MODUS_MAC68K_MACHINE=classic2m`), same
+REPL forms throughout, every answer right:
+
+| | before | now | how |
+|---|---|---|---|
+| code cache floor | 196 KB (the interpreter's stream) | none (64 KB runs) | **chunked streams**: a cold function over `MODUS_68K_CHUNK_KB` (default 4) is several streams; a cross-chunk branch goes through an XJUMP trampoline, which is the RELOAD token over a record-shaped operand |
+| resident image | 607 KB | 443 KB | no NFN table (nothing reads it); CL's runtime macro texts and the boot-only name lists init-only; the constant pool coalesced (4,921 strings, 2,773 distinct) and 8-aligned; no ANSI-test helpers or stage-1/2 probes |
+| saved heap | 657 KB | 400 KB | **cold functions**: the function table's image entries (4,574 names) and `*KERNEL-FN-NAMES*` go to disk at the freeze, as hash-sorted pages; a miss in either table reads one block and keeps what it found (`%HT-COLD-MISS`, `mac68k-cold.lisp`) |
+| low block | 128 KB | 56 KB | the layout's `:ALLOC-START`; the 72 KB went to the young semispaces (64 -> 100 KB) |
+| prompt | 74 s | 55 s | less to read at boot |
+
+`MAC68K_CORE_CENSUS=1 scripts/mac68k-core.py` prints the saved heap by subtag.
+What is left in it is live: symbols and their intern tables (~130 KB), the
+package tables, the bytecode of the 47 runtime macros boot compiles (56 KB),
+dict indexes, conses (60 KB).
+
+### The REPL's code working set is the wall
+
+Profiled with a write tap on the stream table (every load) and a PC sampler:
+one `(length (let ((l nil)) (dotimes (i 5) (push (intern (format nil "S~D" i)) l)) l))`
+touches **732 streams, 830 KB of threaded code** -- the interpreter (125 KB of
+it), `COMPILE-COMPOUND` (96 KB), `EMIT-BYTECODE-FOR-IR` (65 KB), `COMPILE-CALL`,
+`TYPEP`, `%FORMAT-IMPL` ... every REPL form is compiled by the in-image compiler
+and run by the interpreter.  With a 64 KB cache that form costs ~10,000 stream
+loads, and 69% of its time is the loader and the ROM's disk driver:
+
+| chunk size, 64 KB cache | DOTIMES form | DEFUN | DEFMACRO | LET + macro |
+|---|---|---|---|---|
+| 16 KB | 452 s | 70 s | 253 s | 127 s |
+| 4 KB | 239 s | 62 s | 239 s | 89 s |
+
+An LRU simulation over that form's load trace still misses ~6,500 times at
+64 KB, ~1,900 at 192 KB and ~1,200 at 256 KB.  So a 1 MB Mac can be made to
+*fit* (image + saved heap need to reach ~600 KB, from 843 KB: the 1 MB hot list
+`mvm/68k-hot-mac-1m.txt` is -100 KB, stub/table slots ~-50 KB), but with the
+cache it can afford every non-trivial form is minutes of paging -- and a real
+SCSI disk's seek time would make each of those thousands of reads dearer than
+MAME's.  What would change that is a smaller REPL path, not a smaller image.
+
+## A REPL in 1 MB (Mac Plus): `MODUS_MAC68K_MACHINE=plus1m`
+
+MAME `macplus -ramsize 1M`, our boot blocks and SCSI driver, booting from the
+saved core: the prompt at 54 s, and `(+ 1 2)`, DEFUN, a call, FORMAT ~R,
+DEFMACRO and its use, DOTIMES/PUSH/INTERN all right.  Build with an empty
+`MODUS_68K_HOT` (no hot natives).
+
+| range | what |
+|---|---|
+| `#x10000`-`#x18000` | stack |
+| `#x18000`-`#x1C000` | I/O scratch pages |
+| `#x1C000`-`#x3E000` | code cache (136 KB) |
+| `#x3E000`-`#x40000` | NIL's page and T's |
+| `#x40000`-`#x8E000` | resident image (~318 KB) |
+| `#x8E000`-`#xD0000` | saved heap (268 KB) |
+| `#xD1000`-`#xF5000` | low block (56 KB), young semispaces 2 x 40 KB, 8 KB guard |
+| `#xF5000`-`#xF9800` | kind map |
+| `#xFA700`- | the screen |
+
+What it took, beyond the earlier rounds: the init-only text LINKED at 4 MB
+(`*POOL-INIT-BASE*`) for the core run, where this map's region would sit on it;
+CL's runtime macros compiled into the image (-132 KB of saved heap); and the
+serial REPL's input buffer growing from 512 characters instead of a fixed
+16 KB string -- found by dumping RAM at "heap exhausted" and walking the young
+heap through the kind map.  Measured: 20 KB semispaces exhaust before the
+prompt, 32 KB at the first DEFUN, 40 KB with the 16 KB buffer at DEFMACRO.
+
+It is slow: seconds for a call, minutes for DEFMACRO or a loop.  Every REPL
+form is compiled in the image and run by the bytecode interpreter, and their
+working set pages through a 136 KB cache (see "The REPL's code working set is
+the wall" above).
+
+### With the threaded JIT: `MODUS_MAC68K_MACHINE=plus1mjit MODUS_68K_JIT=1`
+
+REPL DEFUNs translated to threaded code (docs/68k-threaded-jit.md).  The JIT's
+shape index (8 KB) and the handlers it adds (79) do not fit plus1m's resident
+range (2.9 KB free), so this map moves the image 16 KB down and takes a code
+area from the cache:
+
+| range | what |
+|---|---|
+| `#x1C000`-`#x36000` | code cache (104 KB) |
+| `#x36000`-`#x3A000` | the JIT's code area (16 KB) |
+| `#x3A000`-`#x3C000` | NIL's page and T's (no lower: the core run's LC ROM keeps its system heap to `#x39FE0`) |
+| `#x3C000`-`#x8E000` | resident image |
+
+A translation pages the compiler and the JIT through the 104 KB cache: with
+every DEFUN translated, a DEFUN took 196-315 s.  So here DEFUN does not
+translate (the layout's `:jit-on-defun nil`) and `(compile 'f)` does.  MAME
+`macplus -ramsize 1M`:
+
+A session, in the order typed (each form's time to the next prompt; the
+second column is the same image before the 2026-11-14 round below):
+
+| type | time | before |
+|---|---|---|
+| `(defun sq (x) (* x x))` (the first form) | 42 s | 62 s |
+| `(defun greet (name) (format nil "Hello, ~A!" name))` | 33 s | 53 s |
+| `(greet "Mac")` | 9 s | 9 s |
+| `(+ 1 2)` | 5 s | 5 s |
+| `(defun fib (n) ...)` | 84 s | 111 s |
+| `(compile 'fib)` | 62 s | 105 s |
+| `(fib 20)` | 19 s | heap exhausted |
+| `(defun fact ...)`, `(compile 'fact)`, `(fact 10)` | 66 s, 60 s, 5 s | |
+| `(defun tri (n) ...)`, `(tri 20)` interpreted | 64 s, 35 s | |
+| `(defmacro twice (x) ...)`, its use in a LET | 297 s, 60 s | |
+| `(compile 'tri)`, `(tri 100)` | 49 s, 4 s | |
+| `(mapcar #'sq (list 1 2 3))` | 46 s | |
+| `(dotimes (i 5) (print (* i i)))` | 116 s | |
+
+Built with `MODUS_68K_HOT=mvm/68k-hot-mac-plus.txt`: one native function,
+`%GV-REF-FILL` (2 KB of the 5.5 KB the resident range has free), which every
+special-variable read of a small image calls.
+
+**What a DEFUN was spending, found by sampling the Lisp call stack** (MAME
+Lua: PC, the threaded IP, and the frame chain's return addresses mapped to
+streams through the cache's owner map; `greet`, 53 s).  None of it is the
+Mac's: it is in the shared evaluator and compiler, where a workstation hides
+it (x64, 3000 DEFUNs through EVAL: 1360 ms before, 1050 ms after; the ANSI
+suite 21680/21681 both sides, the same test failing).
+
+| was | what | now |
+|---|---|---|
+| 9% | `BOUNDP`: is the symbol's name a kernel global's (a string hash), then is its package a kernel package (STRING= against each) | the package first, by EQ (`%KERNEL-HOME-PKG-P`) |
+| 7% | the 94 bootstrap macros copied into a fresh `*MACRO-TABLE*` at every EVAL | the fresh table overlays them (`%MACRO-TABLE-REF`) |
+| 5% | every called name looked up in the kernel's function names -- on a Mac a read of the cold functions on disk | only for a symbol of a non-kernel package |
+| 6% | `TAIL-FORM-IS-VALUES-P` building a list of 53 strings to MEMBER the operator's name in (x64: 3 KB and 5 us a call) | by hash, as its other arms |
+| 3% | the arity check's function name compiled through COMPILE-FORM: a macroexpansion of `(QUOTE NAME)` per function | `COMPILE-QUOTE` |
+
+Also in that round, for the heap: the compile's IR and expansion memo are
+dropped before the form runs; `*MVM-EVAL-CACHE*` has a bound (4096 forms; 0
+here -- it kept every form evaluated, compiled, for the life of the process);
+the JIT's permutation candidates are read from the shape table, not collected
+into a hash table that a 40 KB young semispace could not hold (the "heap
+exhausted" above).  And the cold names' index is searched where it is (15 s
+of the first `(compile 'f)`: 403 PARSE-INTEGERs through the bignum reader).
+
+**Then the disk.**  With those gone a DEFUN (`greet`, 38 s) was the SCSI
+transfer in the ROM ~33%, our loader ~15%, and Lisp a third: one DEFUN called
+616 distinct functions, 664 KB of threaded code, through the 104 KB cache --
+1806 stream loads, 1.7 MB read.  A quarter of that was two functions,
+`EMIT-BYTECODE-FOR-IR` (65 KB; 339 KB read) and `COMPILE-COMPOUND` (95 KB;
+114 KB read): each one long chain of tests walked from the top for every
+instruction or form, so a late clause paged the whole function in, and the
+rest of the cache out.  Now:
+
+- `COMPILE-COMPOUND` sends an operator that is none of its 372 dispatch names
+  -- a call to a function, most forms -- to `COMPILE-CALL` at once
+  (`%COMPOUND-DISPATCH-OP-P`, a binary search; every build checks the name
+  lists are complete, build-checks.lisp CHECK H).
+- `EMIT-BYTECODE-FOR-IR`, `IR-INSTRUCTION-SIZE` and the interpreter's
+  `%MVM-INTERPRET-1` test for the commonest instructions first (the
+  interpreter's order was the opcode table's: OBJ-REF, every read of a local,
+  sat behind a hundred others).
+
+A DEFUN reads 1.2 MB in 1443 loads (`greet`, 33 s); `(tri 20)` interpreted
+went 54 -> 35 s.  On x64 3000 DEFUNs are 980 ms (1360 before both rounds),
+the interpreter unchanged.
+
+**What is left**: still the disk -- 538 functions, 517 KB a DEFUN.  A
+simulation over the recorded references: a clock policy in place of the FIFO
+would save ~20% of the loads, 24 KB more cache ~15%.  The interpreter pages
+itself (64 KB of it for `(tri 20)`, read 18 times over).  DEFMACRO compiles
+its expander in nested EVALs (297 s).  Heap exhaustion is still fatal.
+
+Modules over 1 KB of bytecode (every DEFSTRUCT) stay interpreted.
+
+## Launched from Mac OS: `MODUS_MAC68K_MACHINE=classicos` + `scripts/mac68k-chain.py`
+
+No floppy and no disk of our own: a Mac application, "Modus", whose data fork
+IS the boot disk `mac68k-core.py` writes.  Double-clicked (or set as the
+startup application), it opens its own data fork, reads the image to its
+address, stores the open file's reference number in the image's static block
+(`#x10006050`, `+68K-MAC-FILE-REFNUM+`) and jumps.  The image runs on top of
+Mac OS as it runs on top of the ROM -- low memory, the system heap, drivers,
+interrupt handlers kept -- and its code loader and disk service `_Read` that
+file instead of the boot drive, so the File Manager follows the file's
+extents and nothing is written to the Mac's disk.  One file to copy
+(MacBinary II); restart to get back to the Finder.
+
+- **The map** (`:CLASSIC-OS`): the 4 MB Classic map with nothing under the
+  image.  Measured on MAME, System 6.0.8 with no INITs: the system heap
+  `#x1400`-`#x24270`, the application zone from `#x2427C`.  The stack and the
+  I/O scratch pages move from `#x10000` to under NIL's page.  The application
+  refuses, on the screen, if MemTop is short of the map, the system heap
+  reaches the image, or its own code or stack is where the image goes.
+- **The boot blocks carry a record** for it: `modusCHN`, then DEST ENTRY LEN
+  OFF SPOFF SPLEN REFSLOT MEMTOP; REFSLOT is 0 for a map that cannot run under
+  Mac OS.  The application draws the splash from SPOFF/SPLEN too.
+- **Measured**, MAME `macclasc -ramsize 4M`, System 6.0.8 on our SCSI driver,
+  Modus as the startup application: the prompt at 61-73 s, (+ 1 2), DEFUN, a
+  call; at 2 MB the refusal on the screen.  The same image booted from its own
+  disk: prompt at 60 s, DEFUN 25 s (the 1 MB Plus: 62 s).
+- **Our SCSI driver now reads any position and count** (a partial block
+  through a bounce buffer).  It rounded every request up to whole blocks --
+  modus's own readers never noticed -- and System 6 booted from it crashed in 6
+  boots of 8, its reads overrunning their buffers; 6 of 6 after.

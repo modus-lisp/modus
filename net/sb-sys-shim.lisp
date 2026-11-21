@@ -55,7 +55,13 @@
 (defpackage "SB-SYS"
   (:use)
   (:export "FD-STREAM" "FD-STREAM-P" "FD-STREAM-FD" "MAKE-FD-STREAM"
-           "WITH-PINNED-OBJECTS"))
+           "WITH-PINNED-OBJECTS" "ENABLE-INTERRUPT"))
+
+;;; SB-UNIX: the signal numbers SB-SYS:ENABLE-INTERRUPT takes (beacon ignores SIGPIPE with
+;;; them).  Only the ones Linux and Darwin number alike.
+(defpackage "SB-UNIX"
+  (:use)
+  (:export "SIGHUP" "SIGINT" "SIGPIPE" "SIGALRM" "SIGTERM"))
 
 (defpackage "SB-ALIEN"
   (:use)
@@ -83,7 +89,8 @@
            ;; the browser stack (weft, shuttle, loom) reaches for these
            "FLOAT-NAN-P" "FLOAT-INFINITY-P" "GET-TIME-OF-DAY"
            "MAKE-WEAK-POINTER" "WEAK-POINTER-VALUE" "PARSE-NATIVE-NAMESTRING"
-           "WITH-TIMEOUT" "TIMEOUT"))
+           "WITH-TIMEOUT" "TIMEOUT" "GET-BYTES-CONSED"
+           "WORD" "ATOMIC-INCF" "ATOMIC-DECF"))
 
 ;;; SB-UNICODE: the one name shuttle's regular expressions use (\p{...}).
 (defpackage "SB-UNICODE"
@@ -595,6 +602,49 @@
     (ignore-errors (finish-output *error-output*)))
   (%cli-exit unix-status))
 
+;;; SB-EXT:GET-BYTES-CONSED -- bytes allocated since boot.  The hosted x86-64
+;;; collector keeps the count of every finished cycle in one word
+;;; (translate-x64.lisp +X64-BYTES-CONSED-ADDR+, #x10000D38, stored <<1 so the
+;;; :U64 read is the number); the cycle in progress is the active region's
+;;; allocation pointer above its from-space start (region block +0, stored raw,
+;;; so its :U64 read is half the address).  PARTIAL: another thread's region
+;;; contributes what its finished collections consed, not its current cycle.
+;;; Elsewhere the collector keeps no such word, and this SIGNALS rather than
+;;; answering 0: a "nothing was allocated" reading passes every allocation
+;;; bound a test asserts.
+(defun sb-ext:get-bytes-consed ()
+  (unless (and (member :x86-64 *features*) (member :linux *features*))
+    (error "sb-ext:get-bytes-consed: this modus image does not count allocation ~
+            (hosted x86-64 Linux only)."))
+  (+ (mem-ref #x10000D38 :u64)
+     (- (get-alloc-ptr) (* 2 (mem-ref (%gc-region) :u64)))))
+
+;;; SB-EXT:WORD -- the machine word as an unsigned integer type.
+(deftype sb-ext:word () '(unsigned-byte 64))
+
+;;; SB-EXT:ATOMIC-INCF / ATOMIC-DECF -- add to PLACE as one indivisible step and
+;;; return the OLD value, as SBCL does, for any SETF-able place (SBCL allows a
+;;; struct slot of type WORD, an AREF of a WORD vector, CAR / CDR).  The step
+;;; runs under net/cooperative-atomics.lisp's process-wide atomics lock when
+;;; threads are live (the same lock %ATOMIC-INCF takes), else plainly.
+;;; PARTIAL: no modular wraparound -- SBCL wraps a WORD place at 2^64 and a
+;;; fixnum one at the fixnum range; here the sum is exact.  Atomic only against
+;;; other ATOMIC-INCF / ATOMIC-DECF of the place, not against a plain SETF of
+;;; it (no compare-exchange instruction; see that file).  COMPARE-AND-SWAP is
+;;; deliberately NOT provided, for the reason that file gives.
+(defmacro %sb-atomic-add (place delta)
+  (let ((d (gensym "D")) (old (gensym "OLD")))
+    `(let ((,d ,delta) (,old nil))
+       (if (= (%rt-threads-live-p) 0)
+           (progn (setq ,old ,place) (setf ,place (+ ,old ,d)))
+           (progn
+             (%atomics-acquire)
+             (unwind-protect (progn (setq ,old ,place) (setf ,place (+ ,old ,d)))
+               (%atomics-release))))
+       ,old)))
+(defmacro sb-ext:atomic-incf (place &optional (diff 1)) `(%sb-atomic-add ,place ,diff))
+(defmacro sb-ext:atomic-decf (place &optional (diff 1)) `(%sb-atomic-add ,place (- ,diff)))
+
 (defun sb-ext:gc (&rest options)
   "Force one collection of THIS thread\'s active region.  :FULL and :GEN are
    accepted and ignored: modus\'s collector is a single-generation copier per
@@ -897,11 +947,25 @@
 (defun sb-ext:float-infinity-p (x)
   (and (floatp x) (= x x) (> (abs x) most-positive-double-float)))
 
+;; SB-EXT:*POSIX-ARGV* IS CLI-TOPLEVEL'S *POSIX-ARGV*: the same symbol, so a read sees what the
+;; command line held (element 0 the program, SBCL's own options dropped) and a SETF or LET of it
+;; is seen by both names.  It used to exist only as MODUS-INT::*POSIX-ARGV*, so every
+;; `sb-ext:*posix-argv*' in portable code read as an unbound fresh symbol.
+(let ((s (find-symbol "*POSIX-ARGV*" (symbol-package '%cli-collect-argv))))
+  (when (and s (not (find-symbol "*POSIX-ARGV*" "SB-EXT")))
+    (import s "SB-EXT")
+    (export s "SB-EXT")))
+
 (defun sb-ext:get-time-of-day ()
-  "(values seconds microseconds) since the Unix epoch.  The microseconds come from the internal
-   real-time clock, so they are monotonic within a second's reading rather than the wall clock's."
-  (let ((us (floor (* (get-internal-real-time) 1000000) internal-time-units-per-second)))
-    (values (- (get-universal-time) 2208988800) (mod us 1000000))))
+  "(values seconds microseconds) since the Unix epoch, both halves from ONE CLOCK_REALTIME reading,
+   as gettimeofday(2) gives them.  The microseconds used to come from the monotonic clock while the
+   seconds came from the wall clock, so (+ (* s 1000000) us) jumped by up to a second either way:
+   beacon's store-load log printed a negative duration."
+  (let ((ns (%clock-gettime-ns 0)))
+    (when (or (not (integerp ns)) (<= ns 0))
+      (error "SB-EXT:GET-TIME-OF-DAY: this image has no wall clock"))
+    (multiple-value-bind (s rem) (floor ns 1000000000)
+      (values s (floor rem 1000)))))
 
 ;;; A weak pointer that holds its object STRONGLY: modus's collectors keep no weak references, so
 ;;; the honest answer is "still there".  A cache keyed through one never shrinks, which is the cost.
@@ -936,3 +1000,33 @@
           ((<= #x300 code #x36F) :mn)
           ((<= #xE000 code #xF8FF) :co)
           (t :so))))
+
+
+;;; ---- signals: SB-SYS:ENABLE-INTERRUPT ------------------------------------------------------
+
+(defconstant sb-unix:sighup 1)
+(defconstant sb-unix:sigint 2)
+(defconstant sb-unix:sigpipe 13)
+(defconstant sb-unix:sigalrm 14)
+(defconstant sb-unix:sigterm 15)
+
+(defun sb-sys:enable-interrupt (signal handler)
+  "SBCL's (ENABLE-INTERRUPT SIGNAL HANDLER) for HANDLER :IGNORE (SIG_IGN) and :DEFAULT (SIG_DFL),
+   through rt_sigaction.  NIL, as SBCL.  PARTIAL: a Lisp handler FUNCTION is not supported --
+   modus has no way to run Lisp from an asynchronous signal -- and signals an error rather than
+   installing nothing.  So do the signals the runtime itself catches (SIGILL, SIGBUS, SIGFPE,
+   SIGSEGV: they become Lisp conditions), and a refused rt_sigaction (SIGKILL, a bad number)."
+  (unless (and (integerp signal) (< 0 signal 65))
+    (error "SB-SYS:ENABLE-INTERRUPT: ~S is not a signal number" signal))
+  (when (member signal '(4 7 8 11))
+    (error "SB-SYS:ENABLE-INTERRUPT: signal ~D is modus's own (faults become Lisp conditions); ~
+            it cannot be given another disposition" signal))
+  (let ((disposition (cond ((eq handler :ignore) 1)
+                           ((eq handler :default) 0)
+                           (t (error "SB-SYS:ENABLE-INTERRUPT: modus cannot run a Lisp handler ~
+                                      (~S) for signal ~D; only :IGNORE and :DEFAULT are supported"
+                                     handler signal)))))
+    (let ((r (%set-signal-disposition signal disposition)))
+      (when (< r 0)
+        (error "SB-SYS:ENABLE-INTERRUPT: rt_sigaction(~D, ~S) failed, errno ~D" signal handler (- r)))
+      nil)))

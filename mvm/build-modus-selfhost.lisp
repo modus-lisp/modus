@@ -716,6 +716,109 @@
                        (subseq *boot-linux-aa64-desc-source* 0 start)
                        (subseq *boot-linux-aa64-desc-source* end)))))
 
+;;; --- W32 M1: the RV32 translator, for `--compile-riscv32` (the RV32 DDC) ---
+;; The third DDC: a self-hosted x64 compiler emitting a 30-BIT image.  The
+;; UEFI and AArch64 DDCs are both 64-bit little-endian, so neither can see a
+;; compiler decision taken by the image's OWN width (docs/w32.md, M1); this
+;; one can.  translate-riscv.lisp is truncated at install-riscv-translator for
+;; the aarch64 bake's reason (it SETFs a target struct whose defparameter
+;; init-thunk does not run in-image); the slot wiring is in
+;; *selfhost-target-coinit-source*.  Every name it defines is rv-/riscv-
+;; prefixed apart from TRANSLATE-MVM-TO-RISCV / TRANSLATE-MVM-INSN-RISCV, and
+;; neither collides (checked against every file baked here).
+(defvar *translate-rv-source* (mvm-text "mvm/translate-riscv.lisp"))
+(let ((marker "(defun install-riscv-translator"))
+  (let ((pos (search marker *translate-rv-source*)))
+    (unless pos
+      (error "W32 M1: could not find the install-riscv-translator strip marker"))
+    (setf *translate-rv-source*
+          (concatenate 'string (subseq *translate-rv-source* 0 pos)
+                       modus.mvm::*build-package-reset-text*
+                       (modus.mvm::%source-file-trailer "mvm/translate-riscv.lisp")))))
+;; THE BOOT CONSTANTS THE TRANSLATOR LOOKS UP BY NAME.  RV-HOSTED-HEAP-GEOMETRY
+;; and RV-HOSTED-ROOT-BLOCK-END read +LINUX-RISCV32-HEAP-ADDR+ & co. with
+;; FIND-SYMBOL + BOUNDP + SYMBOL-VALUE, because on the host the translator is
+;; loaded before the boot files.  In an image a DEFCONSTANT is a folded literal
+;; with no symbol value, so both lookups fail and the translator gives up
+;; ("boot file not loaded"; measured: native 0, a 3.5 MB image of constant pool
+;; only).  In the BAKED copy only, substitute the values -- read here from the
+;; boot file's own DEFCONSTANT forms, so they cannot drift from it.  The baked
+;; copy builds RV32 only; it refuses RV64 rather than guess.
+(defun %w32-boot-constant (rel name)
+  (with-open-file (s (cl-user::modus-source rel))
+    (let ((*package* (find-package :modus.mvm)) (*read-eval* nil))
+      (loop for form = (read s nil s)
+            until (eq form s)
+            when (and (consp form) (eq (car form) 'defconstant)
+                      (string= (symbol-name (cadr form)) name))
+              do (if (integerp (caddr form))
+                     (return-from %w32-boot-constant (caddr form))
+                     (error "W32 M1: ~A in ~A is not a literal integer" name rel))))
+    (error "W32 M1: no DEFCONSTANT ~A in ~A" name rel)))
+(flet ((swap (needle repl)
+         (let ((p (search needle *translate-rv-source*)))
+           (unless p (error "W32 M1: translate-riscv.lisp has moved: ~S" needle))
+           (setf *translate-rv-source*
+                 (concatenate 'string (subseq *translate-rv-source* 0 p) repl
+                              (subseq *translate-rv-source* (+ p (length needle))))))))
+  (let ((f "boot/boot-linux-riscv32.lisp"))
+    (swap "(values (c \"+LINUX-RISCV32-HEAP-ADDR+\") (c \"+LINUX-RISCV32-HEAP-SIZE+\")
+                (c \"+LINUX-RISCV32-GC-GUARD+\"))"
+          (format nil "(values ~D ~D ~D)"
+                  (%w32-boot-constant f "+LINUX-RISCV32-HEAP-ADDR+")
+                  (%w32-boot-constant f "+LINUX-RISCV32-HEAP-SIZE+")
+                  (%w32-boot-constant f "+LINUX-RISCV32-GC-GUARD+")))
+    (swap "(values (c \"+LINUX-RISCV-HEAP-ADDR+\") (c \"+LINUX-RISCV-HEAP-SIZE+\")
+                (c \"+LINUX-RISCV-GC-GUARD+\"))"
+          "(error \"baked RISC-V translator: RV32 only\")")
+    (swap "  (let ((sym (if *riscv-64-bit*
+                 (find-symbol \"+LINUX-RISCV-HEAP-ALLOC-START+\" :modus.mvm)
+                 (find-symbol \"+LINUX-RISCV32-HEAP-ALLOC-START+\" :modus.mvm))))
+    (unless (and sym (boundp sym))
+      (error \"hosted RISC-V collector: the ~:[RV32~;RV64~] boot file is not ~
+              loaded, so the root block's end is unknown\" *riscv-64-bit*))
+    (+ +rv-hosted-convention-base+ (symbol-value sym))))"
+          (format nil "  (if *riscv-64-bit*
+      (error \"baked RISC-V translator: RV32 only\")
+      (+ +rv-hosted-convention-base+ ~D)))"
+                  (%w32-boot-constant f "+LINUX-RISCV32-HEAP-ALLOC-START+")))))
+
+;; RV32's boot descriptor, and the ELF32-LE writer it calls
+;; (WRAP-IN-ELF32-LE-I386, generic apart from its name) -- in
+;; build-riscv32-cli.lisp's order; boot-linux-aarch64.lisp is baked already.
+(defvar *boot-linux-i386-desc-source* (mvm-text "boot/boot-linux-i386.lisp"))
+(defvar *boot-linux-rv32-desc-source* (mvm-text "boot/boot-linux-riscv32.lisp"))
+
+;; THE CO-INIT.  The defvar/defparameter init-thunks of the files above do not
+;; run in-image, so each knob translation reads is set here to the value SBCL
+;; holds after build-riscv32-cli.lisp's (setf *riscv-unimpl-ops* nil)
+;; (install-riscv32-translator) (riscv-set-linux-mode t).  test/ddc-riscv32-host.lisp
+;; does exactly that on the SBCL side.  Order matters: RISCV-SET-LINUX-MODE
+;; reads *RV-HOSTED-GLOBALS-BASE*, so that is set first.
+(defvar *rv32-translator-coinit-source* "
+(defun %init-riscv32-translator ()
+  (setq *riscv-reg-map*
+        (vector +rv-a0+ +rv-a1+ +rv-a2+ +rv-a3+
+                +rv-s11+ +rv-s1+ +rv-s2+ +rv-s3+
+                +rv-s4+ +rv-s5+ +rv-s6+ +rv-s7+
+                nil nil nil nil
+                +rv-a0+ +rv-s8+ +rv-s9+ +rv-s10+ +rv-sp+ +rv-fp+ nil))
+  (setq *riscv-64-bit* nil)
+  (setq *riscv-record-unimpl* t)
+  (setq *riscv-unimpl-ops* nil)
+  (setq *riscv-li-const-patches* nil)
+  (setq *rv-hosted-globals-base* #x10000380)
+  (setq *rv-locals-bytes* +rv-local-frame-size+)
+  (setq *rv-last-cmp-rs1* +rv-t3+)
+  (setq *rv-last-cmp-rs2* +rv-t4+)
+  (setq *riscv-genarith-offsets* nil)
+  (setq *rv-gc-collector-offset* nil)
+  (setq *rv-fn-starts* nil)
+  (setq *linux-i386-vl-offset* (- #x10000000 #x1000000))
+  (riscv-set-linux-mode t)
+  t)
+")
+
 ;; The whole self-host tooling block, spliced into *full-source* after mvm-eval.
 ;; Order (from the task): x64-asm → translate-x64 → translator-coinit → target
 ;; → cross → boot-desc.  The target/translator target-slot coinit
@@ -791,6 +894,34 @@
   (setf (target-emit-epilogue *target-aarch64*)
         (function %a64-target-emit-epilogue))
   (register-target *target-aarch64*)
+  ;; W32 M1: *target-riscv32* (target.lisp), for --compile-riscv32.  Values
+  ;; transcribed from its defparameter; the slot wiring replicates
+  ;; install-riscv32-translator, which the bake truncates away.
+  (setq *target-riscv32*
+        (make-target
+         :name :riscv32
+         :word-size 4
+         :endianness :little
+         :reg-map (vector :a0 :a1 :a2 :a3
+                          :s11 :s1 :s2 :s3
+                          :s4 :s5 :s6 :s7
+                          nil nil nil nil
+                          :a0 :s8 :s9 :s10 :sp :fp nil)
+         :n-phys-regs 32
+         :callee-saved (list 4 5 6 7 8 9 10 11)
+         :arg-regs (list 0 1 2 3)
+         :scratch-regs (list 5 6 7 8)
+         :max-inline-regs 11
+         :page-size 4096
+         :translate-fn nil
+         :emit-prologue nil
+         :emit-epilogue nil
+         :emit-boot nil
+         :features (list :32-bit t :has-sbi t :has-plic t)))
+  (setf (target-translate-fn  *target-riscv32*) (function translate-mvm-to-riscv))
+  (setf (target-emit-prologue *target-riscv32*) (function riscv-emit-prologue-fn))
+  (setf (target-emit-epilogue *target-riscv32*) (function riscv-emit-epilogue-fn))
+  (register-target *target-riscv32*)
   t)
 ")
 
@@ -808,10 +939,16 @@
     *translate-aa64-source*         (string #\Newline)
     *aa64-translator-coinit-source* (string #\Newline)
     *aa64-boot-encoder-source*      (string #\Newline)
+    ;; W32 M1: the RISC-V translator (RV32 arm) and its co-init, placed with
+    ;; the other translators for the same sft-auto reason.
+    *translate-rv-source*           (string #\Newline)
+    *rv32-translator-coinit-source* (string #\Newline)
     *target-source*                 (string #\Newline)
     *cross-source*                  (string #\Newline)
     *boot-linux-desc-source*        (string #\Newline)
     *boot-linux-aa64-desc-source*   (string #\Newline)
+    *boot-linux-i386-desc-source*   (string #\Newline)
+    *boot-linux-rv32-desc-source*   (string #\Newline)
     *boot-x64-bare-sources*         (string #\Newline)
     *selfhost-target-coinit-source* (string #\Newline)))
 
@@ -1068,6 +1205,20 @@
   (mvm-interpret (make-array 11 :initial-contents (list 17 16 42 0 0 0 0 0 0 0 162))))
 ")
 (defvar *rt-macros-source* (mvm-text "mvm/runtime-cl-macros.lisp"))
+;;; THE UNICODE CHARACTER-NAME TABLE (see mvm/build-cli-common.lisp).  OFF by default here:
+;;; this image exists to compile itself (--compile, the DDC), and the table is ~210 KB of
+;;; byte-valued string literals that path has never carried.  MODUS_UNICODE_NAMES=1 bakes it.
+(load (merge-pathnames "lib/unicode-names-gen.lisp" *modus-base*))
+(defvar *unicode-names-source*
+  (if (modus.unicode-names-gen::unicode-names-wanted-p nil)
+      (concatenate 'string
+                   (mvm-text "mvm/cl-unicode-names.lisp")
+                   (string #\Newline)
+                   (modus.mvm::%build-package-scoped-source
+                    (modus.unicode-names-gen::unicode-names-source :stream *standard-output*)
+                    "mvm/cl-unicode-names-data.lisp"))
+      (mvm-text "mvm/cl-unicode-names-absent.lisp")))
+
 (defvar *bridge-source*
   (concatenate 'string
     (mvm-text "mvm/cl-sequences.lisp")
@@ -1091,6 +1242,8 @@
     (mvm-text "mvm/kernel-packages.lisp")
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
+    (string #\Newline)
+    *unicode-names-source*
     (string #\Newline)
     (mvm-text "mvm/ansi-test-aux.lisp")
     (string #\Newline)
@@ -1567,6 +1720,7 @@
   (setq *use-jit* nil)
   (setq *jit-linkage-cells* nil)
   (setq *tls-window* nil)
+  (setq *park-safepoints* nil)
   (setq *x64-tls-window* nil)
   (setq *x64-jit-constvec-p* nil)
   (setq *x64-jit-constvec-full-p* nil)
@@ -1780,6 +1934,58 @@
                   (write-string-serial out)
                   (write-string-serial \" (linux-aarch64)\")
                   (write-char-serial 10)))))))))
+;; ---- W32 M1: modus --compile-riscv32 <in.lisp> <out> -----------------------
+;; The RV32 DDC (test/run-riscv32-ddc.sh): this x64 image compiles the dump for
+;; a 30-BIT target.  Everything the compiler decides from a width comes from
+;; build-image's COMPILE-TARGET, not from this image's own folded constants --
+;; which is what the comparison with SBCL's build of the same dump proves.
+;; Shape and knobs exactly as --compile-aarch64's; test/ddc-riscv32-host.lisp
+;; is the SBCL twin.
+(defun %selfhost-compile-file-rv32 (in out)
+  (let ((src (%selfhost-slurp-text in)))
+    (if (null src)
+        (progn (write-string-serial \"modus --compile-riscv32: cannot read \")
+               (write-string-serial in) (write-char-serial 10) (sys-exit 1))
+       (progn
+        (%selfhost-mirror-host-packages)
+        (%selfhost-prebind-constants src)
+        (%selfhost-reset-jit-knobs)
+        (%init-riscv32-translator)
+        (setq *static-keywords-p* t)
+        (setq *static-symbols-p* t)
+        (when (search \"(defun %console-write-char\" src)
+          (setq *write-char-serial-hook* (quote %console-write-char)))
+        (setq *static-build-p* t)
+        (setq *mvm-emit-halves* nil)
+        (setq *mvm-eval-runtime-p* nil)
+        ;; Config probe, as --compile-aarch64 prints its own: a NIL here is a
+        ;; missed co-init.
+        (write-string-serial \"rv32-cfg 64bit=\")
+        (handler-case (write-object *riscv-64-bit*) (t (c) (write-string-serial \"?\")))
+        (write-string-serial \" linux=\")
+        (handler-case (write-object *riscv-linux-mode*) (t (c) nil))
+        (write-string-serial \" globals=\")
+        (handler-case (write-object *rv-globals-base*) (t (c) nil))
+        (write-string-serial \" hstack=\")
+        (handler-case (write-object *rv-hstack-max-depth*) (t (c) nil))
+        (write-string-serial \" v4=\")
+        (handler-case (write-object (aref *riscv-reg-map* 4)) (t (c) nil))
+        (write-char-serial 10)
+        (let ((image (build-image :target :linux-riscv32 :source-text src)))
+          (let ((bytes (kernel-image-image-bytes image))
+                (fd (%selfhost-open-exec out)))
+            (if (< fd 0)
+                (progn (write-string-serial \"modus --compile-riscv32: cannot write \")
+                       (write-string-serial out) (write-char-serial 10) (sys-exit 1))
+                (progn
+                  (%selfhost-write-bytes fd bytes)
+                  (%sys-close fd)
+                  (write-string-serial \"modus: wrote \")
+                  (print-dec (length bytes))
+                  (write-string-serial \" bytes to \")
+                  (write-string-serial out)
+                  (write-string-serial \" (linux-riscv32)\")
+                  (write-char-serial 10)))))))))
 (defun kernel-main ()
   (init-symbol-table)
   (init-keyword-table)
@@ -1952,10 +2158,24 @@
                         (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
                         (write-char-serial 10) (sys-exit 1))))
     (if (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
-             (string= (car (cdr av)) \"--compile-aarch64\"))
+             (or (string= (car (cdr av)) \"--compile-aarch64\")
+                 ;; W32 M1: the RV32 DDC's cross-width emit, same handler shape.
+                 (string= (car (cdr av)) \"--compile-riscv32\")))
         ;; #210 rung 1 cross-arch emit.  Checked BEFORE \"--compile\" because
         ;; STRING= is exact (not a prefix test), but keeping it first also
         ;; makes the intent obvious if that ever changes.
+        (if (string= (car (cdr av)) \"--compile-riscv32\")
+        (handler-case
+            (progn (%selfhost-compile-file-rv32 (nth 2 av) (nth 3 av)) (sys-exit 0))
+          (t (c) (progn (write-string-serial \"modus --compile-riscv32: error at \")
+                        (handler-case (write-object *current-source-location*)
+                          (t (c3) (write-string-serial \"?loc\")))
+                        (write-string-serial \" cond-type=\")
+                        (handler-case (write-object (type-of c))
+                          (t (c4) (write-string-serial \"?type\")))
+                        (write-string-serial \" cond=\")
+                        (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+                        (write-char-serial 10) (sys-exit 1))))
         (handler-case
             (progn (%selfhost-compile-file-aa64 (nth 2 av) (nth 3 av)) (sys-exit 0))
           (t (c) (progn (write-string-serial \"modus --compile-aarch64: error at \")
@@ -1966,7 +2186,7 @@
                           (t (c4) (write-string-serial \"?type\")))
                         (write-string-serial \" cond=\")
                         (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
-                        (write-char-serial 10) (sys-exit 1))))
+                        (write-char-serial 10) (sys-exit 1)))))
     (if (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
              (string= (car (cdr av)) \"--compile\"))
         (handler-case

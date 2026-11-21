@@ -120,7 +120,9 @@ private class FillView: FlippedView {
     override func draw(_ dirtyRect: NSRect) {
         guard let fill else { return }
         fill.setFill()
-        dirtyRect.fill()
+        // only its own bounds: since macOS 14 a view does not clip its drawing, and the dirty rect can reach past it
+        // (the bar, drawn last, filled the whole window over the screens under it)
+        dirtyRect.intersection(bounds).fill()
     }
 }
 
@@ -2788,7 +2790,8 @@ private final class MacForm {
                 field.stringValue = f.value
                 field.placeholderString = f.placeholder
                 field.translatesAutoresizingMaskIntoConstraints = false
-                field.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
+                // a fixed width: "at least 280" let the grid grow the fields past the sheet's right edge
+                field.widthAnchor.constraint(equalToConstant: 280).isActive = true
                 control = field
             }
             controls.append(control)
@@ -2801,6 +2804,9 @@ private final class MacForm {
             grid.rowSpacing = 10
             grid.columnSpacing = 12
             stack.addArrangedSubview(grid)
+            // the sheet as wide as the grid, and its margins: a stack does not hold its own width to an arranged
+            // view's, and the sheet (sized to the stack) cut the fields off at its right edge
+            stack.widthAnchor.constraint(greaterThanOrEqualToConstant: grid.fittingSize.width + 48).isActive = true
         }
         if !buttons.isEmpty {
             let row = NSStackView(views: buttons.map { b in

@@ -67,10 +67,30 @@
 (defconstant +win64-mmap-base+ #x5000000000)
 
 (defparameter *win64-imports*
-  '("ExitProcess" "GetStdHandle" "WriteFile" "ReadFile" "VirtualAlloc"
-    "VirtualFree" "GetCurrentProcessId" "GetSystemTimeAsFileTime" "Sleep"
-    "GetCommandLineA" "GetEnvironmentStringsA")
-  "kernel32 functions the stub imports, in IAT slot order.")
+  '(("KERNEL32.dll"
+     "ExitProcess" "GetStdHandle" "WriteFile" "ReadFile" "VirtualAlloc"
+     "VirtualFree" "GetCurrentProcessId" "GetSystemTimeAsFileTime" "Sleep"
+     "GetCommandLineA" "GetEnvironmentStringsA" "GetLastError"
+     "CreateFileA" "CloseHandle" "SetFilePointerEx" "GetFileSizeEx"
+     "GetFileAttributesA" "GetFileAttributesExA" "DeleteFileA" "MoveFileExA"
+     "CreateDirectoryA" "RemoveDirectoryA" "GetCurrentDirectoryA"))
+  "The functions the image imports, by DLL.  The IAT holds each DLL's slots in
+   this order followed by a NULL terminator slot, DLL after DLL.  The shim calls
+   them by name; the Windows runtime calls them by slot (+W32-NAME+, a syscall
+   number #x1000 + slot, WIN64-IMPORT-CONSTANTS-SOURCE).")
+
+(defun win64-import-slot (name)
+  "NAME's slot in the IAT (terminator slots counted)."
+  (let ((slot 0))
+    (dolist (dll *win64-imports*)
+      (dolist (n (rest dll))
+        (when (string= n name) (return-from win64-import-slot slot))
+        (incf slot))
+      (incf slot))                      ; the DLL's NULL terminator
+    (error "boot-win64: ~A is not in *win64-imports*" name)))
+
+(defun win64-iat-slots ()
+  (loop for dll in *win64-imports* sum (length dll)))   ; names + 1 terminator each
 
 ;; MODUS_WIN64_TRACE=1 (build time): the shim writes "s<nr>" (hex) to stderr for
 ;; every syscall, before dispatching it.  Syscalls the shim does not implement
@@ -80,9 +100,8 @@
   (let ((v (sb-ext:posix-getenv "MODUS_WIN64_TRACE")))
     (and v (plusp (length v)) (string/= v "0"))))
 
-(defun win64-import-slot (name)
-  (or (position name *win64-imports* :test #'string=)
-      (error "boot-win64: ~A is not in *win64-imports*" name)))
+(defconstant +win64-call-base+ #x1000
+  "Syscall numbers from here call an import directly: #x1000 + its IAT slot.")
 
 ;;; ============================================================
 ;;; A tiny two-pass assembler for the stub.  Jumps and calls are relative to
@@ -185,7 +204,8 @@
     (:bytes #x48 #x8B #x45 #xC8)))                  ; mov rax,[rbp-56]
 
 (defun win64-shim-items ()
-  (let ((dispatch '((0 . :h-read) (1 . :h-write) (9 . :h-mmap) (11 . :h-munmap)
+  (let ((dispatch '((0 . :h-read) (1 . :h-write) (3 . :h-close) (8 . :h-lseek)
+                    (9 . :h-mmap) (11 . :h-munmap) (79 . :h-getcwd)
                     (13 . :h-zero) (14 . :h-zero) (35 . :h-nanosleep)
                     (39 . :h-getpid) (60 . :h-exit) (228 . :h-clock)
                     (231 . :h-exit))))
@@ -199,17 +219,38 @@
       ,@(when *win64-trace-syscalls* (win64-trace-items))
       ,@(loop for (nr . lbl) in dispatch
               append `((:bytes #x48 #x3D ,@(w64-le32 nr)) (:jcc 4 ,lbl)))
-      (:jmp :h-enosys)
+      ;; #x1000 + slot: call that import with the Linux argument registers in
+      ;; Win64 order (rcx rdx r8 r9 [rsp+20] [rsp+28], and 0 as a seventh), and
+      ;; return its RAX as it is.  The Windows runtime makes its own sense of it.
+      (:bytes #x48 #x3D ,@(w64-le32 +win64-call-base+))       ; cmp rax,#x1000
+      (:jcc 2 :h-enosys)                                      ; jb
+      (:bytes #x48 #x3D ,@(w64-le32 (+ +win64-call-base+ (win64-iat-slots)))) ; cmp rax,end
+      (:jcc 3 :h-enosys)                                      ; jae
+      (:bytes #x48 #x2D ,@(w64-le32 +win64-call-base+))       ; sub rax,#x1000  (slot)
+      (:bytes #x49 #xC7 #xC3 ,@(w64-le32 (+ +win64-text-va+ 5))) ; mov r11,IAT (the stub's slot 5)
+      (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]
+      (:bytes #x48 #x8B #x55 #xF0)                 ; mov rdx,[rbp-16]
+      (:bytes #x4C #x8B #x45 #xE8)                 ; mov r8,[rbp-24]
+      (:bytes #x4C #x8B #x4D #xE0)                 ; mov r9,[rbp-32]
+      (:bytes #x4C #x8B #x55 #xD8)                 ; mov r10,[rbp-40]
+      (:bytes #x4C #x89 #x54 #x24 #x20)            ; mov [rsp+0x20],r10
+      (:bytes #x4C #x8B #x55 #xD0)                 ; mov r10,[rbp-48]
+      (:bytes #x4C #x89 #x54 #x24 #x28)            ; mov [rsp+0x28],r10
+      (:bytes #x48 #xC7 #x44 #x24 #x30 0 0 0 0)    ; mov qword [rsp+0x30],0
+      (:bytes #x41 #xFF #x14 #xC3)                 ; call [r11+rax*8]
+      (:jmp :done)
 
-      ;; read(fd, buf, count): fd 0 only, from the console or pipe on stdin.
-      ;; A failed ReadFile reads as end-of-file (0 bytes).
+      ;; read(fd, buf, count): fd 0 is stdin; any other fd is a file handle (the
+      ;; Windows %SYS-OPEN-* return the HANDLE as the fd).  A failed ReadFile
+      ;; reads as end-of-file (0 bytes).
       (:label :h-read)
       (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]
       (:bytes #x48 #x85 #xC9)                      ; test rcx,rcx
-      (:jcc 5 :h-ebadf)                            ; jnz
+      (:jcc 5 :r-go)                               ; jnz: any other fd is a file handle
       (:bytes #xB9 ,@(w64-le32 -10))               ; mov ecx,STD_INPUT_HANDLE
       (:call-iat "GetStdHandle")
       (:bytes #x48 #x89 #xC1)                      ; mov rcx,rax
+      (:label :r-go)
       (:bytes #x48 #x8B #x55 #xF0)                 ; mov rdx,[rbp-16]  buf
       (:bytes #x4C #x8B #x45 #xE8)                 ; mov r8,[rbp-24]   count
       (:bytes #x4C #x8D #x4C #x24 #x30)            ; lea r9,[rsp+0x30]
@@ -219,20 +260,22 @@
       (:bytes #x8B #x44 #x24 #x30)                 ; mov eax,[rsp+0x30]
       (:jmp :done)
 
-      ;; write(fd, buf, count): fd 1 -> STD_OUTPUT, fd 2 -> STD_ERROR.
+      ;; write(fd, buf, count): fd 1 -> STD_OUTPUT, fd 2 -> STD_ERROR, any other fd
+      ;; is a file handle.
       (:label :h-write)
       (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]
       (:bytes #x48 #x83 #xF9 #x01)                 ; cmp rcx,1
       (:jcc 4 :w-out)                              ; je
       (:bytes #x48 #x83 #xF9 #x02)                 ; cmp rcx,2
-      (:jcc 5 :h-ebadf)                            ; jne
+      (:jcc 5 :w-go)                               ; jne: any other fd is a file handle
       (:bytes #xB9 ,@(w64-le32 -12))               ; mov ecx,STD_ERROR_HANDLE
-      (:jmp :w-go)
+      (:jmp :w-std)
       (:label :w-out)
       (:bytes #xB9 ,@(w64-le32 -11))               ; mov ecx,STD_OUTPUT_HANDLE
-      (:label :w-go)
+      (:label :w-std)
       (:call-iat "GetStdHandle")
       (:bytes #x48 #x89 #xC1)                      ; mov rcx,rax
+      (:label :w-go)
       (:bytes #x48 #x8B #x55 #xF0)                 ; mov rdx,[rbp-16]  buf
       (:bytes #x4C #x8B #x45 #xE8)                 ; mov r8,[rbp-24]   count
       (:bytes #x4C #x8D #x4C #x24 #x30)            ; lea r9,[rsp+0x30]
@@ -287,6 +330,59 @@
       (:call-iat "VirtualAlloc")
       (:bytes #x48 #x85 #xC0)                      ; test rax,rax
       (:jcc 4 :h-enomem)                           ; je
+      (:jmp :done)
+
+;; close(fd): CloseHandle; the standard fds are left open.
+      (:label :h-close)
+      (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]
+      (:bytes #x48 #x83 #xF9 #x02)                 ; cmp rcx,2
+      (:jcc 6 :h-zero)                             ; jbe: 0, 1, 2
+      (:call-iat "CloseHandle")
+      (:bytes #x85 #xC0)                           ; test eax,eax
+      (:jcc 4 :h-ebadf)                            ; je -> failure
+      (:bytes #x31 #xC0)                           ; xor eax,eax
+      (:jmp :done)
+
+      ;; lseek(fd, offset, whence): SetFilePointerEx.  SEEK_SET/CUR/END are
+      ;; FILE_BEGIN/CURRENT/END (0, 1, 2).
+      (:label :h-lseek)
+      (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]   handle
+      (:bytes #x48 #x8B #x55 #xF0)                 ; mov rdx,[rbp-16]  offset
+      (:bytes #x4C #x8D #x44 #x24 #x38)            ; lea r8,[rsp+0x38] new position
+      (:bytes #x44 #x8B #x4D #xE8)                 ; mov r9d,[rbp-24]  whence
+      (:call-iat "SetFilePointerEx")
+      (:bytes #x85 #xC0)                           ; test eax,eax
+      (:jcc 4 :h-einval)                           ; je -> failure
+      (:bytes #x48 #x8B #x44 #x24 #x38)            ; mov rax,[rsp+0x38]
+      (:jmp :done)
+
+      ;; getcwd(buf, size): GetCurrentDirectoryA, backslashes made slashes so
+      ;; the runtime's pathname code reads it.  Returns the length with the NUL,
+      ;; as Linux does, or -ERANGE.
+      (:label :h-getcwd)
+      (:bytes #x8B #x4D #xF0)                      ; mov ecx,[rbp-16]  size
+      (:bytes #x48 #x8B #x55 #xF8)                 ; mov rdx,[rbp-8]   buf
+      (:call-iat "GetCurrentDirectoryA")
+      (:bytes #x85 #xC0)                           ; test eax,eax
+      (:jcc 4 :h-einval)                           ; je -> failure
+      (:bytes #x3B #x45 #xF0)                      ; cmp eax,[rbp-16]
+      (:jcc 3 :h-erange)                           ; jae: did not fit
+      (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]
+      (:bytes #x31 #xD2)                           ; xor edx,edx
+      (:label :g-loop)
+      (:bytes #x39 #xC2)                           ; cmp edx,eax
+      (:jcc 3 :g-done)                             ; jae
+      (:bytes #x80 #x3C #x11 #x5C)                 ; cmp byte [rcx+rdx],'\'
+      (:jcc 5 :g-next)                             ; jne
+      (:bytes #xC6 #x04 #x11 #x2F)                 ; mov byte [rcx+rdx],'/'
+      (:label :g-next)
+      (:bytes #xFF #xC2)                           ; inc edx
+      (:jmp :g-loop)
+      (:label :g-done)
+      (:bytes #xFF #xC0)                           ; inc eax  (the NUL)
+      (:jmp :done)
+      (:label :h-erange)
+      (:bytes #x48 #xC7 #xC0 ,@(w64-le32 -34))     ; mov rax,-ERANGE
       (:jmp :done)
 
       ;; munmap(addr, len): VirtualFree MEM_RELEASE (the region is freed whole).
@@ -497,7 +593,7 @@
 (defun win64-stub-items ()
   `((:jmp :prologue)
     (:label :iat)
-    (:zeros ,(* 8 (length *win64-imports*)))
+    (:zeros ,(* 8 (win64-iat-slots)))
     ;; The next address a hint-less mmap tries (the shim's h-mmap).  In .text,
     ;; which is writable.
     (:label :mmap-bump)
@@ -567,42 +663,54 @@
 ;;; ============================================================
 
 (defun w64-build-idata (idata-rva iat-rva)
-  "The import directory for KERNEL32.dll, as bytes that live at IDATA-RVA.
-   The IAT (in .text, at IAT-RVA) is the caller's to fill.  Returns
-   (values bytes hint-name-rvas): the RVA of each import's hint/name entry, which
-   is also the value the IAT starts out holding."
-  (let* ((n (length *win64-imports*))
-         (desc-size 40)                              ; two IMAGE_IMPORT_DESCRIPTORs
-         (ilt-off desc-size)
-         (names-off (+ ilt-off (* 8 (1+ n))))
-         (hint-offs nil)
-         (cursor names-off))
-    (dolist (name *win64-imports*)
-      (push cursor hint-offs)
-      (incf cursor (w64-pad (+ 2 (length name) 1) 2)))   ; WORD hint, name, NUL, even
+  "The import directory, as bytes that live at IDATA-RVA: one
+   IMAGE_IMPORT_DESCRIPTOR per DLL plus the terminator, each DLL's ILT, the
+   hint/name entries and the DLL names.  The IAT itself is in .text at IAT-RVA;
+   the caller fills it.  Returns (values bytes iat-init), IAT-INIT being
+   (slot . hint/name RVA) for every import -- what the IAT starts out holding."
+  (let* ((ndll (length *win64-imports*))
+         (cursor (* 20 (1+ ndll)))
+         (ilt-offs nil) (hint-offs nil) (dll-offs nil))
+    ;; Layout pass: ILTs, then hint/name entries, then DLL names.
+    (dolist (dll *win64-imports*)
+      (push cursor ilt-offs)
+      (incf cursor (* 8 (length dll))))         ; names + NULL
+    (setf ilt-offs (nreverse ilt-offs))
+    (dolist (dll *win64-imports*)
+      (dolist (name (rest dll))
+        (push cursor hint-offs)
+        (incf cursor (w64-pad (+ 2 (length name) 1) 2))))   ; WORD hint, name, NUL, even
     (setf hint-offs (nreverse hint-offs))
-    (let* ((dll-name "KERNEL32.dll")
-           (dll-off cursor)
-           (total (+ dll-off (length dll-name) 1))
-           (v (make-array total :element-type '(unsigned-byte 8) :initial-element 0)))
+    (dolist (dll *win64-imports*)
+      (push cursor dll-offs)
+      (incf cursor (1+ (length (first dll)))))
+    (setf dll-offs (nreverse dll-offs))
+    (let ((v (make-array cursor :element-type '(unsigned-byte 8) :initial-element 0))
+          (iat-init nil) (h hint-offs) (slot 0))
       (flet ((put32 (off value)
                (loop for b in (w64-le32 value) for k from off do (setf (aref v k) b)))
              (put64 (off value)
-               (loop for b in (w64-le64 value) for k from off do (setf (aref v k) b))))
-        ;; IMAGE_IMPORT_DESCRIPTOR: OriginalFirstThunk, TimeDateStamp,
-        ;; ForwarderChain, Name, FirstThunk.  The second descriptor is the terminator.
-        (put32 0 (+ idata-rva ilt-off))
-        (put32 12 (+ idata-rva dll-off))
-        (put32 16 iat-rva)
-        (loop for hn in hint-offs
-              for i from 0
-              do (put64 (+ ilt-off (* 8 i)) (+ idata-rva hn))
-                 (loop for c across (nth i *win64-imports*)
-                       for k from (+ hn 2)
-                       do (setf (aref v k) (char-code c))))
-        (loop for c across dll-name for k from dll-off
-              do (setf (aref v k) (char-code c)))
-        (values v (mapcar (lambda (hn) (+ idata-rva hn)) hint-offs))))))
+               (loop for b in (w64-le64 value) for k from off do (setf (aref v k) b)))
+             (put-string (off str)
+               (loop for c across str for k from off do (setf (aref v k) (char-code c)))))
+        (loop for dll in *win64-imports*
+              for d from 0
+              for ilt in ilt-offs
+              for dll-off in dll-offs
+              do ;; OriginalFirstThunk, TimeDateStamp, ForwarderChain, Name, FirstThunk
+                 (put32 (* 20 d) (+ idata-rva ilt))
+                 (put32 (+ (* 20 d) 12) (+ idata-rva dll-off))
+                 (put32 (+ (* 20 d) 16) (+ iat-rva (* 8 slot)))
+                 (put-string dll-off (first dll))
+                 (loop for name in (rest dll)
+                       for i from 0
+                       for hn = (pop h)
+                       do (put64 (+ ilt (* 8 i)) (+ idata-rva hn))
+                          (put-string (+ hn 2) name)
+                          (push (cons slot (+ idata-rva hn)) iat-init)
+                          (incf slot))
+                 (incf slot)))                   ; the terminator slot stays 0
+      (values v (nreverse iat-init)))))
 
 (defun wrap-in-pe64-win (raw-bytes)
   "Wrap the Modus image in a PE32+ console executable at image base #x400000.
@@ -614,7 +722,7 @@
          (text-raw-size (w64-pad raw-len #x200))
          (idata-rva (w64-pad (+ text-rva raw-len) #x1000))
          (iat-rva (+ text-rva (win64-iat-offset))))
-    (multiple-value-bind (idata hint-rvas) (w64-build-idata idata-rva iat-rva)
+    (multiple-value-bind (idata iat-init) (w64-build-idata idata-rva iat-rva)
       (let* ((idata-len (length idata))
              (idata-raw-off (+ text-raw-off text-raw-size))
              (idata-raw-size (w64-pad idata-len #x200))
@@ -632,10 +740,9 @@
           (replace out raw-bytes :start1 text-raw-off)
           ;; The IAT in .text starts out holding the hint/name RVAs; the loader
           ;; overwrites each slot with the resolved function address.
-          (loop for rva in hint-rvas
-                for i from 0
+          (loop for (slot . rva) in iat-init
                 do (loop for b in (w64-le64 rva)
-                         for k from (+ text-raw-off (win64-iat-offset) (* 8 i))
+                         for k from (+ text-raw-off (win64-iat-offset) (* 8 slot))
                          do (setf (aref out k) b)))
           ;; The import directory.
           (replace out idata :start1 idata-raw-off)
@@ -677,7 +784,7 @@
             (w32 (+ opt 108) 16)               ; NumberOfRvaAndSizes
             ;; DataDirectory[1] = import table; the array starts at opt+112.
             (w32 (+ opt 112 8) idata-rva)
-            (w32 (+ opt 112 12) 40))
+            (w32 (+ opt 112 12) (* 20 (1+ (length *win64-imports*)))))
           ;; ---- Section table at #x188: .text, .idata, .bss ----
           (flet ((section (i name vsize va rawsize rawptr chars)
                    (let ((o (+ #x188 (* 40 i))))
@@ -717,6 +824,112 @@
 (defparameter *win64-runtime-source*
   (format nil "
 (defun %jit-window-prefix () 144)
+
+;; FILES.  A Windows HANDLE is the fd: the shim reads, writes, seeks and closes
+;; any fd above 2 as a handle, so streams need nothing else.  Paths go to the
+;; ANSI Win32 calls as they are (forward slashes work; a relative path is
+;; relative to the process's current directory).
+(defun %w32-errno ()
+  (let ((e (syscall6 +w32-getlasterror+ 0 0 0 0 0 0)))
+    (cond ((or (eql e 2) (eql e 3)) 2)          ; FILE/PATH_NOT_FOUND -> ENOENT
+          ((eql e 5) 13)                         ; ACCESS_DENIED -> EACCES
+          ((or (eql e 80) (eql e 183)) 17)       ; FILE/ALREADY_EXISTS -> EEXIST
+          ((eql e 145) 39)                       ; DIR_NOT_EMPTY -> ENOTEMPTY
+          (t 5))))                               ; -> EIO
+(defun %w32-ok (r) (if (eql r 0) (- 0 (%w32-errno)) 0))
+(defun %w32-open (path-str access disposition)
+  (%string-to-cstr path-str *cstr-scratch*)
+  ;; share READ|WRITE|DELETE (7), FILE_ATTRIBUTE_NORMAL (128); the shim passes
+  ;; the seventh argument, hTemplateFile, as 0.
+  (let ((h (syscall6 +w32-createfilea+ *cstr-scratch* access 7 0 disposition 128)))
+    (if (< h 0) (- 0 (%w32-errno)) h)))
+;; GENERIC_READ 2147483648, GENERIC_WRITE 1073741824, FILE_APPEND_DATA 4;
+;; CREATE_NEW 1, CREATE_ALWAYS 2, OPEN_EXISTING 3, OPEN_ALWAYS 4.
+(defun %sys-open-rdonly (path-str) (%w32-open path-str 2147483648 3))
+(defun %sys-open-wronly (path-str) (%w32-open path-str 1073741824 2))
+(defun %sys-open-append (path-str) (%w32-open path-str 4 4))
+(defun %sys-open-rdwr (path-str) (%w32-open path-str 3221225472 4))
+(defun %sys-open-wronly-existing (path-str) (%w32-open path-str 1073741824 3))
+(defun %sys-open-create-excl (path-str) (%w32-open path-str 1073741824 1))
+(defun %sys-unlink (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%w32-ok (syscall6 +w32-deletefilea+ *cstr-scratch* 0 0 0 0 0)))
+(defun %sys-rename (old-str new-str)
+  (%string-to-cstr old-str *cstr-scratch*)
+  (let ((new-addr (+ *cstr-scratch* 2048)))
+    (%string-to-cstr new-str new-addr)
+    (%w32-ok (syscall6 +w32-movefileexa+ *cstr-scratch* new-addr 1 0 0 0))))  ; REPLACE_EXISTING
+(defun %sys-mkdir (path-str mode)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%w32-ok (syscall6 +w32-createdirectorya+ *cstr-scratch* 0 0 0 0 0)))
+(defun %sys-rmdir (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%w32-ok (syscall6 +w32-removedirectorya+ *cstr-scratch* 0 0 0 0 0)))
+(defun %sys-stat-exists (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (not (eql (syscall6 +w32-getfileattributesa+ *cstr-scratch* 0 0 0 0 0) 4294967295)))
+;; WIN32_FILE_ATTRIBUTE_DATA: attributes +0, creation +4, access +12, write
+;; +20 (FILETIME: low, high), size high +28, size low +32.
+(defun %w32-attribute-data (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (not (eql (syscall6 +w32-getfileattributesexa+ *cstr-scratch* 0 *io-buf-addr* 0 0 0) 0)))
+(defun %sys-stat-size (path-str)
+  (if (%w32-attribute-data path-str)
+      (+ (* (mem-ref (+ *io-buf-addr* 28) :u32) 4294967296) (mem-ref (+ *io-buf-addr* 32) :u32))
+      -1))
+(defun %sys-stat-mtime (path-str)
+  (if (%w32-attribute-data path-str)
+      (floor (- (+ (* (mem-ref (+ *io-buf-addr* 24) :u32) 4294967296)
+                   (mem-ref (+ *io-buf-addr* 20) :u32))
+                116444736000000000)
+             10000000)
+      0))
+;; DRIVES: \"C:/a/b\" is absolute here (mvm/cl-fileio.lisp, %DRIVE-NAMESTRING-P).
+(defun %drive-namestring-p (s)
+  (and (>= (length s) 2)
+       (let ((c (char-code (char s 0))))
+         (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+       (= (char-code (char s 1)) 58)
+       (or (= (length s) 2) (= (char-code (char s 2)) 47))))
+
+;; THE FASL CACHE.  Its key covers the source, not the target, so this image
+;; must not share the Linux image's cache: $HOME/.cache/modus/fasl/ seen through
+;; Wine's Z: drive IS the Linux cache, and loading its FASLs runs native code
+;; built for the Linux layout (it failed silently).  Its own directory:
+;; $MODUS_FASL_DIR, else $HOME/.cache/modus/fasl-win64/ (Wine passes no HOME),
+;; else %LOCALAPPDATA%/modus/fasl/.
+(defun %w32-slashes (s)
+  (let ((r (copy-seq s)))
+    (dotimes (i (length r) r)
+      (when (= (char-code (char r i)) 92) (setf (char r i) (code-char 47))))))
+(defvar *w32-fasl-dir* nil)
+(defun %w32-mkdirs (dir)
+  ;; mkdir -p on the raw string, prefix by prefix: the pathname layer does not
+  ;; know drive letters yet, so ENSURE-DIRECTORIES-EXIST does nothing with
+  ;; C:/... .  An existing directory just fails its mkdir.
+  (let ((i 1) (n (length dir)))
+    (loop
+      (when (>= i n) (return dir))
+      (when (= (char-code (char dir i)) 47) (%sys-mkdir (subseq dir 0 i) 493))
+      (setq i (+ i 1)))))
+(defun %fasl-dir ()
+  (or *w32-fasl-dir*
+      (setq *w32-fasl-dir*
+            (let ((d (ignore-errors (%cli-getenv \"MODUS_FASL_DIR\"))))
+              (if (and d (> (length d) 0))
+                  (if (= (char-code (char d (- (length d) 1))) 47) d (concatenate 'string d \"/\"))
+                  (let ((home (ignore-errors (%cli-getenv \"HOME\")))
+                        (local (ignore-errors (%cli-getenv \"LOCALAPPDATA\"))))
+                    (cond ((and home (> (length home) 0))
+                           (%w32-mkdirs (concatenate 'string (%w32-slashes home) \"/.cache/modus/fasl-win64/\")))
+                          ((and local (> (length local) 0))
+                           (%w32-mkdirs (concatenate 'string (%w32-slashes local) \"/modus/fasl/\")))
+                          (t nil))))))))
+(defun %sys-fstat-size (fd)
+  (if (eql (syscall6 +w32-getfilesizeex+ fd *io-buf-addr* 0 0 0 0) 0)
+      -1
+      (+ (* (mem-ref (+ *io-buf-addr* 4) :u32) 4294967296) (mem-ref *io-buf-addr* :u32))))
+
 (defun %cli-collect-argv ()
   (let* ((line (%cli-cstr-at (%cli-read-ptr (%cli-argv-base))))
          (n (length line)) (acc nil) (out (make-string-output-stream))
@@ -737,6 +950,15 @@
     (nreverse acc)))
 "))
 
+(defun win64-import-constants-source ()
+  "(defconstant +W32-NAME+ n) for every import: n is the syscall number that
+   calls it (#x1000 + its IAT slot)."
+  (with-output-to-string (o)
+    (dolist (dll *win64-imports*)
+      (dolist (name (rest dll))
+        (format o "(defconstant +w32-~(~A~)+ ~D)~%"
+                name (+ +win64-call-base+ (win64-import-slot name)))))))
+
 (defun win64-configure-build ()
   "Point the translator at this image's layout and add the Windows runtime
    source.  Called by build-generic-cli.lisp in place of the Linux native-code
@@ -746,7 +968,8 @@
   ;; Every syscall the image makes goes through the stub's shim.
   (setf modus.mvm.x64::*x64-win-shim-va* (win64-shim-va))
   (setq cl-user::*full-source*
-        (concatenate 'string cl-user::*full-source* (string #\Newline) *win64-runtime-source*))
+        (concatenate 'string cl-user::*full-source* (string #\Newline)
+                     (win64-import-constants-source) *win64-runtime-source*))
   ;; The JIT co-init's shim address (build-cli-common, *CLI-WIN64*).  Every copy of
   ;; the co-init in the source gets it; with the JIT on there must be at least one.
   (let ((token "WIN64-SHIM-VA-PLACEHOLDER")

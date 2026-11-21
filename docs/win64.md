@@ -1,11 +1,12 @@
 # Hosted Windows x86-64 (`modus.exe`)
 
-Written 2026-11-21.  Status: **the REPL, the collector and the runtime JIT work
-under Wine**; single-threaded; no file I/O or sockets yet.
+Written 2026-11-21.  Status: **the REPL, the collector, the runtime JIT and file
+I/O (`load`, `--script`, the FASL cache) work under Wine**; single-threaded; no
+sockets or directory listing yet.
 
 ```sh
 sbcl --dynamic-space-size 4096 --script mvm/build-win64-cli.lisp   # -> modus.exe
-WINE_RUN="wine64" test/win64/run-wine.sh modus.exe                  # 11 checks
+WINE_RUN="wine64" test/win64/run-wine.sh modus.exe                  # 18 checks
 ```
 
 `modus.exe` is the same image as `./modus` -- same source, same runtime, the
@@ -30,9 +31,33 @@ Like `SYSCALL` it preserves everything but RAX, RCX and R11, and it leaves the
 Lisp stack alone: Win32 runs on the shim's own stack, and the call site steps
 over the 128-byte red zone.
 
-Implemented: `read`/`write` on fds 0-2, `mmap`/`munmap` (anonymous),
-`clock_gettime`, `nanosleep`, `getpid`, `exit`/`exit_group`; `rt_sigaction`
-and `rt_sigprocmask` return 0.  Everything else returns `-ENOSYS`.
+Implemented in the shim: `read`/`write` (fds 0-2 are the console; any other fd
+is a Win32 HANDLE), `close`, `lseek`, `getcwd` (slashes, not backslashes),
+`mmap`/`munmap` (anonymous), `clock_gettime`, `nanosleep`, `getpid`,
+`exit`/`exit_group`; `rt_sigaction` and `rt_sigprocmask` return 0.  Everything
+else returns `-ENOSYS`.
+
+**Calling Win32 from Lisp.**  Syscall number `#x1000 + slot` calls the import in
+that IAT slot directly: the six Linux argument registers in Win64 order, a zero
+seventh argument (enough for `CreateFileA`), RAX returned as it is.  The build
+generates `(defconstant +w32-createfilea+ ...)` for every import
+(`WIN64-IMPORT-CONSTANTS-SOURCE`), so the Windows runtime writes
+`(syscall6 +w32-getfileattributesexa+ path 0 buf 0 0 0)`.  Imports are grouped by
+DLL in `*WIN64-IMPORTS*`.
+
+**Files.**  The file primitives cl-fileio calls (`%sys-open-*`, `%sys-stat-*`,
+`%sys-fstat-size`, `%sys-unlink`, `%sys-rename`, `%sys-mkdir`, `%sys-rmdir`) are
+overridden in the Windows runtime source on top of that call path; a HANDLE is
+the fd.  Paths go to the ANSI calls as they are: forward slashes work, relative
+paths are relative to the process's current directory.  **Drive letters**:
+`%DRIVE-NAMESTRING-P` (overridable in cl-fileio, NIL elsewhere) makes `C:/a/b`
+an absolute namestring whose first directory component is `"C:"` -- not stripped
+as a logical host, not merged with the current directory, rendered without a
+leading slash, walked from the drive by truename.  **The FASL cache is the
+Windows image's own** (`$MODUS_FASL_DIR`, else `$HOME/.cache/modus/fasl-win64/`,
+else `%LOCALAPPDATA%/modus/fasl/`): the key covers the source, not the target,
+and through Wine's `Z:` drive the Linux cache is right there -- loading its
+FASLs failed silently.
 
 **Memory.**  Every region the runtime knows by address is where the ELF has it:
 
@@ -65,16 +90,17 @@ FS prefix (`%JIT-WINDOW-PREFIX`).
 
 ## Testing
 
-- `test/win64/run-wine.sh EXE`: 11 checks on stdin (arithmetic, bignums,
-  printing, allocation churn, the JIT's calling paths), after a deliberately
-  wrong expectation that must fail.  The churn checks only collect on a
+- `test/win64/run-wine.sh EXE`: 18 checks (arithmetic, bignums, printing,
+  allocation churn, the JIT's calling paths, files: write/read, probe/delete,
+  `load`, `--script`, drive-letter paths), after a deliberately wrong
+  expectation that must fail.  The drive-letter checks run for an `.exe` only.  The churn checks only collect on a
   small-semispace build (`MODUS_X64_MIDPOINT=16777216`).
-- `test/win64/stdin-diff.sh WIN_EXE LINUX_BIN OUTDIR TESTS...`: runs repo tests
-  on both images through stdin (there is no file I/O yet) and compares.
-  2026-11-21: hot-jit, redefine-native-callers, gc-forced-stress, region-gc,
-  region-gc-roots, region-gc-depth, gc-tenure, static-symbols, kernel-shadow,
-  kernel-global-shadow and word-boundary give the same verdicts as Linux;
-  redefine-kernel-callers fails one check more, the one that `load`s a file.
+- Repo tests with `--script`, Windows against a Linux build of the same source
+  (2026-11-21): hot-jit, redefine-native-callers, redefine-kernel-callers,
+  gc-forced-stress, region-gc, region-gc-roots, region-gc-depth, gc-tenure,
+  static-symbols, kernel-shadow, kernel-global-shadow and word-boundary give
+  the same checks, ok and FAIL alike.  `test/win64/stdin-diff.sh` does the same
+  through stdin, for an image without files.
 - JIT and collector together, at the default heap: a JIT-compiled churn past the
   896 MB semispace returns the same value with 6 collections on both platforms.
   (A 16 MB semispace with the JIT overflows the stack inside a collection on
@@ -103,11 +129,12 @@ overlay over `/usr` works), copy `zlib1.dll` into `x86_64-windows`, and run
 
 ## Next
 
-1. A generic "call import K" path in the shim and a second import DLL, so the
-   Windows side of files and sockets can be written in Lisp.
-2. File I/O (`--script`, `load`, `compile-file`, the FASL cache).
-3. Sockets (Winsock: an fd table, `pollfd` conversion, option and errno maps).
-4. Threads.  Needs a per-thread window Windows allows: `WRFSBASE` works under
+1. Sockets: `WS2_32.dll` imports and Lisp over the call path (an fd per SOCKET,
+   `pollfd` conversion, option and errno maps).
+2. Directory listing (`%sys-getdents64`: FindFirstFile/FindNextFile), so
+   `directory` works; and drive letters in the rest of the pathname layer
+   (`pathname-device`).
+3. Threads.  Needs a per-thread window Windows allows: `WRFSBASE` works under
    Wine on Linux but is unverified on real Windows; a TEB TLS slot holding the
    window base works everywhere but changes every window access in the
    translator.

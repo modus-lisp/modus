@@ -509,6 +509,10 @@
           ((and v (string-equal v "verify")) :verify)
           (t :on))))
 
+;; Overridable: the Windows image keeps its own cache (boot/boot-win64.lisp).
+;; The key covers the source, not the target, so two images of one source --
+;; Linux and Windows -- would otherwise replay each other's native code.
+(declaim (overridable %fasl-dir))
 (defun %fasl-dir ()
   (let ((d (ignore-errors (%cli-getenv "MODUS_FASL_DIR"))))
     (if (and d (> (length d) 0))

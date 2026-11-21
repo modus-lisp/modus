@@ -66,5 +66,29 @@ expect "jit redefinition" '(defun jg () 1)
 (defun jg () 2)
 (list :redef (jh))' '(REDEF 2)'
 
+# Files, through relative paths in a scratch directory.
+scratch=$(mktemp -d) || exit 1
+exe_abs=$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")
+cd "$scratch" || exit 1
+exe=$exe_abs
+expect "file write+read" '(progn (with-open-file (s "w64-io.txt" :direction :output :if-exists :supersede) (write-line "hello file" s)) (with-open-file (s "w64-io.txt") (list (read-line s) (file-length s))))' '("hello file" 11)'
+expect "probe+delete"    '(list (not (null (probe-file "w64-io.txt"))) (progn (delete-file "w64-io.txt") (probe-file "w64-io.txt")))' '(T NIL)'
+printf '(defun w64-loaded () 42)\n' > w64-load.lisp
+expect "load a file"     '(progn (load "w64-load.lisp") (w64-loaded))' '42'
+printf '(write-line (princ-to-string (* 6 7)))\n' > w64-script.lisp
+if $run "$exe" --script w64-script.lisp 2>/dev/null | grep -qx -- '42'; then
+  echo "ok   --script a file"; pass=$((pass+1))
+else
+  echo "FAIL --script a file"; fail=$((fail+1))
+fi
+# A drive-letter path: absolute, the drive its first component (Wine's Z: is /).
+# Windows semantics only: elsewhere "C:/x" is a relative path, as it should be.
+case "$exe" in *.exe)
+expect "drive path parse" '(list (namestring (parse-namestring "C:/x/y.lisp")) (pathname-directory "C:/x/y.lisp"))' '("C:/x/y.lisp" (ABSOLUTE "C:" "x"))'
+expect "drive path file" "(progn (with-open-file (s \"Z:$scratch/d.txt\" :direction :output :if-exists :supersede) (write-line \"drive\" s)) (with-open-file (s \"Z:$scratch/d.txt\") (read-line s)))" '"drive"'
+expect "drive truename"  "(namestring (truename \"Z:$scratch/d.txt\"))" "\"Z:$scratch/d.txt\""
+esac
+cd / && rm -rf "$scratch"
+
 echo "== $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

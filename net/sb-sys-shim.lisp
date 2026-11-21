@@ -46,7 +46,7 @@
   (:use)
   (:export "STAT" "STAT-MODE" "STAT-UID" "STAT-GID" "STAT-INO" "STAT-SIZE"
            "S-ISDIR" "S-ISSOCK" "S-ISREG" "CHMOD" "UNLINK" "GETUID" "GETPID"
-           "RENAME" "FTRUNCATE" "SYSCALL-ERROR" "ENOENT"
+           "RENAME" "FTRUNCATE" "SYSCALL-ERROR" "ENOENT" "SETENV" "UNSETENV"
            "TERMIOS" "TCGETATTR" "TCSETATTR" "TERMIOS-IFLAG" "TERMIOS-OFLAG"
            "TERMIOS-CFLAG" "TERMIOS-LFLAG" "TERMIOS-CC"
            "TCSANOW" "TCSADRAIN" "TCSAFLUSH" "ECHO" "ICANON" "ISIG" "IEXTEN" "ECHOE"
@@ -574,10 +574,41 @@
                             (* ,lim internal-time-units-per-second)))
            (error 'sb-ext:timeout :seconds ,lim))))))
 
+(defvar sb-posix::*environment-changes* nil
+  "What SB-POSIX:SETENV and UNSETENV have changed since boot, newest first:
+   (NAME . VALUE), VALUE NIL for an unset.  POSIX-GETENV answers from here
+   before the environment modus booted with.")
+
 (defun sb-ext:posix-getenv (name)
   "The environment variable NAME, or NIL.  modus reads its environment through
-   %CLI-GETENV; this is the SBCL spelling of the same question."
-  (%cli-getenv name))
+   %CLI-GETENV; this is the SBCL spelling of the same question.  A change made
+   by SB-POSIX:SETENV or UNSETENV is answered first."
+  (let ((c (assoc name sb-posix::*environment-changes* :test #'string=)))
+    (if c (cdr c) (%cli-getenv name))))
+
+(defun sb-posix:setenv (name value overwrite)
+  "setenv(3): NAME is VALUE from now on, unless NAME is set and OVERWRITE is 0.
+   Returns 0.  PARTIAL: the change is this image's -- POSIX-GETENV sees it;
+   the process's own environ block, which %CLI-GETENV reads, does not, nor
+   does a child process.  A NAME that is empty or
+   holds #\\= is refused with EINVAL (22), as setenv(3) refuses it."
+  (when (or (zerop (length name)) (find #\= name))
+    (error 'sb-posix:syscall-error :errno 22))
+  (when (or (not (eql overwrite 0)) (null (sb-ext:posix-getenv name)))
+    (setq sb-posix::*environment-changes*
+          (acons (copy-seq name) (copy-seq value)
+                 (remove name sb-posix::*environment-changes*
+                         :key #'car :test #'string=))))
+  0)
+
+(defun sb-posix:unsetenv (name)
+  "unsetenv(3): NAME is unset from now on.  Returns 0.  PARTIAL as SETENV is."
+  (when (or (zerop (length name)) (find #\= name))
+    (error 'sb-posix:syscall-error :errno 22))
+  (setq sb-posix::*environment-changes*
+        (acons (copy-seq name) nil
+               (remove name sb-posix::*environment-changes* :key #'car :test #'string=)))
+  0)
 
 (defvar sb-ext:*invoke-debugger-hook* nil
   "PARTIAL: the variable exists and NOTHING CONSULTS IT.  modus\'s toplevel has

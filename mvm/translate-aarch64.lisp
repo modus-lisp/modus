@@ -2827,27 +2827,50 @@
   (a64-cmp-reg buf +a64-x16+ +a64-x17+)
   (let ((i (a64-current-index buf))) (a64-bcond buf #x8 0) (a64-add-fixup buf i full-label :bcond))) ; HI
 
+(defun a64-exhausted-put-x16 (buf)
+  "The character in w16, to stderr (hosted) or the serial port.  A DEFUN, not an FLET in its
+   caller: this file is baked into the image for the in-image JIT, which compiles every module's
+   GC stub with it."
+  (if *aarch64-linux-mode*
+      (progn (a64-load-conv-addr buf +a64-x17+ #x100001F0)
+             (a64-emit buf (logior #x39000000 (ash 17 5) 16))  ; strb w16,[x17]
+             (a64-load-imm64 buf +a64-x0+ 2)
+             (a64-mov-reg buf +a64-x1+ +a64-x17+)
+             (a64-load-imm64 buf +a64-x2+ 1)
+             (a64-load-imm64 buf +a64-x8+ 64)                  ; write
+             (a64-svc buf 0))
+      (progn (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
+             (when *aarch64-serial-tx-poll*
+               (destructuring-bind (offset bit polarity) *aarch64-serial-tx-poll*
+                 (a64-ldr-width buf +a64-x15+ +a64-x17+ offset 2)
+                 (a64-emit buf (logior (ash (ecase polarity (:tbz #b00110110) (:tbnz #b00110111)) 24)
+                                       (ash bit 19) (ash (logand -1 #x3FFF) 5) +a64-x15+))))
+             (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*))))
+
+(defun a64-exhausted-put-string (buf str)
+  (loop for ch across str
+        do (a64-movz buf +a64-x16+ (char-code ch) 0)
+           (a64-exhausted-put-x16 buf)))
+
 (defun emit-aarch64-gc-exhausted (buf)
   "Print GC: HEAP EXHAUSTED and stop: exit_group(137) hosted, WFE forever on
-   bare metal."
-  (let ((msg (format nil "~%GC: HEAP EXHAUSTED (live data > one semispace)~%")))
-    (loop for ch across msg
-          do (a64-movz buf +a64-x16+ (char-code ch) 0)
-             (if *aarch64-linux-mode*
-                 (progn (a64-load-conv-addr buf +a64-x17+ #x100001F0)
-                        (a64-emit buf (logior #x39000000 (ash 17 5) 16))  ; strb w16,[x17]
-                        (a64-load-imm64 buf +a64-x0+ 2)
-                        (a64-mov-reg buf +a64-x1+ +a64-x17+)
-                        (a64-load-imm64 buf +a64-x2+ 1)
-                        (a64-load-imm64 buf +a64-x8+ 64)                  ; write
-                        (a64-svc buf 0))
-                 (progn (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
-                        (when *aarch64-serial-tx-poll*
-                          (destructuring-bind (offset bit polarity) *aarch64-serial-tx-poll*
-                            (a64-ldr-width buf +a64-x15+ +a64-x17+ offset 2)
-                            (a64-emit buf (logior (ash (ecase polarity (:tbz #b00110110) (:tbnz #b00110111)) 24)
-                                                  (ash bit 19) (ash (logand -1 #x3FFF) 5) +a64-x15+))))
-                        (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*)))))
+   bare metal.  The message NAMES THE HEAP: the semispace size of the region
+   being collected (x25), in hex -- with threads, which region ran out is the
+   first question (a phone's 16 MB and 64 MB worker regions, region 0's young
+   space), and the process ends here with nothing else said."
+  (a64-exhausted-put-string buf (format nil "~%GC: HEAP EXHAUSTED (live data > one semispace of 0x"))
+  ;; eight hex digits of x25 (space_size): x16 = (x25 << (32+4k)) >> 60, then to ASCII
+  (dotimes (k 8)
+    (let ((digit (incf *mvm-label-counter*)))
+      (a64-lsl-imm buf +a64-x16+ +a64-x25+ (+ 32 (* 4 k)))
+      (a64-lsr-imm buf +a64-x16+ +a64-x16+ 60)
+      (a64-add-imm buf +a64-x16+ +a64-x16+ 48)                          ; '0'..
+      (a64-cmp-imm buf +a64-x16+ 58)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i digit :bcond)) ; < ':' : a digit
+      (a64-add-imm buf +a64-x16+ +a64-x16+ 39)                          ; 'a'..'f'
+      (a64-set-label buf digit)
+      (a64-exhausted-put-x16 buf)))
+  (a64-exhausted-put-string buf (format nil " bytes)~%"))
   (if *aarch64-linux-mode*
       (progn (a64-load-imm64 buf +a64-x0+ 137)
              (a64-load-imm64 buf +a64-x8+ 94)                             ; exit_group

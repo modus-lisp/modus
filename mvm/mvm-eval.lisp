@@ -5011,7 +5011,8 @@
           ;; layout comment).  reverse → source order (fn-table order).
           ;; FORMS rides at index 6 so a hit can check its literals are
           ;; the SAME objects (%mvm-literals-same-p).
-          (list bc entry (reverse ft-list) fn-table rt-table lam-offsets forms)))
+          ;; and index 7 the macro-definitions epoch it was compiled under.
+          (list bc entry (reverse ft-list) fn-table rt-table lam-offsets forms %cacheable)))
   ;; Conditions PROPAGATE (see %mvm-eval-run-tuple): production EVAL
   ;; must let an error signalled by the form reach the caller's
   ;; handler-case instead of returning (:interp-err e) as a value.
@@ -5198,15 +5199,20 @@
   ;; none of the setup/hash-alloc cost either.
   ;; Not for COMPILE-FILE's own compile of a toplevel form (mvm/fasl.lisp): a
   ;; hit would RUN the form, and record nothing.
+  ;; %CACHEABLE is the macro-definitions epoch the compile starts under (see
+  ;; *MACRO-DEFS-EPOCH*), or NIL: an entry is only the form's meaning while no
+  ;; macro has been defined, redefined or removed since it was compiled.
   (let ((%cacheable (and (not *mvm-eval-no-cache*)
                          (> (%mvm-eval-cache-limit) 0)
                          (not (and *fasl-compile-only* (%fasl-compile-only-here-p)))
-                         (%mvm-eval-cacheable-p forms))))
+                         (%mvm-eval-cacheable-p forms)
+                         (or *macro-defs-epoch* 0))))
     (when %cacheable
       (unless *mvm-eval-cache*
         (setq *mvm-eval-cache* (make-hash-table :test (quote equal))))
       (let ((%hit (gethash forms *mvm-eval-cache*)))
-        (when (and %hit (%mvm-literals-same-p (nth 6 %hit) forms))
+        (when (and %hit (eql (nth 7 %hit) %cacheable)
+                   (%mvm-literals-same-p (nth 6 %hit) forms))
           (%eval-lock-drop-for-run)
           (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
   (setq *%mexp-impure* nil)

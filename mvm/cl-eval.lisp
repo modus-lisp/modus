@@ -795,6 +795,7 @@
 
 (defun %macro-pkg-put-1 (sym key fn)
   (%mexp-memo-invalidate)
+  (%macro-defs-changed)
   (let ((pn (%macro-sym-pkg-name sym)))
     (when (and pn (stringp key))
       (unless *macro-pkg-table*
@@ -817,7 +818,9 @@
 (defun %macro-pkg-rem-1 (sym key)
   "T when there was an expander to drop.  The expansion memos are dropped only
    then: FMAKUNBOUND runs at every runtime DEFUN, and dropping the not-a-macro
-   set each time made every EVAL search every operator's expander again."
+   set each time made every EVAL search every operator's expander again.  The
+   macro epoch moves on the same condition, for the same reason -- it keys
+   *MVM-EVAL-CACHE*, and moving it at every DEFUN would empty that cache too."
   (let ((pn (%macro-sym-pkg-name sym)) (removed nil))
     (when (and pn *macro-pkg-table* (stringp key))
       (let ((al (gethash key *macro-pkg-table*))
@@ -826,6 +829,7 @@
           (if (string= (car e) pn) (setq removed t) (setq new (cons e new))))
         (when removed
           (%mexp-memo-invalidate)
+          (%macro-defs-changed)
           (puthash key *macro-pkg-table* new))))
     removed))
 

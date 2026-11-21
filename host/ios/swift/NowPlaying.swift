@@ -7,7 +7,7 @@
 //   np_enable()                 take the commands; the handle their events come from (the same every time)
 //   np_text(field, p, n)        0 title, 1 artist, 2 album: the UTF-8 text at P ("" removes it)
 //   np_times(dur, pos, playing) length and position in milliseconds; 1 playing, 0 paused (the system moves the
-//                               position on while playing)
+//                               position on while playing); a length of 0 is a live stream (a radio station)
 //   np_artwork(p, n)            the image file at path P ("" removes it)
 //   np_clear()                  nothing is playing
 //
@@ -85,7 +85,9 @@ let npText: Call = { field, p, n, _, _, _ in
 }
 
 let npTimes: Call = { dur, pos, playing, _, _, _ in
-    info[MPMediaItemPropertyPlaybackDuration] = Double(dur) / 1000
+    // no length: a live stream (a radio station), shown as live rather than as a track of no length
+    info[MPMediaItemPropertyPlaybackDuration] = dur == 0 ? nil : Double(dur) / 1000
+    info[MPNowPlayingInfoPropertyIsLiveStream] = dur == 0
     info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(pos) / 1000
     info[MPNowPlayingInfoPropertyPlaybackRate] = playing != 0 ? 1.0 : 0.0
     publish(playing: playing != 0)

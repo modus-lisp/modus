@@ -1106,6 +1106,12 @@ class MVM {
         }
         case 0x65: {                                                                                     // aref Vd Vobj Vidx
           const o = code[pc + 2], x = code[pc + 3];
+          // Vobj = VFP: frame slot Vidx (tagged), as in the x64 translator.
+          // The &rest prologue's loop walks frame slots this way.
+          if (o === 21) {
+            const i = (this.ebp + SLOT_BASE - this.rlo(x) * 4 - VBASE) >> 2;
+            this.setReg(code[pc + 1], m32[i], m32[i + 1]); pc += 4; break;
+          }
           const a = this.rlo(o) + this.rlo(x) * 4 + 7;
           if (this.rhi(o) !== 0 || a < VBASE || a >= heapEnd) this.memFault('aref');
           const i = (a - VBASE) >> 2;
@@ -1585,7 +1591,8 @@ class MVM {
         }
         case 0x63: out += W(b1, `(${lo(b2)}&15)<<1`, '0'); break;
         case 0x64: out += `{const l=${lo(b2)};let r=0;if((l&15)===9&&${hi(b2)}===0&&l!==${TV}&&l-9>=${VBASE}&&l-9<HE)r=(m32[(l-9-${VBASE})>>2]&255)<<1;${W(b1, 'r', '0')}}`; break;
-        case 0x65: out += `${P}{const a=${lo(b2)}+${lo(b3)}*4+7;${chk(lo(b2), hi(b2), 'a', 'aref')}const i=(a-${VBASE})>>2;${W(b1, 'm32[i]', 'm32[i+1]')}}`; break;
+        case 0x65: if (b2 === 21) { out += `{const i=fb+(${SLOT_BASE >> 2})-(${lo(b3)});${W(b1, 'm32[i]', 'm32[i+1]')}}`; break; }   // VFP: frame slot Vidx
+                   out += `${P}{const a=${lo(b2)}+${lo(b3)}*4+7;${chk(lo(b2), hi(b2), 'a', 'aref')}const i=(a-${VBASE})>>2;${W(b1, 'm32[i]', 'm32[i+1]')}}`; break;
         case 0x66: out += `${P}{const a=${lo(b1)}+${lo(b2)}*4+7;${chk(lo(b1), hi(b1), 'a', 'aset')}const i=(a-${VBASE})>>2;m32[i]=${lo(b3)};m32[i+1]=${hi(b3)};}`; break;
         case 0x67: out += `{const l=${lo(b2)};if((l&15)===9&&${hi(b2)}===0&&l!==${TV}&&l-9>=${VBASE}&&l-9<HE){const i=(l-9-${VBASE})>>2,cl=m32[i]>>>8,ch=m32[i+1];shl64(cl|(ch<<24),ch>>>8,1);${WR(b1)}}else{${W(b1, '0', '0')}}}`; break;
         case 0x70: {

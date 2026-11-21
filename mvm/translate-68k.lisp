@@ -5584,14 +5584,15 @@
         (m68k-emit-bsr buf *68k-mac-service-label*)
         (ws #x4A82) (m68k-emit-bne buf rfail)
         (ws #x2044 #xD1CA)                                   ; A0 = the body
-        ;; the trailer: count at T - 2, the offsets (/2) before it
+        ;; the trailer: count at T - 2, the offsets (/2, each a GAP) before it
         (ws #x2007 #x7200 #x3230 #x08FE)                     ; D1 = count
         (ws #x47F0 #x08FE #x97C1 #x97C1)                     ; A3 = the offsets
         (ws #x2A08 #x9A86)                                   ; D5 = A0 - HOME
+        (ws #x7400)                                          ; D2 = 0: the offsets are GAPS
         (m68k-emit-bra buf test)
         (m68k-emit-label buf lp)
-        (ws #x7000 #x301B #xD080)                            ; D0 = offset
-        (ws #xDBB0 #x0800)                                   ; ADD.L D5,(A0,D0.L)
+        (ws #x7000 #x301B #xD080 #xD480)                     ; D2 += the gap, in bytes
+        (ws #xDBB0 #x2800)                                   ; ADD.L D5,(A0,D2.L)
         (m68k-emit-label buf test)
         (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf lp :disp16) ; DBRA D1
         ;; a relocated application: the body's EXTERNAL relocations, as the
@@ -5630,21 +5631,25 @@
         (ws #x0C38 #x0002 #x012F #x650C)
         (ws #x48E7 #xE0C0 #x7001 #xA198 #x4CDF #x0307)
         (ws #x4CDF #x5FFF #x4E75)                            ; MOVEM.L (SP)+; RTS: the body
-        ;; XG: add D2.W at the D1.W word offsets (/2) at A4 into the body at A0
+        ;; XG: add D2.W at the D1.W word GAPS (/2) at A4 into the body at A0
         (let ((xl (mvm-make-label)) (xt (mvm-make-label)))
           (m68k-emit-label buf xg)
+          (ws #x7600)                                        ; D3 = 0: GAPS, as above
           (m68k-emit-bra buf xt)
           (m68k-emit-label buf xl)
-          (ws #x7000 #x301C #xD080 #xD570 #x0800)            ; ADD.W D2,(A0,D0.L)
+          (ws #x7000 #x301C #xD080 #xD680)                   ; D3 += the gap, in bytes
+          (ws #xD570 #x3800)                                 ; ADD.W D2,(A0,D3.L)
           (m68k-emit-label buf xt)
           (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf xl :disp16)
           (ws #x4E75))
-        ;; XG7: add D7.L at the D1.W word offsets (/2) at A4 into the body at A0
+        ;; XG7: add D7.L at the D1.W word GAPS (/2) at A4 into the body at A0
         (let ((xl (mvm-make-label)) (xt (mvm-make-label)))
           (m68k-emit-label buf xg7)
+          (ws #x7600)                                        ; D3 = 0: GAPS
           (m68k-emit-bra buf xt)
           (m68k-emit-label buf xl)
-          (ws #x7000 #x301C #xD080 #xDFB0 #x0800)            ; ADD.L D7,(A0,D0.L)
+          (ws #x7000 #x301C #xD080 #xD680)                   ; D3 += the gap, in bytes
+          (ws #xDFB0 #x3800)                                 ; ADD.L D7,(A0,D3.L)
           (m68k-emit-label buf xt)
           (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf xl :disp16)
           (ws #x4E75))
@@ -5673,10 +5678,21 @@
                  (let ((tp (gethash label labels)))
                    (when (and tp (>= tp start) (< tp here))
                      (push (- widx (ash start -1)) offs))))))
+    ;; Each offset (in words) as the GAP from the one before (from 0), so a
+    ;; body may be any size: only a 128 KB stretch with no absolute reference
+    ;; to itself does not encode.  (Offsets from 0 capped a body at 128 KB,
+    ;; and the compiler kept every body over ~48 KB of bytecode resident --
+    ;; 1.4 MB of a Mac image.)  COLD-ENTER and mac68k-reloc-disk.py agree.
     (setq offs (sort offs #'<))
-    (when (and offs (>= (car (last offs)) 65536))
-      (error "68k cold: a body of ~D bytes is too big to be cold (keep it)" (- here start)))
-    (dolist (o offs) (m68k-emit-word buf o))
+    (let ((prev 0))
+      (dolist (o offs)
+        (when (>= (- o prev) 65536)
+          (error "68k cold: a body of ~D bytes has a 128 KB stretch with no relocation (keep it)"
+                 (- here start)))
+        (m68k-emit-word buf (- o prev))
+        (setq prev o)))
+    (when (>= (length offs) 65536)
+      (error "68k cold: a body with ~D relocations (keep it)" (length offs)))
     (m68k-emit-word buf (length offs))
     (let* ((end (m68k-buffer-position buf)) (n (- end start)) (tw (second entry))
            (words (m68k-buffer-words buf)))

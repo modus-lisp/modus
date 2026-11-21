@@ -16547,11 +16547,20 @@
        (and (eql (mem-ref #x10000C30 :u32) 0)
             (eql (mem-ref #x10000C34 :u32) 0))))
 
+(defvar *shallow-thread-gate* t
+  "NIL: %EMIT-SHALLOW-THREAD-GATE emits nothing.  For a target that can never
+   arm threads (#x10000DB8 is written only by the hosted x64 thread layer),
+   where the gate always falls through: the 68k builds (build-68k-cli,
+   build-mac68k-cl-repl), 131 KB of a Mac floppy image's resident code.  A
+   host special, so the image's own compiler keeps the gate (correct, larger).")
+
 (defun %emit-shallow-thread-gate (a b slow)
   "Emit IR that falls through when THIS thread binds shallowly (see THE ARMED
    MAIN THREAD BINDS SHALLOWLY) and branches to SLOW otherwise -- i.e. when
    threads are armed AND this thread has a per-thread binding block.  A and B
-   are scratch registers; both are clobbered."
+   are scratch registers; both are clobbered.  Nothing at all when
+   *SHALLOW-THREAD-GATE* is NIL."
+  (unless *shallow-thread-gate* (return-from %emit-shallow-thread-gate nil))
   (let ((fast (make-compiler-label)))
     (emit-li-tagged a (conv-real #x10000DB8))
     (emit-ir :shr a a +fixnum-shift+)
@@ -35992,11 +36001,11 @@
                             (< (loop for insn in (cdr e) sum (ir-instruction-size insn)) 49152))
                        (push e cold)
                        (push e boot)))
-                  ;; a body over ~48 KB of bytecode stays: a cold body's
-                  ;; relocations are 16-bit word offsets (128 KB), and the
-                  ;; 68k code is about the bytecode's size
-                  ((and (%cold-fn-name-p nm)
-                        (< (loop for insn in (cdr e) sum (ir-instruction-size insn)) 49152))
+                  ;; any size: a cold body's relocations are word GAPS now
+                  ;; (translate-68k M68K-COLD-CLOSE), so the old ~48 KB cap
+                  ;; -- 1.4 MB of a Mac image held resident by it -- is gone.
+                  ;; A big body a session runs belongs in the keep-list.
+                  ((%cold-fn-name-p nm)
                    (push e cold))
                   (t (push e hot)))))
         (when boot (format t "~&  boot-only functions last: ~D~%" (length boot)))

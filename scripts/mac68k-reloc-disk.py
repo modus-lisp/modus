@@ -55,7 +55,8 @@ def printable(w):
 def cold_lists(a, b, dest, off, ln, shift):
     """COLD NATIVE CODE (translate-68k M68K-EMIT-COLD-ENTER): per cold body,
     its words that differ between A and B by a relocation, as COLD-ENTER
-    applies them: n8 n16 n7, then each kind's offsets / 2 (u16s).  None when
+    applies them: n8 n16 n7, then each kind's offsets / 2 (u16s), each
+    the gap from the one before (from 0).  None when
     the image has no cold code.  Returns (the index's disk byte, [lists])."""
     k = a.find(b'modusCLD', off, off + ln)
     if k < 0:
@@ -74,10 +75,13 @@ def cold_lists(a, b, dest, off, ln, shift):
                 print('  cold %d +%X: %04X -> %04X' % (i, o, wa, wb))
         lst = struct.pack('>3H', *(len(kinds[kk]) for kk in (8, 16, 7)))
         for kk in (8, 16, 7):
-            for o in kinds[kk]:
-                if o >= 1 << 17:
-                    sys.exit('mac68k-reloc-disk: cold body %d is too big' % i)
-                lst += struct.pack('>H', o // 2)
+            prev = 0
+            for o in sorted(kinds[kk]):     # each as the GAP from the last
+                if o - prev >= 1 << 17:
+                    sys.exit('mac68k-reloc-disk: cold body %d has a 128 KB stretch '
+                             'with no %d-bit relocation' % (i, kk))
+                lst += struct.pack('>H', (o - prev) // 2)
+                prev = o
         lists.append(bytes(lst))
     if bad > int(os.environ.get('MAC68K_RELOC_COLD_ALLOW', '0')):
         sys.exit('mac68k-reloc-disk: %d differences in cold bodies that are not relocations' % bad)

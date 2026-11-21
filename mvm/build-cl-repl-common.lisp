@@ -4036,6 +4036,9 @@
           (format t "~&;; 68k cold native code: ~D functions kept resident (~A)~%"
                   (hash-table-count h) f)
           (setf (symbol-value (sym "*COLD-KEEP*")) h))))
+    ;; No threads on a 68k: the special-variable thread gate always falls
+    ;; through, so emit none (compiler.lisp *SHALLOW-THREAD-GATE*)
+    (setf (symbol-value (sym "*SHALLOW-THREAD-GATE*")) nil)
     ;; MODUS_68K_CALL_ISLANDS=0: no call islands (translate-68k *68K-CALL-ISLANDS*)
     (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_ISLANDS")))
       (setf (symbol-value (sym "*68K-CALL-ISLANDS*"))

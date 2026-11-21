@@ -15,4 +15,7 @@ void *modus_mac_root_view(void);
 // again, and a resize event for the image if either changed.
 void modus_mac_relayout(void);
 
+// Lock the pointer (1: hidden, held still, its moves sent as motion events, type 13) or let it go (0).
+void modus_mac_pointer_lock(int on);
+
 #endif

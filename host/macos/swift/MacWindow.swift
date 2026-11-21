@@ -93,7 +93,15 @@ let windowRemember: Call = { p, n, _, _, _, _ in
     return window.setFrameAutosaveName(name) ? 1 : 0
 }
 
+/// window_pointer_lock(on): a game's mouse-look -- the pointer hidden and held, its moves sent as motion (type 13
+/// events) -- or let go.  The window losing the keyboard lets it go.
+let windowPointerLock: Call = { on, _, _, _, _, _ in
+    modus_mac_pointer_lock(on != 0 ? 1 : 0)
+    return 1
+}
+
 func installWindow() {
+    register("window_pointer_lock", windowPointerLock)
     register("window_title", windowTitle)
     register("window_chrome", windowChrome)
     register("window_size", windowSize)

@@ -19,6 +19,7 @@
 #include <os/lock.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -84,6 +85,17 @@ static void push_pointer(long type, long x, long y) {
     if (x >= fb_w) x = fb_w - 1;
     if (y >= fb_h) y = fb_h - 1;
     queue_event(((uint64_t)type << 40) | ((uint64_t)y << 20) | (uint64_t)x);
+}
+
+// THE POINTER LOCKED (a game's mouse-look): the cursor hidden and held where it is, and each move sent as how far
+// it went (type 13), not where it is -- it never reaches the screen's edge.  DX in the low 20 bits and DY in the
+// next 20, each two's complement, in points.
+static int pointer_locked;
+
+static void push_motion(double dx, double dy) {
+    long x = lround(dx), y = lround(dy);
+    if (!x && !y) return;
+    queue_event(((uint64_t)13 << 40) | (((uint64_t)y & 0xFFFFF) << 20) | ((uint64_t)x & 0xFFFFF));
 }
 
 static void push_resize(long w, long h) {
@@ -211,6 +223,7 @@ static BOOL moving_window;
     push_pointer(1, (long)p.x, (long)p.y);
 }
 - (void)mouseDragged:(NSEvent *)e {
+    if (pointer_locked) { push_motion(e.deltaX, e.deltaY); return; }
     if (moving_window) return;
     NSPoint p = [self pixelPointOf:e];
     push_pointer(2, (long)p.x, (long)p.y);
@@ -229,7 +242,10 @@ static BOOL moving_window;
     push_mask(buttons, (long)p.x, (long)p.y);
 }
 - (void)rightMouseDown:(NSEvent *)e { [self button:4 down:YES at:e]; }
-- (void)rightMouseDragged:(NSEvent *)e { [self button:4 down:YES at:e]; }
+- (void)rightMouseDragged:(NSEvent *)e {
+    if (pointer_locked) { push_motion(e.deltaX, e.deltaY); return; }
+    [self button:4 down:YES at:e];
+}
 - (void)rightMouseUp:(NSEvent *)e { [self button:4 down:NO at:e]; }
 - (void)otherMouseDown:(NSEvent *)e { if (e.buttonNumber == 2) [self button:2 down:YES at:e]; }
 - (void)otherMouseDragged:(NSEvent *)e { if (e.buttonNumber == 2) [self button:2 down:YES at:e]; }
@@ -237,6 +253,7 @@ static BOOL moving_window;
 
 // HOVER: the pointer moving with no button down (type 5), as a mouse does and a finger cannot.
 - (void)mouseMoved:(NSEvent *)e {
+    if (pointer_locked) { push_motion(e.deltaX, e.deltaY); return; }
     if (buttons) return;
     NSPoint p = [self pixelPointOf:e];
     push_pointer(5, (long)p.x, (long)p.y);
@@ -344,6 +361,15 @@ static void command_chord(uint32_t letter) {
 // Modifiers held when the window stops taking keys are released in the image (their releases go elsewhere).
 static void release_modifiers(void) { set_modifiers(0); }
 
+// Lock the pointer (ON) or let it go.  Main thread.  The window losing the keyboard lets it go too: a locked,
+// hidden pointer must never be left behind in another app.
+void modus_mac_pointer_lock(int on) {
+    if (on == pointer_locked) return;
+    pointer_locked = on;
+    CGAssociateMouseAndMouseCursorPosition(on ? false : true);
+    if (on) [NSCursor hide]; else [NSCursor unhide];
+}
+
 // The menu bar: an application menu with Quit, which is what Cmd-Q and the user expect.
 @interface ModusAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @end
@@ -412,6 +438,7 @@ static NSString *app_name(void) {
 }
 - (void)windowDidResignKey:(NSNotification *)n {
     (void)n;
+    modus_mac_pointer_lock(0);
     release_modifiers();
 }
 - (void)applicationDidFinishLaunching:(NSNotification *)n {

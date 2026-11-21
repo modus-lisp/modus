@@ -8,6 +8,7 @@ smallest x and y of any teal pixel (the Clock window covers the corner), and run
 ACTIONs relative to that origin, a screenshot after each:
   click:X:Y      left click            type:TEXT   type TEXT (a-z 0-9 space ( ) + - . ")
   key:QCODE      press a QEMU qcode    wait:SECS
+  drag:X1:Y1:X2:Y2[:STEPS]  press at X1,Y1, move to X2,Y2 in STEPS (20) moves, release
 Ends with Alt+F4, which closes the window and so ends the program.
 """
 import os, sys, time, importlib.util
@@ -73,6 +74,17 @@ def main():
                 press(sock, QCODES.get(c, c))
         elif kind == "key":
             press(sock, tuple(arg.split("+")))
+        elif kind == "drag":
+            v = [int(x) for x in arg.split(":")]
+            x1, y1, x2, y2 = v[:4]; steps = v[4] if len(v) > 4 else 20
+            def to(x, y):
+                d.inp(sock, [{"type": "abs", "data": {"axis": "x", "value": (at[0] + x) * 32767 // (w - 1)}},
+                             {"type": "abs", "data": {"axis": "y", "value": (at[1] + y) * 32767 // (h - 1)}}])
+            to(x1, y1); time.sleep(0.2)
+            d.inp(sock, [{"type": "btn", "data": {"down": True, "button": "left"}}])
+            for i in range(1, steps + 1):
+                to(x1 + (x2 - x1) * i // steps, y1 + (y2 - y1) * i // steps); time.sleep(0.05)
+            d.inp(sock, [{"type": "btn", "data": {"down": False, "button": "left"}}])
         elif kind == "wait":
             time.sleep(float(arg))
         time.sleep(1.5)

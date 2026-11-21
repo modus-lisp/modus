@@ -24,19 +24,26 @@
 ;;;; inside DispatchMessageA, and it only appends the message to the window's ring.  No
 ;;;; Lisp runs inside a Win32 callback; W32-WINDOW-EVENTS reads the ring afterwards.
 ;;;;
-;;;; THE PIXELS ARE COPIED into a back buffer VirtualAlloc'd with the window, and
-;;;; StretchDIBits reads from there: the collector moves Lisp vectors, and a blit runs
-;;;; while other threads may collect.  The wait for messages is GC-safe
-;;;; (%GC-SAFE-BLOCK-6), so a window thread idling in it never holds up a collection.
+;;;; THE PIXELS ARE BLITTED IN PLACE: a packed (unsigned-byte 32) vector (subtag #x17) IS a
+;;;; top-down 32-bit DIB, its row length the stride, so StretchDIBits reads glass's
+;;;; framebuffer itself -- no copy, as the board and the Mac/phone hosts present (kiln).  This
+;;;; is sound because nothing can move the vector between taking its address and the end of
+;;;; the call: the call is not GC-safe (a stop-the-world collection waits for it), and the
+;;;; address is taken after every argument is written, with nothing allocated in between --
+;;;; an allocation is where a thread parks for a collection.  Any other vector (or
+;;;; MODUS_W32_COPY=1, for comparison) is copied into a back buffer mapped with the window and
+;;;; blitted from there.  The wait for messages IS GC-safe (%GC-SAFE-BLOCK-6), so a window
+;;;; thread idling in it never holds up a collection.
 ;;;;
 ;;;; A window is a vector:
 ;;;;   0 hwnd  1 hdc  2 block  3 width  4 height  5 button mask  6 last x  7 last y
-;;;;   8 control held
+;;;;   8 control held  9 presents  10 pixels presented  11 internal time presenting
+;;;;   12 always copy (MODUS_W32_COPY)  -- 9-11 since the last W32-WINDOW-STATS
 ;;;; Block layout: +0 the event ring (count dword, capacity dword at +8, 24-byte entries
 ;;;; from +16); +#x10000 WNDCLASSEXA, +#x10100 MSG, +#x10200 BITMAPINFOHEADER,
 ;;;; +#x10300 RECT, +#x10400 the argument vector of a call, +#x10600 the title,
 ;;;; +#x10700 the class name, +#x10800 the functions (%WW-PROCS order), +#x10A00 a
-;;;; name being looked up; +#x20000 the back buffer.
+;;;; name being looked up, +#x10B00 a scratch word; +#x20000 the back buffer.
 
 (defun %ww-put32 (a v) (setf (mem-ref a :u32) (logand v #xFFFFFFFF)))
 (defun %ww-put16 (a v)
@@ -142,20 +149,47 @@
           (%ww-put32 bmi 40)
           (%ww-put16 (+ bmi 12) 1)
           (%ww-put16 (+ bmi 14) 32))
-        (let ((win (make-array 9 :initial-element 0)))
+        (let ((win (make-array 13 :initial-element 0))
+              (copy (%cli-getenv "MODUS_W32_COPY")))
           (setf (aref win 0) hwnd
                 (aref win 1) (%ww-call block 9 hwnd)              ; GetDC
                 (aref win 2) block
                 (aref win 3) width
                 (aref win 4) height
-                (aref win 8) nil)
+                (aref win 8) nil
+                (aref win 12) (and copy (> (length copy) 0) (not (string= copy "0"))))
           win)))))
+
+(defun %ww-blit-in-place (win pixels x0 y0 rw rh)
+  "StretchDIBits straight from PIXELS (packed, as wide as WIN): rows Y0.. as the DIB."
+  (let* ((block (aref win 2)) (w (aref win 3)) (a (+ block #x10400)) (bmi (+ block #x10200))
+         (scratch (+ block #x10B00))
+         (fn (%ww-get64 (+ block #x10800 (* 8 20)))))
+    (%ww-put32 (+ bmi 4) w)
+    (%ww-put32 (+ bmi 8) (- 0 rh))
+    (%ww-put64 a (aref win 1))
+    (%ww-put64 (+ a 8) x0) (%ww-put64 (+ a 16) y0) (%ww-put64 (+ a 24) rw) (%ww-put64 (+ a 32) rh)
+    (%ww-put64 (+ a 40) x0) (%ww-put64 (+ a 48) 0) (%ww-put64 (+ a 56) rw) (%ww-put64 (+ a 64) rh)
+    (%ww-put64 (+ a 80) bmi) (%ww-put64 (+ a 88) 0) (%ww-put64 (+ a 96) #x00CC0020)
+    ;; LAST, and nothing allocates from here to the end of the call: the vector's address
+    ;; (its word + 7 is element 0; %GC-WORD-OF's two lines).
+    (setf (mem-ref scratch :u64) pixels)
+    (%ww-put64 (+ a 72) (+ (%gc-read64 scratch) 7 (* 4 (* y0 w))))
+    (syscall3 #x3000 fn a 13)))
 
 (defun w32-window-present (win pixels pw x0 y0 x1 y1)
   "Show the rectangle [X0,X1) x [Y0,Y1) of PIXELS (PW pixels to a row) at the same
    place in WIN."
   (let* ((w (aref win 3)) (h (aref win 4))
-         (x0 (max 0 x0)) (y0 (max 0 y0)) (x1 (min w x1)) (y1 (min h y1)))
+         (x0 (max 0 x0)) (y0 (max 0 y0)) (x1 (min w x1)) (y1 (min h y1))
+         (t0 (get-internal-real-time)))
+    (when (and (< x0 x1) (< y0 y1)
+               (not (aref win 12)) (= pw w) (eql (obj-subtag pixels) #x17))
+      (%ww-blit-in-place win pixels x0 y0 (- x1 x0) (- y1 y0))
+      (setf (aref win 9) (+ (aref win 9) 1)
+            (aref win 10) (+ (aref win 10) (* (- x1 x0) (- y1 y0)))
+            (aref win 11) (+ (aref win 11) (- (get-internal-real-time) t0)))
+      (return-from w32-window-present t))
     (when (and (< x0 x1) (< y0 y1))
       (let* ((block (aref win 2)) (buf (+ block #x20000)) (bmi (+ block #x10200))
              (rw (- x1 x0)) (rh (- y1 y0)))
@@ -168,8 +202,17 @@
         (%ww-put32 (+ bmi 4) w)
         (%ww-put32 (+ bmi 8) (- 0 rh))
         (%ww-call block 20 (aref win 1) x0 y0 rw rh x0 0 rw rh   ; StretchDIBits
-                  (+ buf (* 4 (* y0 w))) bmi 0 #x00CC0020)))
+                  (+ buf (* 4 (* y0 w))) bmi 0 #x00CC0020)
+        (setf (aref win 9) (+ (aref win 9) 1)
+              (aref win 10) (+ (aref win 10) (* rw rh))
+              (aref win 11) (+ (aref win 11) (- (get-internal-real-time) t0)))))
     t))
+
+(defun w32-window-stats (win)
+  "(PRESENTS PIXELS MICROSECONDS) since the last call: what W32-WINDOW-PRESENT did."
+  (prog1 (list (aref win 9) (aref win 10)
+               (floor (* (aref win 11) 1000000) internal-time-units-per-second))
+    (setf (aref win 9) 0 (aref win 10) 0 (aref win 11) 0)))
 
 (defun %ww-vk-keysym (vk)
   "The X keysym of a virtual key that WM_CHAR does not carry, or NIL."

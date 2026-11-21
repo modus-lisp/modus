@@ -151,6 +151,31 @@ binary that saved it, so one saved under Wine starts the same `modus.exe` in a
 Windows guest.  **Home**: `user-homedir-pathname` is `$HOME` when set, else
 `%USERPROFILE%` (Wine does not pass `HOME` through).
 
+**Native windows** (`net/win32-window.lisp`; glass's `SERVE-NATIVE` on branch
+`native-window`).  `W32-WINDOW-OPEN` / `-PRESENT` / `-EVENTS` / `-CLOSE` /
+`-STATS`, in MODUS-INT (callable by name: the Windows build hands the file to the
+name scanners through `*CLI-SCAN-EXTRA-SOURCE*`).  USER32 and GDI32 are loaded at
+the first window (LoadLibraryA + GetProcAddress) and called through shim number
+`#x3000` (function pointer, up to 20 arguments in memory), so a console modus.exe
+never maps them -- and this Wine, which cannot load them, still runs it.  The
+window procedure is native (`WIN64-WNDPROC-ITEMS`): it rings the messages Lisp
+reads and defers to DefWindowProcA; no Lisp runs inside a Win32 callback.  The
+events are RFB's, `(:key DOWN KEYSYM)` and `(:pointer MASK X Y)`, so glass hands
+them on unchanged.
+
+Presenting is damage-only and in place: glass's damage (one box per composite,
+`FB-TAKE-FRAME`) is blitted straight from its pixel vector -- a packed
+`(unsigned-byte 32)` vector is a top-down 32-bit DIB -- as kiln presents on the
+board and the Mac.  It is sound because the call is not GC-safe (a stop-the-world
+collection waits for it) and the address is taken after the last allocation.
+Measured in the guest with `GLASS_NATIVE_STATS=1` (glass/wm 800x560): a window
+drag, ~20 frames a second of ~250 Kpx each, cost 300-450 ms a second presenting
+with the old per-pixel copy (`MODUS_W32_COPY=1`) and 33-52 ms in place; the idle
+clock (35 Kpx a second) 4-67 ms against 0.5-10 ms.  The move hint (CopyRect) is
+not used: the window manager repaints the whole box, and only a diff against a
+snapshot -- a Lisp loop as slow as the copy -- could say which moved pixels are
+unchanged.
+
 ## Testing
 
 - `test/win64/cases.sh` holds the checks (arithmetic, bignums, printing,

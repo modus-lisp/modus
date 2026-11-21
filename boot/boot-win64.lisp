@@ -1558,6 +1558,67 @@
       (when (>= i n) (return dir))
       (when (= (char-code (char dir i)) 47) (%sys-mkdir (subseq dir 0 i) 493))
       (setq i (+ i 1)))))
+;; SAVE-AND-DIE RESTORE (lib/save-image.lisp): `modus --core FILE ...' is
+;; decided in kernel-main before anything exists, from argv[1] and a raw argv[2]
+;; pointer the Linux boot stub leaves.  Here argv is one command line
+;; (GetCommandLineA), so these read its tokens as raw bytes -- no string, no
+;; global, no allocation -- with the Windows quoting: a token runs to white
+;; space, a quoted one to its closing quote.
+(defun %w32-cmdline-token (n)
+  \"Raw address of token N (0 = the program) of the command line, after an
+   opening quote; 0 when there is no such token.\"
+  (let ((p (syscall6 +w32-getcommandlinea+ 0 0 0 0 0 0)) (i 0))
+    (loop
+      (loop (let ((c (mem-ref p :u8)))
+              (if (or (= c 32) (= c 9)) (setq p (+ p 1)) (return nil))))
+      (when (= (mem-ref p :u8) 0) (return 0))
+      (let ((quoted (= (mem-ref p :u8) 34)))
+        (when quoted (setq p (+ p 1)))
+        (when (= i n) (return p))
+        (setq p (%w32-token-end p quoted))
+        (when (and quoted (= (mem-ref p :u8) 34)) (setq p (+ p 1)))
+        (setq i (+ i 1))))))
+(defun %w32-token-end (p quoted)
+  (loop (let ((c (mem-ref p :u8)))
+          (if (or (= c 0) (if quoted (= c 34) (or (= c 32) (= c 9))))
+              (return p)
+              (setq p (+ p 1))))))
+(defun %core-requested-p ()
+  (let ((a (%w32-cmdline-token 1)))
+    (and (not (= a 0))
+         (not (= (%w32-cmdline-token 2) 0))
+         (= (mem-ref a :u8) 45) (= (mem-ref (+ a 1) :u8) 45)
+         (= (mem-ref (+ a 2) :u8) 99) (= (mem-ref (+ a 3) :u8) 111)
+         (= (mem-ref (+ a 4) :u8) 114) (= (mem-ref (+ a 5) :u8) 101)
+         (let ((c (mem-ref (+ a 6) :u8))) (or (= c 0) (= c 32) (= c 9) (= c 34))))))
+(defun %core-open-in ()
+  ;; NUL-terminate the path in the command line buffer for the open, then put
+  ;; the byte back: %CLI-COLLECT-ARGV reads the same buffer later.
+  (let* ((a (%w32-cmdline-token 2))
+         (e (%w32-token-end a (= (mem-ref (- a 1) :u8) 34)))
+         (saved (mem-ref e :u8)))
+    (setf (mem-ref e :u8) 0)
+    (let ((fd (%core-open-path-at a)))
+      (setf (mem-ref e :u8) saved)
+      fd)))
+(defun %core-open-path-at (addr)
+  ;; CreateFileA(addr, GENERIC_READ, share READ|WRITE|DELETE, 0, OPEN_EXISTING,
+  ;; FILE_ATTRIBUTE_NORMAL): the HANDLE, or negative.
+  (let ((h (syscall6 +w32-createfilea+ addr 2147483648 7 0 3 128)))
+    (if (< h 0) -2 h)))
+
+;; The home directory: $HOME when it is set (as SBCL on Windows), else
+;; %USERPROFILE% with forward slashes; with a trailing slash, as on Linux.
+(defun user-homedir-pathname (&rest args)
+  (when (and args (cdr args)) (modus.runtime::%signal-program-error))
+  (let ((h (or (let ((x (%cli-getenv \"HOME\"))) (and (stringp x) (> (length x) 0) x))
+               (let ((x (%cli-getenv \"USERPROFILE\")))
+                 (and (stringp x) (> (length x) 0) (%w32-slashes x))))))
+    (modus.runtime::%coerce-to-pathname
+     (if h
+         (if (char= (char h (- (length h) 1)) #\\/) h (concatenate 'string h \"/\"))
+         \"C:/\"))))
+
 (defun %fasl-dir ()
   (or *w32-fasl-dir*
       (setq *w32-fasl-dir*

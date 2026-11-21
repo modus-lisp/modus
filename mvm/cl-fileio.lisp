@@ -2541,6 +2541,7 @@
   (cond
     ((and (stringp host) (string= host "CLTESTROOT")) nil)
     (t (error "load-logical-pathname-translations: unknown host"))))
+(declaim (overridable user-homedir-pathname))   ; Windows: %USERPROFILE% (boot-win64)
 (defun user-homedir-pathname (&rest args)
   "Return the user's home directory pathname.  Accepts an optional host
    designator argument.  Per CLHS: must return a pathname (or NIL)."

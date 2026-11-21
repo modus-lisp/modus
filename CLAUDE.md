@@ -1257,9 +1257,12 @@ test/win64/run-vm.sh win2022.qcow2 modus.exe                        # real Windo
 The same image as `./modus`, built by `build-generic-cli.lisp` with `*CLI-WIN64*` (every
 difference is guarded by it; with it off the Linux image is byte-identical).  Linux syscalls go
 through a shim in the boot stub (`boot/boot-win64.lisp`) to kernel32.  REPL, collector and JIT
-work, and so do files and IPv4 sockets; single-threaded.  `test/win64/run-vm.sh` runs the same checks
-in a real Windows Server 2022 guest (KVM).  **Threads cannot use the FS base on real Windows** (it is
-lost at a context switch; Wine keeps it): test/win64/probe/fsbase.asm.  **The boot stub is assembled at emit time**: an
+work, and so do files, IPv4 sockets, native threads, fault recovery and cores; the glass desk runs.
+`test/win64/run-vm.sh` runs the same checks in a real Windows Server 2022 guest (KVM).  **The window
+and per-CPU bases are TEB TLS slots, not FS/GS** (a user FS base is lost at a context switch on real
+Windows; Wine keeps it): with `*X64-WIN-TLS*`, every FS/GS-prefixed access the translator emits is
+captured and rewritten by `EMIT-BYTE` (`MODUS.ASM:%SEG-BEGIN`).  A hand-counted byte distance across
+such an access must be measured (`X64-TLS-INSN-LENGTH`).  **The boot stub is assembled at emit time**: an
 early copy baked the default allocation limit and the collector never ran.
 
 ### Pi Zero 2 W (real hardware)

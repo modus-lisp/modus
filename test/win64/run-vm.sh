@@ -12,6 +12,9 @@
 # program, say); RUN.CMD does not run them unless EXTRA_CMD is set, a line of
 # cmd that RUN.CMD runs after the cases.
 #
+# VM_FWD gives the guest a NIC (QEMU user networking, an e1000e) with these
+# host forwards, e.g. VM_FWD=tcp::5933-:5910 for a server in the guest on port
+# 5910 that the host reaches at localhost:5933.  Default: no network at all.
 # VM_WORK keeps the work directory (default: a temporary one, removed);
 # VM_RUN_TIMEOUT bounds the whole boot-run-shutdown (default 1200 s).  While it
 # runs, test/win64/vm-screen.py WORK/vm.qmp OUT.png shows the screen.
@@ -73,6 +76,8 @@ mcopy -i "$part" "$stage"/* :: || exit 1
 
 # ---- boot a throwaway overlay of the installed disk -----------------------
 qemu-img create -q -f qcow2 -b "$base" -F qcow2 "$work/run.qcow2" || exit 1
+net="-nic none"
+[ -n "${VM_FWD:-}" ] && net="-nic user,model=e1000e,hostfwd=$VM_FWD"
 echo "booting $(basename "$base") with $n cases (typically 2-5 minutes)"
 t0=$(date +%s)
 timeout ${VM_RUN_TIMEOUT:-1200} qemu-system-x86_64 \
@@ -82,7 +87,7 @@ timeout ${VM_RUN_TIMEOUT:-1200} qemu-system-x86_64 \
   -device ahci,id=ahci \
   -device ide-hd,drive=hd,bus=ahci.0 \
   -device ide-hd,drive=data,bus=ahci.1 \
-  -nic none -display none -vga std \
+  $net -display none -vga std \
   -qmp unix:"$work/vm.qmp",server=on,wait=off
 rc=$?
 echo "guest ran $(( $(date +%s) - t0 )) s (qemu exit $rc)"

@@ -1,8 +1,9 @@
 # Hosted Windows x86-64 (`modus.exe`)
 
 Written 2026-11-21.  Status: **the REPL, the collector, the runtime JIT, file
-I/O (`load`, `--script`, the FASL cache, drive letters) and IPv4 sockets work,
-under Wine and in a real Windows Server 2022 guest**; single-threaded; no
+I/O (`load`, `--script`, the FASL cache, drive letters), IPv4 sockets, native
+threads, fault recovery and save-and-die cores work, under Wine and in a real
+Windows Server 2022 guest, and the glass desk runs** (Testing, below).  No
 directory listing yet.
 
 ```sh
@@ -35,9 +36,12 @@ over the 128-byte red zone.
 
 Implemented in the shim: `read`/`write` (fds 0-2 are the console; any other fd
 is a Win32 HANDLE), `close`, `lseek`, `getcwd` (slashes, not backslashes),
-`mmap`/`munmap` (anonymous), `clock_gettime`, `nanosleep`, `getpid`,
-`exit`/`exit_group`; `rt_sigaction` and `rt_sigprocmask` return 0.  Everything
-else returns `-ENOSYS`.
+`mmap`/`munmap` (anonymous; the hint-less bump is atomic), `clock_gettime`
+(the CPU-time clocks from `GetProcessTimes`/`GetThreadTimes`, the rest from the
+precise system time), `nanosleep`, `getpid`, `exit`/`exit_group`, the thread
+calls (Threads, below), and `rt_sigaction` (Faults, below).
+`rt_sigprocmask`, `sigaltstack`, `mprotect` and the uid/gid calls return 0.
+Everything else returns `-ENOSYS`.
 
 **Sockets.**  The shim answers the Linux socket calls (`socket`, `bind`,
 `listen`, `accept`/`accept4`, `connect`, `getsockname`, `getpeername`,
@@ -91,12 +95,61 @@ there.  `argv[0]` is the whole command line (`GetCommandLineA`), which a Windows
 It then runs the same heap tail as the Linux entry
 (`EMIT-LINUX-X64-HEAP-TAIL`).
 
-**What is off.**  The per-CPU GS block, the FS per-thread window and
-stop-the-world: on Windows GS is the TEB and FS is not the runtime's to set.
-So is everything that needs them -- threads above all.  The runtime JIT's
-co-init (`%INIT-X64-TRANSLATOR`, `*CLI-WIN64*` in build-cli-common) turns the
-same features off, and its bridge thunks write their window slots without the
-FS prefix (`%JIT-WINDOW-PREFIX`).
+**Threads: the window and per-CPU bases are TEB TLS slots.**  On Linux the
+per-thread window is FS-relative and the per-CPU block GS-relative, one prefix
+byte per access.  Windows gives a user process neither: GS is the TEB, and a
+user FS base is lost at the first context switch (`test/win64/probe/fsbase.asm`:
+`WRFSBASE` executes and `fs:` loads use the base, then a `Sleep(1)` resets it;
+Wine keeps it, so Wine cannot answer this).  The prologue claims TlsSlots 59-63
+(`gs:[0x1480 + 8*i]`, by calling `TlsAlloc` until it returns 63):
+
+| slot | TEB offset | holds |
+|---|---|---|
+| 59 | `0x1658` | 0 on the main thread; in a cloned thread its clear-tid word, or-ed with 1 |
+| 60 | `0x1660` | this thread's Win32 stack, where the shim runs Win32 calls |
+| 61 | `0x1668` | the translator's scratch register, parked around an access |
+| 62 | `0x1670` | the per-CPU block (Linux: the GS base) |
+| 63 | `0x1678` | the window base (Linux: the FS base) |
+
+Every access the translator would prefix with FS or GS becomes
+`mov gs:[0x1668],scr; mov scr,gs:[base]; <the access, based on scr>; mov scr,gs:[0x1668]`,
+with SCR a register the access does not name: no stack, no flags.  No call site
+changed shape.  With `*X64-WIN-TLS*` the prefix starts a capture
+(`MODUS.ASM:%SEG-BEGIN`); the translator emits the Linux instruction as always,
+and `EMIT-BYTE` rewrites it in place once complete -- it is then the last thing
+in the buffer.  Lengths change, so the one hand-counted distance across such an
+access (SETJMP's resume LEA) is measured (`X64-TLS-INSN-LENGTH`), and the JIT's
+bridge thunks take their window store from `%JIT-WINDOW-STORE` in 64-byte slots.
+The cost: the image is ~7.6 MB of native code larger than the Linux one.
+
+The thread syscalls are the shim's: `clone` is `CreateThread` (suspended until
+the parent's tid word is written; the child starts in the stub, takes its TLS
+slots and R12-R15 from a record on its new stack, and resumes at the call's
+return address with RAX 0, as a Linux child does); `exit` in a cloned thread
+clears its tid word, `WakeByAddressAll`s it and `ExitThread`s; `futex` is
+`WaitOnAddress`/`WakeByAddressSingle`/`All` (KERNELBASE); `arch_prctl` reads and
+writes slots 62/63; `gettid` is `GetCurrentThreadId`; `sched_yield` is
+`SwitchToThread`.  The window, per-CPU storage and stop-the-world are on, as on
+Linux, in the image and in the JIT's co-init.  Differences that remain: the main
+thread's TID is not the PID.
+
+**Faults.**  `rt_sigaction` for SIGSEGV, SIGILL, SIGFPE and SIGBUS records the
+runtime's signal stub and installs one vectored exception handler.  For an
+access violation, illegal or privileged instruction, or integer divide or
+overflow in the image, heap, JIT arena or mapped stacks, the handler builds a
+siginfo (`si_addr` at +16) and a ucontext (RBP, RAX, RSP, RIP where Linux puts
+them) below its own frame, rewrites the CONTEXT to enter the stub with
+RDI/RSI/RDX as a signal handler, and resumes it.  So a memory fault, a division
+by zero or a refused shared store becomes a Lisp condition, as on Linux.  Not
+covered: stack overflow (the Lisp stacks have no guard page Windows knows).
+
+**Cores.**  `save-and-die` writes a core as on Linux.  `modus --core FILE` is
+decided in kernel-main from `argv[1]` before anything exists; here argv is one
+command line, so `%CORE-REQUESTED-P` and `%CORE-OPEN-IN` read its tokens as raw
+bytes and open the path in place with `CreateFileA`.  A core is tied to the
+binary that saved it, so one saved under Wine starts the same `modus.exe` in a
+Windows guest.  **Home**: `user-homedir-pathname` is `$HOME` when set, else
+`%USERPROFILE%` (Wine does not pass `HOME` through).
 
 ## Testing
 
@@ -124,6 +177,21 @@ FS prefix (`%JIT-WINDOW-PREFIX`).
   static-symbols, kernel-shadow, kernel-global-shadow and word-boundary give
   the same checks, ok and FAIL alike.  `test/win64/stdin-diff.sh` does the same
   through stdin, for an image without files.
+- Threads (2026-11-21, after merging main's a320c0c6): the hosted thread tests
+  -- sleep, threads, many-threads, mutex, sb-thread (45), thread-lisp (30),
+  many-regions (107), thread-gc (40), thread-regions (37), thread-actors (39),
+  stw (7), stw-spinning-worker (27) -- pass in the Windows guest as on Linux,
+  except hosted-threads' "the main thread's TID is the PID".  Put the test files
+  on the disk and run them from `EXTRA_CMD`:
+  `EXTRA_CMD='modus.exe --script hosted-mutex.lisp > hosted-mutex.res 2>&1' test/win64/run-vm.sh BASE modus.exe test/hosted-mutex.lisp`.
+- glass: `test/run-glass-serve.sh WRAPPER 3` passes under Wine (WRAPPER: a
+  shell script that runs `wine64 modus.exe "$@"`): three VNC clients at once,
+  every pixel checked.  The desk (`glass/demo/desk.sh` with `MODUS=WRAPPER`)
+  builds its core under Wine and serves; the same `modus.exe` and core run in
+  the guest with `VM_FWD=tcp::5933-:5910` and an `EXTRA_CMD` that turns the
+  firewall off and starts `modus.exe --core desk.core --script desk-run.lisp`
+  with `DESK_ADDRESS=0.0.0.0`; `test/win64/vnc-shot.py 127.0.0.1 5933 OUT.png
+  [--click X Y]` then shows the desk, and a click opens its root menu.
 - JIT and collector together, at the default heap: a JIT-compiled churn past the
   896 MB semispace returns the same value with 6 collections on both platforms.
   (A 16 MB semispace with the JIT overflows the stack inside a collection on
@@ -153,12 +221,9 @@ overlay over `/usr` works), copy `zlib1.dll` into `x86_64-windows`, and run
 ## Next
 
 1. Directory listing (`%sys-getdents64`: FindFirstFile/FindNextFile), so
-   `directory` works; and drive letters in the rest of the pathname layer
-   (`pathname-device`).
-2. Threads.  Needs a per-thread window Windows allows, and **it cannot be the
-   FS base**: `test/win64/probe/fsbase.asm` measured that on Windows Server 2022
-   `WRFSBASE` executes and `fs:` loads use the new base, but the first context
-   switch (a `Sleep(1)`) loses it.  Under Wine it survives, so Wine cannot
-   answer this.  The design is a TEB TLS slot (`gs:[0x1480 + 8*i]`) holding the
-   window base, loaded into a scratch register at each window access: a
-   translator change at every site that now emits the FS prefix.
+   `directory` works -- and with it Quicklisp's local-projects scan; and drive
+   letters in the rest of the pathname layer (`pathname-device`).
+2. Stack overflow as STACK-EXHAUSTED: a guard page on each Lisp stack and a
+   handler stack Windows can dispatch on.
+3. Size: the window accesses cost ~7.6 MB of native code.  Keeping the base in
+   a register across a function would recover most of it.

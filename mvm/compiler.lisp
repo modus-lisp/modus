@@ -7622,9 +7622,39 @@
                  ;; package, exactly where its DEFSTRUCT/DEFCLASS setter went.
                  ;; Ordered MODUS.MVM-first so the HOST build is unchanged (and
                  ;; so SBCL is never asked to intern into its locked CL package).
+                 ;;
+                 ;; AND ONLY WHEN NO (SETF NAME) IS DEFINED BY THEN.  The
+                 ;; registry clause above sees the setf functions defined at
+                 ;; COMPILE time; a use compiled first and its setter defined
+                 ;; after (a file of accessors loaded after the file that uses
+                 ;; them -- cortez's REMPROP and its C...R setters) was bound to
+                 ;; SET-<NAME> for good, and signalled it undefined while
+                 ;; (SETF NAME) stood.  SBCL calls #'(SETF NAME) as of the
+                 ;; call.  So under runtime EVAL the choice is made when the
+                 ;; form runs: the setter a (DEFUN (SETF NAME) ...) registered
+                 ;; by then -- new value first, CLHS 5.1.2.9 -- else SET-<NAME>
+                 ;; exactly as before, which is what Modus's own SET-* helpers
+                 ;; are reached by.  Asked of the registry the clause above
+                 ;; asks, not of FBOUNDP: FBOUNDP of (SETF FDEFINITION) answers
+                 ;; T through the image's SET-FDEFINITION, whose arguments come
+                 ;; value-LAST, and calling it value-first broke SETF of
+                 ;; FDEFINITION and MACRO-FUNCTION (FDEFINITION.4, MACRO-
+                 ;; FUNCTION.8).  Subforms evaluated once, left to right, then
+                 ;; the value.
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
                                        (%setter-pkg (car place)))))
-                   `(,setter ,@(cdr place) ,value)))))))))
+                   (if *mvm-eval-runtime-p*
+                       (let ((gargs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "SFA"))
+                                            (cdr place)))
+                             (gval (%mvm-gensym "SFV"))
+                             (gfn (%mvm-gensym "SFF")))
+                         `(let* (,@(mapcar #'list gargs (cdr place))
+                                 (,gval ,value)
+                                 (,gfn (%find-setf-function ',(car place))))
+                            (if ,gfn
+                                (funcall ,gfn ,gval ,@gargs)
+                                (,setter ,@gargs ,gval))))
+                       `(,setter ,@(cdr place) ,value))))))))))
 
   ;; DEFSETF — register a setf expander.
   ;;   Short form:  (defsetf accessor setter-fn [doc])

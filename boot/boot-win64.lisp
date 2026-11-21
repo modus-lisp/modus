@@ -73,7 +73,11 @@
      "GetCommandLineA" "GetEnvironmentStringsA" "GetLastError"
      "CreateFileA" "CloseHandle" "SetFilePointerEx" "GetFileSizeEx"
      "GetFileAttributesA" "GetFileAttributesExA" "DeleteFileA" "MoveFileExA"
-     "CreateDirectoryA" "RemoveDirectoryA" "GetCurrentDirectoryA"))
+     "CreateDirectoryA" "RemoveDirectoryA" "GetCurrentDirectoryA")
+    ("WS2_32.dll"
+     "WSAStartup" "WSAGetLastError" "socket" "bind" "listen" "accept" "connect"
+     "getsockname" "getpeername" "setsockopt" "getsockopt" "send" "recv"
+     "sendto" "recvfrom" "closesocket" "shutdown" "ioctlsocket" "WSAPoll"))
   "The functions the image imports, by DLL.  The IAT holds each DLL's slots in
    this order followed by a NULL terminator slot, DLL after DLL.  The shim calls
    them by name; the Windows runtime calls them by slot (+W32-NAME+, a syscall
@@ -127,7 +131,7 @@
     (:jmp 5)
     (:jcc 6)
     (:call-iat 6)
-    ((:rip-load :rip-store) 7)
+    ((:rip-load :rip-store :rip-lea) 7)
     (:align (let ((n (second item))) (mod (- n (mod pos n)) n)))))
 
 (defun w64-assemble (items)
@@ -160,8 +164,8 @@
                           (+ p 4)))
               ;; (:rip-load REG LABEL) / (:rip-store REG LABEL): mov REG,[rip+LABEL]
               ;; / mov [rip+LABEL],REG, for REG 0..7 (rax..rdi).
-              ((:rip-load :rip-store)
-               (put #x48) (put (if (eq (first it) :rip-load) #x8B #x89))
+              ((:rip-load :rip-store :rip-lea)
+               (put #x48) (put (ecase (first it) (:rip-load #x8B) (:rip-store #x89) (:rip-lea #x8D)))
                (put (logior #x05 (ash (second it) 3)))
                (put-rel32 (target (third it)) (+ p 4))))))
         (values out label-alist)))))
@@ -203,9 +207,224 @@
     (:call-iat "WriteFile")
     (:bytes #x48 #x8B #x45 #xC8)))                  ; mov rax,[rbp-56]
 
+(defparameter *win64-wsa-errno*
+  '((10004 . 4) (10009 . 9) (10013 . 13) (10014 . 14) (10022 . 22) (10024 . 24)
+    (10035 . 11) (10036 . 115) (10037 . 114) (10038 . 88) (10039 . 89) (10040 . 90)
+    (10041 . 91) (10042 . 92) (10043 . 93) (10045 . 95) (10047 . 97) (10048 . 98)
+    (10049 . 99) (10050 . 100) (10051 . 101) (10052 . 102) (10053 . 103)
+    (10054 . 104) (10055 . 105) (10056 . 106) (10057 . 107) (10058 . 108)
+    (10060 . 110) (10061 . 111) (10064 . 112) (10065 . 113))
+  "Winsock error -> Linux errno.  Anything else is EIO.")
+
+(defparameter *win64-sol-socket-options*
+  '((2 . 4) (9 . 8) (8 . #x1002) (7 . #x1001) (6 . #x20) (13 . #x80)
+    (4 . #x1007) (3 . #x1008) (15 . 4))
+  "SOL_SOCKET option, Linux -> Windows: REUSEADDR, KEEPALIVE, RCVBUF, SNDBUF,
+   BROADCAST, LINGER, ERROR, TYPE; REUSEPORT is taken as REUSEADDR.")
+
+(defun w64-args-items (n)
+  "Load the first N Linux arguments into the Win64 argument places."
+  (subseq '((:bytes #x48 #x8B #x4D #xF8)            ; mov rcx,[rbp-8]
+            (:bytes #x48 #x8B #x55 #xF0)            ; mov rdx,[rbp-16]
+            (:bytes #x4C #x8B #x45 #xE8)            ; mov r8,[rbp-24]
+            (:bytes #x4C #x8B #x4D #xE0)            ; mov r9,[rbp-32]
+            (:bytes #x4C #x8B #x55 #xD8 #x4C #x89 #x54 #x24 #x20)  ; [rsp+20] = arg5
+            (:bytes #x4C #x8B #x55 #xD0 #x4C #x89 #x54 #x24 #x28)) ; [rsp+28] = arg6
+          0 n))
+
+(defun win64-socket-items ()
+  "Winsock behind the Linux socket syscalls.  sockaddr_in and sockaddr_un are
+   laid out alike on both, so most calls pass straight through; option levels
+   and names, pollfd and the error numbers are translated.  An int result of -1
+   (or INVALID_SOCKET) goes to :WSA-FAIL, which answers -errno."
+  `(;; socket(domain, type, protocol).  The type's SOCK_NONBLOCK (0x800) and
+    ;; SOCK_CLOEXEC bits are not Windows'; NONBLOCK becomes FIONBIO.
+    (:label :h-socket)
+    (:bytes #x48 #x8B #x4D #xF8)                   ; mov rcx,[rbp-8]  domain
+    (:bytes #x8B #x55 #xF0 #x83 #xE2 #x0F)         ; mov edx,[rbp-16]; and edx,15
+    (:bytes #x4C #x8B #x45 #xE8)                   ; mov r8,[rbp-24]  protocol
+    (:call-iat "socket")
+    (:bytes #x48 #x83 #xF8 #xFF)                   ; cmp rax,-1
+    (:jcc 4 :wsa-fail)
+    (:bytes #x48 #x89 #x44 #x24 #x38)              ; mov [rsp+0x38],rax
+    (:bytes #x8B #x45 #xF0 #xA9 0 8 0 0)           ; mov eax,[rbp-16]; test eax,0x800
+    (:jcc 4 :s-done)
+    (:bytes #x48 #x8B #x4C #x24 #x38)              ; mov rcx,[rsp+0x38]
+    (:bytes #xBA #x7E #x66 #x04 #x80)              ; mov edx,FIONBIO
+    (:bytes #xC7 #x44 #x24 #x30 1 0 0 0)           ; mov dword [rsp+0x30],1
+    (:bytes #x4C #x8D #x44 #x24 #x30)              ; lea r8,[rsp+0x30]
+    (:call-iat "ioctlsocket")
+    (:label :s-done)
+    (:bytes #x48 #x8B #x44 #x24 #x38)              ; mov rax,[rsp+0x38]
+    (:jmp :done)
+
+    ;; Three-argument int calls, as Linux has them.
+    ,@(loop for (lbl . fn) in '((:h-bind . "bind") (:h-connect . "connect")
+                                (:h-getsockname . "getsockname")
+                                (:h-getpeername . "getpeername"))
+            append `((:label ,lbl) ,@(w64-args-items 3) (:call-iat ,fn) (:jmp :ws-int)))
+    ,@(loop for (lbl . fn) in '((:h-listen . "listen") (:h-shutdown . "shutdown"))
+            append `((:label ,lbl) ,@(w64-args-items 2) (:call-iat ,fn) (:jmp :ws-int)))
+    ;; accept / accept4 (the flags are dropped): a SOCKET.
+    (:label :h-accept)
+    ,@(w64-args-items 3)
+    (:call-iat "accept")
+    (:bytes #x48 #x83 #xF8 #xFF)                   ; cmp rax,-1
+    (:jcc 4 :wsa-fail)
+    (:jmp :done)
+    ;; sendto / recvfrom: six arguments; only MSG_OOB/PEEK/DONTROUTE (1 2 4)
+    ;; mean the same on both, so the rest of the flags (MSG_NOSIGNAL ...) go.
+    ,@(loop for (lbl . fn) in '((:h-sendto . "sendto") (:h-recvfrom . "recvfrom"))
+            append `((:label ,lbl) ,@(w64-args-items 6)
+                     (:bytes #x41 #x83 #xE1 #x07)  ; and r9d,7
+                     (:call-iat ,fn) (:jmp :ws-int)))
+    ;; setsockopt / getsockopt: SOL_SOCKET is 0xFFFF and its option names differ.
+    ,@(loop for (lbl . fn) in '((:h-setsockopt . "setsockopt") (:h-getsockopt . "getsockopt"))
+            for go = (if (string= fn "setsockopt") :so-set :so-get)
+            append `((:label ,lbl) ,@(w64-args-items 5)
+                     (:bytes #x83 #xFA #x01)       ; cmp edx,1
+                     (:jcc 5 ,go)
+                     (:bytes #xBA #xFF #xFF 0 0)   ; mov edx,0xFFFF
+                     ,@(loop for (lin . win) in *win64-sol-socket-options*
+                             for next = (gensym "SO")
+                             append `((:bytes #x41 #x83 #xF8 ,lin)        ; cmp r8d,LIN
+                                      (:jcc 5 ,next)
+                                      (:bytes #x41 #xB8 ,@(w64-le32 win))  ; mov r8d,WIN
+                                      (:jmp ,go)
+                                      (:label ,next)))
+                     (:label ,go)
+                     (:call-iat ,fn) (:jmp :ws-int)))
+    ;; fcntl(fd, cmd, arg): F_SETFL's O_NONBLOCK becomes FIONBIO; F_GETFL says
+    ;; O_RDWR; the rest (FD_CLOEXEC ...) succeed and do nothing.  On a file the
+    ;; ioctl fails with WSAENOTSOCK, which is fine: files do not block here.
+    (:label :h-fcntl)
+    (:bytes #x8B #x45 #xF0)                        ; mov eax,[rbp-16]  cmd
+    (:bytes #x83 #xF8 #x03)                        ; cmp eax,3  F_GETFL
+    (:jcc 5 :f-set)
+    (:bytes #xB8 2 0 0 0)                          ; mov eax,2  O_RDWR
+    (:jmp :done)
+    (:label :f-set)
+    (:bytes #x83 #xF8 #x04)                        ; cmp eax,4  F_SETFL
+    (:jcc 5 :h-zero)
+    (:bytes #x8B #x45 #xE8 #xC1 #xE8 #x0B #x83 #xE0 #x01) ; mov eax,[rbp-24]; shr eax,11; and eax,1
+    (:bytes #x89 #x44 #x24 #x30)                   ; mov [rsp+0x30],eax
+    (:bytes #x48 #x8B #x4D #xF8)                   ; mov rcx,[rbp-8]
+    (:bytes #xBA #x7E #x66 #x04 #x80)              ; mov edx,FIONBIO
+    (:bytes #x4C #x8D #x44 #x24 #x30)              ; lea r8,[rsp+0x30]
+    (:call-iat "ioctlsocket")
+    (:jmp :h-zero)
+    ;; ioctl(fd, req, argp): FIONREAD (0x541B); anything else (SIOCOUTQ ...)
+    ;; answers 0 in *argp.
+    (:label :h-ioctl)
+    (:bytes #x8B #x45 #xF0)                        ; mov eax,[rbp-16]
+    (:bytes #x3D #x1B #x54 0 0)                    ; cmp eax,0x541B
+    (:jcc 5 :i-zero)
+    (:bytes #x48 #x8B #x4D #xF8)                   ; mov rcx,[rbp-8]
+    (:bytes #xBA #x7F #x66 #x04 #x40)              ; mov edx,FIONREAD
+    (:bytes #x4C #x8B #x45 #xE8)                   ; mov r8,[rbp-24]
+    (:call-iat "ioctlsocket")
+    (:jmp :ws-int)
+    (:label :i-zero)
+    (:bytes #x48 #x8B #x4D #xE8 #xC7 #x01 0 0 0 0) ; mov rcx,[rbp-24]; mov dword [rcx],0
+    (:jmp :h-zero)
+
+    ;; poll(fds, n, timeout): Linux pollfd {int fd; short events, revents} to
+    ;; WSAPOLLFD {SOCKET fd; short events, revents} in a buffer on the shim's
+    ;; stack, and back.  POLLIN 1 <-> POLLRDNORM|POLLRDBAND 0x300, POLLOUT 4 <->
+    ;; POLLWRNORM 0x10; ERR 1->8, HUP 2->16, NVAL 4->32.  The console fds (0-2)
+    ;; are not sockets: WSAPoll skips them (fd -1) and they report ready for
+    ;; what was asked, so LISTEN on a console never blocks the answer.
+    (:label :h-poll)
+    (:bytes #x48 #x8B #x45 #xF0 #x48 #x83 #xF8 #x40) ; mov rax,[rbp-16]; cmp rax,64
+    (:jcc 7 :h-einval)                             ; ja: more than the buffer holds
+    (:bytes #x48 #x81 #xEC #x20 #x04 0 0)          ; sub rsp,0x420
+    (:bytes #x4C #x8B #x55 #xF8)                   ; mov r10,[rbp-8]   src
+    (:bytes #x4C #x8D #x5C #x24 #x20)              ; lea r11,[rsp+0x20] dst
+    (:bytes #x48 #x8B #x4D #xF0)                   ; mov rcx,[rbp-16]  n
+    (:bytes #x45 #x31 #xC9)                        ; xor r9d,r9d       sockets seen
+    (:label :pi-loop)
+    (:bytes #x48 #x85 #xC9) (:jcc 4 :pi-done)      ; test rcx,rcx; jz
+    (:bytes #x49 #x63 #x02)                        ; movsxd rax,[r10]
+    (:bytes #x48 #x83 #xF8 #x02) (:jcc #xF :pi-sock) ; cmp rax,2; jg
+    (:bytes #x48 #xC7 #xC0 #xFF #xFF #xFF #xFF)    ; mov rax,-1  (WSAPoll skips it)
+    (:bytes #x49 #xFF #xC9)                        ; dec r9  (undone below)
+    (:label :pi-sock)
+    (:bytes #x49 #xFF #xC1)                        ; inc r9
+    (:bytes #x49 #x89 #x03)                        ; mov [r11],rax
+    (:bytes #x41 #x0F #xB7 #x42 #x04 #x31 #xD2)    ; movzx eax,word [r10+4]; xor edx,edx
+    (:bytes #xA8 #x01) (:jcc 4 :pi-noin)           ; test al,1
+    (:bytes #x81 #xCA 0 3 0 0)                     ; or edx,0x300
+    (:label :pi-noin)
+    (:bytes #xA8 #x04) (:jcc 4 :pi-noout)          ; test al,4
+    (:bytes #x83 #xCA #x10)                        ; or edx,0x10
+    (:label :pi-noout)
+    (:bytes #x66 #x41 #x89 #x53 #x08)              ; mov [r11+8],dx
+    (:bytes #x66 #x41 #xC7 #x43 #x0A 0 0)          ; mov word [r11+10],0
+    (:bytes #x66 #x41 #xC7 #x42 #x06 0 0)          ; mov word [r10+6],0
+    (:bytes #x49 #x83 #xC2 #x08 #x49 #x83 #xC3 #x10 #x48 #xFF #xC9) ; src+=8 dst+=16 n--
+    (:jmp :pi-loop)
+    (:label :pi-done)
+    (:bytes #x31 #xC0)                             ; xor eax,eax  (no sockets: 0 ready)
+    (:bytes #x4D #x85 #xC9) (:jcc 4 :po-start)     ; test r9,r9; jz: nothing for WSAPoll
+    (:bytes #x48 #x8D #x4C #x24 #x20)              ; lea rcx,[rsp+0x20]
+    (:bytes #x8B #x55 #xF0 #x44 #x8B #x45 #xE8)    ; mov edx,[rbp-16]; mov r8d,[rbp-24]
+    (:call-iat "WSAPoll")
+    (:bytes #x83 #xF8 #xFF) (:jcc 4 :wsa-fail)     ; cmp eax,-1
+    (:label :po-start)
+    (:bytes #x4C #x8B #x55 #xF8 #x4C #x8D #x5C #x24 #x20 #x48 #x8B #x4D #xF0) ; src, dst, n again
+    (:bytes #x45 #x31 #xC9)                        ; xor r9d,r9d  ready count
+    (:label :po-loop)
+    (:bytes #x48 #x85 #xC9) (:jcc 4 :po-done)
+    (:bytes #x31 #xD2)                             ; xor edx,edx
+    (:bytes #x49 #x63 #x02 #x48 #x83 #xF8 #x02) (:jcc #xF :po-sock) ; movsxd rax,[r10]; cmp rax,2; jg
+    (:bytes #x41 #x0F #xB7 #x52 #x04 #x83 #xE2 #x05) ; movzx edx,word [r10+4]; and edx,5
+    (:jmp :po-store)
+    (:label :po-sock)
+    (:bytes #x41 #x0F #xB7 #x43 #x0A)              ; movzx eax,word [r11+10]
+    ,@(loop for (bits . lin) in '((#x300 . 1) (#x10 . 4) (1 . 8) (2 . 16) (4 . 32))
+            for skip = (gensym "PO")
+            append `((:bytes #xA9 ,@(w64-le32 bits)) (:jcc 4 ,skip)   ; test eax,BITS
+                     (:bytes #x83 #xCA ,lin)                          ; or edx,LIN
+                     (:label ,skip)))
+    (:label :po-store)
+    (:bytes #x66 #x41 #x89 #x52 #x06)              ; mov [r10+6],dx
+    (:bytes #x85 #xD2) (:jcc 4 :po-next)           ; test edx,edx
+    (:bytes #x49 #xFF #xC1)                        ; inc r9
+    (:label :po-next)
+    (:bytes #x49 #x83 #xC2 #x08 #x49 #x83 #xC3 #x10 #x48 #xFF #xC9)
+    (:jmp :po-loop)
+    (:label :po-done)
+    (:bytes #x4C #x89 #xC8)                        ; mov rax,r9
+    (:jmp :done)
+
+    ;; Common tails.  :WS-INT: an int result, -1 = failure.
+    (:label :ws-int)
+    (:bytes #x83 #xF8 #xFF) (:jcc 4 :wsa-fail)     ; cmp eax,-1
+    (:bytes #x48 #x63 #xC0)                        ; movsxd rax,eax
+    (:jmp :done)
+    (:label :wsa-fail)
+    (:call-iat "WSAGetLastError")
+    (:label :wsa-map)                              ; eax = Winsock error
+    (:rip-lea 1 :wsa-table)                        ; lea rcx,[rip+table]
+    (:label :wm-loop)
+    (:bytes #x8B #x11 #x85 #xD2) (:jcc 4 :h-eio)   ; mov edx,[rcx]; test edx,edx; jz
+    (:bytes #x39 #xC2) (:jcc 4 :wm-hit)            ; cmp edx,eax
+    (:bytes #x48 #x83 #xC1 #x08) (:jmp :wm-loop)   ; add rcx,8
+    (:label :wm-hit)
+    (:bytes #x8B #x41 #x04 #x48 #xF7 #xD8)         ; mov eax,[rcx+4]; neg rax
+    (:jmp :done)
+    (:label :wsa-table)
+    (:bytes ,@(loop for (w . e) in *win64-wsa-errno* append (append (w64-le32 w) (w64-le32 e)))
+            0 0 0 0 0 0 0 0)))
+
 (defun win64-shim-items ()
   (let ((dispatch '((0 . :h-read) (1 . :h-write) (3 . :h-close) (8 . :h-lseek)
                     (9 . :h-mmap) (11 . :h-munmap) (79 . :h-getcwd)
+                    (41 . :h-socket) (42 . :h-connect) (43 . :h-accept) (288 . :h-accept)
+                    (44 . :h-sendto) (45 . :h-recvfrom) (48 . :h-shutdown) (49 . :h-bind)
+                    (50 . :h-listen) (51 . :h-getsockname) (52 . :h-getpeername)
+                    (54 . :h-setsockopt) (55 . :h-getsockopt) (7 . :h-poll)
+                    (72 . :h-fcntl) (16 . :h-ioctl)
                     (13 . :h-zero) (14 . :h-zero) (35 . :h-nanosleep)
                     (39 . :h-getpid) (60 . :h-exit) (228 . :h-clock)
                     (231 . :h-exit))))
@@ -240,16 +459,28 @@
       (:bytes #x41 #xFF #x14 #xC3)                 ; call [r11+rax*8]
       (:jmp :done)
 
-      ;; read(fd, buf, count): fd 0 is stdin; any other fd is a file handle (the
-      ;; Windows %SYS-OPEN-* return the HANDLE as the fd).  A failed ReadFile
-      ;; reads as end-of-file (0 bytes).
+      ;; read(fd, buf, count): fd 0 is stdin; any other fd is a SOCKET (recv) or,
+      ;; when recv says WSAENOTSOCK, a file HANDLE (the Windows %SYS-OPEN-*
+      ;; return the HANDLE as the fd).  A failed ReadFile reads as end-of-file.
       (:label :h-read)
       (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]
       (:bytes #x48 #x85 #xC9)                      ; test rcx,rcx
-      (:jcc 5 :r-go)                               ; jnz: any other fd is a file handle
+      (:jcc 5 :r-sock)                             ; jnz: a socket or a file handle
       (:bytes #xB9 ,@(w64-le32 -10))               ; mov ecx,STD_INPUT_HANDLE
       (:call-iat "GetStdHandle")
       (:bytes #x48 #x89 #xC1)                      ; mov rcx,rax
+      (:jmp :r-go)
+      (:label :r-sock)
+      (:bytes #x48 #x8B #x55 #xF0)                 ; mov rdx,[rbp-16]  buf
+      (:bytes #x4C #x8B #x45 #xE8)                 ; mov r8,[rbp-24]   count
+      (:bytes #x45 #x31 #xC9)                      ; xor r9d,r9d       flags
+      (:call-iat "recv")
+      (:bytes #x83 #xF8 #xFF)                      ; cmp eax,-1
+      (:jcc 5 :ws-int)                             ; jne: it was a socket
+      (:call-iat "WSAGetLastError")
+      (:bytes #x3D #x36 #x27 #x00 #x00)            ; cmp eax,WSAENOTSOCK
+      (:jcc 5 :wsa-map)                            ; jne: a socket error
+      (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]   a file: handle
       (:label :r-go)
       (:bytes #x48 #x8B #x55 #xF0)                 ; mov rdx,[rbp-16]  buf
       (:bytes #x4C #x8B #x45 #xE8)                 ; mov r8,[rbp-24]   count
@@ -267,7 +498,7 @@
       (:bytes #x48 #x83 #xF9 #x01)                 ; cmp rcx,1
       (:jcc 4 :w-out)                              ; je
       (:bytes #x48 #x83 #xF9 #x02)                 ; cmp rcx,2
-      (:jcc 5 :w-go)                               ; jne: any other fd is a file handle
+      (:jcc 5 :w-sock)                             ; jne: a socket or a file handle
       (:bytes #xB9 ,@(w64-le32 -12))               ; mov ecx,STD_ERROR_HANDLE
       (:jmp :w-std)
       (:label :w-out)
@@ -275,6 +506,18 @@
       (:label :w-std)
       (:call-iat "GetStdHandle")
       (:bytes #x48 #x89 #xC1)                      ; mov rcx,rax
+      (:jmp :w-go)
+      (:label :w-sock)
+      (:bytes #x48 #x8B #x55 #xF0)                 ; mov rdx,[rbp-16]  buf
+      (:bytes #x4C #x8B #x45 #xE8)                 ; mov r8,[rbp-24]   count
+      (:bytes #x45 #x31 #xC9)                      ; xor r9d,r9d       flags
+      (:call-iat "send")
+      (:bytes #x83 #xF8 #xFF)                      ; cmp eax,-1
+      (:jcc 5 :ws-int)                             ; jne: it was a socket
+      (:call-iat "WSAGetLastError")
+      (:bytes #x3D #x36 #x27 #x00 #x00)            ; cmp eax,WSAENOTSOCK
+      (:jcc 5 :wsa-map)                            ; jne: a socket error
+      (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]   a file: handle
       (:label :w-go)
       (:bytes #x48 #x8B #x55 #xF0)                 ; mov rdx,[rbp-16]  buf
       (:bytes #x4C #x8B #x45 #xE8)                 ; mov r8,[rbp-24]   count
@@ -332,11 +575,19 @@
       (:jcc 4 :h-enomem)                           ; je
       (:jmp :done)
 
-;; close(fd): CloseHandle; the standard fds are left open.
+;; close(fd): closesocket, else (WSAENOTSOCK) CloseHandle; the standard fds
+      ;; are left open.
       (:label :h-close)
       (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]
       (:bytes #x48 #x83 #xF9 #x02)                 ; cmp rcx,2
       (:jcc 6 :h-zero)                             ; jbe: 0, 1, 2
+      (:call-iat "closesocket")
+      (:bytes #x85 #xC0)                           ; test eax,eax
+      (:jcc 4 :h-zero)                             ; je: it was a socket
+      (:call-iat "WSAGetLastError")
+      (:bytes #x3D #x36 #x27 #x00 #x00)            ; cmp eax,WSAENOTSOCK
+      (:jcc 5 :wsa-map)                            ; jne
+      (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]   a file
       (:call-iat "CloseHandle")
       (:bytes #x85 #xC0)                           ; test eax,eax
       (:jcc 4 :h-ebadf)                            ; je -> failure
@@ -446,6 +697,8 @@
       (:bytes #x31 #xC0)                           ; xor eax,eax
       (:jmp :done)
 
+      ,@(win64-socket-items)
+
       (:label :h-enomem)
       (:bytes #x48 #xC7 #xC0 ,@(w64-le32 -12))     ; mov rax,-ENOMEM
       (:jmp :done)
@@ -502,6 +755,12 @@
     ;; runtime's exec-page trap falls back to mmap).  Mapped with the JIT off
     ;; too, so the startup state is the Linux image's.
     (:bytes #x48 #x89 #xC5)                              ; mov rbp,rax  (heap base)
+    ;; Winsock, once: WSAStartup(2.2, &WSADATA) with the 408-byte WSADATA here.
+    (:bytes #x48 #x81 #xEC #xC0 #x01 0 0)                ; sub rsp,0x1C0
+    (:bytes #xB9 #x02 #x02 0 0)                          ; mov ecx,0x202
+    (:bytes #x48 #x8D #x54 #x24 #x20)                    ; lea rdx,[rsp+0x20]
+    (:call-iat "WSAStartup")
+    (:bytes #x48 #x81 #xC4 #xC0 #x01 0 0)                ; add rsp,0x1C0
     (:bytes #x48 #xB9 ,@(w64-le64 +linux-x64-jit-arena-base+)) ; mov rcx,arena base
     (:bytes #xBA ,@(w64-le32 +linux-x64-jit-arena-size+))  ; mov edx,arena size
     (:bytes #x41 #xB8 #x00 #x30 #x00 #x00)               ; mov r8d,MEM_RESERVE|MEM_COMMIT

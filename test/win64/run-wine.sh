@@ -66,6 +66,10 @@ expect "jit redefinition" '(defun jg () 1)
 (defun jg () 2)
 (list :redef (jh))' '(REDEF 2)'
 
+# Sockets: a loopback listener, connect, accept, send, receive, close -- one
+# thread, so the connect completes through the backlog.  Same answer as Linux.
+expect "socket loopback" '(let* ((l (modus-int::socket-listen 0 4)) (port (modus-int::socket-local-port l)) (c (modus-int::socket-connect 2130706433 port t)) (a (modus-int::socket-accept l)) (out (make-array 5 :element-type (quote (unsigned-byte 8)) :initial-contents (quote (104 101 108 108 111)))) (in (make-array 5 :element-type (quote (unsigned-byte 8))))) (modus-int::socket-send c out 5) (list :sock (> port 0) (modus-int::socket-recv a in 5) (map (quote string) (function code-char) in) (modus-int::socket-close a) (modus-int::socket-close c) (modus-int::socket-close l)))' '(SOCK T 5 "hello" 0 0 0)'
+
 # Files, through relative paths in a scratch directory.
 scratch=$(mktemp -d) || exit 1
 exe_abs=$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")

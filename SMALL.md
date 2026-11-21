@@ -187,42 +187,14 @@ Validated: hosted ladder 35/35 + h01 under tags3, `validate.sh` and the poison
 build identical to the references, core image included.  x64 and i386 ladder
 images byte-identical to before.
 
-## A REPL on a 1.44 MB floppy
+## A REPL on a 1.44 MB floppy (retired)
 
-The core image above, compressed, is 1.57 MB (xz -9e).  On one 1.44 MB disk
-(1,457,664 bytes under FAT12) it is 1,457,039 bytes, self-unpacking:
-
-    # 1. trim (EXPERIMENTAL, post-link): what a core image never runs again
-    qemu-m68k-static -d in_asm -D LOG IMAGE ...   # over a representative workload
-    grep -oE '^0x[0-9a-f]+' LOG | sort -u > EXEC
-    scripts/68k-floppy-trim.py IMAGE SYMMAP EXEC TRIMMED
-    # 2. the loader: LZMA1 decoder in Lisp, no runtime (a ladder rung's build)
-    MODUS_68K_LINUX_OUT=unlzma sbcl --script mvm/build-hosted.lisp 68k \
-        mvm/68k-unlzma.lisp mvm/unlzma-core.lisp
-    # 3. pack (--test: the image writes the unpacked bytes to stdout instead)
-    scripts/68k-floppy-pack.py unlzma TRIMMED FLOPPY
-
-- **The trim** blanks boot-only code (~300 KB: init, table fillers, the
-  x64/aarch64 JIT runtime) and zeroes the packed name tables (256 KB): xz 1.57
-  -> 1.456 MB.  The shim sources stay -- they are evaluated at first use.
-  It is a post-link hack; the real version is a build-time shake from the
-  core-boot path (see the script's header for the two traps it hit).
-- **The loader** (`mvm/68k-unlzma.lisp`, the Linux head, + `mvm/unlzma-core.lisp`,
-  the decoder; 13.6 KB) is LzmaSpec.cpp in fixnum
-  Lisp: the range coder's 32-bit values are 16-bit halves, the arithmetic the
-  raw `%FIXNUM-` ops on declared fixnums, so there are no overflow checks and
-  nothing to link (generic arithmetic made it 40 KB).  7.46 MB unpacks in
-  ~4 s under qemu; on a 68040, minutes.
-- **The copier** (`scripts/68k-floppy-copier.s`, 88 bytes) maps each segment
-  fresh, copies it in, restores the stack the process started with (the boot
-  stub's saved `stack_base`, `#x10000058`) and jumps to the image's entry --
-  reached from Lisp by `%JIT-CALL` (trap `#x0532`, now on 68k).
-- **The pack** is a raw LZMA1 stream, `lc=2 lp=1 pb=2` (best for 68k code,
-  1,443,186 vs xz's 1,456,180), mapped with the whole file from offset 0 so
-  the payload needs no page padding (its offset is in `e_ident[12..15]`).
-
-Validated: `validate.sh` and DESCRIBE / APROPOS / DOCUMENTATION / COMPILE
-probes identical to the untrimmed image.  The margin is 625 bytes.
+The first floppy (2026-11-11): the hosted Linux/68k core image, trimmed after
+linking and packed behind a self-unpacking LZMA loader written in fixnum Lisp,
+1,457,039 bytes on a 1.44 MB disk.  Its tools (`68k-floppy-trim.py`,
+`68k-floppy-pack.py`, `68k-floppy-copier.s`, `mvm/68k-unlzma.lisp`,
+`mvm/unlzma-core.lisp`) were removed on 2026-11-21, unused since the Mac boot
+floppy below took over; `git show f25d49bd` has them.
 
 ## The same, as a Mac boot floppy
 
@@ -238,9 +210,9 @@ message.  NOT measured: a swap in ONE drive -- headless Basilisk cannot insert
 a disk after boot.
 
 A bare-Mac image (`mvm/build-mac68k-cl-repl.lisp`, linked at `#x00100000`)
-goes behind a Mac loader (`scripts/mac68k-unlzma.s`, 68020 assembly since
-2026-11-20; it was this Lisp decoder with a Mac head, ~15 minutes on a real
-68040's clock): the
+goes behind a Mac loader (`scripts/mac68k-unlzma.s`, now vessel's, 68020
+assembly since 2026-11-20; it was the Lisp decoder above with a Mac head, ~15
+minutes on a real 68040's clock): the
 boot blocks read loader + stream to `#x01200000`, the loader unpacks to
 `#x00100000`, pushes the 68040's caches (`CPUSHA BC`: the image was written
 as data) and jumps.  No trim needed: the small REPL image (5,557,396 bytes,

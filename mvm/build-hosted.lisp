@@ -80,8 +80,7 @@
             (let ((*read-base* 10)) (read-from-string la)))))
   (let* ((srcs (cddr sb-ext:*posix-argv*))
          (out (or (sb-ext:posix-getenv out-env) out-default))
-         ;; several source files are one text, in the order given (a floppy
-         ;; loader is its head, then mvm/unlzma-core.lisp)
+         ;; several source files are one text, in the order given
          (text (if srcs
                    (if (cdr srcs)
                        (format nil "~{~A~%~}" (mapcar #'read-file-text srcs))

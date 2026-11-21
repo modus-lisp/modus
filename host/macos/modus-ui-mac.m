@@ -33,6 +33,14 @@ static long fb_w, fb_h;              // the window's content, in pixels, as it i
 static long fb_cap;                  // the surface's side: square, large enough for every screen
 static long fb_stride;               // the surface's row length in pixels (rows are padded)
 static IOSurfaceRef fb_surface;
+// TWO SURFACES: the image draws into fb_surface; the window shows show_surface, which PRESENT brings up to date by
+// copying what changed.  So the window only ever shows finished frames -- a resize's clear, and the repaint after
+// it, drawn in steps, were seen in flashes when it showed the surface being drawn.
+static IOSurfaceRef show_surface;
+static uint32_t *show_fb;
+static long show_stride;
+// What fill and blit have changed since the last present, in pixels: [x0, x1) x [y0, y1); empty when x1 <= x0.
+static long dirty_x0, dirty_y0, dirty_x1, dirty_y1;
 static dispatch_semaphore_t frame_tick;   // signalled by the display link once a refresh
 static dispatch_semaphore_t ui_ready;
 static dispatch_once_t ui_once;
@@ -51,7 +59,12 @@ static CADisplayLink *display_link;
 
 static void queue_event(uint64_t e) {
     os_unfair_lock_lock(&ev_lock);
-    if (ev_tail - ev_head < NEV) events[ev_tail++ % NEV] = e;
+    // A RESIZE REPLACES ONE STILL WAITING: dragging a window's edge sends dozens, and the image would lay itself out
+    // for every size it passed through, behind the drag; the latest is the only one that matters.
+    if ((e >> 40) == 6 && ev_tail != ev_head && (events[(ev_tail - 1) % NEV] >> 40) == 6)
+        events[(ev_tail - 1) % NEV] = e;
+    else if (ev_tail - ev_head < NEV)
+        events[ev_tail++ % NEV] = e;
     os_unfair_lock_unlock(&ev_lock);
 }
 
@@ -175,14 +188,9 @@ static BOOL moving_window;
 @interface ModusAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @end
 
-static void show_part(void) {
-    // The surface is bigger than the window (it has to hold the largest screen), so only the
-    // part the window shows is drawn: contentsRect is that part, in the surface's own units.
-    if (!fb_view) return;
-    fb_view.layer.contentsRect = CGRectMake(0, 0, (CGFloat)fb_w / (CGFloat)fb_cap,
-                                            (CGFloat)fb_h / (CGFloat)fb_cap);
-}
-
+// The surface is bigger than the window (it has to hold the largest screen).  The layer shows it ONE TO ONE from its
+// top left corner (contentsGravity top-left, at the screen's scale) and the window cuts off the rest: so resizing the
+// window shows more or less of the last frame, and never stretches it while the image draws the next one.
 static void set_pixel_size(long w, long h) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
@@ -190,7 +198,6 @@ static void set_pixel_size(long w, long h) {
     if (h > fb_cap) h = fb_cap;
     fb_w = w;
     fb_h = h;
-    show_part();
 }
 
 // How much of the content's top the title bar covers, in pixels: none, unless the content runs under a transparent
@@ -263,10 +270,14 @@ static NSString *app_name(void) {
     v.layer.contentsScale = ui_scale;
     v.layer.opaque = YES;
     v.layer.geometryFlipped = YES;     // row 0 of the surface is the top of the view
-    if (fb_surface) v.layer.contents = (__bridge id)fb_surface;
+    // one to one from the top left, never stretched (set_pixel_size).  BOTTOM-left, as Core Animation names it: the
+    // geometry is flipped, and in a flipped layer its "top" is the bottom of the screen
+    v.layer.contentsGravity = kCAGravityBottomLeft;
+    v.layer.masksToBounds = YES;                   // the window cuts off the rest of the (larger) surface
+    if (show_surface) v.layer.contents = (__bridge id)show_surface;
     fb_view = v;
     window.contentView = v;
-    if (fb_surface) v.layer.contents = (__bridge id)fb_surface;   // again: the view joined a window
+    if (show_surface) v.layer.contents = (__bridge id)show_surface;   // again: the view joined a window
     [window makeFirstResponder:v];
     [window center];
     [window makeKeyAndOrderFront:nil];
@@ -350,6 +361,16 @@ void modus_mac_main(void) {
             fb = calloc((size_t)(fb_cap * fb_cap), 4);
             fb_stride = fb_cap;
         }
+        show_surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        if (show_surface) {
+            show_fb = (uint32_t *)IOSurfaceGetBaseAddress(show_surface);
+            show_stride = (long)IOSurfaceGetBytesPerRow(show_surface) / 4;
+            // opaque black where nothing is drawn yet (a window grown past the last frame): zero is see-through
+            size_t words = IOSurfaceGetAllocSize(show_surface) / 4;
+            for (size_t i = 0; i < words; i++) show_fb[i] = 0xFF000000;
+        }
+        dirty_x0 = dirty_y0 = fb_cap;      // nothing changed yet
+        dirty_x1 = dirty_y1 = 0;
         ModusAppDelegate *delegate = [[ModusAppDelegate alloc] init];
         app.delegate = delegate;
         build_menu();
@@ -368,19 +389,38 @@ static void wait_ui(void) {
     });
 }
 
+// What fill and blit changed, added to the region the next present copies.
+static void mark_dirty(long x, long y, long w, long h) {
+    if (w <= 0 || h <= 0) return;
+    if (x < dirty_x0) dirty_x0 = x;
+    if (y < dirty_y0) dirty_y0 = y;
+    if (x + w > dirty_x1) dirty_x1 = x + w;
+    if (y + h > dirty_y1) dirty_y1 = y + h;
+}
+
 static void present(void) {
+    // THE FRAME IS DONE: what changed since the last one goes into the surface the window shows.  Here, on the
+    // image's thread, which is the one that draws -- so the copy is of a finished frame, never of the next being drawn.
+    if (show_fb && dirty_x1 > dirty_x0 && dirty_y1 > dirty_y0) {
+        IOSurfaceLock(show_surface, 0, NULL);
+        size_t bytes = (size_t)(dirty_x1 - dirty_x0) * 4;
+        for (long y = dirty_y0; y < dirty_y1; y++)
+            memcpy(show_fb + y * show_stride + dirty_x0, fb + y * fb_stride + dirty_x0, bytes);
+        IOSurfaceUnlock(show_surface, 0, NULL);
+    }
+    dirty_x0 = dirty_y0 = fb_cap;
+    dirty_x1 = dirty_y1 = 0;
     if (__atomic_exchange_n(&present_pending, 1, __ATOMIC_ACQ_REL)) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         __atomic_store_n(&present_pending, 0, __ATOMIC_RELEASE);
-        if (!fb_view) return;
+        if (!fb_view || !show_surface) return;
         // Assign the surface afresh: the layer shows what it holds, and assigning the same object
         // again is not a change to Core Animation.  The window can replace the layer when the view
         // joins it, so this is done on the layer that is there now, every time.
         CALayer *l = fb_view.layer;
         [CATransaction begin]; [CATransaction setDisableActions:YES];
         l.contents = nil;
-        l.contents = (__bridge id)fb_surface;
-        l.contentsRect = CGRectMake(0, 0, (CGFloat)fb_w / (CGFloat)fb_cap, (CGFloat)fb_h / (CGFloat)fb_cap);
+        l.contents = (__bridge id)show_surface;
         [CATransaction commit];
     });
 }
@@ -402,6 +442,7 @@ static long fill(long xy, long wh, long rgb) {
         uint32_t *row = fb + (y + j) * fb_stride + x;
         for (long i = 0; i < w; i++) row[i] = c;
     }
+    mark_dirty(x, y, w, h);
     return 0;
 }
 
@@ -415,6 +456,7 @@ static long blit(long src, long wh, long xy, long stride) {
         const uint64_t *in = s + j * (stride > 0 ? stride : w);
         for (long i = 0; i < cw; i++) row[i] = ((uint32_t)(in[i] >> 1) & 0xFFFFFF) | 0xFF000000;
     }
+    mark_dirty(x, y, cw, ch);
     return 0;
 }
 

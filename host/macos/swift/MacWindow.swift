@@ -54,7 +54,7 @@ let windowChrome: Call = { style, _, _, _, _, _ in
         window.isOpaque = true
         window.backgroundColor = .windowBackgroundColor
         content.layer?.cornerRadius = 0
-        content.layer?.masksToBounds = false
+        content.layer?.masksToBounds = true   // always: the window cuts off the rest of the larger surface
         window.titlebarAppearsTransparent = style >= 2
         window.titleVisibility = style >= 1 ? .hidden : .visible
         for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {

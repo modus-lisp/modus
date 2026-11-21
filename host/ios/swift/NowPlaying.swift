@@ -9,6 +9,8 @@
 //   np_times(dur, pos, playing) length and position in milliseconds; 1 playing, 0 paused (the system moves the
 //                               position on while playing); a length of 0 is a live stream (a radio station)
 //   np_artwork(p, n)            the image file at path P ("" removes it)
+//   np_artwork_data(p, n)       the image whose bytes (JPEG or PNG) are at P, N long: a track's own cover, read out
+//                               of the file (0 bytes removes it)
 //   np_clear()                  nothing is playing
 //
 //   events: MEDIA (h "play" | "pause" | "toggle" | "stop" | "next" | "previous"), SEEK (h milliseconds)
@@ -110,6 +112,28 @@ let npArtwork: Call = { p, n, _, _, _, _ in
     return image != nil || path.isEmpty ? 1 : 0
 }
 
+let npArtworkData: Call = { p, n, _, _, _, _ in
+    var ok = true
+    if n > 0, let bytes = UnsafeRawPointer(bitPattern: p) {
+        let data = Data(bytes: bytes, count: Int(n))
+        #if os(iOS)
+        let image = UIImage(data: data)
+        #else
+        let image = NSImage(data: data)
+        #endif
+        if let image {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+        } else {
+            info[MPMediaItemPropertyArtwork] = nil
+            ok = false
+        }
+    } else {
+        info[MPMediaItemPropertyArtwork] = nil
+    }
+    publish()
+    return ok ? 1 : 0
+}
+
 let npClear: Call = { _, _, _, _, _, _ in
     info = [:]
     MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -124,5 +148,6 @@ func installNowPlaying() {
     register("np_text", npText)
     register("np_times", npTimes)
     register("np_artwork", npArtwork)
+    register("np_artwork_data", npArtworkData)
     register("np_clear", npClear)
 }

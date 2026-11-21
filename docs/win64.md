@@ -1,12 +1,14 @@
 # Hosted Windows x86-64 (`modus.exe`)
 
-Written 2026-11-21.  Status: **the REPL, the collector, the runtime JIT and file
-I/O (`load`, `--script`, the FASL cache) work under Wine**; single-threaded; no
-sockets or directory listing yet.
+Written 2026-11-21.  Status: **the REPL, the collector, the runtime JIT, file
+I/O (`load`, `--script`, the FASL cache, drive letters) and IPv4 sockets work,
+under Wine and in a real Windows Server 2022 guest**; single-threaded; no
+directory listing yet.
 
 ```sh
 sbcl --dynamic-space-size 4096 --script mvm/build-win64-cli.lisp   # -> modus.exe
-WINE_RUN="wine64" test/win64/run-wine.sh modus.exe                  # 18 checks
+WINE_RUN="wine64" test/win64/run-wine.sh modus.exe                  # 19 checks, Wine
+test/win64/run-vm.sh win2022.qcow2 modus.exe                        # the same, real Windows
 ```
 
 `modus.exe` is the same image as `./modus` -- same source, same runtime, the
@@ -36,6 +38,14 @@ is a Win32 HANDLE), `close`, `lseek`, `getcwd` (slashes, not backslashes),
 `mmap`/`munmap` (anonymous), `clock_gettime`, `nanosleep`, `getpid`,
 `exit`/`exit_group`; `rt_sigaction` and `rt_sigprocmask` return 0.  Everything
 else returns `-ENOSYS`.
+
+**Sockets.**  The shim answers the Linux socket calls (`socket`, `bind`,
+`listen`, `accept`/`accept4`, `connect`, `getsockname`, `getpeername`,
+`setsockopt`/`getsockopt`, `sendto`/`recvfrom`, `shutdown`, `poll`, `fcntl`
+O_NONBLOCK, `ioctl` FIONREAD) with WS2_32; the prologue calls `WSAStartup`.  A
+SOCKET is the fd, so `read`/`write`/`close` on an fd above 2 try
+`recv`/`send`/`closesocket` first and fall back to the file call on
+`WSAENOTSOCK`.  WSA errors map to Linux errno values; IPv4 only.
 
 **Calling Win32 from Lisp.**  Syscall number `#x1000 + slot` calls the import in
 that IAT slot directly: the six Linux argument registers in Win64 order, a zero
@@ -90,11 +100,24 @@ FS prefix (`%JIT-WINDOW-PREFIX`).
 
 ## Testing
 
-- `test/win64/run-wine.sh EXE`: 18 checks (arithmetic, bignums, printing,
-  allocation churn, the JIT's calling paths, files: write/read, probe/delete,
-  `load`, `--script`, drive-letter paths), after a deliberately wrong
-  expectation that must fail.  The drive-letter checks run for an `.exe` only.  The churn checks only collect on a
-  small-semispace build (`MODUS_X64_MIDPOINT=16777216`).
+- `test/win64/cases.sh` holds the checks (arithmetic, bignums, printing,
+  allocation churn, the JIT's calling paths, a loopback socket, files:
+  write/read, probe/delete, `load`, `--script`, drive-letter paths).  The churn
+  checks only collect on a small-semispace build (`MODUS_X64_MIDPOINT=16777216`).
+- `test/win64/run-wine.sh EXE` runs them under Wine, after a deliberately wrong
+  expectation that must fail.  The drive-letter checks run for an `.exe` only.
+- `test/win64/run-vm.sh BASE.qcow2 EXE` runs them in **real Windows** under KVM:
+  modus.exe, each case's input and a `RUN.CMD` go on a small FAT disk; a
+  boot-time task in the guest runs `RUN.CMD` and powers off; the outputs are
+  read back with mtools and judged on the host.  Each run boots a throwaway
+  overlay, so the base disk stays clean; a run takes under a minute.  The
+  control there is that `(+ 1 2)` answered 3 in the guest and the check rejects
+  4.  2026-11-21: 19/19 on Windows Server 2022 (10.0.20348.587), as under Wine.
+- The base disk: `test/win64/vm-install.sh SERVER_EVAL.iso DISK.qcow2` installs
+  Server 2022 Core unattended from Microsoft's evaluation ISO (180-day licence;
+  ~15 minutes with KVM), no network, using `test/win64/vm/autounattend.xml`.
+  `test/win64/vm-screen.py SOCKET OUT.png` screenshots either script's VM
+  through its QMP socket.
 - Repo tests with `--script`, Windows against a Linux build of the same source
   (2026-11-21): hot-jit, redefine-native-callers, redefine-kernel-callers,
   gc-forced-stress, region-gc, region-gc-roots, region-gc-depth, gc-tenure,
@@ -129,12 +152,13 @@ overlay over `/usr` works), copy `zlib1.dll` into `x86_64-windows`, and run
 
 ## Next
 
-1. Sockets: `WS2_32.dll` imports and Lisp over the call path (an fd per SOCKET,
-   `pollfd` conversion, option and errno maps).
-2. Directory listing (`%sys-getdents64`: FindFirstFile/FindNextFile), so
+1. Directory listing (`%sys-getdents64`: FindFirstFile/FindNextFile), so
    `directory` works; and drive letters in the rest of the pathname layer
    (`pathname-device`).
-3. Threads.  Needs a per-thread window Windows allows: `WRFSBASE` works under
-   Wine on Linux but is unverified on real Windows; a TEB TLS slot holding the
-   window base works everywhere but changes every window access in the
-   translator.
+2. Threads.  Needs a per-thread window Windows allows, and **it cannot be the
+   FS base**: `test/win64/probe/fsbase.asm` measured that on Windows Server 2022
+   `WRFSBASE` executes and `fs:` loads use the new base, but the first context
+   switch (a `Sleep(1)`) loses it.  Under Wine it survives, so Wine cannot
+   answer this.  The design is a TEB TLS slot (`gs:[0x1480 + 8*i]`) holding the
+   window base, loaded into a scratch register at each window access: a
+   translator change at every site that now emits the FS prefix.

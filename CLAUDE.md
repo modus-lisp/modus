@@ -1247,11 +1247,14 @@ sudo dd if=/tmp/modus-usb.img of=/dev/sdX bs=1M status=progress  # write to USB
 ```bash
 sbcl --dynamic-space-size 4096 --script mvm/build-win64-cli.lisp   # -> modus.exe (PE32+)
 WINE_RUN=wine64 test/win64/run-wine.sh modus.exe                    # under Wine
+test/win64/run-vm.sh win2022.qcow2 modus.exe                        # real Windows (KVM)
 ```
 The same image as `./modus`, built by `build-generic-cli.lisp` with `*CLI-WIN64*` (every
 difference is guarded by it; with it off the Linux image is byte-identical).  Linux syscalls go
 through a shim in the boot stub (`boot/boot-win64.lisp`) to kernel32.  REPL, collector and JIT
-work; single-threaded, no files or sockets yet.  **The boot stub is assembled at emit time**: an
+work, and so do files and IPv4 sockets; single-threaded.  `test/win64/run-vm.sh` runs the same checks
+in a real Windows Server 2022 guest (KVM).  **Threads cannot use the FS base on real Windows** (it is
+lost at a context switch; Wine keeps it): test/win64/probe/fsbase.asm.  **The boot stub is assembled at emit time**: an
 early copy baked the default allocation limit and the collector never ran.
 
 ### Pi Zero 2 W (real hardware)

@@ -123,7 +123,36 @@
               (return (subseq a p)))))
         "unknown")))
 
-(defun %image-configuration-record (target)
+(defun %source-hash (text start end)
+  "Two 32-bit FNV-1a lanes over TEXT outside [START, END), as one hex string:
+   the image's whole source, so two builds with one configuration but different
+   code differ here.  The FASL cache keys on it (mvm/fasl.lisp %FASL-BUILD-KEY):
+   a module's function-table indices are this image's, not the next build's."
+  (let ((a 2166136261) (b 3735928559))
+    (declare (type (unsigned-byte 32) a b))
+    (flet ((run (from to)
+             (loop for i from from below to
+                   for k = (char-code (char text i))
+                   do (setf a (logand (* (logxor a k) 16777619) #xFFFFFFFF))
+                      (setf b (logand (* (logxor b (logand (+ k 41) #xFFFF)) 16777619) #xFFFFFFFF)))))
+      ;; and outside the build id: %CORE-BUILD-ID is drawn fresh per build
+      ;; (build-cli-common; MODUS_BUILD_ID pins it), and the cache should be
+      ;; shared by two builds of one source.  It names the binary for a saved
+      ;; core, which must restore under the binary that wrote it; a FASL is
+      ;; portable across them.
+      (let* ((tag "(defun %core-build-id () ")
+             (q (search tag text))
+             (q-end (and q (position #\) text :start (+ q (length tag))))))
+        (if (and q q-end (or (< q-end start) (>= q end)))
+            (let ((cuts (sort (list (cons start end) (cons q (+ q-end 1))) #'< :key #'car)))
+              (run 0 (car (first cuts)))
+              (run (cdr (first cuts)) (car (second cuts)))
+              (run (cdr (second cuts)) (length text)))
+            (progn (run 0 start)
+                   (run end (length text))))))
+    (format nil "~8,'0x~8,'0x" a b)))
+
+(defun %image-configuration-record (target &optional source-hash)
   (let* ((arch (%target-arch target))
          (commit (%image-source-commit))
          (knobs (let ((acc nil))
@@ -148,7 +177,7 @@
                   (nreverse acc))))
     (list :script (%image-build-script) :target (string-upcase (string target))
           :commit (first commit) :uncommitted-changes (second commit)
-          :knobs knobs :flags flags)))
+          :knobs knobs :flags flags :source-hash source-hash)))
 
 ;;; THE PLACEHOLDER.  The assembly appends IMAGE-CONFIGURATION-TEXT before the build
 ;;; script has finished setting knobs and flags; FINALIZE-IMAGE-CONFIGURATION, run by
@@ -168,5 +197,7 @@
         (concatenate 'string (subseq text 0 p) "'"
                      (with-standard-io-syntax
                        (let ((*package* (find-package "COMMON-LISP-USER")) (*print-readably* nil))
-                         (prin1-to-string (%image-configuration-record target))))
+                         (prin1-to-string
+                          (%image-configuration-record
+                           target (%source-hash text p (+ p (length *placeholder*)))))))
                      (subseq text (+ p (length *placeholder*)))))))

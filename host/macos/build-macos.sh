@@ -81,6 +81,7 @@ case $KIND in
   <key>NSMicrophoneUsageDescription</key><string>Listen: the desk hears what you say.</string>
   <key>NSSpeechRecognitionUsageDescription</key><string>Listen: what you say becomes text.</string>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Chat: messages travel to nearby devices over Bluetooth.</string>
+  <key>NSCameraUsageDescription</key><string>Camera: photos and video, taken here.</string>
 </dict>
 </plist>
 PLIST
@@ -104,7 +105,9 @@ if [ "$KIND" = gui ]; then
   swiftc -target arm64-apple-macos14.0 -swift-version 5 -O -wmo -parse-as-library -module-name ModusSwift \
     -import-objc-header "$HERE/swift/bridge.h" -emit-object -o "$OBJS/swift.o" \
     "$HERE/../ios/swift/Term.swift" "$HERE/../ios/swift/GPU.swift" "$HERE/../ios/swift/Speech.swift" \
-    "$HERE/../ios/swift/Bluetooth.swift" "$HERE/../ios/swift/Files.swift" "$HERE"/swift/*.swift
+    "$HERE/../ios/swift/Bluetooth.swift" "$HERE/../ios/swift/Files.swift" "$HERE/../ios/swift/Camera.swift" \
+    "$HERE/../ios/swift/Microphone.swift" \
+    "$HERE"/swift/*.swift
   LINKX=""
   for W in $WHERE; do
     case $W in
@@ -118,8 +121,13 @@ if [ "$KIND" = gui ]; then
 else
   cc -O2 -Wall -fobjc-arc $DEFS -o "$BIN" "$HERE/modus-shim.c" "$HERE/modus-audio.c" "$HERE/modus-keychain.m" $EXTRA_SRC "$HERE/syscall-stub.S" $FRAMEWORKS $WHERE
 fi
-codesign --force --sign - "$BIN" >/dev/null 2>&1 || true
+# THE SIGNATURE: MODUS_MAC_SIGN, a codesigning identity ("-": ad hoc); by default this Mac's Apple Development
+# identity if it has one.  Signed by a team, the app is the same app to macOS from one build to the next, and a
+# permission given to it (the microphone, the camera) is kept; signed ad hoc, it is asked again after every build.
+SIGN=${MODUS_MAC_SIGN:-$(security find-identity -v -p codesigning 2>/dev/null | awk '/Apple Development/ { print $2; exit }')}
+SIGN=${SIGN:--}
+codesign --force --sign "$SIGN" "$BIN" >/dev/null 2>&1 || codesign --force --sign - "$BIN" >/dev/null 2>&1 || true
 if [ "$KIND" = gui ]; then
-  codesign --force --sign - "$OUT" >/dev/null 2>&1 || true
+  codesign --force --sign "$SIGN" "$OUT" >/dev/null 2>&1 || codesign --force --sign - "$OUT" >/dev/null 2>&1 || true
 fi
 echo "wrote $OUT ($KIND, $(wc -c < "$BIN" | tr -d ' ') bytes in the executable)"

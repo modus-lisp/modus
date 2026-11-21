@@ -1868,6 +1868,8 @@ public func modusSwiftInstall() {
     installSpeech()                                // Speech.swift: the platform's voice and ear
     installBluetooth()                             // Bluetooth.swift: LE links, for a mesh
     installFiles()                                 // Files.swift: Documents, and the document picker (iCloud Drive)
+    installCamera()                                // Camera.swift: a preview, frames, photos and video
+    installMicrophone()                            // Microphone.swift: its samples, for Lisp
     installNative()                                // Native.swift: app-grade components (an app, not the desk)
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)

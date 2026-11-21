@@ -7,8 +7,11 @@
 //   window_chrome(style)           0 standard: a title bar with the title and the three buttons
 //                                  1 the bar and its buttons, no title
 //                                  2 transparent: the content runs under the bar, the buttons float over it
-//                                  3 none: as 2, without the buttons -- nothing but the content (the bar's strip
-//                                    still drags the window, and Command-W, -M and -Q still work)
+//                                  3 none: as 2, without the buttons (the bar's strip, invisible, still takes
+//                                    clicks there, to drag the window, and keeps its height out of the safe area)
+//                                  4 full bleed: no title bar at all -- the content to every edge, the corners
+//                                    rounded and the shadow kept.  Command-drag anywhere moves the window; the
+//                                    Window menu's Command-M, Command-W and Control-Command-F work in every style
 //   window_size(w, h)              the content's size, in points
 //   window_min_size(w, h)          the smallest the person can make it
 //   window_fullscreen(on)          into full screen (1) or out of it (0)
@@ -29,21 +32,37 @@ let windowTitle: Call = { p, n, _, _, _, _ in
     return 0
 }
 
+// The radius of a full-bleed window's corners: a window's own, about, so it still looks like one.
+private let bleedCorner: CGFloat = 12
+
 let windowChrome: Call = { style, _, _, _, _, _ in
-    guard let window = modusWindow(), style <= 3 else { return 0 }
+    guard let window = modusWindow(), let content = rootView(), style <= 4 else { return 0 }
     // the title survives the change: a new style mask makes a new title bar, which came back with the bundle's name
     let title = window.title
     defer { window.title = title }
-    if style >= 2 {
-        window.styleMask.insert(.fullSizeContentView)
+    let edges: NSWindow.StyleMask = [.closable, .miniaturizable, .resizable]
+    if style == 4 {
+        // FULL BLEED: no title bar at all, so nothing covers the content or takes its clicks; the corners rounded
+        // and the shadow kept, as a window's.  The window host's ModusWindow takes the keyboard without a bar.
+        window.styleMask = edges.union(.fullSizeContentView)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        content.layer?.cornerRadius = bleedCorner
+        content.layer?.masksToBounds = true
     } else {
-        window.styleMask.remove(.fullSizeContentView)
+        window.styleMask = edges.union(.titled).union(style >= 2 ? .fullSizeContentView : [])
+        window.isOpaque = true
+        window.backgroundColor = .windowBackgroundColor
+        content.layer?.cornerRadius = 0
+        content.layer?.masksToBounds = false
+        window.titlebarAppearsTransparent = style >= 2
+        window.titleVisibility = style >= 1 ? .hidden : .visible
+        for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            window.standardWindowButton(button)?.isHidden = style == 3
+        }
     }
-    window.titlebarAppearsTransparent = style >= 2
-    window.titleVisibility = style >= 1 ? .hidden : .visible
-    for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-        window.standardWindowButton(button)?.isHidden = style == 3
-    }
+    window.hasShadow = true
+    window.invalidateShadow()
     modus_mac_relayout()
     return 1
 }

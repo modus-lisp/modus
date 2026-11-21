@@ -196,6 +196,7 @@ extern void modus_mac_main(void) __attribute__((noreturn));
 extern int64_t modus_mac_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3);
 extern int64_t modus_objc_call(int64_t frame);   // host/ios/modus-objc.m: built into the Mac window too
 extern int64_t modus_swift_call(int64_t frame);  // host/ios/modus-swift.m: the registry; host/macos/swift/ fills it
+extern void modus_mac_wait_ready(void);          // host/macos/modus-ui-mac.m: until the window is up
 struct mac_image_start { uint64_t sp, entry; };
 static void *mac_image_thread(void *arg) {
     struct mac_image_start st = *(struct mac_image_start *)arg;
@@ -1011,9 +1012,12 @@ static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
 #if defined(MODUS_MAC_GUI)
     case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007: case 1008:   // the window (host/macos/modus-ui-mac.m)
         return modus_mac_call(nr, a0, a1, a2, a3);
+    // the bridges wait for the window, as the window's own calls do: an app's first call can come before it is up
     case 1040:   // the Objective-C runtime: a frame in the image's memory (host/ios/modus-objc.m, the same bridge)
+        modus_mac_wait_ready();
         return modus_objc_call(a0);
     case 1060:   // Lisp calls a Swift function by name (host/ios/modus-swift.m; the Mac's are host/macos/swift/)
+        modus_mac_wait_ready();
         return modus_swift_call(a0);
 #elif TARGET_OS_IPHONE
     case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007: case 1008:   // screen, input, copy, frame clock (host/ios/modus-ui.m)

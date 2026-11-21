@@ -101,6 +101,22 @@ static uint32_t special_keysym(unsigned short code) {
 
 // --- the window -----------------------------------------------------------------------------
 
+// The window: one that can be key and main with no title bar too, so a FULL-BLEED (borderless) window still takes
+// the keyboard -- AppKit refuses a borderless window both, by default.  Close and Minimize are its own, so the Window
+// menu's work when the buttons are hidden or gone.
+@interface ModusWindow : NSWindow
+@end
+@implementation ModusWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+- (void)modusClose:(id)sender { (void)sender; [self close]; }
+- (void)modusMinimize:(id)sender { [self miniaturize:sender]; }
+@end
+
+// A Command-drag moves the window (a full-bleed window has no title bar to take hold of); its events are the
+// window's, not the image's, until the button comes up.
+static BOOL moving_window;
+
 @interface ModusView : NSView
 @end
 @implementation ModusView
@@ -116,14 +132,21 @@ static uint32_t special_keysym(unsigned short code) {
     return NSMakePoint(p.x * ui_scale, p.y * ui_scale);
 }
 - (void)mouseDown:(NSEvent *)e {
+    if (e.modifierFlags & NSEventModifierFlagCommand) {
+        moving_window = YES;
+        [self.window performWindowDragWithEvent:e];
+        return;
+    }
     NSPoint p = [self pixelPointOf:e];
     push_pointer(1, (long)p.x, (long)p.y);
 }
 - (void)mouseDragged:(NSEvent *)e {
+    if (moving_window) return;
     NSPoint p = [self pixelPointOf:e];
     push_pointer(2, (long)p.x, (long)p.y);
 }
 - (void)mouseUp:(NSEvent *)e {
+    if (moving_window) { moving_window = NO; return; }
     NSPoint p = [self pixelPointOf:e];
     push_pointer(3, (long)p.x, (long)p.y);
 }
@@ -223,7 +246,7 @@ static NSString *app_name(void) {
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     (void)n;
     NSRect want = NSMakeRect(0, 0, WANT_W, WANT_H);
-    window = [[NSWindow alloc] initWithContentRect:want
+    window = [[ModusWindow alloc] initWithContentRect:want
                                          styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                                    NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                            backing:NSBackingStoreBuffered
@@ -231,6 +254,8 @@ static NSString *app_name(void) {
     window.title = app_name();
     window.delegate = self;
     window.releasedWhenClosed = NO;
+    // full screen in any chrome: a borderless (full-bleed) window is not offered it unless it asks
+    window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
 
     ModusView *v = [[ModusView alloc] initWithFrame:want];
     v.wantsLayer = YES;
@@ -270,8 +295,26 @@ static void build_menu(void) {
     [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", app_name()]
                        action:@selector(terminate:) keyEquivalent:@"q"];
     appItem.submenu = appMenu;
+    // THE WINDOW MENU: Minimize, Close and Full Screen by their usual keys, whichever chrome the window has (they
+    // reach ModusWindow through the responder chain, so a full-bleed window, with no buttons, has them too)
+    NSMenuItem *windowItem = [[NSMenuItem alloc] init];
+    [bar addItem:windowItem];
+    NSMenu *windowMenu = [[NSMenu alloc] initWithTitle:@"Window"];
+    [windowMenu addItemWithTitle:@"Minimize" action:@selector(modusMinimize:) keyEquivalent:@"m"];
+    [windowMenu addItemWithTitle:@"Close" action:@selector(modusClose:) keyEquivalent:@"w"];
+    NSMenuItem *full = [windowMenu addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:)
+                                      keyEquivalent:@"f"];
+    full.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
+    windowItem.submenu = windowMenu;
+    NSApp.windowsMenu = windowMenu;
     NSApp.mainMenu = bar;
 }
+
+// The image's calls through the bridges (Objective-C 1040, Swift 1060) wait here, on its own thread, until the window
+// is up, as its window calls do: an app's first call (its window's chrome, say) can come before AppKit has finished
+// launching, and found no window.
+static void wait_ui(void);
+void modus_mac_wait_ready(void) { if (ui_ready) wait_ui(); }
 
 // The window's content view, for the native components (host/macos/swift/): they are its subviews, over the
 // framebuffer.  Main thread only, as AppKit is; NULL before the window is up.

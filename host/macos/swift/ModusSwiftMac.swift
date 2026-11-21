@@ -1119,6 +1119,7 @@ public func modusSwiftInstall() {
     installMicrophone()                            // Microphone.swift: its samples, for Lisp
     installNowPlaying()                            // NowPlaying.swift: Now Playing and the media keys
     installGamepad()                               // Gamepad.swift: game controllers
+    installSpatial()                               // Spatial.swift: sound placed in three dimensions
     installNative()                                // NativeMac.swift: app-grade components (an app, not the desk)
     installWindow()                                // MacWindow.swift: the window's title, chrome and size
     register("ui_label_new", labelNew)

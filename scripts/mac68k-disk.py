@@ -22,6 +22,21 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+def kernel_source(name):
+    """scripts/NAME as a build means it: modus's own if it has one, else vessel's
+    kernel/scripts/NAME (lib/load-mvm.lisp MODUS-SOURCE's rule; vessel is
+    $MODUS_VESSEL, else .vessel/ in the tree, else a sibling ../vessel)."""
+    own = os.path.join(HERE, name)
+    if os.path.exists(own):
+        return own
+    root = os.path.dirname(HERE)
+    for v in (os.environ.get('MODUS_VESSEL') or None, os.path.join(root, '.vessel'),
+              os.path.join(os.path.dirname(root), 'vessel')):
+        if v and os.path.exists(os.path.join(v, 'kernel', 'scripts', name)):
+            return os.path.join(v, 'kernel', 'scripts', name)
+    sys.exit('%s is in neither modus scripts/ nor vessel kernel/scripts/' % name)
+
 # boot/boot-mac68k.lisp's image address for MODUS_MAC68K_MACHINE (lc / classic)
 LOAD_ADDR = {'lc': 0x00100000, 'classic': 0x00040000, 'classicos': 0x00040000, 'quadra': 0x00600000, 'floppy': 0x00100000,
              'classic2m': 0x00040000,
@@ -35,7 +50,7 @@ def bootblocks():
     with tempfile.TemporaryDirectory() as d:
         o, b = os.path.join(d, 'b.o'), os.path.join(d, 'b.bin')
         subprocess.run(['m68k-linux-gnu-as', '-m68000', '-o', o,
-                        os.path.join(HERE, 'mac68k-bootblocks.s')], check=True)
+                        kernel_source('mac68k-bootblocks.s')], check=True)
         subprocess.run(['m68k-linux-gnu-objcopy', '-O', 'binary', o, b], check=True)
         syms = {}
         for line in subprocess.run(['m68k-linux-gnu-nm', o], check=True,

@@ -8,7 +8,8 @@
 ;;;; MAC68K_CORE_RAW: the image, its static heap and low block, from the map's :LOAD).
 ;;;; It is compressed as a raw LZMA1 stream (cram's LZMA-COMPRESS, lc 2 lp 1 pb 2)
 ;;;; behind a loader, scripts/mac68k-unlzma.s: 68020 assembly, under 1 KB, its
-;;;; decoder scripts/mac68k-lzma.inc (test/mac68k-unlzma/run.sh checks it).
+;;;; decoder scripts/mac68k-lzma.inc (vessel's kernel/scripts/, like every .s these
+;;;; scripts assemble: MAC68K-TOOLS:KERNEL-SOURCE; vessel's test/mac68k-unlzma checks it).
 ;;;; The boot blocks (scripts/mac68k-disk.lisp) read the blob to #x01200000; the
 ;;;; loader unpacks IMAGE to #x00100000 (or --load) and jumps to it.
 ;;;;

@@ -22,7 +22,12 @@ compiler, the runtime and the hosted platform.  Moved so far: the Raspberry Pi's
 SD, HDMI, GPIO, RNG, `arch-rpi-cl` and `boot-rpi-cl` (stage 1); the x86/QEMU NICs, the PC
 console, SEV-SNP's GHCB and attestation, the bare-metal arch adapters, `bare-threads`,
 `bare-sync`, `bare-perf`, and the bare-metal network services -- `io-net`, `tcp-conns`,
-`bare-sockets`, `net-service`, `main-jobs`, `ssh-inetd`, `http-client` (stage 2).  What
+`bare-sockets`, `net-service`, `main-jobs`, `ssh-inetd`, `http-client` (stage 2).  The 68k
+Mac's floppy runtime (`mvm/mac68k-files.lisp`, `mvm/mac68k-disk-io.lisp`) and its Mac-side
+assembly -- boot blocks, the LZMA loader and decoder, the cold-code disk driver, disk 2's
+prompt, the SCSI boot, the chain loader (`scripts/mac68k-*.s`, `mac68k-lzma.inc`) -- are
+vessel's too (2026-11-21); the Mac disk scripts assemble them through
+`MAC68K-TOOLS:KERNEL-SOURCE` / `kernel_source`, MODUS-SOURCE's rule.  What
 hosted modus reads too (`ip`, `ssh`, `crypto*`, `actors`, the `sb-*` shims) stays here.  So
 do the boot descriptors (`boot/*.lisp`), by decision rather than by omission: they are the
 compiler's knowledge of how to emit a freestanding image for each target, `lib/load-mvm.lisp`

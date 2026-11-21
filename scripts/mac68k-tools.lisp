@@ -5,7 +5,7 @@
 
 (defpackage #:mac68k-tools
   (:use #:cl)
-  (:export #:*scripts* #:run #:read-bytes #:write-bytes #:pad-to #:assemble
+  (:export #:*scripts* #:kernel-source #:run #:read-bytes #:write-bytes #:pad-to #:assemble
            #:env #:env-hex #:argv #:load-cram #:load-fs-fat))
 (in-package #:mac68k-tools)
 
@@ -82,19 +82,30 @@
           (replace w v)
           w))))
 
+(defun kernel-source (name)
+  "scripts/NAME as a build means it: modus's own if it has one, else vessel's
+   kernel/scripts/NAME (lib/load-mvm.lisp MODUS-SOURCE's rule).  The Mac-side
+   assembly -- boot blocks, loaders, the disk drivers -- lives in vessel."
+  (or (probe-file (merge-pathnames name *scripts*))
+      (probe-file (merge-pathnames (concatenate 'string "kernel/scripts/" name)
+                                   (sibling-dir "vessel" "MODUS_VESSEL")))
+      (error "~A is in neither modus's scripts/ nor vessel's kernel/scripts/" name)))
+
 (defun assemble (source &key (cpu "68000") defsyms)
-  "SOURCE (a file in scripts/) assembled for CPU (default the 68000; .include
-   looks in scripts/), DEFSYMS ((NAME . VALUE) ...) defined first: (values its
-   bytes, a hash of its symbols' offsets)."
+  "SOURCE (scripts/SOURCE, KERNEL-SOURCE's: modus's or vessel's) assembled for
+   CPU (default the 68000; .include looks beside it), DEFSYMS ((NAME . VALUE)
+   ...) defined first: (values its bytes, a hash of its symbols' offsets)."
   (let* ((dir (format nil "/tmp/mac68k-as-~D/" (random 1000000000 (make-random-state t))))
+         (src (kernel-source source))
          (o (concatenate 'string dir "s.o")) (b (concatenate 'string dir "s.bin")))
     (ensure-directories-exist dir)
     (unwind-protect
          (progn
-           (apply #'run "m68k-linux-gnu-as" (concatenate 'string "-m" cpu) "-I" (namestring *scripts*)
+           (apply #'run "m68k-linux-gnu-as" (concatenate 'string "-m" cpu)
+                  "-I" (directory-namestring src)
                   (append (loop for (n . v) in defsyms
                                 collect "--defsym" collect (format nil "~A=~D" n v))
-                          (list "-o" o (namestring (merge-pathnames source *scripts*)))))
+                          (list "-o" o (namestring src))))
            (run "m68k-linux-gnu-objcopy" "-O" "binary" o b)
            (let ((syms (make-hash-table :test 'equal)))
              (with-input-from-string (s (run "m68k-linux-gnu-nm" o))

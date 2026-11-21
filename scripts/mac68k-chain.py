@@ -25,6 +25,21 @@ import tempfile
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+def kernel_source(name):
+    """scripts/NAME as a build means it: modus's own if it has one, else vessel's
+    kernel/scripts/NAME (lib/load-mvm.lisp MODUS-SOURCE's rule; vessel is
+    $MODUS_VESSEL, else .vessel/ in the tree, else a sibling ../vessel)."""
+    own = os.path.join(HERE, name)
+    if os.path.exists(own):
+        return own
+    root = os.path.dirname(HERE)
+    for v in (os.environ.get('MODUS_VESSEL') or None, os.path.join(root, '.vessel'),
+              os.path.join(os.path.dirname(root), 'vessel')):
+        if v and os.path.exists(os.path.join(v, 'kernel', 'scripts', name)):
+            return os.path.join(v, 'kernel', 'scripts', name)
+    sys.exit('%s is in neither modus scripts/ nor vessel kernel/scripts/' % name)
+
 NAME, TYPE, CREATOR = b'Modus', b'APPL', b'MDUS'
 
 
@@ -128,7 +143,7 @@ def code1():
         for d_ in os.environ.get('MAC68K_CHAIN_DEFS', '').split():
             defs += ['--defsym', d_]
         subprocess.run(['m68k-linux-gnu-as', '-m68000'] + defs + ['-o', o,
-                        os.path.join(HERE, 'mac68k-chain.s')], check=True)
+                        kernel_source('mac68k-chain.s')], check=True)
         subprocess.run(['m68k-linux-gnu-objcopy', '-O', 'binary', o, b], check=True)
         code = open(b, 'rb').read()
     # the segment header: the first jump-table entry it owns (offset 0), one entry

@@ -4972,11 +4972,22 @@
                              (consp (cadr (cadar body)))
                              (symbolp (car (cadr (cadar body))))
                              (name-eq (car (cadr (cadar body))) "OBJ-SUBTAG"))))))
-      (unless own
-        (setq *struct-accessors*
-              (remove-if (lambda (r) (or (and (eql (car r) h) (%struct-record-for-p r name nil))
-                                         (and (eql (cadr r) h) (%struct-record-for-p r name t))))
-                         *struct-accessors*))))))
+      ;; WRITTEN ONLY WHEN A RECORD GOES.  REMOVE-IF copies the list even when
+      ;; nothing matches, and this runs at every runtime DEFUN -- every EVAL's
+      ;; %MVM-EVAL-THUNK too -- so a worker's EVAL stored its own fresh list
+      ;; into the global, and the shared-store guard refused it
+      ;; (test/worker-eval.lisp).  When one does go on a worker, the new list
+      ;; is made under the runtime lock, in shared memory.
+      (flet ((mine (r) (or (and (eql (car r) h) (%struct-record-for-p r name nil))
+                           (and (eql (cadr r) h) (%struct-record-for-p r name t)))))
+        (when (and (not own) (find-if #'mine *struct-accessors*))
+          (if (%mvm-on-main-thread-p)
+              (setq *struct-accessors* (remove-if #'mine *struct-accessors*))
+              (progn
+                (%rt-enter)
+                (unwind-protect
+                     (setq *struct-accessors* (remove-if #'mine *struct-accessors*))
+                  (%rt-leave)))))))))
 
 (defun %struct-accessor-info (sym)
   "The record for accessor symbol SYM, or NIL."

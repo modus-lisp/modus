@@ -1504,6 +1504,19 @@
   (cond
     ;; Trivial cases
     ((eql t1 t2) (values t t))
+    ;; (MOD N) is (INTEGER 0 N-1) -- CLHS's own definition of it.  Not one of
+    ;; the numeric range heads below, so every question about it fell through
+    ;; to (NIL NIL): (subtypep '(mod 65536) '(unsigned-byte 16)) answered "do
+    ;; not know" where SBCL says T T, and TI's ART-16B, whose element type is
+    ;; (MOD 65536), had no width -- the screen buffer "cannot displace (MOD
+    ;; 65536) onto an array of BIT".  Rewritten on either side and asked again.
+    ((or (and (consp t1) (eq (car t1) 'mod) (consp (cdr t1)) (integerp (cadr t1)) (> (cadr t1) 0))
+         (and (consp t2) (eq (car t2) 'mod) (consp (cdr t2)) (integerp (cadr t2)) (> (cadr t2) 0)))
+     (%subtypep-impl
+      (if (and (consp t1) (eq (car t1) 'mod) (consp (cdr t1)) (integerp (cadr t1)))
+          (list 'integer 0 (- (cadr t1) 1)) t1)
+      (if (and (consp t2) (eq (car t2) 'mod) (consp (cdr t2)) (integerp (cadr t2)))
+          (list 'integer 0 (- (cadr t2) 1)) t2)))
     ;; CLOS class OBJECTS are type specifiers (CLHS 4.2.3): compare by
     ;; their registered NAMES.  uiop's coerce-class does
     ;; (subtypep (find-class 'load-op) (find-class 'operation)) — without

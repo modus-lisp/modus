@@ -3459,9 +3459,49 @@
        ;; Comparing (A3, A2) computes A2 - A3, so carry set means VA < VL.
        ;; Hosted, a full heap calls the collector; bare, it is still ILLEGAL.
        ;; A plain GC-CHECK right before a CONS: the shared CONS checks itself.
-       (unless (and (eql opcode +op-gc-check+)
-                    (m68k-next-is-unlabelled-cons-p mvm-pc))
-         (m68k-emit-gc-check buf)))
+       ;; HOSTED + SIZED (arm32's rule): test VA + SIZE, not VA.  The unsized
+       ;; check lets an object larger than the collector's margin (min 1 MB,
+       ;; a quarter of a semispace) run past VL into the conses the last
+       ;; collection copied to the TOP of the semispace.  Measured: the ANSI
+       ;; suite's live set nearly fills a 64 MB semispace, and the conses
+       ;; came back with character codes in their cdrs -- (TYPE-ERROR 112 is
+       ;; not LIST) in every *UNIVERSE* test of every shard, 129 failures.
+       (cond
+         ;; A CONSTANT size under 64 KB needs no more than the plain check:
+         ;; the smallest heap (1 MB, two 512 KB semispaces) keeps a 128 KB
+         ;; margin below the conses.  Most sites are such (structs, closures),
+         ;; and the sized form costs ~24 bytes a site (+1 MB on the CLI).
+         ((and *68k-gc-label*
+               (or (and (eql opcode +op-gc-check-n+)
+                        (>= (first operands) 65536))
+                   (eql opcode +op-gc-check-r+)))
+          (flet ((size+va ()
+                   ;; D0 = VA + an OVERestimate of the bytes about to go
+                   (if (eql opcode +op-gc-check-n+)
+                       (m68k-emit-move-imm-dn buf (logand (first operands) #xFFFFFFFF) +68k-d0+)
+                       (progn
+                         (m68k-load-vreg buf +68k-d0+ (first operands))
+                         (if (eql (second operands) 1)
+                             (m68k-emit-asr-imm buf +68k-d0+ 1)   ; TAGGED byte count
+                             (m68k-emit-lsl-imm buf +68k-d0+ 2))  ; UNTAGGED slots, 4 bytes
+                         (m68k-emit-addi buf +68k-d0+ 32)))
+                   (m68k-emit-word buf #xD08A)))                  ; ADD.L A2,D0
+            (let ((ok (mvm-make-label)))
+              (size+va)
+              (m68k-emit-word buf #xB08B)                         ; CMP.L A3,D0: D0 - VL
+              (m68k-emit-bcc-word buf +68k-cc-cs+ ok)             ; CS = fits below VL
+              (m68k-emit-bsr-long buf *68k-gc-label*)
+              (size+va)
+              (m68k-emit-word buf #xB08B)
+              (m68k-emit-bcc-word buf +68k-cc-cs+ ok)
+              ;; One object bigger than all the room a collection left: arm32's
+              ;; BKPT.  (Live data that outgrows the heap exits 3 with a message
+              ;; from the collector itself; this is the single huge object.)
+              (m68k-emit-illegal buf)
+              (m68k-emit-label buf ok))))
+         ((and (eql opcode +op-gc-check+)
+               (m68k-next-is-unlabelled-cons-p mvm-pc)))
+         (t (m68k-emit-gc-check buf))))
 
       (#.+op-write-barrier+
        (let ((vobj (first operands)))

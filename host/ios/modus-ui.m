@@ -90,6 +90,29 @@ static void push_event(long type, CGPoint p) {
     os_unfair_lock_unlock(&ev_lock);
 }
 
+// A FINGER'S OWN TOUCH (type 14), beside the 1/2/3 the desk reads: which finger (a slot 0..9, held from the touch's
+// start to its end) in bits 48-51, the phase (0 began, 1 moved, 2 ended or cancelled) in bits 52-53, x and y as a
+// pointer's.  A game's two thumbs -- a stick each -- are told apart by it; the desk ignores it.
+static __unsafe_unretained UITouch *fingers[10];
+
+static void push_finger(UITouch *t, long type, CGPoint p) {
+    long slot = -1;
+    for (long i = 0; i < 10; i++) if (fingers[i] == t) { slot = i; break; }
+    if (slot < 0 && type == 1)
+        for (long i = 0; i < 10; i++) if (!fingers[i]) { fingers[i] = t; slot = i; break; }
+    if (slot < 0) return;                          // an eleventh finger, or one never seen begin
+    long phase = type == 1 ? 0 : type == 2 ? 1 : 2;
+    if (phase == 2) fingers[slot] = nil;
+    long x = (long)(p.x * UI_SCALE), y = (long)(p.y * UI_SCALE);
+    if (x < 0) x = 0; if (y < 0) y = 0;
+    if (x >= fb_w) x = fb_w - 1; if (y >= fb_h) y = fb_h - 1;
+    os_unfair_lock_lock(&ev_lock);
+    if (ev_tail - ev_head < NEV)
+        events[ev_tail++ % NEV] = ((uint64_t)phase << 52) | ((uint64_t)slot << 48) | ((uint64_t)14 << 40)
+                                | ((uint64_t)y << 20) | (uint64_t)x;
+    os_unfair_lock_unlock(&ev_lock);
+}
+
 static void push_resize(long w, long h) {
     os_unfair_lock_lock(&ev_lock);
     if (ev_tail - ev_head < NEV)
@@ -203,7 +226,11 @@ static uint32_t keysym_for(uint32_t cp) {
     if (rest) [super pressesBegan:presses withEvent:e];
 }
 - (void)touches:(NSSet<UITouch *> *)ts type:(long)type {
-    for (UITouch *t in ts) push_event(type, [t locationInView:self]);
+    for (UITouch *t in ts) {
+        CGPoint p = [t locationInView:self];
+        push_event(type, p);
+        push_finger(t, type, p);
+    }
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self touches:t type:1]; }
 - (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self touches:t type:2]; }

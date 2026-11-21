@@ -1117,6 +1117,7 @@ public func modusSwiftInstall() {
     installFiles()                                 // Files.swift: the app's folder, and the file picker
     installCamera()                                // Camera.swift: a preview, frames, photos and video
     installMicrophone()                            // Microphone.swift: its samples, for Lisp
+    installNowPlaying()                            // NowPlaying.swift: Now Playing and the media keys
     installNative()                                // NativeMac.swift: app-grade components (an app, not the desk)
     installWindow()                                // MacWindow.swift: the window's title, chrome and size
     register("ui_label_new", labelNew)

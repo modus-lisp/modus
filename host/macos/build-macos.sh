@@ -106,7 +106,7 @@ if [ "$KIND" = gui ]; then
     -import-objc-header "$HERE/swift/bridge.h" -emit-object -o "$OBJS/swift.o" \
     "$HERE/../ios/swift/Term.swift" "$HERE/../ios/swift/GPU.swift" "$HERE/../ios/swift/Speech.swift" \
     "$HERE/../ios/swift/Bluetooth.swift" "$HERE/../ios/swift/Files.swift" "$HERE/../ios/swift/Camera.swift" \
-    "$HERE/../ios/swift/Microphone.swift" \
+    "$HERE/../ios/swift/Microphone.swift" "$HERE/../ios/swift/NowPlaying.swift" \
     "$HERE"/swift/*.swift
   LINKX=""
   for W in $WHERE; do

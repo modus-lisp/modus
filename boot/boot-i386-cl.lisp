@@ -116,6 +116,21 @@
    sixteenth of the RAM, 256 KB to 8 MB.  0: no area (no native tier).")
 (defconstant +i386-cl-jit-area+ #x12000000
   "jit-i386-native.lisp's +N386-AREA-ADDR+: the hosted layout's code area.")
+(defconstant +i386-cl-v-netpa+ #x80AC
+  "The net block's PHYSICAL address (0: none): RAM mapped at +I386-CL-NET-VA+ on
+   a machine of 32 MB or more, for the NIC drivers' state and DMA rings -- a
+   device needs the physical address of what it reads (e1000.lisp's
+   E1000-DMA-ADDR seam, arch-i386-cl.lisp).")
+(defconstant +i386-cl-net-va+ #x04000000
+  "The net block's VA: where arch-i386-cl.lisp has always kept the NIC and SSH
+   state (#x04000000 .. #x04400000), mapped now rather than assumed.")
+(defconstant +i386-cl-net-size+ #x400000)
+(defconstant +i386-cl-mmio-window+ #x0D000000
+  "VA of a 4 MB window for device registers (a PCI BAR is far above what a
+   fixnum address can name): one page table at +I386-CL-MMIO-PT+, filled by the
+   image's Lisp, uncached.")
+(defconstant +i386-cl-mmio-pt+ #x2A000
+  "PA (= VA) of the MMIO window's page table, past pc-vbe.lisp's buffers.")
 (defconstant +i386-cl-v-stacksz+ #x80A4
   "The stack's bytes: 1 MB, or 384 KB on a machine under 16 MB.")
 (defvar *i386-cl-gc-static*
@@ -259,6 +274,12 @@
                    collect (append (list #xC7 #x83)
                                    (i386l-le32-list (* 4 (+ (ash +i386-cl-fb-window+ -22) i)))
                                    (i386l-le32-list (logior (+ +i386-cl-fb-pts+ (* i 4096)) 3)))))
+       ;; the MMIO window: its page table, empty, in the PD
+       (cons #xBF (i386l-le32-list +i386-cl-mmio-pt+))
+       (cons #xB9 (i386l-le32-list #x1000)) '(:call 0 zero)
+       (i386cl-abs '(#x8B #x1D) +i386-cl-v-pd+)              ; ebx = PD
+       (append (list #xC7 #x83) (i386l-le32-list (* 4 (ash +i386-cl-mmio-window+ -22)))
+               (i386l-le32-list (logior +i386-cl-mmio-pt+ 3)))
        ;; the fixed block, zeroed (hosted: a fresh mapping)
        (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 alloc)
        '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 zero)
@@ -309,6 +330,19 @@
                      (i386cl-abs '(#x8B #x0D) +i386-cl-v-jitsz+)
                      '(#xC1 #xE9 #x0C) '(:call 0 map)
                      '(:label jit-none))))
+       ;; the net block: 4 MB at #x04000000 on a machine of 32 MB or more,
+       ;; its physical address at +I386-CL-V-NETPA+ for DMA
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-netpa+) (i386l-le32-list 0))
+       (cons #x81 (cons #x3D (append (i386l-le32-list +i386-cl-v-ramend+)
+                                     (i386l-le32-list #x2000000))))
+       '(:jcc32 #x72 net-none)                                 ; RAM < 32 MB: none
+       (cons #xB9 (i386l-le32-list +i386-cl-net-size+)) '(:call 0 alloc)
+       (i386cl-abs '(#xA3) +i386-cl-v-netpa+)
+       '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-net-size+)) '(:call 0 zero)
+       '(#x5E)                                                ; esi = PA
+       (cons #xBF (i386l-le32-list +i386-cl-net-va+))
+       (cons #xB9 (i386l-le32-list (floor +i386-cl-net-size+ 4096))) '(:call 0 map)
+       '(:label net-none)
        ;; NIL's page, all NIL
        (cons #xB9 (i386l-le32-list 4096)) '(:call 0 alloc)
        '(#x50) '(#x89 #xC7) (cons #xB8 (i386l-le32-list nil-value))
@@ -965,6 +999,28 @@
       (i386l-bytes buf #x81 #xE2) (i386l-le32 buf #xFFFF0000)
       (i386l-bytes buf #x81 #xCA) (i386l-le32 buf #x8E00)          ; present, 32-bit interrupt gate
       (i386l-bytes buf #x89 #x15) (i386l-le32 buf (+ gate 4)))
+    ;; EVERY PIC VECTOR HAS A GATE.  The IDT had the timer's (20h) and the
+    ;; NE2000's (29h); any other vector met a zeroed descriptor -- #GP, #DF, a
+    ;; triple fault.  Measured: a SPURIOUS IRQ 15 (an 8259 raises vector 2Fh when
+    ;; a line drops before it is acknowledged; the BIOS disk reads PM_READ makes
+    ;; are the usual cause) reset the machine in the middle of DHCP, once the
+    ;; timing allowed it.  Real hardware does this too.  Handlers, next to the
+    ;; existing two: 90420h EOI the master; 90440h return only.  20h..2Fh:
+    ;;   21-26 master EOI | 27 spurious (no EOI) | 28,2A-2E both (90410h)
+    ;;   2F slave spurious: the master's EOI only (its cascade line was real)
+    (i386l-bytes buf #xC7 #x05) (i386l-le32 buf #x90420) (i386l-le32 buf #xE620B050) ; push eax; mov al,20h; out 20h,al
+    (i386l-bytes buf #xC7 #x05) (i386l-le32 buf #x90424) (i386l-le32 buf #x90CF5820) ; ... pop eax; iret
+    (i386l-bytes buf #xC7 #x05) (i386l-le32 buf #x90440) (i386l-le32 buf #x909090CF) ; iret
+    (dolist (v (loop for v from #x21 to #x2F unless (= v #x29) collect v))
+      (let ((isr (cond ((= v #x27) #x90440)
+                       ((= v #x2F) #x90420)
+                       ((>= v #x28) #x90410)
+                       (t #x90420)))
+            (gate (+ #x90000 (* v 8))))
+        (i386l-bytes buf #xC7 #x05) (i386l-le32 buf gate)
+        (i386l-le32 buf (logior (logand isr #xFFFF) (ash 8 16)))
+        (i386l-bytes buf #xC7 #x05) (i386l-le32 buf (+ gate 4))
+        (i386l-le32 buf (logior (ash (ash isr -16) 16) #x8E00))))
     (i386l-bytes buf #xFB)                                    ; sti: the clock ticks
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xE5)        ; mov ebp, esp
     ;; native byte 0 on a 16-byte boundary (OR-3 tagged entries): the JMP

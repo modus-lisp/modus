@@ -1977,9 +1977,13 @@
       ""
       (if *cl-repl-i386-p*
           (concatenate 'string
-            ;; NE2000 ISA (port I/O).  The adapter comes AFTER the driver: it
-            ;; moves the driver's host buffers out of the image (see its header).
+            ;; NE2000 ISA (port I/O) and the E1000 family on PCI (QEMU's e1000,
+            ;; a ThinkPad T420's 82579LM), picked when NIC-PROBE runs.  The
+            ;; adapter comes AFTER both drivers: it moves the NE2000's host
+            ;; buffers out of the image and overrides e1000.lisp's two seams
+            ;; (E1000-MAP-BAR, E1000-DMA-ADDR) -- see its header.
             (%rpi-net-text "ne2000.lisp")          (string #\Newline)
+            (%rpi-net-text "e1000.lisp")           (string #\Newline)
             (%rpi-net-text "arch-i386-cl.lisp")    (string #\Newline))
       (if *cl-repl-x64-p*
           (concatenate 'string
@@ -2079,11 +2083,22 @@
                    send receive rx-buf probe read-reg)))
     (cond
       (*cl-repl-i386-p*
-       (format nil "~%(defun %bind-nic-seams ()
+       ;; an E1000 on PCI if there is one (and a net block to DMA from), else
+       ;; the NE2000: NIC-PROBE rebinds the interface to whichever answered
+       (format nil "~%(defun %pick-e1000-or-ne2k ()
+  (if (and (modus.board::pc-net-block-p) (= (modus.net.e1000:e1000-hw-probe) 1))
+      (progn
+        (setf (fdefinition 'modus.net:nic-send) (function modus.net.e1000:e1000-hw-send))
+        (setf (fdefinition 'modus.net:nic-receive) (function modus.net.e1000:e1000-hw-receive))
+        (setf (fdefinition 'modus.net:nic-rx-buf) (function modus.net.e1000:e1000-hw-rx-buf))
+        (setf (fdefinition 'modus.net:nic-read-reg) (function modus.net.e1000:e1000-read-reg))
+        1)
+      (modus.net.ne2000:ne2k-probe)))
+(defun %bind-nic-seams ()
   (modus.net::%define-nic-seams)
 ~A)~%"
                (bind "modus.net.ne2000:ne2k-send" "modus.net.ne2000:ne2k-receive"
-                     "modus.net.ne2000:ne2k-rx-buf" "modus.net.ne2000:ne2k-probe"
+                     "modus.net.ne2000:ne2k-rx-buf" "%pick-e1000-or-ne2k"
                      "modus.net::no-read-reg")))
       (*cl-repl-x64-p*
        ;; virtio or E1000, decided when NIC-PROBE runs: it probes virtio, and

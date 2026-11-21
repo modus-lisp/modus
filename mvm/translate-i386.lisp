@@ -735,6 +735,13 @@
 ;;;   - a ROOT WORD at +I386-NATIVE-CONST-ROOT+ the collector forwards: the
 ;;;     vector of constants runtime code loads (a heap pointer in code would
 ;;;     go stale at the first collection).
+(defparameter *i386-raw-scratch* #x600140
+  "The raw-32-bit traps' scratch (#x0330..#x0333: MMIO read/write, port read,
+   PCI config read): the raw address at +0, the raw value at +8 -- a value a
+   30-bit fixnum cannot hold passes through memory, and MEM-REF :U32 reads it
+   back whole.  #x600140 is the mini-Lisp images' (kept: they are byte-identical);
+   the bare CL image's own layout puts paged code there, so I386-SET-CL-BARE-MODE
+   moves it to #x1B0A0, low memory pc-console's block leaves free.")
 (defparameter *i386-native-tier* nil)
 (defconstant +i386-native-const-root+ #x10000FBC
   "Hosted i386: the upper half of the 64-bit ports' JIT bump word, unused here.")
@@ -4002,13 +4009,13 @@ modus: heap exhausted -- this machine needs more RAM
               (i386-emit-byte buf #x50)
               ;; mov eax, [0x600140]  — load raw 32-bit address
               (i386-emit-byte buf #xA1)
-              (i386-emit-u32 buf #x600140)
+              (i386-emit-u32 buf *i386-raw-scratch*)
               ;; mov eax, [eax]  — read 32-bit value from that address
               (i386-emit-byte buf #x8B)
               (i386-emit-byte buf #x00)
               ;; mov [0x600148], eax  — store raw result
               (i386-emit-byte buf #xA3)
-              (i386-emit-u32 buf #x600148)
+              (i386-emit-u32 buf (+ *i386-raw-scratch* 8))
               ;; pop eax
               (i386-emit-byte buf #x58))
              ((= code #x0331)
@@ -4018,11 +4025,11 @@ modus: heap exhausted -- this machine needs more RAM
               (i386-emit-byte buf #x51)
               ;; mov eax, [0x600140]  — load raw 32-bit address
               (i386-emit-byte buf #xA1)
-              (i386-emit-u32 buf #x600140)
+              (i386-emit-u32 buf *i386-raw-scratch*)
               ;; mov ecx, [0x600148]  — load raw 32-bit value
               (i386-emit-byte buf #x8B)
               (i386-emit-byte buf #x0D)
-              (i386-emit-u32 buf #x600148)
+              (i386-emit-u32 buf (+ *i386-raw-scratch* 8))
               ;; mov [eax], ecx  — write value to address
               (i386-emit-byte buf #x89)
               (i386-emit-byte buf #x08)
@@ -4039,12 +4046,12 @@ modus: heap exhausted -- this machine needs more RAM
               (i386-emit-byte buf #x66)       ; operand size prefix
               (i386-emit-byte buf #x8B)       ; mov r16, [disp32]
               (i386-emit-byte buf #x15)       ; mod=00 reg=DX r/m=101 (disp32)
-              (i386-emit-u32 buf #x600140)
+              (i386-emit-u32 buf *i386-raw-scratch*)
               ;; in eax, dx  — read 32-bit value from port
               (i386-emit-byte buf #xED)
               ;; mov [0x600148], eax  — store raw result
               (i386-emit-byte buf #xA3)
-              (i386-emit-u32 buf #x600148)
+              (i386-emit-u32 buf (+ *i386-raw-scratch* 8))
               ;; pop edx; pop eax
               (i386-emit-byte buf #x5A)
               (i386-emit-byte buf #x58))
@@ -4079,7 +4086,7 @@ modus: heap exhausted -- this machine needs more RAM
               (i386-emit-byte buf #xED)
               ;; mov [0x600148], eax (store raw 32-bit result)
               (i386-emit-byte buf #xA3)
-              (i386-emit-u32 buf #x600148)
+              (i386-emit-u32 buf (+ *i386-raw-scratch* 8))
               ;; Return byte 0 tagged as fixnum in EAX
               (i386-emit-byte buf #x0F)       ; movzx eax, al
               (i386-emit-byte buf #xB6)
@@ -6483,6 +6490,7 @@ modus: heap exhausted -- this machine needs more RAM
         *i386-fn-tag-3* t
         *i386-fn-align* 16
         *i386-native-code-offset* 0
+        *i386-raw-scratch* #x1B0A0
         *i386-gc-margin-addr* margin-addr
         *i386-pit-clock* tick-addr)
   (i386-set-globals-base globals-base))

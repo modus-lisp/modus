@@ -15,7 +15,7 @@ Run with the venv python (needs machfs).  Environment:
                68040 Quadras.  System 7's Finder ignores "Set Startup", so a copy of
                START's application also goes into System Folder:Startup Items.
   MODUS_FORKS  directory with data and rsrc of the Modus application, as written by
-               scripts/mac68k-chain.py DISK OUT.bin --forks DIR (required for modus)
+               scripts/mac68k-chain.lisp DISK OUT.bin --forks DIR (required for modus)
   VOLNAME      the volume's name (default Macintosh HD)
   MODUS_DESKTOP  V,H: Modus on the desktop (System 7), its icon there, not in a folder
 """

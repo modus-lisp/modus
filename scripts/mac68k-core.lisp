@@ -110,76 +110,30 @@
       (die "no unique modusMCR descriptor (a Classic build?)"))
     (put32 img (+ k (ecase which (:core 8) (:save 12))) value)))
 
-;;; ---- the core run: Basilisk II, its serial port A a pseudo-terminal -----------
-
-(defun open-pty ()
-  "A pseudo-terminal: (values the master's fd, the slave's name, the slave's fd,
-   kept open so the master never reads EOF while Basilisk reopens it)."
-  (let ((m (sb-alien:alien-funcall
-            (sb-alien:extern-alien "posix_openpt" (function sb-alien:int sb-alien:int))
-            (logior 2 #o400))))                ; O_RDWR | O_NOCTTY
-    (when (< m 0) (die "posix_openpt failed"))
-    (sb-alien:alien-funcall (sb-alien:extern-alien "grantpt" (function sb-alien:int sb-alien:int)) m)
-    (sb-alien:alien-funcall (sb-alien:extern-alien "unlockpt" (function sb-alien:int sb-alien:int)) m)
-    (let* ((name (sb-alien:alien-funcall
-                  (sb-alien:extern-alien "ptsname" (function sb-alien:c-string sb-alien:int)) m))
-           (s (sb-unix:unix-open name (logior 2 #o400) 0)))
-      (run "stty" "-F" name "raw" "-echo")
-      (values m name s))))
-
-(defun split-command (s)
-  "MAC68K_BASILISK's words: split on spaces (no quoting; it never needed any)."
-  (loop with words = nil and start = nil
-        for i from 0 to (length s)
-        for c = (if (< i (length s)) (char s i) #\Space)
-        do (cond ((and (char= c #\Space) start) (push (subseq s start i) words) (setq start nil))
-                 ((and (char/= c #\Space) (null start)) (setq start i)))
-        finally (return (nreverse words))))
+;;; ---- the core run: Basilisk II, its serial port A (mac68k-tools BASILISK-SERIAL) --
 
 (defun capture-core (disk timeout)
   "Boot DISK under Basilisk II and read the core it sends: (values what it said
    before the core, the core)."
-  (multiple-value-bind (master slave-name slave) (open-pty)
-    (let* ((cmd (append (split-command (env "MAC68K_BASILISK" "BasiliskII"))
-                        (list "--nogui" "true" "--rom" (env "MAC68K_ROM") "--cpu" "4"
-                              "--fpu" "false"
-                              "--ramsize" (princ-to-string (ash (parse-integer (env "MAC68K_RAM_MB" "32")) 20))
-                              "--jit" (env "MAC68K_JIT" "false") "--jitcachesize" "16384"
-                              "--disk" disk "--seriala" slave-name)))
-           (p (sb-ext:run-program (first cmd) (rest cmd) :search t :wait nil
-                                                         :output nil :error nil :input nil))
-           (got (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
-           (buf (bytes 65536))
-           (end (+ (get-internal-real-time) (* timeout internal-time-units-per-second)))
-           (need nil))
-      (unwind-protect
-           (loop while (and (< (get-internal-real-time) end) (sb-ext:process-alive-p p))
-                 do (when (sb-sys:wait-until-fd-usable master :input 0.5)
-                      (let ((n (sb-sys:with-pinned-objects (buf)
-                                 (sb-unix:unix-read master (sb-sys:vector-sap buf) 65536))))
-                        (when (and n (> n 0))
-                          (loop for i below n do (vector-push-extend (aref buf i) got)))))
-                    (let ((k (find-bytes "MCOR" got)))
-                      (when (and k (null need) (>= (length got) (+ k 24)))
-                        (let ((olo (u32 got (+ k 8))) (ohi (u32 got (+ k 12)))
-                              (clo (u32 got (+ k 16))) (chi (u32 got (+ k 20))))
-                          (setq need (+ k 24 *low-block* (- ohi olo) (- chi clo)))
-                          (format t "mac68k-core: core coming: low block #~(~x~), objects #~(~x~)..#~(~x~), conses #~(~x~)..#~(~x~)~%"
-                                  (u32 got (+ k 4)) olo ohi clo chi)
-                          (finish-output))))
-                    (when (and need (>= (length got) need)) (return)))
-        (dolist (sig '(15 9))
-          (when (sb-ext:process-alive-p p)
-            (ignore-errors (sb-ext:process-kill p sig :process-group))
-            (sleep 1)))
-        (ignore-errors (sb-ext:process-kill p 9 :process-group))
-        (sb-unix:unix-close master)
-        (sb-unix:unix-close slave))
-      (when (or (null need) (< (length got) need))
-        (write-string (latin1 (subseq got (max 0 (- (length got) 2000)))) *error-output*)
-        (die "no complete core on serial (~D bytes)" (length got)))
-      (let ((k (find-bytes "MCOR" got)))
-        (values (subseq got 0 k) (coerce (subseq got k need) '(simple-array (unsigned-byte 8) (*))))))))
+  (let* ((need nil)
+         (got (basilisk-serial
+               disk timeout
+               (lambda (got)
+                 (let ((k (find-bytes "MCOR" got)))
+                   (when (and k (null need) (>= (length got) (+ k 24)))
+                     (let ((olo (u32 got (+ k 8))) (ohi (u32 got (+ k 12)))
+                           (clo (u32 got (+ k 16))) (chi (u32 got (+ k 20))))
+                       (setq need (+ k 24 *low-block* (- ohi olo) (- chi clo)))
+                       (format t "mac68k-core: core coming: low block #~(~x~), objects #~(~x~)..#~(~x~), conses #~(~x~)..#~(~x~)~%"
+                               (u32 got (+ k 4)) olo ohi clo chi)
+                       (finish-output))))
+                 (and need (>= (length got) need)))
+               :ram-mb (parse-integer (env "MAC68K_RAM_MB" "32")))))
+    (when (or (null need) (< (length got) need))
+      (write-string (latin1 (subseq got (max 0 (- (length got) 2000)))) *error-output*)
+      (die "no complete core on serial (~D bytes)" (length got)))
+    (let ((k (find-bytes "MCOR" got)))
+      (values (subseq got 0 k) (subseq got k need)))))
 
 ;;; ---- the cold function records, as pages --------------------------------------
 

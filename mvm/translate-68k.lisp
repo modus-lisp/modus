@@ -251,7 +251,7 @@
   "Paged Mac: where the code cache's streams start (raw), past its owner map.")
 (defconstant +68k-mac-file-refnum+ #x10006050
   "The static block's word for a Mac image launched from Mac OS
-   (scripts/mac68k-chain.py): the reference number of the open file that IS
+   (scripts/mac68k-chain.lisp): the reference number of the open file that IS
    its boot disk, which the code loader and the disk service then _Read
    instead of the boot drive.  0 (as the core sends it) = the boot drive.")
 (defconstant +68k-mac-host+ #x10006054
@@ -4222,7 +4222,7 @@
       (ws #x4298)                                        ; CLR.L (A0)+
       (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
       (m68k-emit-lea-label buf pb +68k-a0+)
-      ;; the boot drive (D4 = 0) launched from Mac OS (scripts/mac68k-chain.py):
+      ;; the boot drive (D4 = 0) launched from Mac OS (scripts/mac68k-chain.lisp):
       ;; the disk is a file
       (ws #x4A44) (m68k-emit-bne buf drive)              ; TST.W D4
       (let ((a (conv-real +68k-mac-file-refnum+)))
@@ -6478,7 +6478,7 @@
             (ws #x4298)                                        ; CLR.L (A0)+
             (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
             (m68k-emit-lea-label buf pb +68k-a0+)
-            ;; launched from Mac OS (scripts/mac68k-chain.py): the disk is a
+            ;; launched from Mac OS (scripts/mac68k-chain.lisp): the disk is a
             ;; file, its reference number in the static block
             (ws #x2039) (l32 (conv-real +68k-mac-file-refnum+))  ; MOVE.L slot,D0
             (m68k-emit-beq buf drive)

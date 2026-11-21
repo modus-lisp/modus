@@ -257,7 +257,7 @@ framebuffer console included) is 1,222,613 bytes of LZMA + a 13 KB loader, a
 Unpacking is the difference: ~58 s interpreted, ~2 s under the JIT.  Debian's
 `BasiliskII-jit` crashes before the ROM loads (any disk, System 7.5.3 too): it
 is a PIE and its JIT bakes 32-bit absolute addresses of its globals and heap.
-`scripts/basilisk-unpie.py` relinks it at `#x10000000`; run it with
+`scripts/basilisk-unpie.lisp` relinks it at `#x10000000`; run it with
 `MALLOC_MMAP_MAX_=0` so every `malloc` comes from the (now low) brk heap.
 
 ## Plan
@@ -341,7 +341,7 @@ no serial port there, so `scripts/mac68k-mame-serial.lua` taps the SCC's
 channel A data register (`#xBFFFFF`) for the ladder's oracle:
 
     MODUS_MAC68K_MACHINE=classic MODUS_68K_CPU=68000 MAC68K_EMULATOR=mame \
-      MAC68K_MAME=mame MAC68K_ROMPATH=ROMS scripts/mac68k-ladder.py
+      MAC68K_MAME=mame MAC68K_ROMPATH=ROMS sbcl --script scripts/mac68k-ladder.lisp
 
 ### Boot's live heap, measured (`MODUS_68K_GC_PEAK=1`)
 
@@ -709,7 +709,7 @@ its expander in nested EVALs (297 s).  Heap exhaustion is still fatal.
 
 Modules over 1 KB of bytecode (every DEFSTRUCT) stay interpreted.
 
-## Launched from Mac OS: `MODUS_MAC68K_MACHINE=classicos` + `scripts/mac68k-chain.py`
+## Launched from Mac OS: `MODUS_MAC68K_MACHINE=classicos` + `scripts/mac68k-chain.lisp`
 
 No floppy and no disk of our own: a Mac application, "Modus", whose data fork
 IS the boot disk `mac68k-core.lisp` writes.  Double-clicked (or set as the

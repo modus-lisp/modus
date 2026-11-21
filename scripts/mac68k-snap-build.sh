@@ -2,7 +2,7 @@
 # mac68k-snap-build.sh SNAPDIR OUTDIR -- the classicos Mac image with the runtime JIT, built from
 # a snapshot of the tree (never edit files a running build reads), its saved core taken on
 # Basilisk II, and a MAME hard disk (OUTDIR/c.hd.chd).  Tool layout: $RSS (default /tmp/rss):
-#   b2/  Basilisk II (basilisk-headless.sh, BasiliskII-jit-lo from scripts/basilisk-unpie.py, lc475.rom)
+#   b2/  Basilisk II (basilisk-headless.sh, BasiliskII-jit-lo from scripts/basilisk-unpie.lisp, lc475.rom)
 #   mame/ldpath, mame/root/usr/bin/chdman  (Debian bookworm's mame, mame-tools unpacked)
 set -u
 S=$1; D=$2; RSS=${RSS:-/tmp/rss}

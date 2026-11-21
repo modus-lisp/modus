@@ -6,7 +6,7 @@
 (defpackage #:mac68k-tools
   (:use #:cl)
   (:export #:*scripts* #:kernel-source #:run #:read-bytes #:write-bytes #:pad-to #:assemble
-           #:env #:env-hex #:argv #:load-cram #:load-fs-fat))
+           #:env #:env-hex #:argv #:load-cram #:load-fs-fat #:split-words #:basilisk-serial))
 (in-package #:mac68k-tools)
 
 (defparameter *scripts* (make-pathname :name nil :type nil :defaults *load-truename*)
@@ -31,8 +31,13 @@
             (probe-file (merge-pathnames (format nil "../../~A/" repo) *scripts*))
             (error "no ~A (set ~A, or check it out beside modus)" repo var)))))
 
+;; fs-apple, with cram's CRC-16 first (its MacBinary header check)
+(unless (find-package "CRAM")
+  (let ((dir (sibling-dir "cram" "CRAM")))
+    (load (merge-pathnames "src/packages.lisp" dir))
+    (load (merge-pathnames "src/crc16.lisp" dir))))
 (unless (find-package "FS-APPLE")
-  (dolist (f '("package" "apm" "packbits"))
+  (dolist (f '("package" "apm" "packbits" "resource-fork" "macbinary"))
     (load (merge-pathnames (format nil "lib/~A.lisp" f) (sibling-dir "fs-apple" "FS_APPLE")))))
 
 (defun load-cram ()
@@ -60,6 +65,63 @@
                   (unless (zerop (sb-ext:process-exit-code p))
                     (error "~A: ~A" program (get-output-stream-string err)))))))
     out))
+
+(defun split-words (s)
+  "S's space-separated words (no quoting: MAC68K_BASILISK and the like never needed any)."
+  (loop with words = nil and start = nil
+        for i from 0 to (length s)
+        for c = (if (< i (length s)) (char s i) #\Space)
+        do (cond ((and (char= c #\Space) start) (push (subseq s start i) words) (setq start nil))
+                 ((and (char/= c #\Space) (null start)) (setq start i)))
+        finally (return (nreverse words))))
+
+(defun %open-pty ()
+  "A pseudo-terminal: (values the master's fd, the slave's name, the slave's fd,
+   kept open so the master never reads EOF while the emulator reopens it)."
+  (let ((m (sb-alien:alien-funcall
+            (sb-alien:extern-alien "posix_openpt" (function sb-alien:int sb-alien:int))
+            (logior 2 #o400))))                ; O_RDWR | O_NOCTTY
+    (when (< m 0) (error "posix_openpt failed"))
+    (sb-alien:alien-funcall (sb-alien:extern-alien "grantpt" (function sb-alien:int sb-alien:int)) m)
+    (sb-alien:alien-funcall (sb-alien:extern-alien "unlockpt" (function sb-alien:int sb-alien:int)) m)
+    (let* ((name (sb-alien:alien-funcall
+                  (sb-alien:extern-alien "ptsname" (function sb-alien:c-string sb-alien:int)) m))
+           (s (sb-unix:unix-open name (logior 2 #o400) 0)))
+      (run "stty" "-F" name "raw" "-echo")
+      (values m name s))))
+
+(defun basilisk-serial (disk timeout done-p &key (ram-mb 32) (fpu "false"))
+  "Boot DISK under Basilisk II (MAC68K_BASILISK the command, MAC68K_ROM, MAC68K_JIT)
+   with serial port A a pseudo-terminal; read it until (DONE-P bytes-so-far) is
+   true, TIMEOUT seconds pass or Basilisk exits.  The bytes read.  Basilisk
+   ignores SIGTERM, so its process group gets TERM and then KILL."
+  (multiple-value-bind (master slave-name slave) (%open-pty)
+    (let* ((cmd (append (split-words (env "MAC68K_BASILISK" "BasiliskII"))
+                        (list "--nogui" "true" "--rom" (env "MAC68K_ROM") "--cpu" "4" "--fpu" fpu
+                              "--ramsize" (princ-to-string (ash ram-mb 20))
+                              "--jit" (env "MAC68K_JIT" "false") "--jitcachesize" "16384"
+                              "--disk" disk "--seriala" slave-name)))
+           (p (sb-ext:run-program (first cmd) (rest cmd) :search t :wait nil
+                                                         :output nil :error nil :input nil))
+           (got (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+           (buf (make-array 65536 :element-type '(unsigned-byte 8)))
+           (end (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
+      (unwind-protect
+           (loop until (or (funcall done-p got) (>= (get-internal-real-time) end)
+                           (not (sb-ext:process-alive-p p)))
+                 do (when (sb-sys:wait-until-fd-usable master :input 0.5)
+                      (let ((n (sb-sys:with-pinned-objects (buf)
+                                 (sb-unix:unix-read master (sb-sys:vector-sap buf) 65536))))
+                        (when (and n (> n 0))
+                          (loop for i below n do (vector-push-extend (aref buf i) got))))))
+        (dolist (sig '(15 9))
+          (when (sb-ext:process-alive-p p)
+            (ignore-errors (sb-ext:process-kill p sig :process-group))
+            (sleep 1)))
+        (ignore-errors (sb-ext:process-kill p 9 :process-group))
+        (sb-unix:unix-close master)
+        (sb-unix:unix-close slave))
+      (coerce got '(simple-array (unsigned-byte 8) (*))))))
 
 (defun read-bytes (path)
   (with-open-file (in path :element-type '(unsigned-byte 8))

@@ -88,7 +88,7 @@
               :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
               :boot-stack-top #x01A00000)
     ;; THE CLASSIC (4 MB) LAUNCHED FROM MAC OS (MODUS_MAC68K_MACHINE=classicos,
-    ;; scripts/mac68k-chain.py): the :CLASSIC map with nothing under the image.
+    ;; scripts/mac68k-chain.lisp): the :CLASSIC map with nothing under the image.
     ;; Mac OS keeps its low memory and system heap -- measured on MAME's Plus
     ;; and System 6.0.8 with no INITs, the system heap #x1400-#x24270, the
     ;; application zone from #x2427C -- and the image runs on top of them as it
@@ -158,7 +158,7 @@
     ;; the boot tail in the map, 800000
     ;; before the keep-list was measured on the Mac, 860000 with a stack of its own, BC0000 before cold native code, D30000 while the JIT area was in the map).  Its
     ;; minimum partition is SPAN + 576 KB = 6,016 KB, measured (SPAN + 1.5 MB
-    ;; while the relocating load aligned to 512 KB: mac68k-chain.py SIZE-RSRC).
+    ;; while the relocating load aligned to 512 KB: mac68k-chain.lisp SIZE-RSRC).
     ;; COLD NATIVE CODE (2026-11-19, compiler.lisp *COLD-KEEP*): the functions a
     ;; coverage run never entered stay on the disk until their first call, so
     ;; the resident image is ~5.4 MB and everything past it moved down 3.4 MB.

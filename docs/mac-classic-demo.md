@@ -1,7 +1,7 @@
 # Modus on a Mac Classic: a demo script
 
 What to type, and what to leave out.  Measured on MAME's Mac Classic with 4 MB, System 6.0.8,
-Modus launched as an application (`scripts/mac68k-chain.py`; SMALL.md,
+Modus launched as an application (`scripts/mac68k-chain.lisp`; SMALL.md,
 "Launched from Mac OS").  Times are from pressing Return to the next prompt and
 include echoing the line; a real Classic's SCSI disk may add a little on the
 first use of something.

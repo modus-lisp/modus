@@ -61,17 +61,24 @@ static void queue_event(uint64_t e) {
     os_unfair_lock_lock(&ev_lock);
     // A RESIZE REPLACES ONE STILL WAITING: dragging a window's edge sends dozens, and the image would lay itself out
     // for every size it passed through, behind the drag; the latest is the only one that matters.
-    if ((e >> 40) == 6 && ev_tail != ev_head && (events[(ev_tail - 1) % NEV] >> 40) == 6)
+    // A hover (5) likewise: only where the pointer is now matters, not every place it passed.
+    uint64_t type = (e >> 40) & 0xFF;
+    if ((type == 6 || type == 5) && ev_tail != ev_head && ((events[(ev_tail - 1) % NEV] >> 40) & 0xFF) == type)
         events[(ev_tail - 1) % NEV] = e;
     else if (ev_tail - ev_head < NEV)
         events[ev_tail++ % NEV] = e;
     os_unfair_lock_unlock(&ev_lock);
 }
 
-static void push_pointer(long type, long x, long y) {
+// MODUS_UI_DEBUG set: every input event is logged as it is queued
+static int ui_debug(void) {
     static int debug = -1;
     if (debug < 0) debug = getenv("MODUS_UI_DEBUG") != NULL;
-    if (debug) fprintf(stderr, "modus-ui-mac: pointer type %ld at %ld,%ld\n", type, x, y);
+    return debug;
+}
+
+static void push_pointer(long type, long x, long y) {
+    if (ui_debug()) fprintf(stderr, "modus-ui-mac: pointer type %ld at %ld,%ld\n", type, x, y);
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x >= fb_w) x = fb_w - 1;
@@ -85,6 +92,46 @@ static void push_resize(long w, long h) {
 
 static void push_key(uint32_t keysym) {
     queue_event(((uint64_t)4 << 40) | (uint64_t)keysym);
+}
+
+// A key PRESSED (8) or RELEASED (9) on its own.  A Mac sends each, the modifiers too, as X11 keysyms (Shift_L,
+// Control_L, Alt_L, Super_L for Command), so Control-C reaches a terminal as the two keys it is, as over VNC.  Type 4
+// is a press and its release at once: typing text in (a paste), and the phone's keyboard.
+static void push_key_edge(uint32_t keysym, BOOL down) {
+    if (ui_debug()) fprintf(stderr, "modus-ui-mac: key %s %#x\n", down ? "down" : "up", keysym);
+    queue_event(((uint64_t)(down ? 8 : 9) << 40) | (uint64_t)keysym);
+}
+
+// THE BUTTONS HELD, X11's mask: 1 left, 2 middle, 4 right; 8 and 16 the wheel up and down, 32 and 64 left and right
+// (each a press and a release, one notch).  A pointer event with its mask is type 12, the mask in bits 48 up; the
+// left button alone keeps its own types (1 down, 2 drag, 3 up), as on the phone.
+static unsigned buttons;
+
+static void push_mask(unsigned mask, long x, long y) {
+    if (ui_debug()) fprintf(stderr, "modus-ui-mac: buttons %u at %ld,%ld\n", mask, x, y);
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= fb_w) x = fb_w - 1;
+    if (y >= fb_h) y = fb_h - 1;
+    queue_event(((uint64_t)(mask & 0xFF) << 48) | ((uint64_t)12 << 40) | ((uint64_t)y << 20) | (uint64_t)x);
+}
+
+// THE MODIFIERS HELD, as last sent; all released when the window stops taking keys, or one would stay down for ever
+// in the image (its release goes to whichever window took the keyboard).
+static NSEventModifierFlags held_modifiers;
+static const struct { NSEventModifierFlags flag; uint32_t keysym; } modifier_keys[] = {
+    { NSEventModifierFlagShift,   0xffe1 },   // Shift_L
+    { NSEventModifierFlagControl, 0xffe3 },   // Control_L
+    { NSEventModifierFlagOption,  0xffe9 },   // Alt_L
+    { NSEventModifierFlagCommand, 0xffeb },   // Super_L
+};
+
+static void set_modifiers(NSEventModifierFlags now) {
+    for (size_t i = 0; i < sizeof modifier_keys / sizeof modifier_keys[0]; i++) {
+        NSEventModifierFlags f = modifier_keys[i].flag;
+        if ((now & f) != (held_modifiers & f)) push_key_edge(modifier_keys[i].keysym, (now & f) != 0);
+    }
+    held_modifiers = now;
 }
 
 // A Unicode code point as the X11 keysym the image expects: Latin-1 as itself, the rest in
@@ -139,6 +186,15 @@ static BOOL moving_window;
 // mouse-down unless it accepts first mouse.  The desk should react to that first click too.
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
 - (BOOL)wantsUpdateLayer { return NO; }
+// THE POINTER'S MOVES over the view, while the window is key (for hover): a tracking area that follows the view's size
+- (void)viewDidMoveToWindow {
+    if (self.window && self.trackingAreas.count == 0)
+        [self addTrackingArea:[[NSTrackingArea alloc]
+                                  initWithRect:NSZeroRect
+                                       options:NSTrackingMouseMoved | NSTrackingActiveInKeyWindow |
+                                               NSTrackingInVisibleRect
+                                         owner:self userInfo:nil]];
+}
 
 - (NSPoint)pixelPointOf:(NSEvent *)e {
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
@@ -150,6 +206,7 @@ static BOOL moving_window;
         [self.window performWindowDragWithEvent:e];
         return;
     }
+    buttons |= 1;
     NSPoint p = [self pixelPointOf:e];
     push_pointer(1, (long)p.x, (long)p.y);
 }
@@ -160,17 +217,73 @@ static BOOL moving_window;
 }
 - (void)mouseUp:(NSEvent *)e {
     if (moving_window) { moving_window = NO; return; }
+    buttons &= ~1u;
     NSPoint p = [self pixelPointOf:e];
     push_pointer(3, (long)p.x, (long)p.y);
 }
 
-- (void)keyDown:(NSEvent *)e {
-    // Command is for the menu: Cmd-Q quits, Cmd-H hides.  The image does not see those.
-    if (e.modifierFlags & NSEventModifierFlagCommand) { [super keyDown:e]; return; }
+// THE OTHER BUTTONS: right (4) and middle (2), in the mask with whatever else is held.
+- (void)button:(unsigned)bit down:(BOOL)down at:(NSEvent *)e {
+    if (down) buttons |= bit; else buttons &= ~bit;
+    NSPoint p = [self pixelPointOf:e];
+    push_mask(buttons, (long)p.x, (long)p.y);
+}
+- (void)rightMouseDown:(NSEvent *)e { [self button:4 down:YES at:e]; }
+- (void)rightMouseDragged:(NSEvent *)e { [self button:4 down:YES at:e]; }
+- (void)rightMouseUp:(NSEvent *)e { [self button:4 down:NO at:e]; }
+- (void)otherMouseDown:(NSEvent *)e { if (e.buttonNumber == 2) [self button:2 down:YES at:e]; }
+- (void)otherMouseDragged:(NSEvent *)e { if (e.buttonNumber == 2) [self button:2 down:YES at:e]; }
+- (void)otherMouseUp:(NSEvent *)e { if (e.buttonNumber == 2) [self button:2 down:NO at:e]; }
+
+// HOVER: the pointer moving with no button down (type 5), as a mouse does and a finger cannot.
+- (void)mouseMoved:(NSEvent *)e {
+    if (buttons) return;
+    NSPoint p = [self pixelPointOf:e];
+    push_pointer(5, (long)p.x, (long)p.y);
+}
+
+// SCROLLING, as the wheel's notches: a press and a release of its button each.  A mouse wheel counts in lines, a
+// trackpad in points (about 16 to a notch); the sign is the person's own (natural scrolling or not): content that
+// should move down is the wheel turned up.
+- (void)scrollWheel:(NSEvent *)e {
+    static double acc_y, acc_x;
+    double per = e.hasPreciseScrollingDeltas ? 16 : 1;
+    acc_y += e.scrollingDeltaY / per;
+    acc_x += e.scrollingDeltaX / per;
+    NSPoint p = [self pixelPointOf:e];
+    for (; acc_y >= 1; acc_y -= 1)  { push_mask(buttons | 8, (long)p.x, (long)p.y);  push_mask(buttons, (long)p.x, (long)p.y); }
+    for (; acc_y <= -1; acc_y += 1) { push_mask(buttons | 16, (long)p.x, (long)p.y); push_mask(buttons, (long)p.x, (long)p.y); }
+    for (; acc_x >= 1; acc_x -= 1)  { push_mask(buttons | 32, (long)p.x, (long)p.y); push_mask(buttons, (long)p.x, (long)p.y); }
+    for (; acc_x <= -1; acc_x += 1) { push_mask(buttons | 64, (long)p.x, (long)p.y); push_mask(buttons, (long)p.x, (long)p.y); }
+}
+
+// THE MODIFIERS, pressed and released, each as its own key.  A key's own event says which are held, too, and is
+// believed over what was last sent: one pressed while another window had the keyboard, or a key sent by a program
+// with its modifiers as flags only, brings no flagsChanged.
+static void sync_modifiers(NSEvent *e) {
+    set_modifiers(e.modifierFlags & (NSEventModifierFlagShift | NSEventModifierFlagControl |
+                                     NSEventModifierFlagOption | NSEventModifierFlagCommand));
+}
+- (void)flagsChanged:(NSEvent *)e { sync_modifiers(e); }
+
+// A key's keysym: one with no character by its code; otherwise its character -- with Control or Command held, the
+// key's own (c for Control-C, not the control code AppKit makes of it).  0: none, or more than one character.
+static uint32_t keysym_of(NSEvent *e) {
     uint32_t ks = special_keysym(e.keyCode);
-    if (ks) { push_key(ks); return; }
-    NSString *s = e.characters;
-    if (!s) return;
+    if (ks) return ks;
+    BOOL chord = (e.modifierFlags & (NSEventModifierFlagControl | NSEventModifierFlagCommand)) != 0;
+    NSString *s = chord ? e.charactersIgnoringModifiers : e.characters;
+    if (s.length == 0) return 0;
+    NSRange first = [s rangeOfComposedCharacterSequenceAtIndex:0];
+    if (first.length != s.length) return 0;
+    uint32_t cp = 0;
+    [s getBytes:&cp maxLength:4 usedLength:NULL encoding:NSUTF32LittleEndianStringEncoding
+        options:0 range:first remainingRange:NULL];
+    return keysym_for(cp);
+}
+
+// A string typed in: each character a press and its release (type 4).
+static void type_text(NSString *s) {
     [s enumerateSubstringsInRange:NSMakeRange(0, s.length)
                           options:NSStringEnumerationByComposedCharacterSequences
                        usingBlock:^(NSString *ch, NSRange r, NSRange er, BOOL *stop) {
@@ -178,11 +291,58 @@ static BOOL moving_window;
         uint32_t cp = 0;
         [ch getBytes:&cp maxLength:4 usedLength:NULL encoding:NSUTF32LittleEndianStringEncoding
              options:0 range:NSMakeRange(0, ch.length) remainingRange:NULL];
-        uint32_t k = keysym_for(cp);
+        uint32_t k = (cp == '\n' || cp == '\r') ? 0xff0d : (cp == '\t' ? 0xff09 : keysym_for(cp));
         if (k) push_key(k);
     }];
 }
+
+// KEYS, pressed and released.  The menu has first claim on Command keys (Quit, Close, Minimize, the Edit menu); a
+// Command key it does not claim comes here and goes to the image, with Super_L held, for its apps.
+// AppKit does not send the release of a key pressed with Command held, so that one is sent pressed and released at
+// once, and its keyUp (if one comes) is not.
+- (void)keyDown:(NSEvent *)e {
+    sync_modifiers(e);
+    uint32_t ks = keysym_of(e);
+    BOOL command = (e.modifierFlags & NSEventModifierFlagCommand) != 0;
+    if (ks) {
+        if (!e.isARepeat || !command) push_key_edge(ks, YES);
+        if (command) push_key_edge(ks, NO);
+    } else if (e.characters.length) type_text(e.characters);    // several characters at once
+}
+- (void)keyUp:(NSEvent *)e {
+    if (e.modifierFlags & NSEventModifierFlagCommand) return;
+    uint32_t ks = keysym_of(e);
+    if (ks) push_key_edge(ks, NO);
+    sync_modifiers(e);
+}
+
+// THE EDIT MENU, the standard selectors (so a native text field over the desk has its own).  Paste types the
+// clipboard's text in; Cut, Copy and Select All are sent as the keys they are -- Command with X, C or A -- for the
+// image's app to take as it means them.
+static void command_chord(uint32_t letter) {
+    BOOL held = (held_modifiers & NSEventModifierFlagCommand) != 0;
+    if (!held) push_key_edge(0xffeb, YES);
+    push_key_edge(letter, YES);
+    push_key_edge(letter, NO);
+    if (!held) push_key_edge(0xffeb, NO);
+}
+- (void)paste:(id)sender {
+    (void)sender;
+    NSString *s = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
+    if (!s.length) return;
+    // typed with Command up, or each character would be a Command key to the image
+    BOOL held = (held_modifiers & NSEventModifierFlagCommand) != 0;
+    if (held) push_key_edge(0xffeb, NO);
+    type_text(s);
+    if (held) push_key_edge(0xffeb, YES);
+}
+- (void)copy:(id)sender { (void)sender; command_chord('c'); }
+- (void)cut:(id)sender { (void)sender; command_chord('x'); }
+- (void)selectAll:(id)sender { (void)sender; command_chord('a'); }
 @end
+
+// Modifiers held when the window stops taking keys are released in the image (their releases go elsewhere).
+static void release_modifiers(void) { set_modifiers(0); }
 
 // The menu bar: an application menu with Quit, which is what Cmd-Q and the user expect.
 @interface ModusAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
@@ -250,6 +410,10 @@ static NSString *app_name(void) {
     (void)n;
     refit();
 }
+- (void)windowDidResignKey:(NSNotification *)n {
+    (void)n;
+    release_modifiers();
+}
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     (void)n;
     NSRect want = NSMakeRect(0, 0, WANT_W, WANT_H);
@@ -261,6 +425,7 @@ static NSString *app_name(void) {
     window.title = app_name();
     window.delegate = self;
     window.releasedWhenClosed = NO;
+    window.acceptsMouseMovedEvents = YES;          // hover
     // full screen in any chrome: a borderless (full-bleed) window is not offered it unless it asks
     window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
 
@@ -306,6 +471,16 @@ static void build_menu(void) {
     [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", app_name()]
                        action:@selector(terminate:) keyEquivalent:@"q"];
     appItem.submenu = appMenu;
+    // THE EDIT MENU: the standard selectors, so a native text field has Cut, Copy, Paste and Select All, and the
+    // desk has them as ModusView's (paste types the clipboard in)
+    NSMenuItem *editItem = [[NSMenuItem alloc] init];
+    [bar addItem:editItem];
+    NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+    [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+    [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
+    [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+    editItem.submenu = editMenu;
     // THE WINDOW MENU: Minimize, Close and Full Screen by their usual keys, whichever chrome the window has (they
     // reach ModusWindow through the responder chain, so a full-bleed window, with no buttons, has them too)
     NSMenuItem *windowItem = [[NSMenuItem alloc] init];

@@ -187,6 +187,37 @@ static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t 
 }
 #endif
 
+#if defined(MODUS_MAC_GUI)
+// THE MACOS WINDOW (build-macos.sh --gui).  AppKit owns the main thread: its run loop must be there.
+// The image runs on a thread of its own, exactly as on iOS, and reaches the window through the
+// pseudo-syscalls 1001-1008, which modus-ui-mac.m answers.  host/macos/modus-ui-mac.m.
+extern void modus_mac_init(void);
+extern void modus_mac_main(void) __attribute__((noreturn));
+extern int64_t modus_mac_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3);
+struct mac_image_start { uint64_t sp, entry; };
+static void *mac_image_thread(void *arg) {
+    struct mac_image_start st = *(struct mac_image_start *)arg;
+    stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0 };
+    modus_altstack(&ss);
+    image_leader = 1;
+    modus_enter(st.sp, st.entry);
+}
+static void run_image_beside_appkit(uint64_t sp, uint64_t entry) __attribute__((noreturn));
+static void run_image_beside_appkit(uint64_t sp, uint64_t entry) {
+    static struct mac_image_start st;
+    st.sp = sp; st.entry = entry;
+    modus_mac_init();
+    pthread_attr_t at; pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    if (pthread_create(&th, &at, mac_image_thread, &st) != 0) {
+        fprintf(stderr, "modus-shim: could not start the image thread\n");
+        _exit(1);
+    }
+    modus_mac_main();
+}
+#endif
+
 // THE LINUX WORD.  Every syscall argument and result is a 64-bit register on the image's side; a C long is
 // 32 bits on a watch (arm64_32, ILP32), so the syscall interface says int64_t, and an address in one of these
 // words reaches C through uintptr_t (an arm64_32 layout lies below 4 GB: image-segments.sh MODUS_SEGMENT_SHIFT).
@@ -975,7 +1006,10 @@ static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
     case 103: return 0;                            // setitimer
     case 1030: case 1031: case 1032:                                    // the keychain, random bytes (modus-keychain.m)
         return modus_keychain_call(nr, a0, a1, a2);
-#if TARGET_OS_IPHONE
+#if defined(MODUS_MAC_GUI)
+    case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007: case 1008:   // the window (host/macos/modus-ui-mac.m)
+        return modus_mac_call(nr, a0, a1, a2, a3);
+#elif TARGET_OS_IPHONE
     case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007: case 1008:   // screen, input, copy, frame clock (host/ios/modus-ui.m)
         return modus_ui_call(nr, a0, a1, a2, a3);
     case 1040:   // the Objective-C runtime: a frame in the image's memory (host/ios/modus-objc.m)
@@ -1358,7 +1392,9 @@ int main(int argc, char **argv, char **envp) {
     reserve_delta_key();
     install_fault_report();
     start_profiler();
-#if TARGET_OS_IPHONE
+#if defined(MODUS_MAC_GUI)
+    run_image_beside_appkit((uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
+#elif TARGET_OS_IPHONE
     run_image_beside_uikit(argc, argv, (uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
 #else
     image_leader = 1;

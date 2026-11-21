@@ -4,11 +4,13 @@
 ;;;; Linux system calls directly.  Windows has no stable system-call interface,
 ;;;; so this image keeps the SAME runtime and the SAME syscall ABI, and replaces
 ;;;; the one place a syscall leaves the image: every `syscall' instruction the
-;;;; translator emits becomes `call SHIM', where SHIM is a routine in the boot
-;;;; stub that takes the Linux number in RAX and the arguments in RDI RSI RDX
+;;;; translator emits becomes `call SHIM' (translate-x64's EMIT-X64-SYSCALL),
+;;;; where SHIM takes the Linux number in RAX and the arguments in RDI RSI RDX
 ;;;; R10 R8 R9, dispatches to kernel32 through the import address table, and
 ;;;; returns a Linux-style result (-errno on failure).  It preserves every
-;;;; register a Linux syscall preserves (all but RAX, RCX and R11).
+;;;; register a Linux syscall preserves (all but RAX, RCX and R11), and like
+;;;; SYSCALL it leaves the Lisp stack alone: Win32 runs on the shim's own stack
+;;;; and the call site steps over the red zone.  docs/win64.md is the overview.
 ;;;;
 ;;;; IMAGE LAYOUT.  The PE headers occupy file bytes [0, 0x400) and the code
 ;;;; starts at file offset 0x1000, which the .text section maps at RVA 0x1000.
@@ -16,23 +18,34 @@
 ;;;;     #x400000 + #x1000 + O
 ;;;; exactly as the ELF wrapper's raw bytes sit at load-addr + header-total.
 ;;;; The image base is FIXED (no relocations): the runtime's absolute addresses
-;;;; are compiled in, as they are for the ELF.  The BSS that holds the fixed low
-;;;; block (#x10000000..) is a zero-filled section, like the ELF's p_memsz tail.
+;;;; are compiled in, as they are for the ELF.
+;;;;
+;;;; MEMORY.  Every region the runtime knows by address is where the ELF has it:
+;;;;     0x401000      .text: boot stub, native code, constants (RWX)
+;;;;     ..0x20000000  .bss: the fixed low block (0x10000000..), zero-filled
+;;;;     0x2000000000  heap, VirtualAlloc'd by the prologue
+;;;;     0x3000000000  JIT arena (RWX), bump word at 0x10000FB8
+;;;;     0x4000000000  16 MB stack: the shim's Win32 stack in the bottom 1 MB,
+;;;;                   the Lisp stack above it, the argc/argv/envp block on top
+;;;;     0x5000000000+ hint-less mmaps, bump-placed (Linux puts them high too)
 ;;;;
 ;;;; THE STUB (raw offsets from 0), all of it before the JMP cross.lisp puts
 ;;;; after the boot code:
 ;;;;     0        JMP prologue
 ;;;;     5        IAT: one 8-byte slot per import (filled by the loader)
+;;;;     ...      the mmap bump word
 ;;;;     ...      SHIM: the syscall dispatcher
-;;;;     ...      PROLOGUE: VirtualAlloc the heap, argc, then the shared heap tail
-;;;;              (emit-linux-x64-heap-tail), which falls through into the JMP to
-;;;;              kernel-main.
+;;;;     ...      PROLOGUE: heap, JIT arena, stack and its argv/envp block, argc,
+;;;;              then the shared heap tail (emit-linux-x64-heap-tail), which
+;;;;              falls through into the JMP to kernel-main.
+;;;; EMIT-WIN64-ENTRY assembles the stub when the image is built; an early copy
+;;;; (WIN64-STUB) only tells the translator where the shim and native code are.
 ;;;;
-;;;; SCOPE (this milestone): one OS thread.  The per-CPU GS block and the FS
-;;;; per-thread window are OFF in the Windows build (build-win64-cli.lisp), since
-;;;; on Windows GS base is the TEB.  clone, futex, arch_prctl and real signal
-;;;; handlers are not provided: they return -ENOSYS, or 0 for sigaction, which
-;;;; is correct only while nothing runs a second thread or depends on a signal.
+;;;; SCOPE: one OS thread.  The per-CPU GS block and the FS per-thread window are
+;;;; OFF in the Windows build (build-win64-cli.lisp): on Windows GS base is the
+;;;; TEB, and FS is not the runtime's to set.  clone, futex and arch_prctl return
+;;;; -ENOSYS; sigaction returns 0 and nothing is delivered.  Files and sockets
+;;;; are not mapped yet (-ENOSYS).
 
 (in-package :modus.mvm)
 
@@ -40,18 +53,17 @@
 (defconstant +win64-header-size+ #x1000)    ; PE headers + padding; raw code starts here
 (defconstant +win64-text-va+ #x401000)      ; = image base + header size
 (defconstant +win64-bss-end-va+ #x20000000) ; the zero-filled low block runs to here
-;; The Lisp stack: a fixed, fully committed region well above 4 GB, like the
-;; Linux process stack.  The loader's main-thread stack lands at 0x20000000,
-;; inside the runtime's [0x10000000, 0x40000000) data window.
+;; The stack: a fixed, fully committed region, so the runtime finds the block a
+;; Linux process starts with above its stack base (argv and envp are read from
+;; there) and no Windows guard-page logic is involved.
 (defconstant +win64-stack-va+ #x4000000000)
 (defconstant +win64-stack-size+ #x1000000)  ; 16 MB
 ;; The bottom 1 MB of that region is the shim's own stack: every Win32 call runs
 ;; there, so kernel32 and ntdll never write to the Lisp stack.  (A Linux SYSCALL
 ;; writes nothing to the user stack, and the runtime was only ever run that way.)
 (defconstant +win64-win32-stack-top+ (+ #x4000000000 #x100000))
-;; Where hint-less mmaps are placed.  Linux puts them high (0x7f...); Wine's
-;; VirtualAlloc(NULL) returns the lowest free region (0x240000, below the image),
-;; and this runtime classifies some addresses by range ("code addrs are < 4GB").
+;; Where hint-less mmaps are placed.  Linux puts them high; Wine's
+;; VirtualAlloc(NULL) returns the lowest free region (0x240000, below the image).
 (defconstant +win64-mmap-base+ #x5000000000)
 
 (defparameter *win64-imports*
@@ -390,9 +402,9 @@
     (:call-iat "ExitProcess")                            ; no heap: nothing can run
     (:label :p-ok)
     ;; The JIT arena, as the Linux entry maps it: one RWX region at a fixed base,
-    ;; its bump word [0x10000FB8] set to the base, or 0 if refused.  Done even
-    ;; with the JIT off, because the Linux image has this word set at startup and
-    ;; the Windows image did not (the GC fault in the win64 notes).
+    ;; its bump word [0x10000FB8] set to the base, or 0 if refused (then the
+    ;; runtime's exec-page trap falls back to mmap).  Mapped with the JIT off
+    ;; too, so the startup state is the Linux image's.
     (:bytes #x48 #x89 #xC5)                              ; mov rbp,rax  (heap base)
     (:bytes #x48 #xB9 ,@(w64-le64 +linux-x64-jit-arena-base+)) ; mov rcx,arena base
     (:bytes #xBA ,@(w64-le32 +linux-x64-jit-arena-size+))  ; mov edx,arena size
@@ -685,3 +697,70 @@
            (win64-iat-offset)))
   (unless (= +win64-text-va+ (+ +win64-image-base+ +win64-header-size+))
     (error "boot-win64: text VA and header size disagree")))
+
+;;; ============================================================
+;;; The build: what build-generic-cli.lisp calls when *CLI-WIN64* is set.
+;;; ============================================================
+
+;; WINDOWS RUNTIME SOURCE, appended to the image's own source.  It must go on
+;; *FULL-SOURCE* itself: that text is assembled when build-cli-common.lisp loads,
+;; so appending to *CLI-ARCH-OVERRIDE-SOURCE* here (after the load) is lost.
+;;
+;; %JIT-WINDOW-PREFIX: the JIT's hand-assembled bridge thunks store to window
+;; slots with this byte first; 144 (#x90, NOP) instead of the FS override, since
+;; this image has no window and FS is not ours (mvm/mvm-eval.lisp).
+;; %CLI-COLLECT-ARGV: the stub puts the whole command line (GetCommandLineA)
+;;    in argv[0]; split it with the Windows rules -- whitespace separates outside
+;;    double quotes, a quote toggles quoting, \" is a literal quote.  Characters
+;;    are written as codes (92 backslash, 34 quote, 32 space, 9 tab) to keep the
+;;    text free of escapes.  Last definition wins (the original is overridable).
+(defparameter *win64-runtime-source*
+  (format nil "
+(defun %jit-window-prefix () 144)
+(defun %cli-collect-argv ()
+  (let* ((line (%cli-cstr-at (%cli-read-ptr (%cli-argv-base))))
+         (n (length line)) (acc nil) (out (make-string-output-stream))
+         (in-token nil) (quoted nil) (i 0))
+    (loop
+      (when (>= i n) (return))
+      (let ((c (char-code (char line i))))
+        (cond ((and (= c 92) (< (+ i 1) n) (= (char-code (char line (+ i 1))) 34))
+               (write-char (code-char 34) out) (setq in-token t) (setq i (+ i 1)))
+              ((= c 34) (setq quoted (not quoted)) (setq in-token t))
+              ((and (not quoted) (or (= c 32) (= c 9)))
+               (when in-token
+                 (push (get-output-stream-string out) acc)
+                 (setq in-token nil)))
+              (t (write-char (code-char c) out) (setq in-token t))))
+      (setq i (+ i 1)))
+    (when in-token (push (get-output-stream-string out) acc))
+    (nreverse acc)))
+"))
+
+(defun win64-configure-build ()
+  "Point the translator at this image's layout and add the Windows runtime
+   source.  Called by build-generic-cli.lisp in place of the Linux native-code
+   offset, after build-cli-common has assembled *FULL-SOURCE*."
+  (win64-image-check)
+  (setf modus.mvm.x64::*x64-native-code-offset* (win64-native-code-offset))
+  ;; Every syscall the image makes goes through the stub's shim.
+  (setf modus.mvm.x64::*x64-win-shim-va* (win64-shim-va))
+  (setq cl-user::*full-source*
+        (concatenate 'string cl-user::*full-source* (string #\Newline) *win64-runtime-source*))
+  ;; The JIT co-init's shim address (build-cli-common, *CLI-WIN64*).  Every copy of
+  ;; the co-init in the source gets it; with the JIT on there must be at least one.
+  (let ((token "WIN64-SHIM-VA-PLACEHOLDER")
+        (value (princ-to-string (modus.mvm::win64-shim-va)))
+        (n 0))
+    (loop
+      (let* ((src cl-user::*full-source*)
+             (at (search token src)))
+        (unless at (return))
+        (incf n)
+        (setq cl-user::*full-source*
+              (concatenate 'string (subseq src 0 at) value
+                           (subseq src (+ at (length token)))))))
+    (format t "~&;; win64: shim address #x~X in ~D JIT co-init cop~:@P~%"
+            (modus.mvm::win64-shim-va) n n)
+    (when (and cl-user::*jit-on* (zerop n))
+      (error "win64-configure-build: the JIT is on but its co-init has no ~A" token))))

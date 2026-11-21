@@ -7367,6 +7367,42 @@
                       (mvm-find-setf-expander (car place)))
                  (funcall (mvm-find-setf-expander (car place))
                           (cdr place) value))
+                ;; A (DEFUN (SETF NAME) ...) for a LIBRARY's own symbol is that
+                ;; place's store, whatever its name spells.  The built-in cases
+                ;; below match by NAME (NAME-EQ), so a package that shadows CAR,
+                ;; CDR, FIRST, AREF ... and defines (SETF CDR) on its own CDR was
+                ;; given CL:CDR's store instead -- SET-CDR of an object that is
+                ;; not a cons ("is not of type CONS"), where SBCL calls the
+                ;; package's setter.  cortez's CDR, which takes a locative,
+                ;; stopped TI's screen at (SETF (CDR loc) ...).  Asked only of a
+                ;; symbol whose home folds (%FN-KEY-PKG-OF): COMMON-LISP's own
+                ;; places, and Modus's, never reach the registry here.
+                ;;
+                ;; IN CLHS 5.1.2's ORDER, which is the point: a place that is a
+                ;; MACRO form is expanded and the expansion is the place
+                ;; (5.1.2.7); a (SETF NAME) function is for a place that is not
+                ;; one (5.1.2.9).  Calling the setf function first sent TI's
+                ;; accessor macros -- DEFSUBSTs and the like, that also have a
+                ;; (SETF NAME) -- to the function, and their Release 6 patches
+                ;; went from 97 to 44 of 99 forms ("SHEET is not a flavor").
+                ;; The function call is the registry clause's expansion further
+                ;; down: subforms once, left to right, then the value, FIRST.
+                ((and (consp place) (symbolp (car place)) (car place)
+                      (%fn-key-pkg-of (car place))
+                      (not (and *macrolet-names*
+                                (member (normalize-name (car place)) *macrolet-names*)))
+                      (or (cdr (%macroexpand-1-mvm-raw place))
+                          (%find-setf-function (car place))))
+                 (let ((ex (%macroexpand-1-mvm-raw place)))
+                   (if (cdr ex)
+                       `(setf ,(car ex) ,value)
+                       (let* ((setter (%find-setf-function (car place)))
+                              (gargs  (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "SFA"))
+                                              (cdr place)))
+                              (gval   (%mvm-gensym "SFV")))
+                         `(let* (,@(mapcar #'list gargs (cdr place))
+                                 (,gval ,value))
+                            (,setter ,gval ,@gargs))))))
                 ;; (setf (car x) v) → (set-car x v)
                 ((and (consp place) (name-eq (car place) "CAR"))
                  `(set-car ,(cadr place) ,value))

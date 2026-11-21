@@ -106,7 +106,39 @@
    per-thread window is on.  Legacy prefixes precede REX, so this must be the
    last thing emitted before the instruction itself.  With the window off it
    emits nothing at all, which is what keeps every other image byte-identical."
-  (when *x64-tls-window* (emit-bytes buf #x64)))
+  (when *x64-tls-window* (emit-fs-prefix buf)))
+
+(defvar *x64-win-tls* nil
+  "WINDOWS: the FS (window) and GS (per-CPU) bases are TEB TLS slots, not
+   segment bases.  Every place this file would emit the 0x64 or 0x65 prefix
+   instead starts a capture (MODUS.ASM:%SEG-BEGIN); the instruction that follows
+   is emitted exactly as on Linux and rewritten, once complete, into
+   `mov gs:[save],scr; mov scr,gs:[base]; <access based on scr>; mov scr,gs:[save]'.
+   On Windows GS is the TEB, and a user FS base is lost at the first context
+   switch (test/win64/probe/fsbase.asm), so neither segment is the runtime's.
+   Instruction LENGTHS change, so a hand-counted distance across one of these
+   accesses must be measured (X64-TLS-INSN-LENGTH).  NIL: not a byte changes.")
+
+(defun emit-fs-prefix (buf)
+  "The prefix of a per-thread-window access (FS on Linux)."
+  (if *x64-win-tls*
+      (%seg-begin buf +win-tls-window+)
+      (emit-byte buf #x64)))
+
+(defun emit-gs-prefix (buf)
+  "The prefix of a per-CPU access (GS on Linux)."
+  (if *x64-win-tls*
+      (%seg-begin buf +win-tls-percpu+)
+      (emit-byte buf #x65)))
+
+(defun x64-tls-insn-length (bytes)
+  "Bytes the window access BYTES (the instruction without its prefix) takes once
+   emitted: one more than BYTES with the window on, BYTES as they are with it
+   off, and the TLS-slot sequence on Windows."
+  (let ((b (make-code-buffer :bytes (make-array 128 :element-type '(unsigned-byte 8)))))
+    (emit-tls-prefix b)
+    (dolist (x bytes) (emit-byte b x))
+    (code-buffer-position b)))
 
 (defun emit-tls-base (buf reg)
   "REG = this thread's FS base, or 0 when the per-thread window is off.
@@ -219,7 +251,7 @@
 
 (defun emit-fs-store-reg (buf addr reg)
   "mov fs:[ADDR], REG"
-  (emit-byte buf #x64)
+  (emit-fs-prefix buf)
   (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
   (emit-byte buf #x89)
   (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
@@ -228,7 +260,7 @@
 
 (defun emit-fs-cmp-reg (buf reg addr)
   "cmp REG, fs:[ADDR]"
-  (emit-byte buf #x64)
+  (emit-fs-prefix buf)
   (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
   (emit-byte buf #x3B)
   (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
@@ -270,15 +302,15 @@
 
 (defun emit-fs-xchg-abs-r11 (buf addr)
   "xchg fs:[ADDR], r11"
-  (emit-bytes buf #x64 #x4C #x87 #x1C #x25) (emit-abs32 buf addr))
+  (emit-fs-prefix buf) (emit-bytes buf #x4C #x87 #x1C #x25) (emit-abs32 buf addr))
 
 (defun emit-fs-xchg-abs-rcx (buf addr)
   "xchg fs:[ADDR], rcx"
-  (emit-bytes buf #x64 #x48 #x87 #x0C #x25) (emit-abs32 buf addr))
+  (emit-fs-prefix buf) (emit-bytes buf #x48 #x87 #x0C #x25) (emit-abs32 buf addr))
 
 (defun emit-fs-store-rsp (buf addr)
   "mov fs:[ADDR], rsp"
-  (emit-bytes buf #x64 #x48 #x89 #x24 #x25) (emit-abs32 buf addr))
+  (emit-fs-prefix buf) (emit-bytes buf #x48 #x89 #x24 #x25) (emit-abs32 buf addr))
 
 (defconstant +stw-owner-addr+ #x10005028
   "ABSOLUTE: the self base + 1 of the thread holding STOP (0 = none).  Lets a
@@ -388,7 +420,7 @@
 
 (defun %ssg-fs-rcx-op (buf opcode addr)
   ;; OPCODE rcx, fs:[addr]   (64 48 op 0C 25 disp32)
-  (emit-bytes buf #x64 #x48 opcode #x0C #x25) (emit-u32 buf addr))
+  (emit-fs-prefix buf) (emit-bytes buf #x48 opcode #x0C #x25) (emit-u32 buf addr))
 
 (defun %ssg-emit-in-region (buf inside)
   "Jump to INSIDE when RAX (an untagged address) lies in this thread's region
@@ -423,8 +455,8 @@
     (%ssg-emit-in-region buf ok)                     ; target is ours too: fine
     ;; A thread-local object is about to be stored into shared memory.
     (emit-bytes buf #x48 #x8B #x4C #x24 #x10)        ; mov rcx, [rsp+16]  store site
-    (emit-bytes buf #x64 #x48 #x89 #x0C #x25) (emit-u32 buf +ssg-site-addr+)
-    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf +ssg-marker-addr+) (emit-u32 buf 1)
+    (emit-fs-prefix buf) (emit-bytes buf #x48 #x89 #x0C #x25) (emit-u32 buf +ssg-site-addr+)
+    (emit-fs-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) (emit-u32 buf +ssg-marker-addr+) (emit-u32 buf 1)
     (emit-bytes buf #x0F #x0B)                       ; ud2 -- before the store
     (emit-label buf ok)
     (emit-pop buf 'rcx)
@@ -688,7 +720,7 @@
     (emit-jmp buf try)
     (emit-label buf acquired)
     ;; OWNER := my self base + 1, so a fault or a watchdog knows who holds it.
-    (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-abs32 buf #x10000C30) ; mov rax, fs:[self]
+    (emit-fs-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25) (emit-abs32 buf #x10000C30) ; mov rax, fs:[self]
     (emit-bytes buf #x48 #xFF #xC0)                  ; inc rax
     (emit-bytes buf #x48 #x89 #x04 #x25) (emit-abs32 buf +stw-owner-addr+)
     ;; SPIN BUDGET: waiting for the other threads to reach a safe point.  A
@@ -697,7 +729,7 @@
     (emit-bytes buf #xB9 #xFF #xFF #xFF #x7F)        ; mov ecx, 0x7FFFFFFF
     (emit-stw-load-table buf 'r11 done)
     ;; r14 = my segment base (0 on main)
-    (emit-bytes buf #x64 #x4C #x8B #x34 #x25) (emit-abs32 buf #x10000C30)
+    (emit-fs-prefix buf) (emit-bytes buf #x4C #x8B #x34 #x25) (emit-abs32 buf #x10000C30)
     (emit-cmp-reg-imm buf 'r14 0)
     (emit-jcc buf :e skip-main)
     (emit-label buf wm)                              ; a worker collecting: stop main
@@ -820,7 +852,7 @@
     (emit-cmp-abs64-zero buf +stw-stop-addr+)
     (emit-jcc buf :e ret)
     (emit-stw-load-table buf 'r11 ret)
-    (emit-bytes buf #x64 #x4C #x8B #x34 #x25) (emit-abs32 buf #x10000C30) ; r14 = my seg
+    (emit-fs-prefix buf) (emit-bytes buf #x4C #x8B #x34 #x25) (emit-abs32 buf #x10000C30) ; r14 = my seg
     (emit-cmp-reg-imm buf 'r14 0)
     (emit-jcc buf :e skip-main)
     ;; MAIN, stopped by a worker: its stack up to region 0's stack_base.
@@ -2778,9 +2810,10 @@
               ;; this LEA and the end of the trap block, so the displacement
               ;; is 15 rather than 14 when the per-thread window is on.  Get
               ;; this wrong and SETJMP records a resume point one byte off.
+              ;; Windows: the store is the TLS-slot sequence (X64-TLS-INSN-LENGTH).
               (emit-bytes buf #x48 #x8D #x05
                           (if *x64-linux-mode*
-                              (if *x64-tls-window* #x0F #x0E)
+                              (+ (x64-tls-insn-length '(#x48 #x89 #x41 #x10)) 10)
                               #x1A)
                           #x00 #x00 #x00)            ; lea rax, [rip+14/15/26]
               ;; mov [rcx+16], rax  — save return IP
@@ -2953,12 +2986,12 @@
                 ;; keeps the one being handled.
                 (when (x64-fault-rec-p)
                   (let ((rec-busy (make-label)))
-                    (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf #x100051F8) (emit-bytes buf #x00)
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #x83 #x3C #x25) (emit-u32 buf #x100051F8) (emit-bytes buf #x00)
                     (emit-jcc buf :ne rec-busy)                     ; cmp qword fs:[busy], 0
                     (emit-bytes buf #x48 #x8B #x46 #x10)            ; mov rax, [rsi+16] (si_addr)
-                    (emit-bytes buf #x64 #x48 #x89 #x04 #x25) (emit-u32 buf +fault-rec-addr-addr+)
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #x89 #x04 #x25) (emit-u32 buf +fault-rec-addr-addr+)
                     (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (RIP)
-                    (emit-bytes buf #x64 #x48 #x89 #x04 #x25) (emit-u32 buf +fault-rec-pc-addr+)
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #x89 #x04 #x25) (emit-u32 buf +fault-rec-pc-addr+)
                     (emit-label buf rec-busy)))
                 ;; FRAGILITY DIAG: capture useful state from the kernel's
                 ;; ucontext (RDX, requires SA_SIGINFO above).
@@ -3073,14 +3106,14 @@
                   (let ((walk-loop (make-label)) (walk-done (make-label))
                         (walk-busy (make-label)))
                     (emit-bytes buf #x56 #x57 #x41 #x50)            ; push rsi / rdi / r8
-                    (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf #x100051F8) (emit-bytes buf #x00)
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #x83 #x3C #x25) (emit-u32 buf #x100051F8) (emit-bytes buf #x00)
                     (emit-jcc buf :ne walk-busy)                    ; cmp qword fs:[busy], 0
-                    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf #x100051F8) (emit-u32 buf 1)
-                    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf #x10005200) (emit-u32 buf 0)
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) (emit-u32 buf #x100051F8) (emit-u32 buf 1)
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) (emit-u32 buf #x10005200) (emit-u32 buf 0)
                     (emit-bytes buf #x48 #x8B #x72 #x78)            ; mov rsi, [rdx+0x78]  (RBP)
                     (emit-bytes buf #x4C #x8B #x82 #xA0 #x00 #x00 #x00) ; mov r8, [rdx+0xA0] (RSP)
                     (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (RIP)
-                    (emit-bytes buf #x64 #x48 #x89 #x04 #x25) (emit-u32 buf #x10005208) ; frame 0
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #x89 #x04 #x25) (emit-u32 buf #x10005208) ; frame 0
                     (emit-bytes buf #xB9 #x01 #x00 #x00 #x00)       ; mov ecx, 1
                     (emit-bytes buf #x4C #x89 #xC7)                 ; mov rdi, r8 (the faulting RSP)
                     (emit-label buf walk-loop)
@@ -3097,15 +3130,15 @@
                     (emit-bytes buf #x48 #x8B #x46 #x08)            ; mov rax, [rsi+8] (return address)
                     (emit-bytes buf #x48 #x3D) (emit-u32 buf 4096)  ; cmp rax, 4096
                     (emit-jcc buf :b walk-done)
-                    (emit-bytes buf #x64 #x48 #x89 #x04 #xCD) (emit-u32 buf #x10005208) ; fs:[+0x5208+rcx*8]
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #x89 #x04 #xCD) (emit-u32 buf #x10005208) ; fs:[+0x5208+rcx*8]
                     (emit-bytes buf #xFF #xC1)                      ; inc ecx
                     (emit-bytes buf #x4C #x8D #x46 #x10)            ; lea r8, [rsi+16]
                     (emit-bytes buf #x48 #x8B #x36)                 ; mov rsi, [rsi]
                     (emit-jmp buf walk-loop)
                     (emit-label buf walk-done)
-                    (emit-bytes buf #x64 #x48 #x89 #x0C #x25) (emit-u32 buf #x10005200) ; count
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #x89 #x0C #x25) (emit-u32 buf #x10005200) ; count
                     (emit-label buf walk-busy)
-                    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf #x100051F8) (emit-u32 buf 0)
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) (emit-u32 buf #x100051F8) (emit-u32 buf 0)
                     (emit-bytes buf #x41 #x58 #x5F #x5E)))          ; pop r8 / rdi / rsi
                 ;; lock inc qword [0x10000CA0] -- the recovered-fault COUNT.
                 ;; The longjmp below publishes no condition; %HC-FAULT-FIXUP
@@ -3128,11 +3161,11 @@
                 ;; resume on it.
                 (when (x64-fault-rec-p)
                   (let ((not-gc (make-label)))
-                    (emit-bytes buf #x64 #x89 #x3C #x25)  ; mov fs:[code], edi
+                    (emit-fs-prefix buf) (emit-bytes buf #x89 #x3C #x25)  ; mov fs:[code], edi
                     (emit-u32 buf +fault-rec-code-addr+)
-                    (emit-bytes buf #x64 #xC7 #x04 #x25)  ; mov dword fs:[code+4], 0
+                    (emit-fs-prefix buf) (emit-bytes buf #xC7 #x04 #x25)  ; mov dword fs:[code+4], 0
                     (emit-u32 buf (+ +fault-rec-code-addr+ 4)) (emit-u32 buf 0)
-                    (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf +fault-rec-gc-addr+) (emit-bytes buf #x00)
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #x83 #x3C #x25) (emit-u32 buf +fault-rec-gc-addr+) (emit-bytes buf #x00)
                     (emit-jcc buf :e not-gc)              ; cmp qword fs:[in-gc], 0
                     (emit-fault-report buf "inside a garbage collection"
                                        "the heap is half-copied and cannot be trusted; stopping."
@@ -3250,7 +3283,7 @@
                 ;; address and PC.  A refused shared store keeps its own text.
                 (when (x64-fault-rec-p)
                   (let ((not-guard (make-label)))
-                    (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf +ssg-marker-addr+) (emit-bytes buf #x01)
+                    (emit-fs-prefix buf) (emit-bytes buf #x48 #x83 #x3C #x25) (emit-u32 buf +ssg-marker-addr+) (emit-bytes buf #x01)
                     (emit-jcc buf :ne not-guard)
                     (emit-fatal-message buf (format nil "~%modus: a thread stored one of its own objects into shared memory, and nothing on that thread handles errors. Threads share no state -- pass the value as a message. The store was refused; stopping.~%") +uncaught-fault-exit-code+)
                     (emit-label buf not-guard)
@@ -5777,7 +5810,7 @@
              ;; PER-THREAD WINDOW: one FS override byte, emitted before the
              ;; REX prefix as the encoding requires.  With the window off (or
              ;; the bit clear) not a byte changes.
-             (when tls (emit-bytes buf #x64))
+             (when tls (emit-fs-prefix buf))
              (ecase width
                (0 ;; u8: MOVZX r64, byte [addr]
                 ;; REX.W 0F B6 /r (ModRM: [reg])
@@ -5812,7 +5845,7 @@
              (emit-load-vreg buf vs 'r13)
              (setf ps 'r13))
            ;; PER-THREAD WINDOW: see the matching note in +OP-LOAD+.
-           (when tls (emit-bytes buf #x64))
+           (when tls (emit-fs-prefix buf))
            (ecase width
              (0 (emit-mov-mem-byte buf pa ps))
              (1 (emit-mov-mem-word buf pa ps))
@@ -6462,7 +6495,7 @@
            ;; GS prefix + MOV r64, [disp32]
            ;; 65 REX.W 8B /05 disp32  (RIP-relative, but we use absolute)
            ;; Actually for GS:[disp32] with no base: 65 REX.W 8B 04 25 disp32
-           (emit-byte buf #x65)                   ; GS prefix
+           (emit-gs-prefix buf)                   ; GS prefix
            (emit-byte buf (rex-prefix t (reg-extended-p d) nil nil))
            (emit-byte buf #x8B)                    ; MOV r64, r/m64
            ;; ModRM: mod=00 r/m=100 (SIB follows), reg=d
@@ -6482,7 +6515,7 @@
              (emit-load-vreg buf vs 'rax)
              (setf ps 'rax))
            ;; GS prefix + MOV [disp32], r64
-           (emit-byte buf #x65)                    ; GS prefix
+           (emit-gs-prefix buf)                    ; GS prefix
            (emit-byte buf (rex-prefix t (reg-extended-p ps) nil nil))
            (emit-byte buf #x89)                    ; MOV r/m64, r64
            (emit-byte buf (modrm #b00 (reg-code ps) 4))
@@ -8261,7 +8294,7 @@
                      REG's low three bits must not be 4 (SIB escape) or 5 ~
                      (RIP/disp32 escape); got ~S" reg))
            ;; MOV reg, GS:[cpu_id]          65 REX.W 8B /r SIB=25 disp32
-           (emit-byte buf #x65)
+           (emit-gs-prefix buf)
            (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
            (emit-byte buf #x8B)
            (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
@@ -8426,13 +8459,13 @@
                    (8 . "arithmetic fault (SIGFPE)")
                    (4 . "illegal instruction (SIGILL)")))
         (let ((next (make-label)))
-          (emit-bytes buf #x64 #x81 #x3C #x25) (emit-u32 buf +fault-rec-code-addr+) (emit-u32 buf (car k))
+          (emit-fs-prefix buf) (emit-bytes buf #x81 #x3C #x25) (emit-u32 buf +fault-rec-code-addr+) (emit-u32 buf (car k))
           (emit-jcc buf :ne next)                                ; cmp dword fs:[code], k
           (lit (cdr k))
           (emit-jmp buf done)
           (emit-label buf next)))
       (lit "hardware fault (signal ")
-      (emit-bytes buf #x64 #x8B #x04 #x25) (emit-u32 buf +fault-rec-code-addr+) ; mov eax, fs:[code]
+      (emit-fs-prefix buf) (emit-bytes buf #x8B #x04 #x25) (emit-u32 buf +fault-rec-code-addr+) ; mov eax, fs:[code]
       (dec)
       (lit ")")
       (emit-label buf done))
@@ -8440,7 +8473,7 @@
     ;; Which thread: self base 0 is main; else the slot whose window block it
     ;; is (net/hosted-sync %THR-TLS-BLOCK: page + 0x94000 + slot*0x8000).
     (let ((worker (make-label)) (anon (make-label)) (thr-done (make-label)))
-      (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-u32 buf #x10000C30) ; mov rax, fs:[self]
+      (emit-fs-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000C30) ; mov rax, fs:[self]
       (emit-bytes buf #x48 #x85 #xC0) (emit-jcc buf :ne worker)
       (lit "the main thread")
       (emit-jmp buf thr-done)
@@ -8465,10 +8498,10 @@
     (emit-x64-syscall buf)
     (dec)
     (lit "): address ")
-    (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-u32 buf +fault-rec-addr-addr+)
+    (emit-fs-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf +fault-rec-addr-addr+)
     (hex)
     (lit ", pc ")
-    (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-u32 buf +fault-rec-pc-addr+)
+    (emit-fs-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf +fault-rec-pc-addr+)
     (hex)
     (lit (format nil "; ~A~%" suffix))
     (emit-bytes buf #x48 #x89 #xFA)                              ; mov rdx, rdi
@@ -8496,8 +8529,8 @@
    threaded hosted image, 0x10000CB0 elsewhere."
   (if (x64-fault-rec-p)
       (progn
-        (emit-bytes buf #x64 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-code-addr+) (emit-u32 buf code)
-        (emit-bytes buf #x64 #xC7 #x04 #x25) (emit-u32 buf (+ +fault-rec-code-addr+ 4)) (emit-u32 buf 0))
+        (emit-fs-prefix buf) (emit-bytes buf #xC7 #x04 #x25) (emit-u32 buf +fault-rec-code-addr+) (emit-u32 buf code)
+        (emit-fs-prefix buf) (emit-bytes buf #xC7 #x04 #x25) (emit-u32 buf (+ +fault-rec-code-addr+ 4)) (emit-u32 buf 0))
       (progn
         (emit-bytes buf #xC7 #x04 #x25) (emit-u32 buf #x10000CB0) (emit-u32 buf code))))
 
@@ -8662,7 +8695,7 @@
 (defun x64-stw-token-and-rec (buf table token rec)
   "TOKEN = 2*cpu+2, REC = this thread's record.  The CPU id is per-CPU slot
    GS:[cpu-id], tagged (2*cpu), as EMIT-LOAD-GC-REGION reads it."
-  (emit-byte buf #x65)
+  (emit-gs-prefix buf)
   (emit-byte buf (logior #x48 (if (reg-extended-p token) #x04 0)))
   (emit-byte buf #x8B)
   (emit-byte buf (logior #x04 (ash (reg-code token) 3)))
@@ -10430,7 +10463,7 @@
     ;; THIS THREAD IS COLLECTING (A FAULT INSIDE A COLLECTION STOPS THE
     ;; PROCESS), until the restore label.
     (when (x64-fault-rec-p)
-      (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-gc-addr+) (emit-u32 buf 1))
+      (emit-fs-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-gc-addr+) (emit-u32 buf 1))
 
     ;; ---- STOP THE WORLD if this is region 0 with threads live, BEFORE any
     ;; metadata is read: a collector that has to wait for another one reads
@@ -10446,9 +10479,9 @@
     ;; so it fires once.  RCX is on the stack.
     (when (x64-fault-rec-p)
       (let ((no-test (make-label)))
-        (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf +fault-rec-gc-test-addr+) (emit-bytes buf #x00)
+        (emit-fs-prefix buf) (emit-bytes buf #x48 #x83 #x3C #x25) (emit-u32 buf +fault-rec-gc-test-addr+) (emit-bytes buf #x00)
         (emit-jcc buf :e no-test)
-        (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-gc-test-addr+) (emit-u32 buf 0)
+        (emit-fs-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-gc-test-addr+) (emit-u32 buf 0)
         (emit-bytes buf #x48 #x8B #x0C #x25) (emit-u32 buf 8) ; mov rcx, [8]
         (emit-label buf no-test)))
 
@@ -11130,7 +11163,7 @@
     (emit-mov-reg-reg buf 'rsp 'rbp)
     ;; The heap is consistent again: this thread is no longer collecting.
     (when (x64-fault-rec-p)
-      (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-gc-addr+) (emit-u32 buf 0))
+      (emit-fs-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-gc-addr+) (emit-u32 buf 0))
     ;; ---- ...and it has ended.  Before the pops, so RAX is still scratch.
     (emit-gc-concurrency-exit buf)
     (emit-pop buf 'rbp)

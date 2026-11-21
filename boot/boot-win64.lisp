@@ -73,7 +73,12 @@
      "GetCommandLineA" "GetEnvironmentStringsA" "GetLastError"
      "CreateFileA" "CloseHandle" "SetFilePointerEx" "GetFileSizeEx"
      "GetFileAttributesA" "GetFileAttributesExA" "DeleteFileA" "MoveFileExA"
-     "CreateDirectoryA" "RemoveDirectoryA" "GetCurrentDirectoryA")
+     "CreateDirectoryA" "RemoveDirectoryA" "GetCurrentDirectoryA"
+     "TlsAlloc" "CreateThread" "ResumeThread" "ExitThread" "GetCurrentThreadId"
+     "SwitchToThread" "AddVectoredExceptionHandler" "GetProcessTimes"
+     "GetThreadTimes" "GetSystemTimePreciseAsFileTime")
+    ("KERNELBASE.dll"
+     "WaitOnAddress" "WakeByAddressSingle" "WakeByAddressAll")
     ("WS2_32.dll"
      "WSAStartup" "WSAGetLastError" "socket" "bind" "listen" "accept" "connect"
      "getsockname" "getpeername" "setsockopt" "getsockopt" "send" "recv"
@@ -103,6 +108,32 @@
 (defvar *win64-trace-syscalls*
   (let ((v (sb-ext:posix-getenv "MODUS_WIN64_TRACE")))
     (and v (plusp (length v)) (string/= v "0"))))
+
+;; THREADS.  Five of the TEB's TlsSlots (gs:[#x1480 + 8*index]), claimed by the
+;; prologue, hold what Linux keeps in segment bases and the kernel:
+;;   61 SAVE   the translator's scratch register, parked around a window access
+;;   62 PERCPU this thread's per-CPU block (Linux: the GS base)
+;;   63 WINDOW this thread's window base (Linux: the FS base)
+;;   60 STACK  this thread's Win32 stack top, where the shim runs Win32 calls
+;;   59 CHILD  0 on the main thread; in a clone()d thread, its clear-tid word | 1
+;; The translator reads 61-63 (MODUS.ASM:+WIN-TLS-*+); the shim all five.
+(defconstant +win64-tls-first+ 59)
+(defconstant +win64-tls-child+ #x1658)
+(defconstant +win64-tls-stack+ #x1660)
+(defconstant +win64-tls-save+ #x1668)
+(defconstant +win64-tls-percpu+ #x1670)
+(defconstant +win64-tls-window+ #x1678)
+(assert (and (= +win64-tls-save+ modus.asm:+win-tls-save+)
+             (= +win64-tls-percpu+ modus.asm:+win-tls-percpu+)
+             (= +win64-tls-window+ modus.asm:+win-tls-window+)
+             (= +win64-tls-child+ (+ #x1480 (* 8 +win64-tls-first+)))))
+
+(defun w64-gs-load (reg slot)
+  "mov REG, gs:[SLOT] for REG 0..7 (rax..rdi)."
+  `(:bytes #x65 #x48 #x8B ,(logior #x04 (ash reg 3)) #x25 ,@(w64-le32 slot)))
+(defun w64-gs-store (slot reg)
+  "mov gs:[SLOT], REG for REG 0..7."
+  `(:bytes #x65 #x48 #x89 ,(logior #x04 (ash reg 3)) #x25 ,@(w64-le32 slot)))
 
 (defconstant +win64-call-base+ #x1000
   "Syscall numbers from here call an import directly: #x1000 + its IAT slot.")
@@ -425,15 +456,20 @@
                     (50 . :h-listen) (51 . :h-getsockname) (52 . :h-getpeername)
                     (54 . :h-setsockopt) (55 . :h-getsockopt) (7 . :h-poll)
                     (72 . :h-fcntl) (16 . :h-ioctl)
-                    (13 . :h-zero) (14 . :h-zero) (35 . :h-nanosleep)
-                    (39 . :h-getpid) (60 . :h-exit) (228 . :h-clock)
-                    (231 . :h-exit))))
+                    (14 . :h-zero) (35 . :h-nanosleep)
+                    (39 . :h-getpid) (60 . :h-exit-thread) (228 . :h-clock)
+                    (231 . :h-exit)
+                    (56 . :h-clone) (158 . :h-arch-prctl) (186 . :h-gettid)
+                    (24 . :h-yield) (202 . :h-futex)
+                    (131 . :h-zero) (10 . :h-zero) (13 . :h-sigaction)
+                    (102 . :h-zero) (104 . :h-zero) (107 . :h-zero) (108 . :h-zero))))
     `((:label :shim)
       ;; push rbp; mov rbp,rsp; push rdi,rsi,rdx,r10,r8,r9,rax
       (:bytes #x55 #x48 #x89 #xE5 #x57 #x56 #x52 #x41 #x52 #x41 #x50 #x41 #x51 #x50)
-      ;; Onto the shim's private stack (16-aligned), then sub rsp,0x40; mov rax,[rbp-56].
-      ;; LEAVE in the epilogue restores the Lisp RSP from RBP.
-      (:bytes #x48 #xBC ,@(w64-le64 +win64-win32-stack-top+)) ; mov rsp,imm64
+      ;; Onto this thread's Win32 stack (16-aligned; TLS slot STACK), then
+      ;; sub rsp,0x40; mov rax,[rbp-56].  LEAVE in the epilogue restores the
+      ;; Lisp RSP from RBP.
+      ,(w64-gs-load 4 +win64-tls-stack+)            ; mov rsp,gs:[stack]
       (:bytes #x48 #x83 #xEC #x40 #x48 #x8B #x45 #xC8)
       ,@(when *win64-trace-syscalls* (win64-trace-items))
       ,@(loop for (nr . lbl) in dispatch
@@ -542,19 +578,19 @@
       (:label :m-try)
       (:bytes #x48 #x83 #x7D #xF8 #x00)            ; cmp qword [rbp-8],0
       (:jcc 5 :m-hint)                             ; jne: the caller named an address
-      ;; No hint: take the next bump address, as Linux would place it high.
-      (:rip-load 1 :mmap-bump)                     ; mov rcx,[rip+bump]
+      ;; No hint: take the next bump address, as Linux would place it high --
+      ;; atomically, since threads map their stacks concurrently.
+      (:bytes #x48 #x8B #x4D #xF0)                 ; mov rcx,[rbp-16]  len
+      (:bytes #x48 #x81 #xC1 #xFF #xFF #x00 #x00)  ; add rcx,0xFFFF
+      (:bytes #x48 #x81 #xE1 #x00 #x00 #xFF #xFF)  ; and rcx,-0x10000  (64 KB granule)
+      (:rip-lea 0 :mmap-bump)                      ; lea rax,[rip+bump]
+      (:bytes #xF0 #x48 #x0F #xC1 #x08)            ; lock xadd [rax],rcx  (rcx = old)
       (:bytes #x48 #x8B #x55 #xF0)                 ; mov rdx,[rbp-16]  len
       (:bytes #x41 #xB8 #x00 #x30 #x00 #x00)       ; mov r8d,MEM_RESERVE|MEM_COMMIT
       (:bytes #x44 #x8B #x4C #x24 #x38)            ; mov r9d,[rsp+0x38]
       (:call-iat "VirtualAlloc")
       (:bytes #x48 #x85 #xC0)                      ; test rax,rax
       (:jcc 4 :m-hint)                             ; je: occupied, fall back to NULL below
-      (:bytes #x48 #x8B #x4D #xF0)                 ; mov rcx,[rbp-16]  len
-      (:bytes #x48 #x81 #xC1 #xFF #xFF #x00 #x00)  ; add rcx,0xFFFF
-      (:bytes #x48 #x81 #xE1 #x00 #x00 #xFF #xFF)  ; and rcx,-0x10000  (64 KB granule)
-      (:bytes #x48 #x01 #xC1)                      ; add rcx,rax
-      (:rip-store 1 :mmap-bump)                    ; mov [rip+bump],rcx
       (:jmp :done)
       (:label :m-hint)
       (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]   addr
@@ -650,12 +686,40 @@
       ;; clock_gettime(clk, ts): wall clock from GetSystemTimeAsFileTime.
       ;; FILETIME counts 100 ns units from 1601; the Unix epoch is
       ;; 116444736000000000 of them.
+      ;; clock_gettime(id, ts): CLOCK_PROCESS_CPUTIME_ID (2) and
+      ;; CLOCK_THREAD_CPUTIME_ID (3) are kernel + user time; every other clock
+      ;; is the precise system time (GetSystemTimeAsFileTime ticks every ~15 ms).
       (:label :h-clock)
+      (:bytes #x8B #x45 #xF8)                      ; mov eax,[rbp-8]   id
+      (:bytes #x83 #xF8 #x02)                      ; cmp eax,2
+      (:jcc 4 :c-cpu)
+      (:bytes #x83 #xF8 #x03)                      ; cmp eax,3
+      (:jcc 4 :c-cpu)
       (:bytes #x48 #x8D #x4C #x24 #x38)            ; lea rcx,[rsp+0x38]
-      (:call-iat "GetSystemTimeAsFileTime")
+      (:call-iat "GetSystemTimePreciseAsFileTime")
       (:bytes #x48 #x8B #x44 #x24 #x38)            ; mov rax,[rsp+0x38]
       (:bytes #x49 #xBA ,@(w64-le64 116444736000000000)) ; mov r10,epoch offset
       (:bytes #x4C #x29 #xD0)                      ; sub rax,r10
+      (:jmp :c-conv)
+      (:label :c-cpu)
+      (:bytes #x48 #x83 #xEC #x40)                 ; sub rsp,0x40  (LEAVE undoes it)
+      (:bytes #x48 #x8D #x54 #x24 #x40)            ; lea rdx,[rsp+0x40]  creation
+      (:bytes #x4C #x8D #x44 #x24 #x48)            ; lea r8,[rsp+0x48]   exit
+      (:bytes #x4C #x8D #x4C #x24 #x50)            ; lea r9,[rsp+0x50]   kernel
+      (:bytes #x48 #x8D #x44 #x24 #x58)            ; lea rax,[rsp+0x58]  user
+      (:bytes #x48 #x89 #x44 #x24 #x20)            ; mov [rsp+0x20],rax
+      (:bytes #x83 #x7D #xF8 #x03)                 ; cmp dword [rbp-8],3
+      (:jcc 4 :c-thr)
+      (:bytes #x48 #xC7 #xC1 #xFF #xFF #xFF #xFF)  ; mov rcx,-1  (this process)
+      (:call-iat "GetProcessTimes")
+      (:jmp :c-sum)
+      (:label :c-thr)
+      (:bytes #x48 #xC7 #xC1 #xFE #xFF #xFF #xFF)  ; mov rcx,-2  (this thread)
+      (:call-iat "GetThreadTimes")
+      (:label :c-sum)
+      (:bytes #x48 #x8B #x44 #x24 #x50)            ; mov rax,[rsp+0x50]
+      (:bytes #x48 #x03 #x44 #x24 #x58)            ; add rax,[rsp+0x58]
+      (:label :c-conv)
       (:bytes #x31 #xD2)                           ; xor edx,edx
       (:bytes #xB9 ,@(w64-le32 10000000))          ; mov ecx,10^7
       (:bytes #x48 #xF7 #xF1)                      ; div rcx        rax=sec rdx=rem
@@ -690,7 +754,292 @@
 
       (:label :h-getpid)
       (:call-iat "GetCurrentProcessId")
+      (:bytes #x89 #xC0)                           ; mov eax,eax  (a DWORD)
       (:jmp :done)
+
+      ;; ---- THREADS ----
+      ;; exit(code) ends the calling THREAD.  In a clone()d thread: clear its
+      ;; tid word and wake its joiners (the kernel's CLONE_CHILD_CLEARTID), then
+      ;; ExitThread.  On the main thread, as exit_group.
+      (:label :h-exit-thread)
+      ,(w64-gs-load 0 +win64-tls-child+)            ; mov rax,gs:[child]
+      (:bytes #x48 #x85 #xC0)                      ; test rax,rax
+      (:jcc 4 :h-exit)                             ; je: the main thread
+      (:bytes #x48 #x83 #xE0 #xFE)                 ; and rax,-2
+      (:jcc 4 :et-go)                              ; je: no tid word
+      (:bytes #xC7 #x00 0 0 0 0)                   ; mov dword [rax],0
+      (:bytes #x48 #x89 #xC1)                      ; mov rcx,rax
+      (:call-iat "WakeByAddressAll")
+      (:label :et-go)
+      (:bytes #x8B #x4D #xF8)                      ; mov ecx,[rbp-8]
+      (:call-iat "ExitThread")
+
+      ;; arch_prctl(code, addr): the FS and GS bases are TLS slots.
+      (:label :h-arch-prctl)
+      (:bytes #x48 #x8B #x4D #xF0)                 ; mov rcx,[rbp-16]  addr
+      (:bytes #x8B #x45 #xF8)                      ; mov eax,[rbp-8]   code
+      (:bytes #x3D ,@(w64-le32 #x1001))            ; cmp eax,ARCH_SET_GS
+      (:jcc 4 :ap-setgs)
+      (:bytes #x3D ,@(w64-le32 #x1002))            ; cmp eax,ARCH_SET_FS
+      (:jcc 4 :ap-setfs)
+      (:bytes #x3D ,@(w64-le32 #x1003))            ; cmp eax,ARCH_GET_FS
+      (:jcc 4 :ap-getfs)
+      (:bytes #x3D ,@(w64-le32 #x1004))            ; cmp eax,ARCH_GET_GS
+      (:jcc 4 :ap-getgs)
+      (:jmp :h-einval)
+      (:label :ap-setgs)
+      ,(w64-gs-store +win64-tls-percpu+ 1)          ; mov gs:[percpu],rcx
+      (:jmp :h-zero)
+      (:label :ap-setfs)
+      ,(w64-gs-store +win64-tls-window+ 1)          ; mov gs:[window],rcx
+      (:jmp :h-zero)
+      (:label :ap-getfs)
+      ,(w64-gs-load 0 +win64-tls-window+)           ; mov rax,gs:[window]
+      (:bytes #x48 #x89 #x01)                      ; mov [rcx],rax
+      (:jmp :h-zero)
+      (:label :ap-getgs)
+      ,(w64-gs-load 0 +win64-tls-percpu+)           ; mov rax,gs:[percpu]
+      (:bytes #x48 #x89 #x01)                      ; mov [rcx],rax
+      (:jmp :h-zero)
+
+      ;; rt_sigaction(sig, act, ...): for SIGILL, SIGBUS, SIGFPE and SIGSEGV
+      ;; record act's handler (one for all four: the runtime installs the same
+      ;; stub) and install the vectored exception handler below, once.
+      ;; Everything else (SIGPIPE ...) is accepted and ignored.
+      (:label :h-sigaction)
+      (:bytes #x8B #x45 #xF8)                      ; mov eax,[rbp-8]  sig
+      (:bytes #x83 #xF8 #x04) (:jcc 4 :sa-ok)      ; SIGILL
+      (:bytes #x83 #xF8 #x07) (:jcc 4 :sa-ok)      ; SIGBUS
+      (:bytes #x83 #xF8 #x08) (:jcc 4 :sa-ok)      ; SIGFPE
+      (:bytes #x83 #xF8 #x0B) (:jcc 5 :h-zero)     ; SIGSEGV, else ignore
+      (:label :sa-ok)
+      (:bytes #x48 #x8B #x4D #xF0)                 ; mov rcx,[rbp-16]  act
+      (:bytes #x48 #x85 #xC9)                      ; test rcx,rcx
+      (:jcc 4 :h-zero)
+      (:bytes #x48 #x8B #x09)                      ; mov rcx,[rcx]     handler
+      (:bytes #x48 #x83 #xF9 #x01)                 ; cmp rcx,1  (SIG_DFL, SIG_IGN)
+      (:jcc 6 :h-zero)                             ; jbe
+      (:rip-store 1 :sig-handler)
+      (:rip-load 0 :veh-installed)
+      (:bytes #x48 #x85 #xC0)                      ; test rax,rax
+      (:jcc 5 :h-zero)
+      (:bytes #xB9 #x01 #x00 #x00 #x00)            ; mov ecx,1  (first)
+      (:rip-lea 2 :veh)                            ; lea rdx,[rip+veh]
+      (:call-iat "AddVectoredExceptionHandler")
+      (:rip-store 0 :veh-installed)
+      (:jmp :h-zero)
+
+      ;; THE VECTORED EXCEPTION HANDLER (RCX = EXCEPTION_POINTERS): a fault in
+      ;; Lisp code becomes what Linux delivers -- the recorded handler entered
+      ;; with RDI = signal, RSI = a siginfo (si_addr at +16), RDX = a ucontext
+      ;; (RBP +0x78, RAX +0x90, RSP +0xA0, RIP +0xA8), both built on the
+      ;; faulting thread's stack.  The CONTEXT is rewritten to enter
+      ;; the handler and Windows resumes it (EXCEPTION_CONTINUE_EXECUTION), so
+      ;; no dispatch frame is abandoned.  Only for code in the image, the heap,
+      ;; the JIT arena and the mapped stacks; any other exception is passed on.
+      ;; The frames are built below this handler's own stack frame.
+      (:label :veh)
+      (:bytes #x48 #x8B #x01)                      ; mov rax,[rcx]    ExceptionRecord
+      (:bytes #x48 #x8B #x51 #x08)                 ; mov rdx,[rcx+8]  ContextRecord
+      (:bytes #x44 #x8B #x00)                      ; mov r8d,[rax]    code
+      (:bytes #x41 #xB9 #x0B #x00 #x00 #x00)       ; mov r9d,SIGSEGV
+      (:bytes #x41 #x81 #xF8 ,@(w64-le32 #xC0000005)) (:jcc 4 :v-sig) ; access violation
+      (:bytes #x41 #xB9 #x04 #x00 #x00 #x00)       ; mov r9d,SIGILL
+      (:bytes #x41 #x81 #xF8 ,@(w64-le32 #xC000001D)) (:jcc 4 :v-sig) ; illegal instruction
+      (:bytes #x41 #x81 #xF8 ,@(w64-le32 #xC0000096)) (:jcc 4 :v-sig) ; privileged instruction
+      (:bytes #x41 #xB9 #x08 #x00 #x00 #x00)       ; mov r9d,SIGFPE
+      (:bytes #x41 #x81 #xF8 ,@(w64-le32 #xC0000094)) (:jcc 4 :v-sig) ; integer divide by zero
+      (:bytes #x41 #x81 #xF8 ,@(w64-le32 #xC0000095)) (:jcc 4 :v-sig) ; integer overflow
+      (:jmp :v-pass)
+      (:label :v-sig)
+      (:rip-load 1 :sig-handler)                   ; mov rcx,[rip+handler]
+      (:bytes #x48 #x85 #xC9)                      ; test rcx,rcx
+      (:jcc 4 :v-pass)
+      (:bytes #x4C #x8B #x92 #xF8 #x00 #x00 #x00)  ; mov r10,[rdx+0xF8]  Rip
+      (:bytes #x49 #x81 #xFA ,@(w64-le32 #x400000)) ; cmp r10,0x400000
+      (:jcc 2 :v-pass)                             ; jb
+      (:bytes #x49 #x81 #xFA ,@(w64-le32 +win64-bss-end-va+)) ; cmp r10,end of the image
+      (:jcc 2 :v-ours)                             ; jb
+      (:bytes #x49 #xBB ,@(w64-le64 #x2000000000)) ; mov r11,heap base
+      (:bytes #x4D #x39 #xDA)                      ; cmp r10,r11
+      (:jcc 2 :v-pass)
+      (:bytes #x49 #xBB ,@(w64-le64 #x6000000000)) ; mov r11,end of the mapped stacks
+      (:bytes #x4D #x39 #xDA)                      ; cmp r10,r11
+      (:jcc 3 :v-pass)                             ; jae
+      (:label :v-ours)
+      (:bytes #x4C #x8B #x58 #x10)                 ; mov r11,[rax+0x10] ExceptionAddress
+      (:bytes #x41 #x83 #xF9 #x0B)                 ; cmp r9d,SIGSEGV
+      (:jcc 5 :v-addr)
+      (:bytes #x4C #x8B #x58 #x28)                 ; mov r11,[rax+0x28] the faulting address
+      (:label :v-addr)
+      ;; Below this handler's own frame: the EXCEPTION_RECORD and CONTEXT
+      ;; Windows built sit between here and the faulting RSP.
+      (:bytes #x4C #x8D #x94 #x24 #x00 #xF0 #xFF #xFF) ; lea r10,[rsp-0x1000]
+      (:bytes #x49 #x83 #xE2 #xF0)                 ; and r10,-16
+      (:bytes #x45 #x89 #x4A #x40)                 ; mov [r10+0x40],r9d   si_signo
+      (:bytes #x4D #x89 #x5A #x50)                 ; mov [r10+0x50],r11   si_addr
+      (:bytes #x48 #x8B #x82 #xA0 #x00 #x00 #x00)  ; mov rax,[rdx+0xA0]   Rbp
+      (:bytes #x49 #x89 #x82 #x78 #x01 #x00 #x00)  ; mov [r10+0x178],rax
+      (:bytes #x48 #x8B #x42 #x78)                 ; mov rax,[rdx+0x78]   Rax
+      (:bytes #x49 #x89 #x82 #x90 #x01 #x00 #x00)  ; mov [r10+0x190],rax
+      (:bytes #x48 #x8B #x82 #x98 #x00 #x00 #x00)  ; mov rax,[rdx+0x98]   Rsp
+      (:bytes #x49 #x89 #x82 #xA0 #x01 #x00 #x00)  ; mov [r10+0x1A0],rax
+      (:bytes #x48 #x8B #x82 #xF8 #x00 #x00 #x00)  ; mov rax,[rdx+0xF8]   Rip
+      (:bytes #x49 #x89 #x82 #xA8 #x01 #x00 #x00)  ; mov [r10+0x1A8],rax
+      (:bytes #x4C #x89 #x8A #xB0 #x00 #x00 #x00)  ; mov [rdx+0xB0],r9    Rdi = signal
+      (:bytes #x49 #x8D #x42 #x40)                 ; lea rax,[r10+0x40]
+      (:bytes #x48 #x89 #x82 #xA8 #x00 #x00 #x00)  ; mov [rdx+0xA8],rax   Rsi = &siginfo
+      (:bytes #x49 #x8D #x82 #x00 #x01 #x00 #x00)  ; lea rax,[r10+0x100]
+      (:bytes #x48 #x89 #x82 #x88 #x00 #x00 #x00)  ; mov [rdx+0x88],rax   Rdx = &ucontext
+      (:bytes #x4C #x89 #x92 #x98 #x00 #x00 #x00)  ; mov [rdx+0x98],r10   Rsp
+      (:bytes #x48 #x89 #x8A #xF8 #x00 #x00 #x00)  ; mov [rdx+0xF8],rcx   Rip = handler
+      (:bytes #xB8 #xFF #xFF #xFF #xFF)            ; mov eax,EXCEPTION_CONTINUE_EXECUTION
+      (:bytes #xC3)                                ; ret
+      (:label :v-pass)
+      (:bytes #x31 #xC0)                           ; xor eax,eax  EXCEPTION_CONTINUE_SEARCH
+      (:bytes #xC3)                                ; ret
+
+      (:label :h-gettid)
+      (:call-iat "GetCurrentThreadId")
+      (:bytes #x89 #xC0)                           ; mov eax,eax
+      (:jmp :done)
+
+      (:label :h-yield)
+      (:call-iat "SwitchToThread")
+      (:jmp :h-zero)
+
+      ;; futex(uaddr, op, val, timeout): WAIT is WaitOnAddress on the 4-byte
+      ;; word (it returns at once if the word is not VAL: Linux says -EAGAIN,
+      ;; this says 0, and a futex caller must re-check either way); WAKE is
+      ;; WakeByAddressSingle/All and answers 0.  FUTEX_PRIVATE_FLAG is ignored:
+      ;; every wait here is in-process.
+      (:label :h-futex)
+      (:bytes #x8B #x45 #xF0)                      ; mov eax,[rbp-16]  op
+      (:bytes #x83 #xE0 #x7F)                      ; and eax,0x7F
+      (:jcc 4 :fx-wait)                            ; je: FUTEX_WAIT (0)
+      (:bytes #x83 #xF8 #x01)                      ; cmp eax,1
+      (:jcc 4 :fx-wake)
+      (:jmp :h-enosys)
+      (:label :fx-wait)
+      (:bytes #x41 #xB9 #xFF #xFF #xFF #xFF)       ; mov r9d,INFINITE
+      (:bytes #x48 #x8B #x45 #xE0)                 ; mov rax,[rbp-32]  timeout
+      (:bytes #x48 #x85 #xC0)                      ; test rax,rax
+      (:jcc 4 :fx-w)
+      (:bytes #x48 #x8B #x08)                      ; mov rcx,[rax]     tv_sec
+      (:bytes #x48 #x69 #xC9 #xE8 #x03 #x00 #x00)  ; imul rcx,rcx,1000
+      (:bytes #x48 #x8B #x40 #x08)                 ; mov rax,[rax+8]   tv_nsec
+      (:bytes #x48 #x05 #x3F #x42 #x0F #x00)       ; add rax,999999  (round up)
+      (:bytes #x31 #xD2)                           ; xor edx,edx
+      (:bytes #x41 #xB8 #x40 #x42 #x0F #x00)       ; mov r8d,1000000
+      (:bytes #x49 #xF7 #xF0)                      ; div r8
+      (:bytes #x48 #x01 #xC1)                      ; add rcx,rax       ms
+      (:bytes #x41 #xB9 #xFE #xFF #xFF #xFF)       ; mov r9d,0xFFFFFFFE
+      (:bytes #x4C #x39 #xC9)                      ; cmp rcx,r9
+      (:bytes #x4C #x0F #x42 #xC9)                 ; cmovb r9,rcx
+      (:label :fx-w)
+      (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]   uaddr
+      (:bytes #x48 #x8D #x55 #xE8)                 ; lea rdx,[rbp-24]  &val
+      (:bytes #x41 #xB8 #x04 #x00 #x00 #x00)       ; mov r8d,4
+      (:call-iat "WaitOnAddress")
+      (:bytes #x85 #xC0)                           ; test eax,eax
+      (:jcc 5 :h-zero)                             ; jnz: woken (or not equal)
+      (:call-iat "GetLastError")
+      (:bytes #x3D #xB4 #x05 #x00 #x00)            ; cmp eax,ERROR_TIMEOUT
+      (:jcc 5 :h-zero)
+      (:bytes #x48 #xC7 #xC0 ,@(w64-le32 -110))    ; mov rax,-ETIMEDOUT
+      (:jmp :done)
+      (:label :fx-wake)
+      (:bytes #x48 #x8B #x4D #xF8)                 ; mov rcx,[rbp-8]
+      (:bytes #x83 #x7D #xE8 #x01)                 ; cmp dword [rbp-24],1
+      (:jcc 5 :fx-all)
+      (:call-iat "WakeByAddressSingle")
+      (:jmp :h-zero)
+      (:label :fx-all)
+      (:call-iat "WakeByAddressAll")
+      (:jmp :h-zero)
+
+      ;; clone(flags, newsp, ptid, ctid, tls): a Win32 thread that resumes at
+      ;; this call's return address with RAX = 0 and RSP = newsp (less the red
+      ;; zone the call site steps back over), as the Linux child does.  The
+      ;; record it starts from is on its own new stack, below anything it will
+      ;; use before reading it: return address, RBX (the clone stub's entry),
+      ;; the clear-tid word, its window base (CLONE_SETTLS's tls, else the
+      ;; parent's: Linux inherits the FS base), the parent's per-CPU base, its
+      ;; RSP, and R12-R15 (allocation registers and NIL, inherited on Linux).
+      ;; Created suspended so the tid is in the parent's word before the child
+      ;; can run and clear it.
+      (:label :h-clone)
+      (:bytes #x48 #x8B #x45 #xF0)                 ; mov rax,[rbp-16]  newsp
+      (:bytes #x4C #x8D #x98 #x00 #xFF #xFF #xFF)  ; lea r11,[rax-0x100] record
+      (:bytes #x48 #x8B #x4D #x08)                 ; mov rcx,[rbp+8]   return address
+      (:bytes #x49 #x89 #x0B)                      ; mov [r11],rcx
+      (:bytes #x49 #x89 #x5B #x08)                 ; mov [r11+8],rbx
+      (:bytes #x48 #x8B #x4D #xE0)                 ; mov rcx,[rbp-32]  ctid
+      (:bytes #x49 #x89 #x4B #x10)                 ; mov [r11+0x10],rcx
+      ,(w64-gs-load 1 +win64-tls-window+)           ; mov rcx,gs:[window]
+      (:bytes #xF7 #x45 #xF8 #x00 #x00 #x08 #x00)  ; test dword [rbp-8],CLONE_SETTLS
+      (:jcc 4 :cl-fs)
+      (:bytes #x48 #x8B #x4D #xD8)                 ; mov rcx,[rbp-40]  tls
+      (:label :cl-fs)
+      (:bytes #x49 #x89 #x4B #x18)                 ; mov [r11+0x18],rcx
+      ,(w64-gs-load 1 +win64-tls-percpu+)           ; mov rcx,gs:[percpu]
+      (:bytes #x49 #x89 #x4B #x20)                 ; mov [r11+0x20],rcx
+      (:bytes #x48 #x8D #x48 #x80)                 ; lea rcx,[rax-0x80]
+      (:bytes #x49 #x89 #x4B #x28)                 ; mov [r11+0x28],rcx
+      (:bytes #x4D #x89 #x63 #x30)                 ; mov [r11+0x30],r12
+      (:bytes #x4D #x89 #x6B #x38)                 ; mov [r11+0x38],r13
+      (:bytes #x4D #x89 #x73 #x40)                 ; mov [r11+0x40],r14
+      (:bytes #x4D #x89 #x7B #x48)                 ; mov [r11+0x48],r15
+      (:bytes #x31 #xC9)                           ; xor ecx,ecx       no attributes
+      (:bytes #xBA #x00 #x00 #x10 #x00)            ; mov edx,1 MB      Win32 stack
+      (:rip-lea 0 :thread-start)                   ; lea rax,[rip+start]
+      (:bytes #x49 #x89 #xC0)                      ; mov r8,rax
+      (:bytes #x4D #x89 #xD9)                      ; mov r9,r11        the record
+      (:bytes #x48 #xC7 #x44 #x24 #x20 #x04 #x00 #x01 #x00) ; CREATE_SUSPENDED|STACK_SIZE_PARAM_IS_A_RESERVATION
+      (:bytes #x48 #x8D #x44 #x24 #x38)            ; lea rax,[rsp+0x38]
+      (:bytes #x48 #x89 #x44 #x24 #x28)            ; mov [rsp+0x28],rax  &tid
+      (:call-iat "CreateThread")
+      (:bytes #x48 #x85 #xC0)                      ; test rax,rax
+      (:jcc 4 :h-eagain)
+      (:bytes #x48 #x89 #x44 #x24 #x30)            ; mov [rsp+0x30],rax  handle
+      (:bytes #xF7 #x45 #xF8 #x00 #x00 #x10 #x00)  ; test dword [rbp-8],CLONE_PARENT_SETTID
+      (:jcc 4 :cl-resume)
+      (:bytes #x48 #x8B #x4D #xE8)                 ; mov rcx,[rbp-24]  ptid
+      (:bytes #x48 #x85 #xC9)                      ; test rcx,rcx
+      (:jcc 4 :cl-resume)
+      (:bytes #x8B #x44 #x24 #x38)                 ; mov eax,[rsp+0x38]
+      (:bytes #x89 #x01)                           ; mov [rcx],eax
+      (:label :cl-resume)
+      (:bytes #x48 #x8B #x4C #x24 #x30)            ; mov rcx,[rsp+0x30]
+      (:call-iat "ResumeThread")
+      (:bytes #x48 #x8B #x4C #x24 #x30)            ; mov rcx,[rsp+0x30]
+      (:call-iat "CloseHandle")
+      (:bytes #x8B #x44 #x24 #x38)                 ; mov eax,[rsp+0x38]  tid
+      (:jmp :done)
+
+      ;; The new thread starts here (RCX = the record) on its Win32 stack,
+      ;; which becomes its shim stack.  It takes its TLS slots and registers
+      ;; from the record and jumps into the clone stub's child path.
+      (:label :thread-start)
+      (:bytes #x48 #x8D #x84 #x24 #x00 #xFF #xFF #xFF) ; lea rax,[rsp-0x100]
+      (:bytes #x48 #x83 #xE0 #xF0)                 ; and rax,-16
+      ,(w64-gs-store +win64-tls-stack+ 0)           ; mov gs:[stack],rax
+      (:bytes #x48 #x8B #x41 #x10)                 ; mov rax,[rcx+0x10]  ctid
+      (:bytes #x48 #x83 #xC8 #x01)                 ; or rax,1
+      ,(w64-gs-store +win64-tls-child+ 0)           ; mov gs:[child],rax
+      (:bytes #x48 #x8B #x41 #x18)                 ; mov rax,[rcx+0x18]
+      ,(w64-gs-store +win64-tls-window+ 0)          ; mov gs:[window],rax
+      (:bytes #x48 #x8B #x41 #x20)                 ; mov rax,[rcx+0x20]
+      ,(w64-gs-store +win64-tls-percpu+ 0)          ; mov gs:[percpu],rax
+      (:bytes #x48 #x8B #x59 #x08)                 ; mov rbx,[rcx+8]
+      (:bytes #x4C #x8B #x61 #x30)                 ; mov r12,[rcx+0x30]
+      (:bytes #x4C #x8B #x69 #x38)                 ; mov r13,[rcx+0x38]
+      (:bytes #x4C #x8B #x71 #x40)                 ; mov r14,[rcx+0x40]
+      (:bytes #x4C #x8B #x79 #x48)                 ; mov r15,[rcx+0x48]
+      (:bytes #x48 #x8B #x11)                      ; mov rdx,[rcx]       return address
+      (:bytes #x48 #x8B #x61 #x28)                 ; mov rsp,[rcx+0x28]
+      (:bytes #x31 #xC0)                           ; xor eax,eax
+      (:bytes #xFF #xE2)                           ; jmp rdx
 
       ;; rt_sigaction / rt_sigprocmask: Windows delivers no POSIX signals.
       (:label :h-zero)
@@ -710,6 +1059,9 @@
       (:jmp :done)
       (:label :h-eio)
       (:bytes #x48 #xC7 #xC0 ,@(w64-le32 -5))      ; mov rax,-EIO
+      (:jmp :done)
+      (:label :h-eagain)
+      (:bytes #x48 #xC7 #xC0 ,@(w64-le32 -11))     ; mov rax,-EAGAIN
       (:jmp :done)
       (:label :h-enosys)
       (:bytes #x48 #xC7 #xC0 ,@(w64-le32 -38))     ; mov rax,-ENOSYS
@@ -740,6 +1092,28 @@
 (defun win64-prologue-items ()
   `((:label :prologue)
     (:bytes #x48 #x83 #xEC #x28)                         ; sub rsp,0x28  (shadow space + align)
+    ;; Claim TlsSlots 59..63 (the THREADS slots above).  TlsAlloc hands out the
+    ;; lowest free index, so allocate until it returns 63 and require that all
+    ;; five came to us.  The lower indices stay allocated: the process has over
+    ;; a thousand.
+    (:bytes #x31 #xDB)                                   ; xor ebx,ebx
+    (:label :p-tls)
+    (:call-iat "TlsAlloc")
+    (:bytes #x83 #xF8 #x3F)                              ; cmp eax,63
+    (:jcc 7 :p-tls-bad)                                  ; ja (TLS_OUT_OF_INDEXES too)
+    (:bytes #x83 #xF8 ,+win64-tls-first+)                ; cmp eax,59
+    (:jcc 2 :p-tls)                                      ; jb
+    (:bytes #xFF #xC3)                                   ; inc ebx
+    (:bytes #x83 #xF8 #x3F)                              ; cmp eax,63
+    (:jcc 5 :p-tls)                                      ; jne
+    (:bytes #x83 #xFB #x05)                              ; cmp ebx,5
+    (:jcc 4 :p-tls-ok)                                   ; je
+    (:label :p-tls-bad)
+    (:bytes #xB9 3 0 0 0)                                ; mov ecx,3
+    (:call-iat "ExitProcess")                            ; a slot is taken: no threads
+    (:label :p-tls-ok)
+    (:bytes #x48 #xB8 ,@(w64-le64 +win64-win32-stack-top+)) ; mov rax,Win32 stack top
+    ,(w64-gs-store +win64-tls-stack+ 0)                  ; mov gs:[stack],rax
     (:bytes #x48 #xB9 ,@(w64-le64 +linux-x64-fixed-heap-base+)) ; mov rcx,heap base
     (:bytes #xBA ,@(w64-le32 +linux-x64-heap-size+))     ; mov edx,heap size
     (:bytes #x41 #xB8 #x00 #x30 #x00 #x00)               ; mov r8d,MEM_RESERVE|MEM_COMMIT
@@ -857,6 +1231,12 @@
     ;; which is writable.
     (:label :mmap-bump)
     (:bytes ,@(w64-le64 +win64-mmap-base+))
+    ;; The fault handler rt_sigaction recorded, and whether the vectored
+    ;; exception handler is installed (the shim's h-sigaction).
+    (:label :sig-handler)
+    (:zeros 8)
+    (:label :veh-installed)
+    (:zeros 8)
     (:align 16)
     ,@(win64-shim-items)
     (:align 16)
@@ -1072,9 +1452,10 @@
 ;; *FULL-SOURCE* itself: that text is assembled when build-cli-common.lisp loads,
 ;; so appending to *CLI-ARCH-OVERRIDE-SOURCE* here (after the load) is lost.
 ;;
-;; %JIT-WINDOW-PREFIX: the JIT's hand-assembled bridge thunks store to window
-;; slots with this byte first; 144 (#x90, NOP) instead of the FS override, since
-;; this image has no window and FS is not ours (mvm/mvm-eval.lisp).
+;; %JIT-WINDOW-STORE / %JIT-THUNK-STRIDE: the JIT's hand-assembled bridge thunks
+;;    store to window slots; here through the TLS window slot, with RAX (which
+;;    the thunk loads next anyway) as the base, in 64-byte thunk slots
+;;    (mvm/mvm-eval.lisp).  #x1678 is +WIN64-TLS-WINDOW+.
 ;; %CLI-COLLECT-ARGV: the stub puts the whole command line (GetCommandLineA)
 ;;    in argv[0]; split it with the Windows rules -- whitespace separates outside
 ;;    double quotes, a quote toggles quoting, \" is a literal quote.  Characters
@@ -1082,7 +1463,13 @@
 ;;    text free of escapes.  Last definition wins (the original is overridable).
 (defparameter *win64-runtime-source*
   (format nil "
-(defun %jit-window-prefix () 144)
+(defun %jit-window-store (slot imm)
+  ;; mov rax,gs:[TLS window slot] ; mov dword [rax + #x10000000 + SLOT],IMM
+  (list #x65 #x48 #x8B #x04 #x25 #x78 #x16 #x00 #x00
+        #xC7 #x80 (logand slot 255) (logand (ash slot -8) 255) #x00 #x10
+        (logand imm 255) (logand (ash imm -8) 255) (logand (ash imm -16) 255)
+        (logand (ash imm -24) 255)))
+(defun %jit-thunk-stride () 64)
 
 ;; FILES.  A Windows HANDLE is the fd: the shim reads, writes, seeks and closes
 ;; any fd above 2 as a handle, so streams need nothing else.  Paths go to the

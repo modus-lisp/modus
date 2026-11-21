@@ -706,12 +706,10 @@
        ;; WIN64-SHIM-VA-PLACEHOLDER is replaced by build-win64-cli with the
        ;; shim's address (it needs boot-win64, which loads after this file).
        ;; Set here, not at top level: init-all-globals resets a top-level setq.
+       ;; The window, per-CPU storage and stop-the-world are on, as on Linux;
+       ;; *X64-WIN-TLS* turns their FS/GS prefixes into TEB TLS-slot accesses.
        "  (setq modus.mvm.x64::*x64-win-shim-va* WIN64-SHIM-VA-PLACEHOLDER)
-  (setq *x64-tls-window* nil)
-  (setq *tls-window* nil)
-  (setq *x64-gc-region-percpu* nil)
-  (setq *x64-stw* nil)
-  (setq *park-safepoints* nil)
+  (setq modus.mvm.x64::*x64-win-tls* t)
 "
        "")
    "  t)

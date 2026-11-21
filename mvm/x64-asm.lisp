@@ -34,7 +34,11 @@
   (bytes (make-array 100663296 :element-type '(unsigned-byte 8)))
   (labels (make-hash-table :test 'eq))      ; label -> position
   (fixups nil)                              ; list of (position label offset-size)
-  (position 0))
+  (position 0)
+  ;; WINDOWS SEGMENT REWRITE (see %SEG-BEGIN): the position where a captured
+  ;; window/per-CPU instruction starts, or NIL; and the TEB offset of its base.
+  (seg nil)
+  (seg-base 0))
 
 (defun %code-buffer-ensure (buf pos)
   "Ensure BUF's byte array can hold index POS.  Grows (doubling) and
@@ -61,7 +65,200 @@
       (%code-buffer-ensure buf pos)
       (setq bytes (code-buffer-bytes buf)))
     (setf (aref bytes pos) (logand byte 255))
-    (setf (code-buffer-position buf) (+ pos 1))))
+    (setf (code-buffer-position buf) (+ pos 1))
+    (when (code-buffer-seg buf) (%seg-step buf))))
+
+;;; ============================================================
+;;; Windows: a segment-relative access through a TEB TLS slot
+;;; ============================================================
+;;;
+;;; On Linux the per-thread window is FS-relative and the per-CPU block
+;;; GS-relative: one prefix byte on the access.  On Windows GS is the TEB and a
+;;; user FS base does not survive a context switch (test/win64/probe/fsbase.asm),
+;;; so each base lives in a TEB TLS slot instead -- gs:[#x1480 + 8*index], the
+;;; process's TlsSlots, claimed at startup by boot/boot-win64.lisp -- and an
+;;; access becomes
+;;;     mov gs:[SAVE], scr ; mov scr, gs:[BASE] ; <access, based on scr> ; mov scr, gs:[SAVE]
+;;; SCR is a register the access does not name; it is parked in a third TLS
+;;; slot, so neither the stack nor the flags are touched.
+;;;
+;;; The translator calls %SEG-BEGIN where Linux would emit the prefix byte and
+;;; then emits the Linux instruction as it always has.  EMIT-BYTE notices when
+;;; the captured instruction is complete -- it is then the last thing in the
+;;; buffer -- and rewrites it in place.  So no call site changes shape, and a
+;;; buffer that never captures pays one slot test per byte.
+
+(defconstant +win-tls-save+ #x1668
+  "TEB offset of TlsSlots[61]: the scratch register's parking slot.")
+(defconstant +win-tls-window+ #x1678
+  "TEB offset of TlsSlots[63]: this thread's window base (Linux: the FS base).")
+(defconstant +win-tls-percpu+ #x1670
+  "TEB offset of TlsSlots[62]: this thread's per-CPU block (Linux: the GS base).")
+
+(defun %seg-begin (buf base-slot)
+  "The next instruction emitted into BUF is a window (or per-CPU) access whose
+   base is in TEB slot BASE-SLOT; EMIT-BYTE rewrites it once it is complete."
+  (when (code-buffer-seg buf)
+    (error "%seg-begin: an instruction is already being captured at ~D"
+           (code-buffer-seg buf)))
+  (setf (code-buffer-seg-base buf) base-slot)
+  (setf (code-buffer-seg buf) (code-buffer-position buf)))
+
+(defun %x64-imm-size (op two modrm opsz)
+  "Immediate bytes after the memory operand of a one-byte opcode OP."
+  (if two
+      0
+      (let ((ext (logand (ash modrm -3) 7)))
+        (cond ((or (= op #xC7) (= op #x81) (= op #x69)) (if opsz 2 4))
+              ((or (= op #xC6) (= op #x80) (= op #x83) (= op #x6B)
+                   (= op #xC0) (= op #xC1)) 1)
+              ((= op #xF7) (if (= ext 0) (if opsz 2 4) 0))
+              ((= op #xF6) (if (= ext 0) 1 0))
+              (t 0)))))
+
+(defun %x64-insn-len (b s e)
+  "Length of the instruction at B[S..], or NIL while B[S..E) is too short to
+   tell.  Covers the forms the translator emits with a window prefix: optional
+   66 / F0 prefixes, REX, a one- or 0F-two-byte opcode with a ModRM memory
+   operand, or A0-A3 with a 64-bit absolute address."
+  (let ((i s) (opsz nil) (op 0) (two nil) (len nil))
+    (loop while (and (< i e) (or (= (aref b i) #x66) (= (aref b i) #xF0)))
+          do (progn (when (= (aref b i) #x66) (setq opsz t))
+                    (setq i (+ i 1))))
+    (when (and (< i e) (= (logand (aref b i) #xF0) #x40))
+      (setq i (+ i 1)))
+    (when (< i e)
+      (setq op (aref b i))
+      (setq i (+ i 1))
+      (if (and (>= op #xA0) (<= op #xA3))
+          (setq len (+ (- i s) 8))
+          (progn
+            (when (= op #x0F)
+              (setq two t)
+              (setq i (if (< i e) (+ i 1) (+ e 1))))
+            (when (< i e)
+              (let* ((modrm (aref b i))
+                     (md (ash modrm -6))
+                     (rm (logand modrm 7))
+                     (n (+ (- i s) 1)))
+                (when (= md 3)
+                  (error "%x64-insn-len: a window access with no memory operand"))
+                (if (= rm 4)
+                    (when (< (+ i 1) e)
+                      (let ((base (logand (aref b (+ i 1)) 7)))
+                        (setq len (+ n 1
+                                     (cond ((= md 1) 1) ((= md 2) 4)
+                                           ((= base 5) 4) (t 0))
+                                     (%x64-imm-size op two modrm opsz)))))
+                    (setq len (+ n
+                                 (cond ((= md 1) 1) ((= md 2) 4)
+                                       ((= rm 5) 4) (t 0))
+                                 (%x64-imm-size op two modrm opsz)))))))))
+    len))
+
+(defun %seg-step (buf)
+  (let* ((start (code-buffer-seg buf))
+         (end (code-buffer-position buf))
+         (len (%x64-insn-len (code-buffer-bytes buf) start end)))
+    (when len
+      (when (> (- end start) len)
+        (error "%seg-step: captured ~D bytes of a ~D-byte instruction"
+               (- end start) len))
+      (when (= (- end start) len)
+        (setf (code-buffer-seg buf) nil)
+        (%seg-rewrite buf start end)))))
+
+(defun %seg-tls-mov (buf opcode scr slot)
+  "mov gs:[SLOT], SCR (OPCODE 89) or mov SCR, gs:[SLOT] (OPCODE 8B)."
+  (emit-byte buf #x65)
+  (emit-byte buf (logior #x48 (if (>= scr 8) #x04 0)))
+  (emit-byte buf opcode)
+  (emit-byte buf (logior #x04 (ash (logand scr 7) 3)))
+  (emit-byte buf #x25)
+  (emit-u32 buf slot))
+
+(defun %seg-rewrite (buf start end)
+  "Replace the complete instruction at BUF[START..END) by its TLS-slot form."
+  (let* ((b (code-buffer-bytes buf))
+         (n (- end start))
+         (ins (make-array 16 :element-type '(unsigned-byte 8)))
+         (i 0) (rex 0) (has-rex nil) (pre nil) (op 0) (two 0)
+         (reg 0) (base -1) (index -1)
+         (md 0) (rm 0) (sib 0) (moffs nil) (tail 0) (scr -1))
+    (dotimes (k n) (setf (aref ins k) (aref b (+ start k))))
+    (setf (code-buffer-position buf) start)
+    ;; Prefixes: kept as they are, in order.
+    (loop while (or (= (aref ins i) #x66) (= (aref ins i) #xF0))
+          do (progn (setq pre (cons (aref ins i) pre))
+                    (setq i (+ i 1))))
+    (when (= (logand (aref ins i) #xF0) #x40)
+      (setq rex (aref ins i)) (setq has-rex t) (setq i (+ i 1)))
+    (setq op (aref ins i)) (setq i (+ i 1))
+    (when (= op #x0F) (setq two (aref ins i)) (setq i (+ i 1)))
+    (if (and (>= op #xA0) (<= op #xA3))
+        ;; mov al/eax/rax <-> [moffs64]: becomes 8A/8B/88/89 with a disp32.
+        (progn
+          (setq moffs t)
+          (dotimes (k 4)
+            (unless (= (aref ins (+ i 4 k)) 0)
+              (error "%seg-rewrite: a window address above 4 GB")))
+          (setq reg 0)
+          (setq op (cond ((= op #xA0) #x8A) ((= op #xA1) #x8B)
+                         ((= op #xA2) #x88) (t #x89)))
+          (setq tail i))
+        (let ((modrm (aref ins i)))
+          (setq md (ash modrm -6))
+          (setq rm (logand modrm 7))
+          (setq reg (logior (if (logtest rex 4) 8 0) (logand (ash modrm -3) 7)))
+          (setq i (+ i 1))
+          (if (= rm 4)
+              (progn
+                (setq sib (aref ins i)) (setq i (+ i 1))
+                (let ((ix (logior (if (logtest rex 2) 8 0) (logand (ash sib -3) 7))))
+                  (unless (= ix 4) (setq index ix)))
+                (unless (and (= md 0) (= (logand sib 7) 5))
+                  (setq base (logior (if (logtest rex 1) 8 0) (logand sib 7)))))
+              (progn
+                (when (and (= md 0) (= rm 5))
+                  (error "%seg-rewrite: a RIP-relative window access"))
+                (setq base (logior (if (logtest rex 1) 8 0) rm))))
+          (when (and (>= base 0) (>= index 0))
+            (error "%seg-rewrite: a window access with both a base and an index"))
+          (setq tail i)))
+    ;; A scratch register the instruction does not name.
+    (dolist (c '(11 0 2 1 10 9 8))
+      (when (and (< scr 0) (/= c reg) (/= c base) (/= c index))
+        (setq scr c)))
+    (%seg-tls-mov buf #x89 scr +win-tls-save+)
+    (%seg-tls-mov buf #x8B scr (code-buffer-seg-base buf))
+    (dolist (p (reverse pre)) (emit-byte buf p))
+    (let ((w (logand rex 8)) (r (logand rex 4)) (x (logand rex 2)) (bb (logand rex 1))
+          (m md) (r-m rm) (s sib) (use-sib nil))
+      (cond (moffs
+             (setq m 2) (setq r-m (logand scr 7)) (setq x 0)
+             (setq bb (if (>= scr 8) 1 0)))
+            ((< base 0)
+             ;; [disp32] or [index*s + disp32]: SCR becomes the base.
+             (setq m 2) (setq r-m 4) (setq use-sib t)
+             (setq s (logior (logand sib #xF8) (logand scr 7)))
+             (setq bb (if (>= scr 8) 1 0)))
+            (t
+             ;; [base + disp]: SCR becomes the index.
+             (setq r-m 4) (setq use-sib t)
+             (setq s (logior (ash (logand scr 7) 3) (logand base 7)))
+             (setq x (if (>= scr 8) 2 0))))
+      (let ((nrex (logior #x40 w r x bb)))
+        (when (or has-rex (/= nrex #x40)) (emit-byte buf nrex)))
+      (if (= op #x0F)
+          (progn (emit-byte buf #x0F) (emit-byte buf two))
+          (emit-byte buf op))
+      (emit-byte buf (logior (ash m 6) (ash (logand reg 7) 3) r-m))
+      (when use-sib (emit-byte buf s))
+      ;; The displacement (moffs: its low four bytes) and any immediate.
+      (if moffs
+          (dotimes (k 4) (emit-byte buf (aref ins (+ tail k))))
+          (dotimes (k (- n tail)) (emit-byte buf (aref ins (+ tail k))))))
+    (%seg-tls-mov buf #x8B scr +win-tls-save+)))
 
 (defun emit-bytes (buf &rest bytes)
   (dolist (b bytes)

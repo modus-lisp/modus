@@ -240,7 +240,7 @@
 ;; the BSS, so a ./modus that never starts a thread behaves exactly as before.
 ;; The branch is paid three times per COLLECTION (the only callers are inside
 ;; the GC trampoline), never in an allocation fast path.
-(setf modus.mvm.x64::*x64-gc-region-percpu* (if cl-user::*cli-win64* nil :runtime)) ; Windows: GS is the TEB
+(setf modus.mvm.x64::*x64-gc-region-percpu* :runtime)
 
 ;; NATIVE THREADS, STEP 6: THE MULTIPLE-VALUE BUFFER AND THE HANDLER-FRAME
 ;; STACK BECOME PER-THREAD.  Both sides of the seam are set here because they
@@ -255,16 +255,18 @@
 ;; a fresh Linux process has FS base 0, so every one of these accesses names
 ;; the same word at the same address it always did.  A worker thread installs
 ;; its own FS base as its first act.
-;; Windows: off -- FS is not the runtime's to set there.
-(setf modus.mvm::*tls-window* (not cl-user::*cli-win64*))
-(setf modus.mvm.x64::*x64-tls-window* (not cl-user::*cli-win64*))
+;; Windows: on too, with the FS (and GS) prefixes turned into TEB TLS-slot
+;; accesses (*X64-WIN-TLS*, mvm/translate-x64.lisp): FS is not the runtime's
+;; there, and GS is the TEB.
+(setf modus.mvm::*tls-window* t)
+(setf modus.mvm.x64::*x64-tls-window* t)
+(setf modus.mvm.x64::*x64-win-tls* cl-user::*cli-win64*)
 ;; STOP-THE-WORLD FOR REGION 0 (translate-x64): the trampoline's handshake,
 ;; the back-edge poll and the safe-region traps; and layout key :STW, which
 ;; turns on the runtime half (net/hosted-sync.lisp %GC-STW-ARM, the safe
 ;; regions).  x86-64 has no other hosted layout keys, so this is the list.
-(setf modus.mvm.x64::*x64-stw* (not cl-user::*cli-win64*))   ; Windows: one thread
-(unless cl-user::*cli-win64*
-  (setf modus.mvm::*hosted-layout* (list* :stw 1 modus.mvm::*hosted-layout*)))
+(setf modus.mvm.x64::*x64-stw* t)
+(setf modus.mvm::*hosted-layout* (list* :stw 1 modus.mvm::*hosted-layout*))
 (let ((txt (with-open-file (s (merge-pathnames "net/hosted-actors.lisp"
                                                cl-user::*modus-base*))
              (let ((b (make-string (file-length s))))

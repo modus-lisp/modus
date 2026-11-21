@@ -1241,23 +1241,30 @@
     (%jit-thunk-new-page))
   (if *jit-thunk-page* t nil))
 
-;; The first byte of the hand-assembled thunk stores to PER-THREAD WINDOW slots
-;; (the nargs slot, the bridge index): the FS override, as every compiled store
-;; to those slots carries.  An image built without the window -- Windows, where
-;; FS is not the runtime's (under Wine it is glibc's thread block) -- overrides
-;; this to #x90, a NOP of the same length: the store becomes the absolute one its
-;; compiled code makes, and every offset after it in the thunk is unchanged.
-(declaim (overridable %jit-window-prefix))
-(defun %jit-window-prefix () #x64)
+;; The hand-assembled thunks store to PER-THREAD WINDOW slots (the nargs slot,
+;; the bridge index), so the store is the window access every compiled store to
+;; those slots is: `mov dword fs:[SLOT], IMM' on Linux.  Windows overrides it
+;; with the TEB-slot form (boot/boot-win64.lisp), which is longer and uses RAX --
+;; free in a thunk, whose next instruction loads RAX -- and gives thunks a
+;; bigger slot (%JIT-THUNK-STRIDE).  SLOT is the window slot's low 16 bits
+;; (#x10000000 + SLOT); IMM is 32 bits.
+(declaim (overridable %jit-window-store))
+(defun %jit-window-store (slot imm)
+  (list #x64 #xC7 #x04 #x25 (logand slot 255) (logand (ash slot -8) 255) #x00 #x10
+        (logand imm 255) (logand (ash imm -8) 255) (logand (ash imm -16) 255)
+        (logand (ash imm -24) 255)))
+
+(declaim (overridable %jit-thunk-stride))
+(defun %jit-thunk-stride () 48)
 
 (defun %jit-thunk-alloc ()
-  "Address of a fresh 48-byte thunk slot, or NIL."
-  (when (> (+ *jit-thunk-bump* 48) 4096)
+  "Address of a fresh thunk slot (%JIT-THUNK-STRIDE bytes, 16-aligned), or NIL."
+  (when (> (+ *jit-thunk-bump* (%jit-thunk-stride)) 4096)
     (%jit-thunk-new-page))
   (if (null *jit-thunk-page*)
       nil
       (let ((a (+ *jit-thunk-page* *jit-thunk-bump*)))
-        (setq *jit-thunk-bump* (+ *jit-thunk-bump* 48))
+        (setq *jit-thunk-bump* (+ *jit-thunk-bump* (%jit-thunk-stride)))
         a)))
 
 (defun %jit-emit-bytes (addr bytes)
@@ -1286,11 +1293,11 @@
    threads called through bridges."
   (%jit-emit-bytes (+ addr k) (list #x48 #xBE))
   (%jit-write-imm64 addr (+ k 2) (ash idx 1))
-  (%jit-emit-bytes (+ addr k 10) (list (%jit-window-prefix) #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
-  (%jit-emit-bytes (+ addr k 22) (list #x48 #xB8))
-  (%jit-write-imm64 addr (+ k 24) (%jit-bridge-entry nargs))
-  (%jit-emit-bytes (+ addr k 32) (list #xFF #xE0))
-  (+ k 34))
+  (let ((j (+ k 10 (%jit-emit-bytes (+ addr k 10) (%jit-window-store #x150 (+ nargs 1))))))
+    (%jit-emit-bytes (+ addr j) (list #x48 #xB8))
+    (%jit-write-imm64 addr (+ j 2) (%jit-bridge-entry nargs))
+    (%jit-emit-bytes (+ addr j 10) (list #xFF #xE0))
+    (+ j 12)))
 
 (defun %jit-thunk-fill (addr name nargs)
   (let ((idx *jit-bridge-count*))
@@ -1316,11 +1323,10 @@
             (let ((idx *jit-bridge-count*))
               (setf (aref *jit-bridge-names* idx) name)
               (setq *jit-bridge-count* (+ idx 1))
-              (%jit-emit-bytes addr (list (%jit-window-prefix) #xC7 #x04 #x25 #x78 #x01 #x00 #x10
-                                          (logand idx 255) (logand (ash idx -8) 255) 0 0))
-              (%jit-emit-bytes (+ addr 12) (list #x48 #xB8))
-              (%jit-write-imm64 addr 14 (or to (%jit-bridge-any-entry)))
-              (%jit-emit-bytes (+ addr 22) (list #xFF #xE0))
+              (let ((j (%jit-emit-bytes addr (%jit-window-store #x178 idx))))
+                (%jit-emit-bytes (+ addr j) (list #x48 #xB8))
+                (%jit-write-imm64 addr (+ j 2) (or to (%jit-bridge-any-entry)))
+                (%jit-emit-bytes (+ addr j 10) (list #xFF #xE0)))
               addr)))))
 
 (defvar *jit-fnaddr-x64-thunks* nil

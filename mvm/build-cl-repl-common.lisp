@@ -206,6 +206,12 @@
    output, PS/2 keyboard input, beside COM1.  MODUS_PC_CONSOLE=1 / =0
    overrides the default (on for bare i386, and for UEFI unless SEV-SNP).")
 
+(defparameter *pc-vbe-entry-points*
+  '(vbe-init vbe-test-pattern vbe-fill vbe-on-p vbe-base vbe-pitch vbe-width vbe-height
+    %vbe-edid-size %vbe-mode-list %vbe-mode-info %vbe-choose %pcbios-int %pcbios-out)
+  "net/pc-vbe.lisp's entry points: their names, here in code, keep them through MODUS_SHAKE
+   (which keeps every name the build scripts spell) until the image calls them itself.")
+
 (defun %pc-console-text ()
   "net/pc-console.lisp with the data it reads: boot/boot-uefi-x64.lisp's 8x8
    font and PS/2 scancode tables, and whether a GOP framebuffer may be used
@@ -220,7 +226,13 @@
             (coerce (symbol-value (find-symbol "*PS2-SCANCODE-NORMAL*" :modus.mvm)) 'list)
             (coerce (symbol-value (find-symbol "*PS2-SCANCODE-SHIFTED*" :modus.mvm)) 'list)
             (if *cl-repl-uefi-p* "t" "nil")
-            (%rpi-net-text "pc-console.lisp"))))
+            (concatenate 'string (%rpi-net-text "pc-console.lisp")
+                         ;; bare i386: a VBE framebuffer, chosen in Lisp through the pcboot
+                         ;; shim's PM_BIOS (net/pc-vbe.lisp); MODUS_PC_VBE=0 leaves it out
+                         (if (and *cl-repl-i386-p*
+                                  (not (equal (sb-ext:posix-getenv "MODUS_PC_VBE") "0")))
+                             (%rpi-net-text "pc-vbe.lisp")
+                             "")))))
 
 (defun %mac-console-text ()
   "mac/mac-console.lisp (vessel) with the 8x8 font it draws in: the bare Mac's

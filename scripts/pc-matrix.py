@@ -284,7 +284,14 @@ def run_cell(cell, disk, idx, keep, forms=None):
             own = os.path.join(tmp, 'disk.img'); shutil.copyfile(disk, own)
             cyl = 16 * 63 * 512
             with open(own, 'r+b') as f: f.truncate(-(-os.path.getsize(own) // cyl) * cyl)
-            m = Bochs(cell, own, tmp, 24000 + idx)
+            # COM1's port: one the OS says is free (a fixed 24000 + i met
+            # leftovers of earlier runs), and another if Bochs cannot bind it
+            for attempt in range(4):
+                probe = socket.socket(); probe.bind(('localhost', 0))
+                port = probe.getsockname()[1]; probe.close()
+                try: m = Bochs(cell, own, tmp, port); break
+                except RuntimeError as e:
+                    if 'bind()' not in str(e) or attempt == 3: raise
         while not m.at_prompt():
             if time.time() - t0 > 180:
                 res['detail'] = 'no prompt in 180 s: ' + ' / '.join(m.text().strip().splitlines()[-3:])

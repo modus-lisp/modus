@@ -49,6 +49,14 @@
 (defconstant +i386-cl-low-va+     #x10000000)
 (defconstant +i386-cl-low-size+   #x20000 "+linux-i386-bss-end+ - #x10000000.")
 (defconstant +i386-cl-pt-reserve+ #x40000 "RAM kept back for the heap's page tables.")
+(defconstant +i386-cl-fb-window+ #x0C000000
+  "VA of the 16 MB framebuffer window: four page tables at +I386-CL-FB-PTS+,
+   empty until the image's own Lisp has set a VBE mode and fills them with
+   its framebuffer's pages.")
+(defconstant +i386-cl-fb-pts+ #x20000
+  "PA (= VA: the low megabyte is identity-mapped) of the framebuffer window's
+   four page tables -- where MODUS.COM ran, which nothing uses once the image
+   does.  x86 caches no not-present entry, so filling them needs no flush.")
 ;; the stub's own variables, in the low megabyte (identity-mapped, unused)
 (defconstant +i386-cl-v-panext+ #x8000 "next free physical byte")
 (defconstant +i386-cl-v-pd+     #x8004 "the page directory")
@@ -236,6 +244,15 @@
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-imgend+)
        '(#xC1 #xE9 #x0C) '(:call 0 map)                    ; shr ecx, 12
        '(:label map-image-done)
+       ;; the framebuffer window: its four page tables, empty, in the PD
+       (cons #xBF (i386l-le32-list +i386-cl-fb-pts+))
+       (cons #xB9 (i386l-le32-list #x4000)) '(:call 0 zero)
+       (i386cl-abs '(#x8B #x1D) +i386-cl-v-pd+)              ; ebx = PD
+       (cons :splice
+             (loop for i below 4                              ; mov [ebx+PDE], PT | 3
+                   collect (append (list #xC7 #x83)
+                                   (i386l-le32-list (* 4 (+ (ash +i386-cl-fb-window+ -22) i)))
+                                   (i386l-le32-list (logior (+ +i386-cl-fb-pts+ (* i 4096)) 3)))))
        ;; the fixed block, zeroed (hosted: a fresh mapping)
        (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 alloc)
        '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 zero)

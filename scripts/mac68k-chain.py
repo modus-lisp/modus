@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mac68k-chain.py DISK OUT.bin [--forks DIR] -- modus as a Mac application.
 
-DISK is a modus boot disk that can run on top of Mac OS: scripts/mac68k-core.py's
+DISK is a modus boot disk that can run on top of Mac OS: scripts/mac68k-core.lisp's
 output for MODUS_MAC68K_MACHINE=classicos (its boot blocks' record names a
 REFSLOT).  OUT.bin is a MacBinary II file -- the usual way to carry a Mac file,
 both forks, through anything that is not a Mac -- of an application, "Modus":

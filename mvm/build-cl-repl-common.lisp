@@ -3236,7 +3236,7 @@
 ;;; follows MODUS_SMALL_IMAGE as on the hosted 68k CLI).  After boot the heap is
 ;;; frozen (mvm/68k-gc-static.lisp, as mvm/build-68k-cli.lisp does).  On the
 ;;; Classic layout a boot whose stub found the SAVE flag (the build's core run,
-;;; scripts/mac68k-core.py) then sends its core over serial port A -- "MCOR",
+;;; scripts/mac68k-core.lisp) then sends its core over serial port A -- "MCOR",
 ;;; the low block's address and the static ranges, the low block, the static
 ;;; objects and conses -- and stops; a boot whose stub found a CORE (the low
 ;;; block's #x10006014 set, as the core was saved) skips boot init and goes
@@ -3246,7 +3246,7 @@
   (let ((s (sb-ext:posix-getenv "MODUS_SMALL_IMAGE")))
     (and s (plusp (length s)) (not (string= s "0")))))
 ;;; :MAC68K: COLD NAMES (mvm/mac68k-cold.lisp): with the saved core, the names
-;;; *SYM-NAME-TABLE* holds are also written to IMAGE.cold, which mac68k-core.py
+;;; *SYM-NAME-TABLE* holds are also written to IMAGE.cold, which mac68k-core.lisp
 ;;; puts on the core's disk, and the core run drops the table (430 KB of a
 ;;; Classic's static heap).  Follows the static heap; MODUS_MAC68K_COLD_NAMES=0
 ;;; keeps the table.
@@ -3262,7 +3262,7 @@
 
 ;;; :MAC68K: INIT-ONLY TEXT (cross.lisp *POOL-INIT-ONLY*), with the saved core:
 ;;; the boot tables' packed text (symbol, function and global names) goes last
-;;; in the resident image, where mac68k-core.py starts the static heap over it.
+;;; in the resident image, where mac68k-core.lisp starts the static heap over it.
 ;;; MODUS_MAC68K_INIT_ONLY=0 keeps it in the pool.
 (defvar *mac-init-only*
   (and *mac-cold-names-out*
@@ -3551,7 +3551,7 @@
     ;; emulator that is the host's timing -- measured, two core runs of one
     ;; build (Basilisk II) saved different heaps (a closure where the other had
     ;; garbage), so the shift pair a relocatable image is made from
-    ;; (mac68k-reloc-disk.py) no longer differed by relocations alone.
+    ;; (mac68k-reloc-disk.lisp) no longer differed by relocations alone.
     (setq text (concatenate 'string text "
 (defun %jit-hot-ns ()
   (if (eql (mem-ref #x1000602C :u32) 1) 1099511627776 10000000))
@@ -3559,7 +3559,7 @@
     (setq *cli-arch-override-source*
           (concatenate 'string *cli-arch-override-source* (string #\Newline) text
                        "
-;; THE MAC'S SAVED CORE (boot/boot-mac68k.lisp, scripts/mac68k-core.py).
+;; THE MAC'S SAVED CORE (boot/boot-mac68k.lisp, scripts/mac68k-core.lisp).
 (defun %core-requested-p () (eql (mem-ref #x10006014 :u32) 1))
 (defun %core-pre-restore () t)
 (defun %restore-image () nil)
@@ -4816,7 +4816,7 @@
     (format t "~%Run: ~A~%"
             (cond
               (cl-user::*cl-repl-mac68k-p*
-                (format nil "scripts/mac68k-disk.py ~A DISK, then Basilisk II with it (serial port A is the console)" path))
+                (format nil "sbcl --script scripts/mac68k-disk.lisp ~A DISK, then Basilisk II with it (serial port A is the console)" path))
               (cl-user::*cl-repl-arm32-p*
                 (format nil "qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 -kernel ~A -display none -serial stdio -no-reboot" path))
               (cl-user::*cl-repl-x64-p*

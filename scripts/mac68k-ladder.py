@@ -3,7 +3,7 @@
 
 Each rung (test/arch-rungs/) is built for the :mac68k target
 (`mvm/build-hosted.lisp mac68k`, boot/boot-mac68k.lisp), written to a boot
-disk (scripts/mac68k-disk.py) and booted under Basilisk II: the Mac ROM runs
+disk (scripts/mac68k-disk.lisp) and booted under Basilisk II: the Mac ROM runs
 our boot blocks, which load the image, which answers over serial port A --
 four bytes, as on the hosted ladder.  Basilisk's serial port A is a
 pseudo-terminal this script reads.

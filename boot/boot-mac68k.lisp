@@ -1,7 +1,7 @@
 ;;;; boot-mac68k.lisp — a bare 68k Macintosh: modus IS the boot disk.
 ;;;;
 ;;;; The Mac ROM reads the boot disk's first two blocks (the boot blocks: 'LK',
-;;;; a branch, a header) and jumps into them; scripts/mac68k-disk.py writes boot
+;;;; a branch, a header) and jumps into them; scripts/mac68k-disk.lisp writes boot
 ;;;; blocks that read this image off the disk to +MAC68K-LOAD-ADDR+ with the
 ;;;; ROM's own driver and jump to its first byte, the entry below.  No OS, no
 ;;;; System file, no MMU: the image runs on the Mac's physical RAM, with the
@@ -132,7 +132,7 @@
     ;; PACKED ABOVE THE IMAGE (2026-11-19).  The resident image (8.3 MB of 68k with
     ;; CONS / ALLOC-OBJ shared, type-error codes, no call-site temp saves, the
     ;; unreachable DEFUNs left out: MODUS_SHAKE) must end below :STATIC-LO,
-    ;; ~250 KB of room to grow; mac68k-core.py lays the
+    ;; ~250 KB of room to grow; mac68k-core.lisp lays the
     ;; frozen static heap (~320 KB) from the image's end and fails the build
     ;; past :STATIC-HI.  Then the JIT area, the code cache, the stack, the I/O
     ;; pages, NIL's page and the region, as before but 7.2 MB lower: the
@@ -150,7 +150,7 @@
     ;; shift carries #xF00000 to #x1000000, and the image's source text spells
     ;; layout addresses in hex, so the pool grew a word and every address after
     ;; it moved -- differences the relocation table cannot describe.
-    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): 550000 -- the low
+    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.lisp's SPAN): 550000 -- the low
     ;; block's end, then what HSIZE needs for two 128 KB semispaces (its HMIN:
     ;; every benchmark form runs in them, 2026-11-20; the old 512 KB floor was
     ;; a guess from an older bug), the guard, the kind map and a 256 KB code
@@ -173,7 +173,7 @@
     ;; needs the tail, so ITS stack is :BOOT-STACK-TOP, above the disk boot's
     ;; code area in Basilisk's free RAM; the scratch and I/O pages, NIL's page
     ;; and the low block, which both runs use, start past the tail
-    ;; (mac68k-core.py fails a tail that reaches :STACK-TOP).  Span 800000.  The loader
+    ;; (mac68k-core.lisp fails a tail that reaches :STACK-TOP).  Span 800000.  The loader
     ;; (mac68k-chain.s HSIZE) gives the young heap 4/9 of the room past the low
     ;; block, after aligning the image's base to 512 KB inside the partition --
     ;; so what one partition size leaves varies with where the Process Manager
@@ -208,7 +208,7 @@
     ;; (MODUS_68K_COLD_KEEP=mvm/68k-keep-quadra.txt, ~4 MB), every other one
     ;; COLD: on the floppy, read at its first call into the code area.  The
     ;; floppy's loader installs a driver (scripts/mac68k-lzdisk.s) whose drive
-    ;; is the core's disk as mac68k-core.py wrote it, the cold tail kept as
+    ;; is the core's disk as mac68k-core.lisp wrote it, the cold tail kept as
     ;; LZMA blocks: the image reads it as it would any boot disk.
     ;;   #x040000  the image (the ROM's system heap ends below: #x39FE0 on a
     ;;             32 MB LC), then the static heap the core brings, to :STATIC-HI
@@ -241,7 +241,7 @@
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
     ;; the 4 MB map; the static heap from the image's init-only text
-    ;; (mac68k-core.py) up to #x178000; then the low block, a YOUNG pair of
+    ;; (mac68k-core.lisp) up to #x178000; then the low block, a YOUNG pair of
     ;; 100 KB (56 KB of low block + 2 x 100 KB) and a 16 KB
     ;; guard, the kind map over them, a 196 KB code cache (the interpreter's
     ;; stream, ~176 KB, is the floor), NIL's page under the screen.  The boot
@@ -527,7 +527,7 @@
    mode, on the ROM's boot stack.
 
    THE CLASSIC (*MAC68K-MACHINE* :CLASSIC) has two boots.  With a SAVED CORE --
-   the core descriptor's CORE flag set by scripts/mac68k-core.py, which put the
+   the core descriptor's CORE flag set by scripts/mac68k-core.lisp, which put the
    low block and the static heap where the boot blocks read them -- the low
    block is NOT cleared, the young semispaces are the small ones after it, and
    KERNEL-MAIN resumes the REPL without boot init.  Without one (the build's
@@ -576,7 +576,7 @@
           ;; :BOOT-JIT-AREA: the core run's code area, in the words an
           ;; application's loader leaves its partition's in (+MAC68K-HEAP-SLOT+
           ;; +8 / +12), which COLD-ENTER and the JIT take over the layout's
-          ;; (mac68k-core.py clears them in the core it saves)
+          ;; (mac68k-core.lisp clears them in the core it saves)
           (let ((lo (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) :boot-jit-area-lo)))
             (when lo
               (m68k-emit-move-imm-an buf (conv-real (+ +mac68k-heap-slot+ 8)) +68k-a0+)

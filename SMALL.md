@@ -369,11 +369,11 @@ session's growth, not for boot.
     MODUS_MAC68K_MACHINE=classic MODUS_68K_PAGED=1 MODUS_68K_CPU=68000 \
       MODUS_SMALL_IMAGE=1 MODUS_NARROW_STRINGS=1 MODUS_68K_THREADED=1 \
       MODUS_68K_HOT=/dev/null ... sbcl --script mvm/build-mac68k-cl-repl.lisp
-    scripts/mac68k-core.py IMAGE DISK          # boots it once on a 32 MB Mac
+    scripts/mac68k-core.lisp IMAGE DISK          # boots it once on a 32 MB Mac
 
 Every function threaded and paged: 804 KB resident (stubs, handlers, the
 512 KB constant pool), 3.96 MB of streams on disk.  A Classic cannot boot the
-image from scratch (a 5 MB heap, ~50 MB of allocation), so `mac68k-core.py`
+image from scratch (a 5 MB heap, ~50 MB of allocation), so `mac68k-core.lisp`
 boots the SAME binary once on Basilisk II with 32 MB -- the stub's :BOOT- heap,
 code cache and stack above 4 MB -- where it freezes and sends its core over
 serial; the static heap (1.28 MB of objects, 0.27 MB of conses) is moved to
@@ -491,7 +491,7 @@ A 68000 has no MMU, so there is no page fault to catch: data comes off the
 disk where it is ASKED FOR, through a function, as the code streams do.
 **Cold names** (`mvm/mac68k-cold.lisp`) are the first: the build writes the
 12,247 names, sorted by hash, to 512-byte pages (`IMAGE.cold`, 203 KB);
-`mac68k-core.py` puts them on the disk after the streams; the core run drops
+`mac68k-core.lisp` puts them on the disk after the streams; the core run drops
 `*SYM-NAME-TABLE*`; and `SYMBOL-NAME`, where the table would have answered,
 asks `%COLD-SYM-NAME` -- a binary search of the pages' first hashes (in the
 image), ONE block read (`SYSCALL3` service 1 on a bare Mac, the code loader's
@@ -511,7 +511,7 @@ customers, or replaced by a test on what is already resident.
 
 ## Shrinking what stays, and a code cache that can evict anything
 
-**The core's own collection** (`mac68k-core.py`): a core boot's only roots are
+**The core's own collection** (`mac68k-core.lisp`): a core boot's only roots are
 the low block's words, so the builder keeps what they reach and compacts it --
 326 KB the freeze had kept live through a stale stack word went.  **Hash
 tables**: the symbol-function table is a compact dict now -- keys and values
@@ -554,7 +554,7 @@ REPL forms throughout, every answer right:
 | low block | 128 KB | 56 KB | the layout's `:ALLOC-START`; the 72 KB went to the young semispaces (64 -> 100 KB) |
 | prompt | 74 s | 55 s | less to read at boot |
 
-`MAC68K_CORE_CENSUS=1 scripts/mac68k-core.py` prints the saved heap by subtag.
+`MAC68K_CORE_CENSUS=1 scripts/mac68k-core.lisp` prints the saved heap by subtag.
 What is left in it is live: symbols and their intern tables (~130 KB), the
 package tables, the bytecode of the 47 runtime macros boot compiles (56 KB),
 dict indexes, conses (60 KB).
@@ -712,7 +712,7 @@ Modules over 1 KB of bytecode (every DEFSTRUCT) stay interpreted.
 ## Launched from Mac OS: `MODUS_MAC68K_MACHINE=classicos` + `scripts/mac68k-chain.py`
 
 No floppy and no disk of our own: a Mac application, "Modus", whose data fork
-IS the boot disk `mac68k-core.py` writes.  Double-clicked (or set as the
+IS the boot disk `mac68k-core.lisp` writes.  Double-clicked (or set as the
 startup application), it opens its own data fork, reads the image to its
 address, stores the open file's reference number in the image's static block
 (`#x10006050`, `+68K-MAC-FILE-REFNUM+`) and jumps.  The image runs on top of

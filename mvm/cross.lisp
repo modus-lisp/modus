@@ -349,7 +349,7 @@
 ;;; only boot reads -- the boot tables' packed text.  BUILD-CONSTANT-POOL lays
 ;;; them out LAST, after an 8-byte "modusINI" marker at *POOL-INIT-START*
 ;;; (pool-relative), and the image assembly moves that tail past the NFN table
-;;; and the footer, to the very end of the resident image; mac68k-core.py then
+;;; and the footer, to the very end of the resident image; mac68k-core.lisp then
 ;;; starts the static heap at the marker, over text a core boot never reads.
 ;;; NIL: one pool, as always.
 (defvar *pool-init-only* nil)
@@ -366,7 +366,7 @@
   "NIL: the pool's init-only tail is linked where it lies, last in the resident
    image.  An address: it is LINKED there (16-aligned), though the file still
    carries it last -- the bare Mac's 1 MB map, whose runtime-data region sits
-   where the tail would; scripts/mac68k-core.py puts the bytes at this address
+   where the tail would; scripts/mac68k-core.lisp puts the bytes at this address
    for the core run, and a core boot never reads them.")
 
 (defun build-constant-pool (module target)

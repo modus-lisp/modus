@@ -49,10 +49,10 @@
      "INSTALL-68K-TRANSLATOR"     "M68K-SET-LINUX-MODE"  :linux-68k
      "MODUS_68K_LINUX_OUT"     "/tmp/modus-68k-linux"     "qemu-m68k-static")
     ;; Not hosted: the bare 68k Mac (boot/boot-mac68k.lisp), a flat image for
-    ;; scripts/mac68k-disk.py; the same single-source build.
+    ;; scripts/mac68k-disk.lisp; the same single-source build.
     ("mac68k"  ("boot/boot-linux-68k.lisp" "boot/boot-mac68k.lisp")
      "INSTALL-68K-TRANSLATOR"     "MAC68K-CONFIGURE"     :mac68k
-     "MODUS_MAC68K_OUT"        "/tmp/modus-mac68k.bin"    "scripts/mac68k-disk.py")))
+     "MODUS_MAC68K_OUT"        "/tmp/modus-mac68k.bin"    "sbcl --script scripts/mac68k-disk.lisp")))
 
 (defparameter *hosted-port*
   (let ((arch (second sb-ext:*posix-argv*)))

@@ -230,7 +230,7 @@
 (defvar *68k-stream-table-label* nil)
 (defvar *68k-stream-section-label* nil)
 ;;; THE MAC'S STREAM LOADER (paged + Mac mode).  The disk builder
-;;; (scripts/mac68k-disk.py --paged) gives the boot blocks only the RESIDENT
+;;; (scripts/mac68k-disk.lisp --paged) gives the boot blocks only the RESIDENT
 ;;; part of the image and marks every stream-table entry "not loaded" -- bit 0
 ;;; set, its home address otherwise (streams are word-aligned).  COLD-ENTER
 ;;; takes such an entry to the loader, which reads the blocks holding the
@@ -1299,7 +1299,7 @@
 ;;; functions, followed by a TRAILER: the body-relative word offsets (/2) of
 ;;; its absolute references to itself, then their count (a word).  T is body +
 ;;; trailer; HOME the body's address as linked; I its index.  The tail is never
-;;; read at boot (mac68k-core.py puts it on the disk after the boot read), so
+;;; read at boot (mac68k-core.lisp puts it on the disk after the boot read), so
 ;;; HOME is only a disk position: disk byte = HOME - the descriptor's BIAS.
 ;;; At the first call COLD-ENTER reads the body into the code area's top (the
 ;;; JIT's grows from the bottom), adds (where it landed - HOME) at each trailer
@@ -5501,7 +5501,7 @@
 (defun m68k-emit-cold-native-resident (buf function-table label-map)
   "Cold native code, at the resident boundary: a stub for each cold function
    (at its label), COLD-ENTER, the descriptor and the external relocations'
-   index (filled by scripts/mac68k-reloc-disk.py).  Fills *68K-COLD-NATIVE*."
+   index (filled by scripts/mac68k-reloc-disk.lisp).  Fills *68K-COLD-NATIVE*."
   (let ((offs nil) (i 0) (first-stub (mvm-make-label)))
     (maphash (lambda (idx off) (declare (ignore idx))
                (when (>= off *68k-cold-pc*) (pushnew off offs)))
@@ -5525,7 +5525,7 @@
       (incf i))
     (m68k-emit-cold-enter buf)
     ;; the descriptor: "modusCLD", the disk BIAS (a body's disk byte is HOME -
-    ;; BIAS: the build's disk has the image at byte 1024; mac68k-core.py
+    ;; BIAS: the build's disk has the image at byte 1024; mac68k-core.lisp
     ;; rewrites it for the disk it makes), the cold section, the count, the
     ;; external relocations' index, the first stub (the I-th is 16 I on), and
     ;; the resident functions' end (*68K-ROUTINES-LABEL*)
@@ -5597,7 +5597,7 @@
         (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf lp :disp16) ; DBRA D1
         ;; a relocated application: the body's EXTERNAL relocations, as the
         ;; application's loader applies its own (scripts/mac68k-chain.s
-        ;; RELOCATE), from the list the index names (mac68k-reloc-disk.py):
+        ;; RELOCATE), from the list the index names (mac68k-reloc-disk.lisp):
         ;; entry = blocks << 25 | disk byte; the list = n8 n16 n7, then the
         ;; offsets (/2) of each kind
         (ws #x2A39) (l32 (conv-real +68k-reloc-delta+))      ; D5 = DELTA
@@ -5682,7 +5682,7 @@
     ;; body may be any size: only a 128 KB stretch with no absolute reference
     ;; to itself does not encode.  (Offsets from 0 capped a body at 128 KB,
     ;; and the compiler kept every body over ~48 KB of bytecode resident --
-    ;; 1.4 MB of a Mac image.)  COLD-ENTER and mac68k-reloc-disk.py agree.
+    ;; 1.4 MB of a Mac image.)  COLD-ENTER and mac68k-reloc-disk.lisp agree.
     (setq offs (sort offs #'<))
     (let ((prev 0))
       (dolist (o offs)
@@ -6607,7 +6607,7 @@
     ;; the descriptor: "modusPGD", the table's address, the count, the
     ;; section, and the DISK BIAS: home address - bias = the stream's byte on
     ;; the boot disk (load address - 1024 when the image follows the boot
-    ;; blocks; scripts/mac68k-disk.py rewrites it when the streams go elsewhere)
+    ;; blocks; scripts/mac68k-disk.lisp rewrites it when the streams go elsewhere)
     (dolist (w '(#x6D6F #x6475 #x7350 #x4744)) (m68k-emit-word buf w))
     (m68k-emit-abs32-data buf *68k-stream-table-label*)
     (m68k-emit-long buf (length fns))

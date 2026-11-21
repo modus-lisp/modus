@@ -1116,6 +1116,7 @@ public func modusSwiftInstall() {
     installBluetooth()                             // Bluetooth.swift: LE links, for a mesh
     installFiles()                                 // Files.swift: the app's folder, and the file picker
     installNative()                                // NativeMac.swift: app-grade components (an app, not the desk)
+    installWindow()                                // MacWindow.swift: the window's title, chrome and size
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
     register("ui_switch_new", switchNew)

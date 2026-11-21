@@ -44,14 +44,33 @@ case $KIND in
     # Lisp-calls-Swift (modus-swift.m, whose functions here are host/macos/swift/)
     EXTRA_SRC="$HERE/modus-ui-mac.m $HERE/../ios/modus-objc.m $HERE/../ios/modus-swift.m"
     FRAMEWORKS="-framework AudioToolbox -framework Security -framework Foundation -framework AppKit -framework IOSurface -framework QuartzCore"
-    cat > "$OUT/Contents/Info.plist" <<'PLIST'
+    # THE APP'S NAME (the Dock's, the menu bar's, the window's first title) and identity, and its icon:
+    #   MODUS_MAC_NAME       default "modus"
+    #   MODUS_MAC_BUNDLE_ID  default org.modus-lisp.modus
+    #   MODUS_MAC_ICON       a square PNG (1024 x 1024 is best), made into the bundle's AppIcon.icns
+    NAME=$(printf '%s' "${MODUS_MAC_NAME:-modus}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+    BUNDLE_ID=${MODUS_MAC_BUNDLE_ID:-org.modus-lisp.modus}
+    ICON_KEY=""
+    if [ -n "${MODUS_MAC_ICON:-}" ]; then
+      SET=$(mktemp -d)/AppIcon.iconset
+      mkdir -p "$SET" "$OUT/Contents/Resources"
+      for S in 16 32 128 256 512; do
+        sips -z $S $S "$MODUS_MAC_ICON" --out "$SET/icon_${S}x${S}.png" >/dev/null
+        sips -z $((S * 2)) $((S * 2)) "$MODUS_MAC_ICON" --out "$SET/icon_${S}x${S}@2x.png" >/dev/null
+      done
+      iconutil -c icns "$SET" -o "$OUT/Contents/Resources/AppIcon.icns"
+      rm -rf "$(dirname "$SET")"
+      ICON_KEY="<key>CFBundleIconFile</key><string>AppIcon</string>"
+    fi
+    cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>modus</string>
-  <key>CFBundleDisplayName</key><string>modus</string>
-  <key>CFBundleIdentifier</key><string>org.modus-lisp.modus</string>
+  <key>CFBundleName</key><string>$NAME</string>
+  <key>CFBundleDisplayName</key><string>$NAME</string>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
+  $ICON_KEY
   <key>CFBundleExecutable</key><string>modus</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>

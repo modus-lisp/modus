@@ -170,6 +170,38 @@ static void set_pixel_size(long w, long h) {
     show_part();
 }
 
+// How much of the content's top the title bar covers, in pixels: none, unless the content runs under a transparent
+// title bar (host/macos/swift/MacWindow.swift's window_chrome).  The image reads it as the top of the safe area
+// (1001 3), as the phone's status bar is, and lays itself out below it.
+static long safe_top_px;
+
+// The window's content in pixels, and its covered top, as they are now; a change to either is a resize event, which
+// the image lays itself out again for.  The window resizing calls it, and so does a change of its chrome.
+static void refit(void) {
+    if (!fb_view) return;
+    NSSize pts = fb_view.bounds.size;
+    long w = (long)(pts.width * ui_scale), h = (long)(pts.height * ui_scale);
+    long top = 0;
+    if (window && (window.styleMask & NSWindowStyleMaskFullSizeContentView))
+        top = (long)((pts.height - window.contentLayoutRect.size.height) * ui_scale);
+    if (top < 0) top = 0;
+    if (w == fb_w && h == fb_h && top == safe_top_px) return;
+    safe_top_px = top;
+    set_pixel_size(w, h);
+    push_resize(fb_w, fb_h);
+}
+
+// For the Swift side, after it changes the window's chrome (the content's size and covered top change with it, and
+// AppKit sends no resize for that).  Main thread.
+void modus_mac_relayout(void) { refit(); }
+
+// The app's name, as its bundle gives it (build-macos.sh writes it from MODUS_MAC_NAME): the window's first title,
+// and the menu's.
+static NSString *app_name(void) {
+    NSString *name = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"];
+    return name.length ? name : @"modus";
+}
+
 @implementation ModusAppDelegate
 // The display link calls this on the main thread once per refresh; it only signals the image.
 - (void)tick:(CADisplayLink *)link {
@@ -186,11 +218,7 @@ static void set_pixel_size(long w, long h) {
 }
 - (void)windowDidResize:(NSNotification *)n {
     (void)n;
-    NSSize pts = fb_view.bounds.size;
-    long w = (long)(pts.width * ui_scale), h = (long)(pts.height * ui_scale);
-    if (w == fb_w && h == fb_h) return;
-    set_pixel_size(w, h);
-    push_resize(fb_w, fb_h);
+    refit();
 }
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     (void)n;
@@ -200,7 +228,7 @@ static void set_pixel_size(long w, long h) {
                                                    NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                            backing:NSBackingStoreBuffered
                                              defer:NO];
-    window.title = @"modus";
+    window.title = app_name();
     window.delegate = self;
     window.releasedWhenClosed = NO;
 
@@ -238,8 +266,9 @@ static void build_menu(void) {
     NSMenu *bar = [[NSMenu alloc] init];
     NSMenuItem *appItem = [[NSMenuItem alloc] init];
     [bar addItem:appItem];
-    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"modus"];
-    [appMenu addItemWithTitle:@"Quit modus" action:@selector(terminate:) keyEquivalent:@"q"];
+    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:app_name()];
+    [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", app_name()]
+                       action:@selector(terminate:) keyEquivalent:@"q"];
     appItem.submenu = appMenu;
     NSApp.mainMenu = bar;
 }
@@ -351,7 +380,8 @@ int64_t modus_mac_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a
     wait_ui();
     switch (nr) {
     case 1001: switch (a0) { case 0: return fb_w; case 1: return fb_h; case 2: return ui_scale;
-                             case 3: case 4: case 5: case 6: return 0;   // no safe area on a Mac
+                             case 3: return safe_top_px;   // the title bar, when the content runs under it
+                             case 4: case 5: case 6: return 0;
                              default: return -22; }
     case 1002: { if (fb_surface) IOSurfaceLock(fb_surface, 0, NULL);
                  long r = fill(a0, a1, a2);

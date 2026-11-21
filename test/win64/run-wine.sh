@@ -51,5 +51,20 @@ expect "list printing"   "(list 1 2 3)"            '(1 2 3)'
 expect "gc churn"        '(let ((s 0)) (dotimes (i 200000) (setq s (+ s (length (list i i i))))) s)' '600000'
 expect "gc live list"    '(let ((l nil)) (dotimes (i 100000) (push i l)) (+ (car l) (length l)))' '199999'
 
+# The runtime JIT's calling paths (a MODUS_WIN64_JIT=1 image; the interpreter
+# image must give the same answers).  A DEFUN goes native after 64 calls; a
+# native caller reaches a still-interpreted callee through a bridge thunk (the
+# any-arity one for 4+ arguments and &rest), and a redefinition reaches native
+# callers through the callee's linkage stub.
+expect "jit hot defun"   '(progn (defun jf (n) (let ((s 0)) (dotimes (i n) (setq s (+ s i))) s)) (dotimes (k 100) (jf 10)) (jf 1000))' '499500'
+expect "jit 5-arg bridge" '(progn (defun j5 (a b c d e) (+ a b c d e)) (defun cj5 () (j5 1 2 3 4 5)) (dotimes (k 100) (cj5)) (cj5))' '15'
+expect "jit &rest bridge" '(progn (defun jr (&rest xs) (length xs)) (defun cjr () (jr 1 2 3 4 5 6)) (dotimes (k 100) (cjr)) (cjr))' '6'
+# Separate top-level forms: inside one PROGN the module binds JG early (and says so).
+expect "jit redefinition" '(defun jg () 1)
+(defun jh () (jg))
+(dotimes (k 100) (jh))
+(defun jg () 2)
+(list :redef (jh))' '(REDEF 2)'
+
 echo "== $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

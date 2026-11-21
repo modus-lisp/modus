@@ -185,16 +185,8 @@
         (concatenate 'string *cli-arch-override-source*
                      (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline))))
 
-;; REFUSE the JIT build.  The runtime JIT emits absolute function addresses that
-;; are wrong in a PE image: a JIT-compiled call jumps to a raw image offset, not
-;; to a virtual address, and the process faults on its first JIT-compiled form.
-;; Until that is fixed the Windows image is built interpreter-only, and this
-;; refuses to build the JIT variant rather than ship a binary that faults.
-(unless (or (equal (sb-ext:posix-getenv "MODUS_NO_JIT") "1")
-            (equal (sb-ext:posix-getenv "MODUS_WIN64_JIT") "1"))   ; experimental opt-in
-  (format *error-output* "~&build-win64-cli: set MODUS_NO_JIT=1.  The runtime JIT is~%~
-  not yet verified in a Windows image (MODUS_WIN64_JIT=1 builds it anyway).~%")
-  (sb-ext:exit :code 2 :abort t))
+;; The runtime JIT is on by default, as on Linux; MODUS_NO_JIT=1 builds the
+;; interpreter-only image (build-cli-common reads it).
 
 ;; The runtime JIT's co-init must match this image's settings (no TLS window,
 ;; no per-CPU block, no STW): build-cli-common reads this.
@@ -239,6 +231,9 @@
 ;; *FULL-SOURCE* itself: that text is assembled when build-cli-common.lisp loads,
 ;; so appending to *CLI-ARCH-OVERRIDE-SOURCE* here (after the load) is lost.
 ;;
+;; %JIT-WINDOW-PREFIX: the JIT's hand-assembled bridge thunks store to window
+;; slots with this byte first; 144 (#x90, NOP) instead of the FS override, since
+;; this image has no window and FS is not ours (mvm/mvm-eval.lisp).
 ;; %CLI-COLLECT-ARGV: the stub puts the whole command line (GetCommandLineA)
 ;;    in argv[0]; split it with the Windows rules -- whitespace separates outside
 ;;    double quotes, a quote toggles quoting, \" is a literal quote.  Characters
@@ -246,6 +241,7 @@
 ;;    text free of escapes.  Last definition wins (the original is overridable).
 (defparameter *win64-runtime-source*
   (format nil "
+(defun %jit-window-prefix () 144)
 (defun %cli-collect-argv ()
   (let* ((line (%cli-cstr-at (%cli-read-ptr (%cli-argv-base))))
          (n (length line)) (acc nil) (out (make-string-output-stream))

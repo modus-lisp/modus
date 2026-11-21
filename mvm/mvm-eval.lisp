@@ -1241,6 +1241,15 @@
     (%jit-thunk-new-page))
   (if *jit-thunk-page* t nil))
 
+;; The first byte of the hand-assembled thunk stores to PER-THREAD WINDOW slots
+;; (the nargs slot, the bridge index): the FS override, as every compiled store
+;; to those slots carries.  An image built without the window -- Windows, where
+;; FS is not the runtime's (under Wine it is glibc's thread block) -- overrides
+;; this to #x90, a NOP of the same length: the store becomes the absolute one its
+;; compiled code makes, and every offset after it in the thunk is unchanged.
+(declaim (overridable %jit-window-prefix))
+(defun %jit-window-prefix () #x64)
+
 (defun %jit-thunk-alloc ()
   "Address of a fresh 48-byte thunk slot, or NIL."
   (when (> (+ *jit-thunk-bump* 48) 4096)
@@ -1277,7 +1286,7 @@
    threads called through bridges."
   (%jit-emit-bytes (+ addr k) (list #x48 #xBE))
   (%jit-write-imm64 addr (+ k 2) (ash idx 1))
-  (%jit-emit-bytes (+ addr k 10) (list #x64 #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
+  (%jit-emit-bytes (+ addr k 10) (list (%jit-window-prefix) #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
   (%jit-emit-bytes (+ addr k 22) (list #x48 #xB8))
   (%jit-write-imm64 addr (+ k 24) (%jit-bridge-entry nargs))
   (%jit-emit-bytes (+ addr k 32) (list #xFF #xE0))
@@ -1307,7 +1316,7 @@
             (let ((idx *jit-bridge-count*))
               (setf (aref *jit-bridge-names* idx) name)
               (setq *jit-bridge-count* (+ idx 1))
-              (%jit-emit-bytes addr (list #x64 #xC7 #x04 #x25 #x78 #x01 #x00 #x10
+              (%jit-emit-bytes addr (list (%jit-window-prefix) #xC7 #x04 #x25 #x78 #x01 #x00 #x10
                                           (logand idx 255) (logand (ash idx -8) 255) 0 0))
               (%jit-emit-bytes (+ addr 12) (list #x48 #xB8))
               (%jit-write-imm64 addr 14 (or to (%jit-bridge-any-entry)))

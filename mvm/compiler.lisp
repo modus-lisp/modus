@@ -4972,11 +4972,22 @@
                              (consp (cadr (cadar body)))
                              (symbolp (car (cadr (cadar body))))
                              (name-eq (car (cadr (cadar body))) "OBJ-SUBTAG"))))))
-      (unless own
-        (setq *struct-accessors*
-              (remove-if (lambda (r) (or (and (eql (car r) h) (%struct-record-for-p r name nil))
-                                         (and (eql (cadr r) h) (%struct-record-for-p r name t))))
-                         *struct-accessors*))))))
+      ;; WRITTEN ONLY WHEN A RECORD GOES.  REMOVE-IF copies the list even when
+      ;; nothing matches, and this runs at every runtime DEFUN -- every EVAL's
+      ;; %MVM-EVAL-THUNK too -- so a worker's EVAL stored its own fresh list
+      ;; into the global, and the shared-store guard refused it
+      ;; (test/worker-eval.lisp).  When one does go on a worker, the new list
+      ;; is made under the runtime lock, in shared memory.
+      (flet ((mine (r) (or (and (eql (car r) h) (%struct-record-for-p r name nil))
+                           (and (eql (cadr r) h) (%struct-record-for-p r name t)))))
+        (when (and (not own) (find-if #'mine *struct-accessors*))
+          (if (%mvm-on-main-thread-p)
+              (setq *struct-accessors* (remove-if #'mine *struct-accessors*))
+              (progn
+                (%rt-enter)
+                (unwind-protect
+                     (setq *struct-accessors* (remove-if #'mine *struct-accessors*))
+                  (%rt-leave)))))))))
 
 (defun %struct-accessor-info (sym)
   "The record for accessor symbol SYM, or NIL."
@@ -5172,8 +5183,14 @@
   (let ((tb *%not-macro*))
     (and tb (member sym (gethash h tb) :test #'eq) t)))
 (defun %note-not-macro (sym h)
-  (let ((tb (or *%not-macro* (setq *%not-macro* (make-hash-table :test 'eql)))))
-    (setf (gethash h tb) (cons sym (gethash h tb)))))
+  ;; MAIN ONLY, as every global cache (%MVM-ON-MAIN-THREAD-P): on a worker the
+  ;; table and the conses are its own objects, and storing them into main's set
+  ;; is refused (x86-64's shared-store guard) -- every SB-THREAD:MAKE-THREAD
+  ;; body, which runs interpreted, died before its first form.  A worker reads
+  ;; main's set and adds nothing to it.
+  (when (%mvm-on-main-thread-p)
+    (let ((tb (or *%not-macro* (setq *%not-macro* (make-hash-table :test 'eql)))))
+      (setf (gethash h tb) (cons sym (gethash h tb))))))
 
 ;;; The memo is keyed by the form's ADDRESS in the image, and the copying
 ;;; collector moves every form: after a GC every entry MISSED (the EQ
@@ -16530,11 +16547,20 @@
        (and (eql (mem-ref #x10000C30 :u32) 0)
             (eql (mem-ref #x10000C34 :u32) 0))))
 
+(defvar *shallow-thread-gate* t
+  "NIL: %EMIT-SHALLOW-THREAD-GATE emits nothing.  For a target that can never
+   arm threads (#x10000DB8 is written only by the hosted x64 thread layer),
+   where the gate always falls through: the 68k builds (build-68k-cli,
+   build-mac68k-cl-repl), 131 KB of a Mac floppy image's resident code.  A
+   host special, so the image's own compiler keeps the gate (correct, larger).")
+
 (defun %emit-shallow-thread-gate (a b slow)
   "Emit IR that falls through when THIS thread binds shallowly (see THE ARMED
    MAIN THREAD BINDS SHALLOWLY) and branches to SLOW otherwise -- i.e. when
    threads are armed AND this thread has a per-thread binding block.  A and B
-   are scratch registers; both are clobbered."
+   are scratch registers; both are clobbered.  Nothing at all when
+   *SHALLOW-THREAD-GATE* is NIL."
+  (unless *shallow-thread-gate* (return-from %emit-shallow-thread-gate nil))
   (let ((fast (make-compiler-label)))
     (emit-li-tagged a (conv-real #x10000DB8))
     (emit-ir :shr a a +fixnum-shift+)
@@ -35975,11 +36001,11 @@
                             (< (loop for insn in (cdr e) sum (ir-instruction-size insn)) 49152))
                        (push e cold)
                        (push e boot)))
-                  ;; a body over ~48 KB of bytecode stays: a cold body's
-                  ;; relocations are 16-bit word offsets (128 KB), and the
-                  ;; 68k code is about the bytecode's size
-                  ((and (%cold-fn-name-p nm)
-                        (< (loop for insn in (cdr e) sum (ir-instruction-size insn)) 49152))
+                  ;; any size: a cold body's relocations are word GAPS now
+                  ;; (translate-68k M68K-COLD-CLOSE), so the old ~48 KB cap
+                  ;; -- 1.4 MB of a Mac image held resident by it -- is gone.
+                  ;; A big body a session runs belongs in the keep-list.
+                  ((%cold-fn-name-p nm)
                    (push e cold))
                   (t (push e hot)))))
         (when boot (format t "~&  boot-only functions last: ~D~%" (length boot)))

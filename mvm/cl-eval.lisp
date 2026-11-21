@@ -2066,8 +2066,10 @@
                    (not (and *%extra-macro-names*
                              (gethash h *%extra-macro-names*)))
                    (fboundp op))
-          (let ((tb (or *%simple-ops* (setq *%simple-ops* (make-hash-table :test 'eql)))))
-            (setf (gethash h tb) (cons op (gethash h tb))))
+          ;; Main only, as %NOTE-NOT-MACRO (a worker's conses in main's table).
+          (when (%mvm-on-main-thread-p)
+            (let ((tb (or *%simple-ops* (setq *%simple-ops* (make-hash-table :test 'eql)))))
+              (setf (gethash h tb) (cons op (gethash h tb)))))
           t))))
 
 (defun %eval-simple-p (form depth)

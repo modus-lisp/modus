@@ -15,7 +15,11 @@
 //
 // Data is bytes in the image's memory, read in place: a single-float vector's payload is IEEE singles already.
 
+#if os(macOS)
+import AppKit          // the macOS window host builds this file too (host/macos/build-macos.sh gui)
+#else
 import UIKit
+#endif
 import Metal
 import QuartzCore
 
@@ -36,6 +40,36 @@ private func bytes(_ p: UInt, _ n: UInt) -> UnsafeRawPointer? {
 }
 
 /// A view the GPU draws: its layer is a CAMetalLayer, sized in pixels to the view.
+#if os(macOS)
+final class GPUView: NSView {
+    var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        wantsLayer = true                    // the layer comes from makeBackingLayer
+    }
+    required init?(coder: NSCoder) { fatalError("no coder") }
+
+    override func makeBackingLayer() -> CALayer {
+        let layer = CAMetalLayer()
+        layer.device = device
+        layer.pixelFormat = .bgra8Unorm
+        layer.framebufferOnly = true
+        return layer
+    }
+
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }   // the phone's isUserInteractionEnabled = false
+
+    private func fit() {
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        metalLayer.contentsScale = scale
+        metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+    }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); fit() }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); fit() }
+}
+#else
 final class GPUView: UIView {
     override class var layerClass: AnyClass { CAMetalLayer.self }
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
@@ -56,6 +90,7 @@ final class GPUView: UIView {
         metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
     }
 }
+#endif
 
 /// A frame in progress: its drawable, command buffer and encoder.
 private final class Pass {

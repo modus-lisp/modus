@@ -2,7 +2,7 @@
 ;;;;
 ;;;;   sbcl --script scripts/mac68k-hd.lisp VOLUME OUT [--chd CHDMAN]
 ;;;;
-;;;; VOLUME is a modus boot volume (mac68k-core.py, mac68k-disk.lisp or
+;;;; VOLUME is a modus boot volume (mac68k-core.lisp, mac68k-disk.lisp or
 ;;;; mac68k-floppy.lisp output: boot blocks at byte 0).  OUT is a raw disk: block 0
 ;;;; the driver descriptor (one driver, Mac OS), a partition map in blocks 1-3,
 ;;;; the driver (scripts/mac68k-scsi.s, its BASE and VOLBLOCKS words patched in)

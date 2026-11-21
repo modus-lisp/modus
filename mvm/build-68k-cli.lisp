@@ -381,6 +381,9 @@
           (loop for l = (read-line in nil) while l
                 do (let ((n (string-trim " " l))) (when (plusp (length n)) (setf (gethash n h) t)))))
         (setf *68k-hot-names* h)))))
+;; No threads on a 68k: the special-variable thread gate always falls through
+;; (compiler.lisp *SHALLOW-THREAD-GATE*)
+(setf modus.mvm::*shallow-thread-gate* nil)
 (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_SAVES")))
   (setf modus.mvm::*call-temps-survive*
         (and (not *68k-threaded*) (not (and v (string= v "1"))))))

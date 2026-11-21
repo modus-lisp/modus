@@ -6,8 +6,19 @@
 ;; hash tables, CLOS, DEFMACRO, HANDLER-CASE, bignums and floats -- and the stubs it had
 ;; rewritten to JMP afterwards are these.  Plus %CORE-BUILD-ID (every launch reads it)
 ;; and %MVM-INTERPRET-1 (too big to be cold).
+;; And (2026-11-21) the evaluator's own bodies over ~48 KB of bytecode, which
+;; that measurement never saw (bodies that size could not be cold then): every
+;; REPL form compiles and runs through them, and together (~700 KB) they would
+;; not fit in the code area beside the session's other cold code.
 %CORE-BUILD-ID
 %MVM-INTERPRET-1
+COMPILE-COMPOUND
+COMPILE-CALL
+EMIT-BYTECODE-FOR-IR
+%MVM-COMPILE-TOPLEVEL-1
+%MVM-EVAL-FORMS-2
+%MVM-EVAL-FORMS-WORKER
+%MVM-EVAL-COMPILE-TUPLE
 %%STRUCT-CTOR-BINDING
 %%STRUCT-CTOR-COMPILE-ENV
 %%STRUCT-CTOR-FUNCTION-INFO

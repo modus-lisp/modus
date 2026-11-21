@@ -77,6 +77,15 @@ def expected_of(path):
     return int(m.group(1)) if m else None
 
 
+def not_on_of(path):
+    """A rung's `not-on: ARCH ... -- REASON' header line: the arches it is known
+    not to pass on yet, and why.  Those cells are reported SKIP with the reason
+    and counted, never dropped: a gap stays on the page."""
+    with open(path) as f:
+        m = re.search(r"not-on:\s*([^\n]*?)\s+--\s+([^\n]*)", f.read())
+    return (m.group(1).split(), m.group(2).strip()) if m else ([], "")
+
+
 def run_cell(arch, rung_path, expect, keep=False):
     out_env, qemu = ARCHES[arch]
     with open(rung_path) as f:
@@ -135,6 +144,7 @@ def main():
         rungs = [a if os.path.exists(a) else os.path.join(RUNGS, a) for a in args[1:]]
 
     failures = 0
+    skips = 0
     for arch in arches:
         # THE GATE MUST PROVE IT CAN FAIL, AND FAIL FOR THE RIGHT REASON.  One
         # rung runs FIRST with a deliberately wrong expected value, and the
@@ -146,7 +156,11 @@ def main():
         # "failed as required" then certifies a harness in which nothing works
         # at all.  scripts/arch-ladder-gate.sh printed exactly that -- "the gate
         # can fail" above 14 BUILD-FAILs -- which is how this was found.
-        outcome, why = run_cell(arch, rungs[0], expected_of(rungs[0]) + 1)
+        runnable = [r for r in rungs if arch not in not_on_of(r)[0]]
+        if not runnable:
+            print(f"{arch}: every rung given is not-on {arch}; nothing to run")
+            return 2
+        outcome, why = run_cell(arch, runnable[0], expected_of(runnable[0]) + 1)
         if outcome == "PASS":
             print(f"{arch}: POSITIVE CONTROL PASSED — the ladder cannot fail; refusing to run")
             return 2
@@ -158,13 +172,17 @@ def main():
         n = min(jobs(), len(rungs))
         with ThreadPoolExecutor(max_workers=n) as pool:
             results = list(pool.map(
-                lambda r: (r,) + run_cell(arch, r, expected_of(r), keep), rungs))
+                lambda r: ((r, "SKIP", not_on_of(r)[1]) if arch in not_on_of(r)[0]
+                           else (r,) + run_cell(arch, r, expected_of(r), keep)),
+                rungs))
         for r, outcome, why in results:
-            if outcome != "PASS":
+            if outcome == "SKIP":
+                skips += 1
+            elif outcome != "PASS":
                 failures += 1
             print(f"  {os.path.basename(r):<24} {arch:<8} "
                   f"{outcome if outcome != 'WRONG' else 'FAIL':<5} {why}")
-    print(f"\nhosted ladder: {failures} failed")
+    print(f"\nhosted ladder: {failures} failed, {skips} skipped (not-on)")
     return 0 if failures == 0 else 1
 
 

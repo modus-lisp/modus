@@ -2995,8 +2995,12 @@ Stopping.
          (*cf-trace* nil)
          (*cf-trace-i* 0)
          (*e2-gf-name-memo* nil)
+         ;; MVM-EVAL notes the one form it compiles here (a SETQ per EVAL,
+         ;; 9ab99550): on a worker that form is the worker's own object, and
+         ;; storing it into main's cell was refused (test/worker-eval.lisp).
+         (*%sole-eval-form* nil)
          )
-     (declare (special *cf-trace* *cf-trace-i* *e2-gf-name-memo*
+     (declare (special *cf-trace* *cf-trace-i* *e2-gf-name-memo* *%sole-eval-form*
                        *mexp-memo* *mexp-memo-gc* *mvm-eval-buffer* *mvm-eval-cache* *e2-thread-pool* *%defun-deferred* *%mexp-impure* *fasl-depth* *fasl-base* *fasl-outer* *fasl-slot* *fasl-effects* *fasl-taint*
                        *%file-stream-paths* *%escape-report-busy* *jit-native-ran* *jit-infra-fallback* *e2-active-defun-names* *e2-persist-defuns* *e2-module-defuns* *mvm-eval-no-cache* *jit-inhibit*
                        *mvm-last-mv* *nlx-state-serial* *current-condition* *catch-active* *restart-stack* *handler-bind-stack* *handler-bind-effective-skip* *restart-frame-condition-map* *signal-walk-depth* *restarts-being-invoked* *restart-invoking-p* *restart-case-result* *rc-invoked-restart* *format-iter-escape* *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx* *load-error-condition* *%load-depth* *%next-methods* *%current-gf-args* *%current-gf* *%dmc-call-args* *catch-tag* *catch-value* *catch-values* *catch-tags*))

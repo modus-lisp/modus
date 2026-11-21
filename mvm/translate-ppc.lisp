@@ -1106,8 +1106,8 @@
 ;;; The push and pop are inline at every site; their slow paths are ONE
 ;;; out-of-line stub each per module (PPC-EMIT-HSTACK-STUBS), reached by BL
 ;;; (LR is free in a body: every prologue has saved it, as :gc-check relies on).
-;;; There is no signal stub on this port (boot-linux-ppc installs no handlers),
-;;; so nothing else walks the frames.
+;;; The hosted signal stub (TRAP #x0520) longjmps through the same body
+;;; (PPC-EMIT-LONGJMP-BODY) and walks nothing else.
 
 (defconstant +ppc-jmpbuf-words+ 8)
 (defun ppc-hstack-max-depth ()
@@ -1579,6 +1579,9 @@
               (ppc-emit-cmpi-word buf +ppc-scratch1+ 0)
               (ppc-emit-bgt buf top)
               (ppc-emit-label buf done)))
+           ((and (= code #x0520) *ppc-linux-mode*)
+            ;; INSTALL-SIGNAL-HANDLERS, hosted: PPC-EMIT-INSTALL-SIGNAL-HANDLERS.
+            (ppc-emit-install-signal-handlers buf))
            ((and (= code #x0300) *ppc-linux-mode*)
             ;; HOSTED: the serial write becomes write(1, &byte, 1).  The byte
             ;; goes on the stack because write(2) wants an ADDRESS, and it is
@@ -3087,6 +3090,92 @@
     (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-exit+)
     (ppc-emit-li buf +ppc-r3+ status)
     (ppc-emit-sc buf)))
+
+;;; HARDWARE FAULTS, HOSTED (TRAP #x0520).  SIGSEGV / SIGBUS / SIGFPE / SIGILL
+;;; longjmp into the innermost HANDLER-CASE, as on every other hosted port; with
+;;; nothing armed, one line naming the fault and exit 70.  This port had no
+;;; signal stub at all: TRAP #x0520 fell through to a real TW, and any fault
+;;; was the kernel's SIGSEGV, caught or not.
+;;;
+;;; rt_sigaction (173) with the kernel's PowerPC struct { handler; flags;
+;;; restorer; mask (8 bytes) } and SA_SIGINFO|SA_NODEFER.  The handler never
+;;; returns, so it needs no restorer, and it unblocks the four signals itself
+;;; (rt_sigprocmask, 174) -- qemu-user was measured keeping the signal blocked
+;;; despite SA_NODEFER on riscv64, and the second fault then killed.
+;;;
+;;; SA_HANDLER IS THE STUB'S ADDRESS ON BOTH WIDTHS: the ppc64 image is ELFv2
+;;; (e_flags 2), where a handler is code, not an ELFv1 { entry, TOC } descriptor.
+(defconstant +ppc-linux-sys-rt-sigaction+ 173)
+(defconstant +ppc-linux-sys-rt-sigprocmask+ 174)
+
+(defun ppc-emit-uncaught-fault-report (buf)
+  "Nothing armed at a hardware fault: name it from the recorded signal, exit 70."
+  (ppc-emit-li buf +ppc-r12+ (ppc-pending-fault-addr))
+  (ppc-emit-lwz buf +ppc-r11+ +ppc-r12+ 0)
+  (dolist (k '((11 . "memory fault (SIGSEGV)") (7 . "bus error (SIGBUS)")
+               (8 . "arithmetic fault (SIGFPE)") (4 . "illegal instruction (SIGILL)")))
+    (let ((next (mvm-make-label)))
+      (ppc-emit-cmpwi buf +ppc-r11+ (car k))
+      (ppc-emit-bne buf next)
+      (ppc-emit-die buf (format nil "~%modus: ~A with no handler armed; stopping.~%" (cdr k)) 70)
+      (ppc-emit-label buf next)))
+  (ppc-emit-die buf (format nil "~%modus: hardware fault with no handler armed; stopping.~%") 70))
+
+(defun ppc-emit-install-signal-handlers (buf)
+  (let ((stub (mvm-make-label)) (past (mvm-make-label))
+        (ws (ppc-word-size))
+        (saved (list +ppc-r3+ +ppc-r4+ +ppc-r5+ +ppc-r6+ +ppc-r7+ +ppc-r8+
+                     +ppc-r9+ +ppc-r10+ +ppc-r11+ +ppc-r12+)))
+    (ppc-emit-b buf past)
+    ;; ---- the handler: r3 = signum (never returns) ----
+    (ppc-emit-label buf stub)
+    (ppc-emit-li buf +ppc-r12+ (ppc-pending-fault-addr))
+    (ppc-emit-stw buf +ppc-r3+ +ppc-r12+ 0)
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -32)
+    (ppc-emit-li buf +ppc-r0+ #x4C8)                    ; ILL|BUS|FPE|SEGV bits
+    (if *ppc-64-bit*
+        (ppc-emit-std buf +ppc-r0+ +ppc-r1+ 16)
+        (progn (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 16)
+               (ppc-emit-li buf +ppc-r0+ 0)
+               (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 20)))
+    (ppc-emit-li buf +ppc-r3+ 1)                        ; SIG_UNBLOCK
+    (ppc-emit-addi buf +ppc-r4+ +ppc-r1+ 16)
+    (ppc-emit-li buf +ppc-r5+ 0)
+    (ppc-emit-li buf +ppc-r6+ 8)
+    (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-rt-sigprocmask+)
+    (ppc-emit-sc buf)
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 32)
+    (ppc-emit-longjmp-body buf (lambda () (ppc-emit-uncaught-fault-report buf)))
+    ;; ---- install ----
+    (ppc-emit-label buf past)
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ (- (* 16 ws)))
+    (loop for r in saved for i from 0 do (ppc-emit-store-word buf r +ppc-r1+ (* i ws)))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -64)
+    ;; r9 = the stub's address: bl .+4 ; mflr ; @ha/@l, as SETJMP's resume.
+    (ppc-emit-word buf #x48000005)                      ; bl .+4
+    (ppc-emit-mflr buf +ppc-r9+)
+    (ppc-emit-addis buf +ppc-r9+ +ppc-r9+ 0)
+    (ppc-emit-fixup buf stub :pcrel-ha)
+    (ppc-emit-addi buf +ppc-r9+ +ppc-r9+ 0)
+    (ppc-emit-fixup buf stub :pcrel-lo)
+    ;; struct sigaction at 16(r1): handler, flags, restorer, mask (8 bytes, 0)
+    (ppc-emit-store-word buf +ppc-r9+ +ppc-r1+ 16)
+    (ppc-emit-li buf +ppc-r0+ #x40000004)               ; SA_NODEFER|SA_SIGINFO
+    (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+ (+ 16 ws))
+    (ppc-emit-li buf +ppc-r0+ 0)
+    (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+ (+ 16 (* 2 ws)))
+    (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ (+ 16 (* 3 ws)))
+    (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ (+ 20 (* 3 ws)))
+    (dolist (sig '(11 7 8 4))
+      (ppc-emit-li buf +ppc-r3+ sig)
+      (ppc-emit-addi buf +ppc-r4+ +ppc-r1+ 16)
+      (ppc-emit-li buf +ppc-r5+ 0)
+      (ppc-emit-li buf +ppc-r6+ 8)
+      (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-rt-sigaction+)
+      (ppc-emit-sc buf))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 64)
+    (loop for r in saved for i from 0 do (ppc-emit-load-word buf r +ppc-r1+ (* i ws)))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ (* 16 ws))))
 
 (defun ppc-emit-kind-addr (buf dst addr)
   "DST = the kind-byte address of the granule at ADDR; K is in r16."

@@ -10,7 +10,7 @@
 ;;;; filesystem.  The boot blocks' SPLASH (boot/mac68k-splash.pbm) follows IMAGE.
 ;;;;
 ;;;; Also a library: (defvar cl-user::*mac68k-disk-library* t) before loading it,
-;;;; then call MAC68K-DISK:WRITE-DISK / PAGED.  It replaced mac68k-disk.py, byte for byte
+;;;; then call MAC68K-DISK:WRITE-DISK / PAGED.  It replaced mac68k-disk.lisp, byte for byte
 ;;;; (2026-11-20).
 
 (load (merge-pathnames "mac68k-tools.lisp" *load-truename*))

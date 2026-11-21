@@ -1,4 +1,4 @@
--- mac68k-mame-serial.lua -- MAME autoboot script for scripts/mac68k-ladder.py on
+-- mac68k-mame-serial.lua -- MAME autoboot script for scripts/mac68k-ladder.lisp on
 -- a Mac Classic (macclasc): the bytes the Mac sends on serial port A, written
 -- to $MAC68K_SERIAL_OUT as they go.  MAME 0.251's Classic has no RS-232 port,
 -- so the oracle is a write tap on the SCC: on the Classic the CPU writes the

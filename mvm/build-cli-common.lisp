@@ -3308,7 +3308,7 @@
 ;;; COLD NAMES (the bare Mac, CL-USER::*MAC-COLD-NAMES-OUT*): the same names,
 ;;; also written to a file of 512-byte pages, sorted by name hash -- each entry
 ;;; the hash (4 bytes, big-endian), the name's length (1) and its bytes; a page
-;;; ends at a zero hash -- which scripts/mac68k-core.py puts on the disk after
+;;; ends at a zero hash -- which scripts/mac68k-core.lisp puts on the disk after
 ;;; the code streams.  The image gets each page's first hash (%COLD-NAMES-INDEX,
 ;;; 8 hex digits a page) and the hash of "CAR" as the build computed it
 ;;; (%COLD-NAMES-CHECK), so SYMBOL-NAME can read a name from disk once the core
@@ -3322,7 +3322,7 @@
                  ;; NOT NUMBERS: the harvest also yields literals (#x1300000 as
                  ;; "X1300000", "-246415360"), and those are addresses -- the
                  ;; table's page breaks, so its index string's length, then
-                 ;; moved with the memory map (mac68k-reloc.py found it)
+                 ;; moved with the memory map (mac68k-reloc.lisp found it)
                  (not (every (lambda (c) (or (digit-char-p c) (char= c #\-))) nm))
                  (not (and (> (length nm) 1) (char-equal (char nm 0) #\X)
                            (every (lambda (c) (digit-char-p c 16)) (subseq nm 1)))))

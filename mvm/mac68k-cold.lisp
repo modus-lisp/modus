@@ -5,7 +5,7 @@
 ;;;; which holds only its hash.  On a Mac Classic's saved core it was 430 KB of
 ;;;; a 1.3 MB static heap, and a REPL session reads almost none of it.  So the
 ;;;; build also writes the names to a file of 512-byte pages sorted by hash
-;;;; (build-cli-common.lisp, COLD NAMES), scripts/mac68k-core.py puts the file
+;;;; (build-cli-common.lisp, COLD NAMES), scripts/mac68k-core.lisp puts the file
 ;;;; on the disk after the code streams and the disk byte it starts at in the
 ;;;; static block's word #x10006044, and the freeze drops the table: from then
 ;;;; on a name the table would have given comes from %COLD-SYM-NAME -- the
@@ -40,7 +40,7 @@
 (defun %cold-disk-read (at buf)
   "512 bytes of a cold table into BUF; 0 when read.  AT is a disk byte (the
    Mac disk service), or -- when #x10006078 is non-zero, a core booted from a
-   compressed floppy that carries the tables in RAM (mac68k-core.py
+   compressed floppy that carries the tables in RAM (mac68k-core.lisp
    MAC68K_CORE_RAW) -- their address."
   (if (eql (mem-ref #x10006078 :u32) 0)
       (syscall3 1 at buf 512)
@@ -96,7 +96,7 @@
 (defun %cold-names-drop ()
   "At the freeze of the CORE RUN (the SAVE flag, #x1000602C): drop
    *SYM-NAME-TABLE*, whose names the saved core's disk carries cold
-   (mac68k-core.py writes them and #x10006044).  Its strings that something
+   (mac68k-core.lisp writes them and #x10006044).  Its strings that something
    else holds (a symbol's cached name, the function table's keys) stay.  A boot
    from scratch keeps the table: its disk has no cold names."
   (when (and (eql (mem-ref #x1000602C :u32) 1)
@@ -153,7 +153,7 @@
 ;;; moves) and writes it as a record -- hash.l, the function's raw word.l,
 ;;; flags.b (bit 0: a kernel name), length.b, the name, even -- into one byte
 ;;; vector whose raw word goes to the static block's #x10006048.
-;;; scripts/mac68k-core.py takes the records out of the core, sorts them by hash
+;;; scripts/mac68k-core.lisp takes the records out of the core, sorts them by hash
 ;;; into 512-byte pages after an index of each page's first hash, and puts the
 ;;; disk byte they start at in #x1000604C.  From then on a miss in either table
 ;;; (prelude's GETHASH, *%HT-COLD-TABLES*) asks %HT-COLD-MISS: the index once,
@@ -211,7 +211,7 @@
         n))))
 
 (defun %cold-fns-hand-over ()
-  "After the freeze: the records' raw word where mac68k-core.py looks."
+  "After the freeze: the records' raw word where mac68k-core.lisp looks."
   (when *cold-fns-out*
     (setf (mem-ref #x10006048 :u64) *cold-fns-out*)
     (setq *cold-fns-out* nil)))

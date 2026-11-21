@@ -1684,16 +1684,44 @@
       (setq *%ht-pair-sides* (cons (cons ht side) *%ht-pair-sides*))
       side)))
 
+;;; A WORKER MAKES A SHARED TABLE'S PAIR UNDER THE RUNTIME LOCK, as
+;;; %HT-READ-BUILD-INDEX builds a shared table's index.  The pair, the side
+;;; table and the *%HT-PAIR-SIDES* entry all end up reachable from a table every
+;;; thread reads; made on a worker outside the lock they were the worker's own
+;;; objects.  On x86-64 the shared-store guard refused the side PUTHASH, so every
+;;; SB-THREAD:MAKE-THREAD body died before its first form -- its first call
+;;; through the symbol-function table asked for a pair (it came in with the dict
+;;; pairs, daa29493, and no test started a thread on x86-64 after it).  Inside
+;;; the lock the allocations come from the lock arena;
+;;; look again there, since another thread may have made the pair meanwhile.
+;;; Main, a process with no threads, and a worker's own table are unchanged.
+(defun %ht-dict-pair-1 (key ht v)
+  (let ((side (%ht-pair-side ht t)))
+    (or (gethash key side)
+        (let ((p (cons key v)))
+          (puthash key side p)
+          p))))
+
+(defun %ht-dict-pair-shared-key (key)
+  "KEY, or under the runtime lock a copy of it when it is a string of THIS
+   worker's own: the JIT bridge looks a package-qualified callee up again by
+   its bare name, a SUBSEQ the worker just made, and that key goes into the
+   pair and the side -- shared objects.  Measured: the first thread's first
+   such call refused the side's index build (%HTD-FROM-ALIST)."
+  (if (and (stringp key) (%own-region-object-p key)) (copy-seq key) key))
+
 (defun %ht-dict-pair (key ht)
   "KEY's pair in dict table HT, made and entered in its side on first use; NIL
    when KEY is absent."
   (multiple-value-bind (v present) (gethash key ht)
     (when present
-      (let ((side (%ht-pair-side ht t)))
-        (or (gethash key side)
-            (let ((p (cons key v)))
-              (puthash key side p)
-              p))))))
+      (if (or (eql (mem-ref #x10000DB8 :u32) 0) (eql (%dynb-block) 0)
+              (%own-region-object-p ht))
+          (%ht-dict-pair-1 key ht v)
+          (progn
+            (%rt-enter)
+            (unwind-protect (%ht-dict-pair-1 (%ht-dict-pair-shared-key key) ht v)
+              (%rt-leave)))))))
 
 (defun %ht-pair-set (ht key value)
   "PUTHASH's step: KEY's handed-out pair, if any, now holds VALUE."

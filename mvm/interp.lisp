@@ -1526,7 +1526,7 @@
   (let* ((state (make-mvm-state))
          ;; NIL's top half (the LI arm's NIL/T test), from NIL itself: as
          ;; +MVM-NIL-B3+/-B2+ constants these were bytes of an address folded
-         ;; into the code, which a Mac image cannot relocate (mac68k-reloc.py)
+         ;; into the code, which a Mac image cannot relocate (mac68k-reloc.lisp)
          (nil-hi16 (logand (ash (%val->word nil) -16) #xFFFF))
          (bc (if (typep bytecode '(simple-array (unsigned-byte 8) (*)))
                  bytecode

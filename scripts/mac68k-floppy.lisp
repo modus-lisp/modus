@@ -4,11 +4,12 @@
 ;;;;   sbcl --script scripts/mac68k-floppy.lisp CORE-DISK DISK --core [--one]
 ;;;;
 ;;;; IMAGE is a flat bare-Mac image (built for :mac68k, linked at #x00100000), or
-;;;; with --load HEX one that goes at HEX -- a saved core (mac68k-core.py's
+;;;; with --load HEX one that goes at HEX -- a saved core (mac68k-core.lisp's
 ;;;; MAC68K_CORE_RAW: the image, its static heap and low block, from the map's :LOAD).
 ;;;; It is compressed as a raw LZMA1 stream (cram's LZMA-COMPRESS, lc 2 lp 1 pb 2)
 ;;;; behind a loader, scripts/mac68k-unlzma.s: 68020 assembly, under 1 KB, its
-;;;; decoder scripts/mac68k-lzma.inc (test/mac68k-unlzma/run.sh checks it).
+;;;; decoder scripts/mac68k-lzma.inc (vessel's kernel/scripts/, like every .s these
+;;;; scripts assemble: MAC68K-TOOLS:KERNEL-SOURCE; vessel's test/mac68k-unlzma checks it).
 ;;;; The boot blocks (scripts/mac68k-disk.lisp) read the blob to #x01200000; the
 ;;;; loader unpacks IMAGE to #x00100000 (or --load) and jumps to it.
 ;;;;
@@ -23,7 +24,7 @@
 ;;;;     order it loads, so it shares few blocks) FS_FAT=fs-fat
 ;;;;     MODUS_68K_THREADED=0 MODUS_68K_PAGED=0 (and mac68k-snap-build.sh's other
 ;;;;     quadra knobs) sbcl ... mvm/build-mac68k-cl-repl.lisp
-;;;;   MODUS_MAC68K_MACHINE=floppy scripts/mac68k-core.py IMAGE CORE-DISK
+;;;;   MODUS_MAC68K_MACHINE=floppy scripts/mac68k-core.lisp IMAGE CORE-DISK
 ;;;;   MODUS_MAC68K_MACHINE=floppy sbcl --script scripts/mac68k-floppy.lisp CORE-DISK DISK --core
 ;;;; which writes DISK-1, the boot floppy, and DISK-2, a FAT12 floppy with the cold
 ;;;; code as MODUS/COLD.BIN and ~600 KB free for the user's code and files (--one:
@@ -169,7 +170,7 @@
                               (length part2) (- +floppy+ 512 len2)))))))))))))
 ;;; ---- THE CORE FLOPPIES (--core): 8 MB, cold code packed on a second floppy ------
 ;;;
-;;; IMAGE is a core disk (mac68k-core.py's c.dsk) of a map whose cold native code
+;;; IMAGE is a core disk (mac68k-core.lisp's c.dsk) of a map whose cold native code
 ;;; stays on the disk (boot-mac68k :FLOPPY, MODUS_68K_COLD_KEEP).  Two floppies:
 ;;;   DISK-1, the boot floppy: the boot blocks, reading the BLOB to :BLOB --
 ;;;     the loader (mac68k-unlzma.s) | the payload: header, jumper, the DRIVER

@@ -244,6 +244,10 @@ static void build_menu(void) {
     NSApp.mainMenu = bar;
 }
 
+// The window's content view, for the native components (host/macos/swift/): they are its subviews, over the
+// framebuffer.  Main thread only, as AppKit is; NULL before the window is up.
+void *modus_mac_root_view(void) { return (__bridge void *)fb_view; }
+
 // Before the image thread starts: from then on a UI call waits for the window.
 void modus_mac_init(void) { ui_ready = dispatch_semaphore_create(0); frame_tick = dispatch_semaphore_create(0); }
 

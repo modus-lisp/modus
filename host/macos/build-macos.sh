@@ -40,8 +40,9 @@ case $KIND in
     mkdir -p "$OUT/Contents/MacOS"
     BIN=$OUT/Contents/MacOS/modus
     DEFS="-DMODUS_MAC_GUI=1"
-    # the window, and the Objective-C bridge the iOS build uses (host/ios/modus-objc.m: it needs no UIKit)
-    EXTRA_SRC="$HERE/modus-ui-mac.m $HERE/../ios/modus-objc.m"
+    # the window, and the iOS build's bridges (neither needs UIKit): the Objective-C runtime (modus-objc.m) and
+    # Lisp-calls-Swift (modus-swift.m, whose functions here are host/macos/swift/)
+    EXTRA_SRC="$HERE/modus-ui-mac.m $HERE/../ios/modus-objc.m $HERE/../ios/modus-swift.m"
     FRAMEWORKS="-framework AudioToolbox -framework Security -framework Foundation -framework AppKit -framework IOSurface -framework QuartzCore"
     cat > "$OUT/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -68,8 +69,31 @@ PLIST
     ;;
 esac
 
-# shellcheck disable=SC2086  # WHERE, DEFS, EXTRA_SRC and FRAMEWORKS are flag lists
-cc -O2 -Wall -fobjc-arc $DEFS -o "$BIN" "$HERE/modus-shim.c" "$HERE/modus-audio.c" "$HERE/modus-keychain.m" $EXTRA_SRC "$HERE/syscall-stub.S" $FRAMEWORKS $WHERE
+# shellcheck disable=SC2086  # WHERE, DEFS, EXTRA_SRC, FRAMEWORKS and LINKX are flag lists
+if [ "$KIND" = gui ]; then
+  # THE OBJECTS, then THE LINK, as build-ios.sh does: clang compiles each C and Objective-C file; the Swift files
+  # (host/macos/swift/, with the phone's Term.swift: the wire format) compile to one object; swiftc links them,
+  # because it brings the Swift runtime.  The image's linker flags become swiftc's -Xlinker options.
+  OBJS=$(mktemp -d)
+  for SRC in "$HERE/modus-shim.c" "$HERE/modus-audio.c" "$HERE/modus-keychain.m" $EXTRA_SRC "$HERE/syscall-stub.S"; do
+    cc -O2 -Wall -fobjc-arc $DEFS -c "$SRC" -o "$OBJS/$(basename "$SRC").o"
+  done
+  swiftc -target arm64-apple-macos14.0 -swift-version 5 -O -wmo -parse-as-library -module-name ModusSwift \
+    -import-objc-header "$HERE/swift/bridge.h" -emit-object -o "$OBJS/swift.o" \
+    "$HERE/../ios/swift/Term.swift" "$HERE"/swift/*.swift
+  LINKX=""
+  for W in $WHERE; do
+    case $W in
+      *.s)   cc -c "$W" -o "$OBJS/$(basename "$W").o" ;;
+      -Wl,*) LINKX="$LINKX $(echo "$W" | sed -e 's/^-Wl,/-Xlinker /' -e 's/,/ -Xlinker /g')" ;;
+      *)     LINKX="$LINKX $W" ;;
+    esac
+  done
+  swiftc -target arm64-apple-macos14.0 -o "$BIN" "$OBJS"/*.o $FRAMEWORKS $LINKX
+  rm -rf "$OBJS"
+else
+  cc -O2 -Wall -fobjc-arc $DEFS -o "$BIN" "$HERE/modus-shim.c" "$HERE/modus-audio.c" "$HERE/modus-keychain.m" $EXTRA_SRC "$HERE/syscall-stub.S" $FRAMEWORKS $WHERE
+fi
 codesign --force --sign - "$BIN" >/dev/null 2>&1 || true
 if [ "$KIND" = gui ]; then
   codesign --force --sign - "$OUT" >/dev/null 2>&1 || true

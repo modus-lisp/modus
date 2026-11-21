@@ -203,13 +203,24 @@
 
 (defun %obj-class-name (obj)
   "Return most-specific class name for OBJ (CLOS or built-in)."
-  (if (%clos-instance-p obj)
-    (%inst-key obj)
-    (%type-of-for-dispatch obj)))
+  (cond ((%clos-instance-p obj) (%inst-key obj))
+        ((%fin-p obj) (%inst-key (%fin-instance obj)))
+        (t (%type-of-for-dispatch obj))))
 
 (defun %obj-cpl (obj)
   "Return CPL for OBJ as list of class names."
   (cond
+    ;; a funcallable instance: its class's CPL, and FUNCTION -- as SBCL's,
+    ;; (... FUNCALLABLE-STANDARD-OBJECT FUNCTION STANDARD-OBJECT ... T)
+    ((%fin-p obj)
+     (let* ((cpl (%obj-cpl (%fin-instance obj)))
+            (add (append (unless (member 'funcallable-standard-object cpl)
+                           (list 'funcallable-standard-object))
+                         (unless (member 'function cpl) (list 'function))))
+            (at (position 'standard-object cpl)))
+       (cond ((null add) cpl)
+             (at (append (subseq cpl 0 at) add (nthcdr at cpl)))
+             (t (append (butlast cpl) add (last cpl))))))
     ((%clos-instance-p obj)
      (let ((cls-name (%inst-key obj)))
        (let ((cls (%find-clos-class cls-name)))
@@ -260,6 +271,99 @@
         (eq (aref x 0) '%clos-instance)
         nil)
       nil)))
+
+;;; ============================================================
+;;; FUNCALLABLE INSTANCES (AMOP; SBCL's SB-MOP:FUNCALLABLE-STANDARD-CLASS).
+;;;
+;;; An object that is a function and an instance at once: FUNCALL, APPLY and
+;;; FUNCTIONP take it as a function, CLASS-OF, SLOT-VALUE, TYPEP and method
+;;; dispatch as an instance of its class, and SET-FUNCALLABLE-INSTANCE-
+;;; FUNCTION changes what calling THIS object does -- its identity never
+;;; changes.  An instance of a class whose metaclass is FUNCALLABLE-STANDARD-
+;;; CLASS is one.
+;;;
+;;; It is a closure, so every function path takes it with no change: the code
+;;; of %FIN-CLOSURE's one lambda, closed over ONE value -- (function . instance),
+;;; the instance an ordinary %CLOS-INSTANCE vector holding its class and slots.
+;;; One captured value, so its place in the closure's environment is not a
+;;; question of the compiler's capture order.  Every funcallable instance
+;;; shares that lambda's code, which is how one is known (%FIN-P).  Where the CLOS paths below take an
+;;; instance, they take a funcallable one's vector -- and give back the object
+;;; itself wherever they give back the instance.
+
+(defvar *%fin-code* nil
+  "The code every funcallable instance runs: %FIN-CLOSURE's lambda.  Learned
+   the first time %FIN-P is asked on the main thread (a worker's object must
+   not reach a global; the code is image code and is not one, but the main
+   thread is where it is cached all the same).")
+
+(defun %fin-no-function (&rest args)
+  (declare (ignore args))
+  (error "This funcallable instance has no function: SET-FUNCALLABLE-INSTANCE-FUNCTION was never called on it."))
+
+(defun %fin-closure (data)
+  (lambda (&rest args) (apply (or (car data) (function %fin-no-function)) args)))
+
+(defun %fin-code ()
+  (or *%fin-code*
+      (let ((c (%prim-aref (%fin-closure (cons nil nil)) 0)))
+        (when (%gf-cache-writable-p) (setq *%fin-code* c))
+        c)))
+
+(defun %fin-p (x)
+  "True of a funcallable instance.  Only a closure can be one: a compiled
+   function's or generic function's object (low tag 3) has no slot 0."
+  (and (= (%lowtag x) 9) (not (%raw-arrayp x)) (functionp x)
+       (eq (%prim-aref x 0) (%fin-code))))
+
+(defun %fin-instance (fin)
+  "The instance vector -- class and slots -- of funcallable instance FIN."
+  (cdr (car (%prim-aref fin 1))))
+
+(defun %fin-unwrap (x)
+  "X, or its instance vector when X is a funcallable instance."
+  (if (%fin-p x) (%fin-instance x) x))
+
+(defun %make-fin (instance)
+  "A funcallable instance around INSTANCE, with no function yet."
+  (%fin-closure (cons nil instance)))
+
+(defun set-funcallable-instance-function (fin function)
+  "Make calling FIN call FUNCTION."
+  (unless (%fin-p fin)
+    (error 'type-error :datum fin :expected-type 'funcallable-standard-object))
+  (setf (car (car (%prim-aref fin 1))) function)
+  function)
+
+(defvar *%funcallable-classes* nil
+  "Names of the classes DEFCLASS gave the metaclass FUNCALLABLE-STANDARD-CLASS.")
+
+(defun %register-clos-funcallable (name funcallable-p)
+  "Record whether NAME's DEFCLASS named FUNCALLABLE-STANDARD-CLASS its metaclass."
+  (setq *%funcallable-classes* (remove name *%funcallable-classes*))
+  (when funcallable-p (setq *%funcallable-classes* (cons name *%funcallable-classes*)))
+  name)
+
+(defun %class-funcallable-p (class-name)
+  "True when instances of CLASS-NAME are funcallable: it, or a class it
+   inherits from, has the metaclass FUNCALLABLE-STANDARD-CLASS (SBCL requires
+   a funcallable class's subclasses to be funcallable too)."
+  (and *%funcallable-classes*
+       (or (member class-name *%funcallable-classes*)
+           (dolist (c (%clos-class-cpl-names class-name) nil)
+             (when (member c *%funcallable-classes*) (return t))))
+       t))
+
+(defun %funcallable-class-names ()
+  "The two class names, as cl-clos spells them, for SB-MOP to export."
+  (list 'funcallable-standard-class 'funcallable-standard-object))
+
+(defun %ensure-funcallable-classes ()
+  "Boot: make FUNCALLABLE-STANDARD-OBJECT and FUNCALLABLE-STANDARD-CLASS."
+  (unless (%find-clos-class 'funcallable-standard-object)
+    (%defclass 'funcallable-standard-object nil '(standard-object)))
+  (unless (%find-clos-class 'funcallable-standard-class)
+    (%defclass 'funcallable-standard-class nil '(standard-class))))
 
 (defun %clos-class-p (x)
   "True if X is a CLOS class descriptor array."
@@ -2036,7 +2140,9 @@
 
 (defun %clos-instance-plan-build (class-name)
   (let ((p (make-array 10))
-        (cls (%find-clos-class class-name)))
+        ;; no plan for a funcallable class: the plan writes slots by index
+        ;; into the instance vector, and its instance is a closure
+        (cls (and (not (%class-funcallable-p class-name)) (%find-clos-class class-name))))
     (aset p 0 (%clos-method-gen))
     (aset p 1 nil) (aset p 6 nil) (aset p 7 nil) (aset p 8 nil)
     (when cls
@@ -2251,7 +2357,7 @@
     (%word-aset inst 1 (or (%find-clos-class class-name) class-name))
     (%word-aset inst 2 sv)
     (%word-aset inst 3 layout)
-    inst))
+    (if (%class-funcallable-p class-name) (%make-fin inst) inst)))
 
 (defun %inst-slots (obj)
   "OBJ's slot vector, after bringing OBJ up to its class's current layout."
@@ -2344,6 +2450,7 @@
 
    :allocation :class slots route to per-class shared storage via
    %slot-class-owner / %class-slot-get."
+  (when (%fin-p obj) (return-from %slot-value (%slot-value (%fin-instance obj) slot-name)))
   (when (or (null obj) (not (%clos-instance-p obj)))
     ;; A DEFSTRUCT instance: its own registry knows the slots (SLOT-VALUE on a structure is
     ;; SBCL's and every implementation's; it answered NIL for every slot, and a program that
@@ -2395,6 +2502,8 @@
    Calls slot-missing when SLOT-NAME doesn't name a slot.
 
    :allocation :class slots route to per-class shared storage."
+  (when (%fin-p obj)
+    (return-from set-slot-value (set-slot-value (%fin-instance obj) slot-name new-val)))
   (when (or (null obj) (not (%clos-instance-p obj)))
     (when (%struct-instance-p obj)
       (let ((dummy (aset obj (%struct-slot-location obj slot-name 'setf) new-val))) dummy)
@@ -2425,6 +2534,7 @@
 (defun %slot-boundp (obj slot-name)
   "True if slot SLOT-NAME of OBJ is bound.  Calls slot-missing for
    nonexistent slots; whatever it returns is taken as the boundp answer."
+  (when (%fin-p obj) (return-from %slot-boundp (%slot-boundp (%fin-instance obj) slot-name)))
   ;; a structure's slots are always bound (they are initialised, to NIL at worst)
   (when (%struct-instance-p obj)
     (%struct-slot-location obj slot-name 'slot-boundp)
@@ -2512,6 +2622,7 @@
    be called on any object, not just standard objects — in particular it
    must work on condition objects (slot-exists-p.15/.16)."
   (when (null obj) (return-from %slot-exists-p nil))
+  (when (%fin-p obj) (return-from %slot-exists-p (%slot-exists-p (%fin-instance obj) slot-name)))
   (when (%struct-instance-p obj)
     (return-from %slot-exists-p
       (>= (%struct-slot-index (%struct-type-name obj) slot-name) 0)))
@@ -2917,12 +3028,14 @@
 (defun standard-instance-access (instance location)
   "MOP raw slot access by LOCATION (integer slot index).  Returns
    the unbound sentinel if the slot is unbound."
+  (setq instance (%fin-unwrap instance))
   (when (%clos-instance-p instance)
     (let ((sv (%inst-slots instance)))
       (when (< location (array-length sv))
         (aref sv location)))))
 
 (defun (setf standard-instance-access) (new-val instance location)
+  (setq instance (%fin-unwrap instance))
   (when (%clos-instance-p instance)
     (let ((sv (%inst-slots instance)))
       (when (< location (array-length sv))
@@ -8532,6 +8645,9 @@
           and slot is currently unbound, apply initform if present.
        3. Else leave slot alone.
    Returns INSTANCE."
+  (when (%fin-p instance)
+    (apply (function %shared-initialize-default) (%fin-instance instance) slot-names initargs)
+    (return-from %shared-initialize-default instance))
   (when (or (null instance) (not (%clos-instance-p instance)))
     (return-from %shared-initialize-default instance))
   (let* ((class-name (%inst-key instance))
@@ -8637,6 +8753,9 @@
   (let* ((instance   (car args))
          (slot-names (car (cdr args)))
          (initargs   (cdr (cdr args))))
+    (when (%fin-p instance)
+      (%shared-init-default-spread (cons (%fin-instance instance) (cdr args)))
+      (return-from %shared-init-default-spread instance))
     (when (or (null instance) (not (%clos-instance-p instance)))
       (return-from %shared-init-default-spread instance))
     (let* ((class-name (%inst-key instance))
@@ -8982,8 +9101,8 @@
    REINITIALIZE-INSTANCE / SHARED-INITIALIZE methods.  This used to do NO
    validation at all, so (reinitialize-instance i :totally-bogus 2)
    returned quietly."
-  (when (%clos-instance-p instance)
-    (%clos-validate-reinit-initargs (%inst-key instance) initargs))
+  (when (%clos-instance-p (%fin-unwrap instance))
+    (%clos-validate-reinit-initargs (%inst-key (%fin-unwrap instance)) initargs))
   (let ((gf (%find-gf 'shared-initialize)))
     (cond
       ((and gf (%gf-methods gf))
@@ -9258,6 +9377,7 @@
       (%program-error "class-of requires exactly 1 argument")
       (cond
         ((%clos-instance-p x) (%inst-class x))
+        ((%fin-p x)           (%inst-class (%fin-instance x)))
         ((%clos-class-p x)    (find-class 'standard-class))
         ;; A class proxy is a DEFSTRUCT's or a built-in type's class: its
         ;; metaclass is STRUCTURE-CLASS / BUILT-IN-CLASS (as TYPE-OF says),
@@ -9503,6 +9623,7 @@
    (It used to print nothing, so a user method's CALL-NEXT-METHOD lost the
    default output.)"
   (cond ((%clos-instance-p object) (%print-instance-default object stream))
+        ((%fin-p object) (%print-instance-default (%fin-instance object) stream))
         ((%struct-instance-p object) (%print-struct-default object stream nil *print-escape*))
         (t (%write-obj object stream nil *print-escape*)))
   object)
@@ -9588,6 +9709,7 @@
   ;; user-defined methods apply.  Installing a default method whose
   ;; body uses &rest+apply hits the funcall+&rest truncation that
   ;; loses trailing initargs.
+  (%ensure-funcallable-classes)
   (%builtin-defgeneric 'initialize-instance '(instance &rest initargs))
   ;; NO-APPLICABLE-METHOD / NO-NEXT-METHOD
   (%builtin-defgeneric 'no-applicable-method '(gf &rest args))

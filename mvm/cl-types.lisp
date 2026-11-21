@@ -5525,6 +5525,7 @@
     ;; (type-of.8 / .9 after (setf (class-name c) nil) / (setf (find-class
     ;; 'n) nil)).  CLHS 4.3.7: type-of returns the class when it has no
     ;; proper name.
+    ((%fin-p obj) (type-of (%fin-instance obj)))
     ((%clos-instance-p obj)
      (let* ((cls (%inst-class obj))
             (cname (if cls (class-name cls) (aref obj 1))))
@@ -5714,6 +5715,11 @@
                      (eq (car type) 'function))))
     (error "typep: this type-specifier is not legal here"))
   (cond
+    ;; A funcallable instance is of every class in its CPL (its class's,
+    ;; with FUNCALLABLE-STANDARD-OBJECT and FUNCTION); any other atomic type
+    ;; it is tested as the closure it is, by the clauses below.  A class
+    ;; object comes back here by name from the clause after.
+    ((and (symbolp type) type (%fin-p obj) (member type (%obj-cpl obj) :test #'eq)) t)
     ;; A class OBJECT: OBJ's own class is it, even when the class no
     ;; longer has a name (upstream TYPE-OF.10); otherwise by name.
     ((%clos-class-p type)

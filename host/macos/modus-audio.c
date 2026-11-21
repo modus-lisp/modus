@@ -3,8 +3,11 @@
 // The image speaks Linux syscalls and has no way to reach Core Audio, so the
 // shim offers three pseudo-syscalls past every Linux number (as 1000-1005 are):
 //
-//   1010 AUDIO-OPEN rate     open the output: mono, signed 16-bit, RATE Hz.
-//                            0, or a negative error.  Idempotent.
+//   1010 AUDIO-OPEN rate ch  open the output: signed 16-bit, RATE Hz, CH channels -- 0 or 1 mono, 2 stereo
+//                            (a game's sounds placed left and right; the desk's mixer is mono).  0, or a
+//                            negative error.  Idempotent: the first open decides.
+//                            Stereo samples are written interleaved, left then right; every count below
+//                            is of samples, not frames (a stereo second is 2 * RATE).
 //   1011 AUDIO-WRITE src n   queue N samples from SRC, the address of element 0
 //                            of a SIMPLE-VECTOR of fixnums -- a (SIGNED-BYTE 16)
 //                            array as modus stores it, one 8-byte word each
@@ -49,6 +52,7 @@ static int running;               // the queue is started (not paused)
 static uint64_t last_sound_ns;    // when a sample that was not silence was last written
 static uint64_t drained_ns;       // paused: when the wall-clock drain last ran
 static long q_rate;
+static long q_channels = 1;
 #define IDLE_NS (2ULL * 1000000000ULL)
 
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -56,7 +60,7 @@ static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 // Paused: what the device would have played since the last look, taken from the ring (lk held).
 static void drain_by_clock(void) {
     uint64_t t = now_ns();
-    uint64_t n = (t - drained_ns) * (uint64_t)q_rate / 1000000000ULL;
+    uint64_t n = (t - drained_ns) * (uint64_t)q_rate / 1000000000ULL * (uint64_t)q_channels;
     if (n) {
         uint64_t avail = wr - rd;
         rd += n < avail ? n : avail;
@@ -84,9 +88,11 @@ static void refill(void *u, AudioQueueRef aq, AudioQueueBufferRef b) {
     AudioQueueEnqueueBuffer(aq, b, 0, NULL);
 }
 
-static long audio_open(long rate) {
+static long audio_open(long rate, long channels) {
     if (q) return 0;
     if (rate < 8000 || rate > 192000) return -22;
+    if (channels < 1) channels = 1;
+    if (channels > 2) return -22;
 #if TARGET_OS_IPHONE && !TARGET_OS_WATCH
     modus_audio_session();
 #endif
@@ -95,15 +101,15 @@ static long audio_open(long rate) {
     f.mSampleRate = (Float64)rate;
     f.mFormatID = kAudioFormatLinearPCM;
     f.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
-    f.mBytesPerPacket = 2; f.mFramesPerPacket = 1; f.mBytesPerFrame = 2;
-    f.mChannelsPerFrame = 1; f.mBitsPerChannel = 16;
+    f.mBytesPerPacket = (UInt32)(2 * channels); f.mFramesPerPacket = 1; f.mBytesPerFrame = (UInt32)(2 * channels);
+    f.mChannelsPerFrame = (UInt32)channels; f.mBitsPerChannel = 16;
     // No run loop: the queue calls back on a thread of its own.
     if (AudioQueueNewOutput(&f, refill, NULL, NULL, NULL, 0, &q) != noErr) { q = NULL; return -5; }
     // 40 ms a buffer, not 10: an iPhone's hardware takes ~1024 frames a cycle, and three 10 ms
     // buffers (30 ms in all) let the queue run dry whenever its callback was a little late --
     // short regular gaps in the radio (Groove Salad on an iPhone 15 Pro) while the ring held
     // 150 ms and every sample the image wrote was whole (a tap of them showed no gap at all).
-    uint32_t bytes = (uint32_t)(rate / 25) * 2;
+    uint32_t bytes = (uint32_t)(rate / 25) * 2 * (uint32_t)channels;
     for (int i = 0; i < NBUF; i++) {
         AudioQueueBufferRef b;
         if (AudioQueueAllocateBuffer(q, bytes, &b) != noErr) return -12;
@@ -111,6 +117,7 @@ static long audio_open(long rate) {
     }
     // not started: the first sound starts it (audio_write)
     q_rate = rate;
+    q_channels = channels;
     running = 0;
     drained_ns = now_ns();
     return 0;
@@ -157,7 +164,7 @@ static long audio_queued(void) {
 
 int64_t modus_audio_call(int64_t nr, int64_t a0, int64_t a1) {   // int64_t: a long is 32 bits on a watch
     switch (nr) {
-    case 1010: return audio_open((long)a0);
+    case 1010: return audio_open((long)a0, (long)a1);
     case 1011: return audio_write((long)a0, (long)a1);
     case 1012: return audio_queued();
     case 1013: return (int64_t)underruns;

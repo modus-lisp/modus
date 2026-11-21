@@ -1391,9 +1391,15 @@ int main(int argc, char **argv, char **envp) {
     char exedir0[4096] = "";
     { char exe[4096]; uint32_t n = sizeof exe;
       if (_NSGetExecutablePath(exe, &n) == 0) strncpy(exedir0, dirname(exe), sizeof exedir0 - 1); }
+    // A Mac app's are in its Resources (Contents/MacOS holds only code, as codesign wants): `kiln mac' writes
+    // them there, so the app opens from the Finder, the Dock or `open' as well as from `kiln mac run'.
     if (argc == 1 && exedir0[0]) {
         char path[4200]; snprintf(path, sizeof path, "%s/modus.args", exedir0);
         FILE *af = fopen(path, "r");
+        if (!af) {
+            snprintf(path, sizeof path, "%s/../Resources/modus.args", exedir0);
+            af = fopen(path, "r");
+        }
         if (af) {
             char **nv = calloc(64, sizeof *nv); int nc = 0; char line[4096];
             nv[nc++] = argv[0];

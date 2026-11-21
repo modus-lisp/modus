@@ -47,6 +47,24 @@
     (and fn (let ((w (%val->word fn)))
               (and (integerp w) (> w 3) (- w 3))))))
 
+;; WINDOWS SYSCALLS (boot/boot-win64.lisp).  Windows has no stable syscall
+;; interface, so a Windows hosted image routes every syscall through a shim in
+;; its boot stub instead of executing SYSCALL.  Set to the shim's virtual address
+;; by the Windows build; NIL (the default) leaves every site emitting SYSCALL.
+(defvar *x64-win-shim-va* nil
+  "Virtual address of the Windows syscall shim, or NIL for SYSCALL.")
+
+(defun emit-x64-syscall (buf)
+  "Emit one system call.  SYSCALL on Linux and the bare-metal hosts; on Windows,
+   `mov r11, shim; call r11'.  The shim takes the same registers and, like
+   SYSCALL, destroys RCX and R11 and preserves everything else."
+  (if *x64-win-shim-va*
+      (progn
+        (emit-bytes buf #x49 #xBB)                  ; mov r11, imm64
+        (emit-u64 buf *x64-win-shim-va*)
+        (emit-bytes buf #x41 #xFF #xD3))            ; call r11
+      (emit-bytes buf #x0F #x05)))                  ; syscall
+
 (defvar *x64-linux-mode* nil
   "When non-nil, TRAP codes emit Linux syscalls instead of bare-metal I/O.
    Set by Linux x64 builds to use SYS_write/SYS_read/SYS_exit instead of
@@ -272,10 +290,10 @@
     (emit-bytes buf #xBA) (emit-u32 buf (length bytes)) ; mov edx, len
     (emit-bytes buf #xBF #x02 #x00 #x00 #x00)      ; mov edi, 2
     (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)      ; mov eax, 1 (write)
-    (emit-bytes buf #x0F #x05)
+    (emit-x64-syscall buf)
     (emit-bytes buf #xBF) (emit-u32 buf code)      ; mov edi, code
     (emit-bytes buf #xB8 #xE7 #x00 #x00 #x00)      ; mov eax, 231 (exit_group)
-    (emit-bytes buf #x0F #x05)))
+    (emit-x64-syscall buf)))
 
 (defun emit-futex-stop-timed (buf op val)
   "futex(&STOP, OP, VAL, {1 s}) -- clobbers rax rcx rdx rsi rdi r10 r11."
@@ -286,7 +304,7 @@
   (emit-bytes buf #xBA) (emit-u32 buf val)                 ; mov edx, val
   (emit-bytes buf #x49 #x89 #xE2)                          ; mov r10, rsp
   (emit-bytes buf #xB8 #xCA #x00 #x00 #x00)                ; mov eax, 202
-  (emit-bytes buf #x0F #x05)                               ; syscall
+  (emit-x64-syscall buf)                               ; syscall
   (emit-bytes buf #x48 #x83 #xC4 #x10))                    ; add rsp, 16
 
 (defun emit-futex-stop (buf op val)
@@ -296,7 +314,7 @@
   (emit-bytes buf #xBA) (emit-u32 buf val)                 ; mov edx, val
   (emit-bytes buf #x45 #x31 #xD2)                          ; xor r10d, r10d
   (emit-bytes buf #xB8 #xCA #x00 #x00 #x00)                ; mov eax, 202
-  (emit-bytes buf #x0F #x05))                              ; syscall
+  (emit-x64-syscall buf))                              ; syscall
 
 (defparameter *stw-park-regs*
   '(rax rcx rdx rbx rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15))
@@ -594,14 +612,14 @@
    registers) before popping -- the collector may be rewriting the pushed words.
    RCX and R11 are free: SYSCALL itself destroys them."
   (if (null park-label)
-      (emit-bytes buf #x0F #x05)
+      (emit-x64-syscall buf)
       (let ((done (make-label)))
         (dolist (r '(rbx rbp r12 r13 r14 r15)) (emit-push buf r))
         (emit-x64-r0-count-snapshot buf 'rcx)             ; RCX: SYSCALL destroys it
         (emit-fs-store-rsp buf +stw-rsp-addr+)
         (emit-bytes buf #x41 #xBB #x01 #x00 #x00 #x00)  ; mov r11d, 1
         (emit-fs-xchg-abs-r11 buf +stw-state-addr+)
-        (emit-bytes buf #x0F #x05)                        ; syscall
+        (emit-x64-syscall buf)                        ; syscall
         (emit-bytes buf #x45 #x31 #xDB)                   ; xor r11d, r11d
         (emit-fs-xchg-abs-r11 buf +stw-state-addr+)
         (emit-cmp-abs64-zero buf +stw-stop-addr+)
@@ -1435,7 +1453,7 @@
 (defun emit-syscall-saving-rcx-r11 (buf)
   (emit-bytes buf #x51)              ; push rcx
   (emit-bytes buf #x41 #x53)         ; push r11
-  (emit-bytes buf #x0F #x05)         ; syscall
+  (emit-x64-syscall buf)         ; syscall
   (emit-bytes buf #x41 #x5B)         ; pop r11
   (emit-bytes buf #x59))             ; pop rcx
 
@@ -2127,7 +2145,7 @@
               ;; zombie leader beside its parked scheduler threads, forever.
               ;; exit_group is the right call with or without threads.
               (emit-bytes buf #x48 #xC7 #xC0 #xE7 #x00 #x00 #x00) ; mov rax, 231 (exit_group)
-              (emit-bytes buf #x0F #x05))       ; syscall
+              (emit-x64-syscall buf))       ; syscall
              ((= code #x0502)
               ;; Generic 3-arg Linux syscall
               ;; V0(RSI)=syscall#, V1(RDI)=arg1, V2(R8)=arg2, V3(R9)=arg3
@@ -2423,7 +2441,7 @@
                     (emit-bytes buf #x81 #xCF #x00 #x00 #x08 #x00)) ; or edi, CLONE_SETTLS
                   (emit-bytes buf #x45 #x31 #xC0))      ; xor r8d, r8d  (tls: unused)
               (emit-bytes buf #xB8 #x38 #x00 #x00 #x00) ; mov eax, 56 (SYS_clone)
-              (emit-bytes buf #x0F #x05)            ; syscall
+              (emit-x64-syscall buf)            ; syscall
               (emit-bytes buf #x48 #x85 #xC0)       ; test rax, rax
               (let ((child (make-label))
                     (done (make-label)))
@@ -2446,7 +2464,7 @@
                 (emit-bytes buf #xFF #xD3)          ; call rbx
                 (emit-bytes buf #x31 #xFF)          ; xor edi, edi  (status 0)
                 (emit-bytes buf #xB8 #x3C #x00 #x00 #x00) ; mov eax, 60 (SYS_exit)
-                (emit-bytes buf #x0F #x05)          ; syscall
+                (emit-x64-syscall buf)          ; syscall
                 (emit-bytes buf #x0F #x0B)          ; ud2 — unreachable
                 (emit-label buf done)))
              ((= code #x0544)
@@ -2618,19 +2636,19 @@
                 (emit-bytes buf #xB8 #xE4 #x00 #x00 #x00)          ; eax = clock_gettime
                 (emit-bytes buf #xBF #x01 #x00 #x00 #x00)          ; edi = MONOTONIC
                 (emit-bytes buf #x48 #x89 #xE6)                    ; rsi = rsp
-                (emit-bytes buf #x0F #x05)                         ; syscall
+                (emit-x64-syscall buf)                         ; syscall
                 ;; nanosleep({0, 10 ms}) with the request at [rsp+16]
                 (emit-bytes buf #x48 #xC7 #x44 #x24 #x10) (emit-u32 buf 0)
                 (emit-bytes buf #x48 #xC7 #x44 #x24 #x18) (emit-u32 buf 10000000)
                 (emit-bytes buf #xB8 #x23 #x00 #x00 #x00)          ; eax = nanosleep
                 (emit-bytes buf #x48 #x8D #x7C #x24 #x10)          ; rdi = rsp+16
                 (emit-bytes buf #x31 #xF6)                         ; rsi = NULL
-                (emit-bytes buf #x0F #x05)
+                (emit-x64-syscall buf)
                 ;; ts1 at [rsp+16]
                 (emit-bytes buf #xB8 #xE4 #x00 #x00 #x00)
                 (emit-bytes buf #xBF #x01 #x00 #x00 #x00)
                 (emit-bytes buf #x48 #x8D #x74 #x24 #x10)          ; rsi = rsp+16
-                (emit-bytes buf #x0F #x05)
+                (emit-x64-syscall buf)
                 ;; ticks -> r9
                 (emit-bytes buf #x0F #x01 #xF9)
                 (emit-bytes buf #x48 #xC1 #xE2 #x20 #x48 #x09 #xD0)
@@ -3213,7 +3231,7 @@
                   (emit-bytes buf #xBE #x30 #x0C #x00 #x10)   ; mov esi, 0x10000C30
                   (emit-bytes buf #xBA #x30 #x00 #x00 #x00)   ; mov edx, 48
                   (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)   ; mov eax, 1 (write)
-                  (emit-bytes buf #x0F #x05))                 ; syscall
+                  (emit-x64-syscall buf))                 ; syscall
                 ;; SAY WHY.  A fault with no handler armed on the faulting
                 ;; thread -- unbounded recursion outside every HANDLER-CASE,
                 ;; a worker whose body arms none (bordeaux-threads' wrapper
@@ -3237,7 +3255,7 @@
                 ;; mov eax, 231 (sys_exit_group)
                 (emit-bytes buf #xB8 #xE7 #x00 #x00 #x00)
                 ;; syscall
-                (emit-bytes buf #x0F #x05)
+                (emit-x64-syscall buf)
 
                 ;; --- Restorer trampoline (sa_restorer) ---
                 ;; Linux x86-64 requires SA_RESTORER + sa_restorer on raw
@@ -3248,7 +3266,7 @@
                 (emit-label buf restorer-label)
                 ;; mov eax, 15 (SYS_rt_sigreturn)
                 (emit-bytes buf #xB8 #x0F #x00 #x00 #x00)
-                (emit-bytes buf #x0F #x05)              ; syscall
+                (emit-x64-syscall buf)              ; syscall
 
                 ;; --- Past stub: install handlers via rt_sigaction ---
                 (emit-label buf past-stub-label)
@@ -7832,7 +7850,7 @@
     (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF) ; mov r8, -1
     (emit-bytes buf #x45 #x31 #xC9)                  ; xor r9d, r9d
     (emit-bytes buf #xB8 #x09 #x00 #x00 #x00)        ; mov eax, 9 (mmap)
-    (emit-bytes buf #x0F #x05)                       ; syscall
+    (emit-x64-syscall buf)                       ; syscall
     (emit-bytes buf #x41 #x5A #x41 #x59 #x41 #x58)   ; pop r10/r9/r8
     (emit-bytes buf #x5F #x5E #x5A #x59)             ; pop rdi/rsi/rdx/rcx
     (emit-bytes buf #x48 #x3D #x00 #xF0 #xFF #xFF)   ; cmp rax, -4096
@@ -8038,7 +8056,7 @@
     (emit-bytes buf #x48 #xC7 #xC7 #x01 #x00 #x00 #x00) ; mov rdi, 1 (fd)
     (emit-bytes buf #x48 #xC7 #xC2 #x01 #x00 #x00 #x00) ; mov rdx, 1 (len)
     (emit-bytes buf #x48 #xC7 #xC0 #x01 #x00 #x00 #x00) ; mov rax, 1 (sys_write)
-    (emit-bytes buf #x0F #x05)                      ; syscall
+    (emit-x64-syscall buf)                      ; syscall
     (emit-bytes buf #x48 #x83 #xC4 #x08)            ; add rsp, 8
     (emit-pop buf 'r11) (emit-pop buf 'rcx) (emit-pop buf 'rdx)
     (emit-pop buf 'rsi) (emit-pop buf 'rdi) (emit-pop buf 'rax)))
@@ -8438,7 +8456,7 @@
       (emit-label buf thr-done))
     (lit " (tid ")
     (emit-bytes buf #xB8 #xBA #x00 #x00 #x00)                    ; mov eax, 186 (gettid)
-    (emit-bytes buf #x0F #x05)
+    (emit-x64-syscall buf)
     (dec)
     (lit "): address ")
     (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-u32 buf +fault-rec-addr-addr+)
@@ -8452,10 +8470,10 @@
     (emit-bytes buf #x4C #x89 #xC6)                              ; mov rsi, r8
     (emit-bytes buf #xBF #x02 #x00 #x00 #x00)                    ; mov edi, 2
     (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)                    ; mov eax, 1 (write)
-    (emit-bytes buf #x0F #x05)
+    (emit-x64-syscall buf)
     (emit-bytes buf #xBF) (emit-u32 buf exit-code)               ; mov edi, code
     (emit-bytes buf #xB8 #xE7 #x00 #x00 #x00)                    ; mov eax, 231 (exit_group)
-    (emit-bytes buf #x0F #x05)))
+    (emit-x64-syscall buf)))
 
 (defun emit-diag-store (buf addr)
   "mov [ADDR], rax -- one of the #x0520 stub's absolute FRAGILITY DIAG words
@@ -8575,7 +8593,7 @@
     (emit-bytes buf #x45 #x31 #xD2))                        ; xor r10d, r10d
   (emit-bytes buf #xBE) (emit-u32 buf op)                   ; mov esi, op
   (emit-bytes buf #xB8 #xCA #x00 #x00 #x00)                 ; mov eax, 202
-  (emit-bytes buf #x0F #x05)                                ; syscall
+  (emit-x64-syscall buf)                                ; syscall
   (when timeout-ns
     (emit-bytes buf #x48 #x83 #xC4 #x10)))                  ; add rsp, 16
 

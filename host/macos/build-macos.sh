@@ -79,7 +79,8 @@ if [ "$KIND" = gui ]; then
   # because it brings the Swift runtime.  The image's linker flags become swiftc's -Xlinker options.
   OBJS=$(mktemp -d)
   for SRC in "$HERE/modus-shim.c" "$HERE/modus-audio.c" "$HERE/modus-keychain.m" $EXTRA_SRC "$HERE/syscall-stub.S"; do
-    cc -O2 -Wall -fobjc-arc $DEFS -c "$SRC" -o "$OBJS/$(basename "$SRC").o"
+    # the same minimum macOS as the Swift (and Info.plist), or ld warns that every object is "built for newer"
+    cc -O2 -Wall -fobjc-arc -mmacosx-version-min=14.0 $DEFS -c "$SRC" -o "$OBJS/$(basename "$SRC").o"
   done
   swiftc -target arm64-apple-macos14.0 -swift-version 5 -O -wmo -parse-as-library -module-name ModusSwift \
     -import-objc-header "$HERE/swift/bridge.h" -emit-object -o "$OBJS/swift.o" \

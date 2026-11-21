@@ -503,6 +503,8 @@ let calendarNew: Call = { seconds, x, y, w, h, _ in
     picker.datePickerElements = .yearMonthDay
     picker.dateValue = Date(timeIntervalSince1970: TimeInterval(seconds))
     picker.appearance = NSAppearance(named: .darkAqua)
+    // a Mac's calendar has its own size and draws from the bottom of a larger frame: its size, at the frame's top left
+    picker.frame = CGRect(origin: CGPoint(x: CGFloat(x), y: CGFloat(y)), size: picker.fittingSize)
     let handle = adopt(picker)
     wire(picker, handle) { _ in send("DATE", [.int(Int(handle)), .double(picker.dateValue.timeIntervalSince1970)]) }
     return handle
@@ -637,7 +639,14 @@ let blurNew: Call = { x, y, w, h, _, _ in
     view.blendingMode = .withinWindow
     view.state = .active
     view.appearance = NSAppearance(named: .darkAqua)
-    return adopt(view)
+    // the children go in a FLIPPED view inside the blur, so their frames mean what they mean on the phone (an
+    // effect view is not flipped: a label at y 10 sat at its bottom, or past it)
+    let content = FlippedView(frame: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+    content.autoresizingMask = [.width, .height]
+    view.addSubview(content)
+    let handle = adopt(view)
+    scrollDocuments[handle] = content
+    return handle
 }
 
 // grid_new(titles, length, x, y, w, h): tiles of 100 x 60, one per title, in rows; a click sends SELECT.
@@ -1006,7 +1015,12 @@ let listNew: Call = { x, y, w, h, _, _ in
     scroll.hasVerticalScroller = true
     scroll.drawsBackground = false
     let table = NSTableView()
-    table.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("row")))
+    // one column as wide as the list, and kept so: AppKit's default column is narrow, and a row's subtitle was cut
+    let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("row"))
+    column.width = CGFloat(w)
+    column.resizingMask = .autoresizingMask
+    table.addTableColumn(column)
+    table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
     table.headerView = nil
     table.backgroundColor = .clear
     table.style = .plain
@@ -1096,6 +1110,11 @@ func register(_ name: String, _ fn: Call) {
 // modus-swift.m calls this, once, before the first Lisp call.  The same names as the phone's (ModusSwift.swift).
 @_cdecl("modus_swift_install")
 public func modusSwiftInstall() {
+    // the phone's own files, built here too (host/ios/swift/: each has a macOS branch where it needs one)
+    installGPU()                                   // GPU.swift: Metal, under WebGPU's shape
+    installSpeech()                                // Speech.swift: the platform's voice and ear
+    installBluetooth()                             // Bluetooth.swift: LE links, for a mesh
+    installFiles()                                 // Files.swift: the app's folder, and the file picker
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
     register("ui_switch_new", switchNew)

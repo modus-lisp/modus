@@ -59,6 +59,9 @@ case $KIND in
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Listen: the desk hears what you say.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>Listen: what you say becomes text.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>Chat: messages travel to nearby devices over Bluetooth.</string>
 </dict>
 </plist>
 PLIST
@@ -80,7 +83,8 @@ if [ "$KIND" = gui ]; then
   done
   swiftc -target arm64-apple-macos14.0 -swift-version 5 -O -wmo -parse-as-library -module-name ModusSwift \
     -import-objc-header "$HERE/swift/bridge.h" -emit-object -o "$OBJS/swift.o" \
-    "$HERE/../ios/swift/Term.swift" "$HERE"/swift/*.swift
+    "$HERE/../ios/swift/Term.swift" "$HERE/../ios/swift/GPU.swift" "$HERE/../ios/swift/Speech.swift" \
+    "$HERE/../ios/swift/Bluetooth.swift" "$HERE/../ios/swift/Files.swift" "$HERE"/swift/*.swift
   LINKX=""
   for W in $WHERE; do
     case $W in

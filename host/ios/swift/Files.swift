@@ -11,7 +11,11 @@
 //   files_copy(src, n, dst, m) the file or folder at src copied to dst, when nothing is there yet: the
 //                              bundle's sample media seeded into Documents.  Returns 1 if it copied.
 
+#if os(macOS)
+import AppKit          // the macOS window host builds this file too (host/macos/build-macos.sh gui)
+#else
 import UIKit
+#endif
 import UniformTypeIdentifiers
 
 private func filesCopyOut(_ s: String, _ buf: UInt, _ cap: UInt) -> UInt {
@@ -22,8 +26,17 @@ private func filesCopyOut(_ s: String, _ buf: UInt, _ cap: UInt) -> UInt {
     return UInt(bytes.count)
 }
 
+// On a Mac the app has no Documents of its own: ~/Documents is the person's, and the media library seeds its
+// samples into this folder.  So the app's own folder, under Application Support.
 private func documentsURL() -> URL {
+    #if os(macOS)
+    let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    let url = support.appendingPathComponent("org.modus-lisp.modus/Documents", isDirectory: true)
+    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
+    #else
     FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    #endif
 }
 
 // A name not yet taken in DIR: "song.mp3", then "song 2.mp3", "song 3.mp3", ...
@@ -40,6 +53,30 @@ private func freeName(_ name: String, in dir: URL) -> URL {
     return url
 }
 
+let filesDocuments: Call = { buf, cap, _, _, _, _ in filesCopyOut(documentsURL().path, buf, cap) }
+
+#if os(macOS)
+// The Mac's picker: an Open panel over the window.  What is chosen is COPIED into the folder (the files are the
+// person's own, not the picker's copies as on the phone).
+let filesPick: Call = { p, n, _, _, _, _ in
+    guard let root = rootView(), let window = root.window else { return 0 }
+    let into = n > 0 ? URL(fileURLWithPath: text(p, n), isDirectory: true) : documentsURL()
+    let panel = NSOpenPanel()
+    panel.allowedContentTypes = [.audio, .movie, .image, .pdf]
+    panel.allowsMultipleSelection = true
+    panel.beginSheetModal(for: window) { response in
+        guard response == .OK else { return }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: into, withIntermediateDirectories: true)
+        for url in panel.urls {
+            do { try fm.copyItem(at: url, to: freeName(url.lastPathComponent, in: into)) } catch {
+                NSLog("files_pick: %@: %@", url.path, "\(error)")
+            }
+        }
+    }
+    return 1
+}
+#else
 private final class Picked: NSObject, UIDocumentPickerDelegate {
     let into: URL
     init(into: URL) { self.into = into }
@@ -64,8 +101,6 @@ private final class Picked: NSObject, UIDocumentPickerDelegate {
 
 private var picking: Picked?       // the delegate, held while the picker is up (the picker's reference is weak)
 
-let filesDocuments: Call = { buf, cap, _, _, _, _ in filesCopyOut(documentsURL().path, buf, cap) }
-
 let filesPick: Call = { p, n, _, _, _, _ in
     let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
     guard var top = (windows.first { $0.isKeyWindow } ?? windows.first)?.rootViewController else { return 0 }
@@ -81,6 +116,7 @@ let filesPick: Call = { p, n, _, _, _, _ in
     top.present(picker, animated: true)
     return 1
 }
+#endif
 
 let filesCopy: Call = { sp, sn, dp, dn, _, _ in
     let fm = FileManager.default

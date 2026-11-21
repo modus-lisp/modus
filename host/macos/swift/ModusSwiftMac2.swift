@@ -21,7 +21,9 @@ import UniformTypeIdentifiers
 
 // Views kept beside a component, removed with it (ui_remove): input_keys_on's row.
 var attached: [UInt: [NSView]] = [:]
-// A paging scroll view's document: ui_add puts its pages there (ModusSwiftMac.swift's addChild).
+// Where ui_add puts a view's children when they go in a container inside it (ModusSwiftMac.swift's addChild): a
+// paging scroll view's document, a blur's flipped content.
+
 var scrollDocuments: [UInt: NSView] = [:]
 
 private let sheetColor = NSColor(white: 0.12, alpha: 1)

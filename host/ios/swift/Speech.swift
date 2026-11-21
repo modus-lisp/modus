@@ -32,10 +32,13 @@ private func say(_ text: String) -> AVSpeechUtterance {
 
 let speechSay: Call = { p, n, _, _, _, _ in
     // the speaker, as the media player has it: playback, through the silent switch -- or Bluetooth headphones
-    // when they are on (A2DP: without it play-and-record drops them from the outputs, and their music with them)
+    // when they are on (A2DP: without it play-and-record drops them from the outputs, and their music with them).
+    // A Mac has no audio session: its speaker is just there (the macOS window host builds this file too).
+    #if os(iOS)
     try? AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default,
                                                      options: [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP])
     try? AVAudioSession.sharedInstance().setActive(true)
+    #endif
     synthesizer.speak(say(text(p, n)))
     return 1
 }
@@ -140,10 +143,12 @@ private final class Ear {
     }
 
     private func startEngine() {
+        #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playAndRecord, mode: .measurement,
                                  options: [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP])
         try? session.setActive(true)
+        #endif
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.requiresOnDeviceRecognition = false

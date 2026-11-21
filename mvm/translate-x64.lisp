@@ -60,9 +60,15 @@
    SYSCALL, destroys RCX and R11 and preserves everything else."
   (if *x64-win-shim-va*
       (progn
+        ;; SYSCALL writes nothing below RSP, so code may keep data in the SysV
+        ;; 128-byte red zone across it.  Step over the red zone first: the
+        ;; call's return address and the shim's pushes land below it.  LEA
+        ;; leaves the flags alone.
+        (emit-bytes buf #x48 #x8D #x64 #x24 #x80)   ; lea rsp, [rsp-0x80]
         (emit-bytes buf #x49 #xBB)                  ; mov r11, imm64
         (emit-u64 buf *x64-win-shim-va*)
-        (emit-bytes buf #x41 #xFF #xD3))            ; call r11
+        (emit-bytes buf #x41 #xFF #xD3)             ; call r11
+        (emit-bytes buf #x48 #x8D #xA4 #x24 #x80 #x00 #x00 #x00)) ; lea rsp, [rsp+0x80]
       (emit-bytes buf #x0F #x05)))                  ; syscall
 
 (defvar *x64-linux-mode* nil

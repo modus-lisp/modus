@@ -104,6 +104,11 @@
 ;;; block (%init-x64-translator + x64-asm.lisp) on an AARCH64 image, dead only
 ;;; because its *jit-on* was nil — see #266.
 (defvar *cli-bare-metal* nil)
+;; T for the Windows hosted image (mvm/build-win64-cli.lisp), which builds with
+;; the per-thread FS window, the per-CPU GS block and stop-the-world OFF (on
+;; Windows GS is the TEB, and FS is not ours to set).  The runtime JIT must emit
+;; the same shape, so its co-init (%INIT-X64-TRANSLATOR) turns them off too.
+(defvar *cli-win64* nil)
 (defvar *cli-bare-metal-tarball* nil)
 (defvar *cli-bare-metal-net-source* "")
 ;;; SAVE-AND-DIE on bare metal: what a restored process runs INSTEAD of boot
@@ -693,6 +698,18 @@
   (setq *ws5-force-no-kindcheck* t)
   (setq *x64-gc-region-percpu* nil)
   (setq *x64-sched-lock-addr* nil)
+  (setq *x64-stw* nil)
+  (setq *park-safepoints* nil)
+"
+       "")
+   (if *cli-win64*
+       ;; WIN64-SHIM-VA-PLACEHOLDER is replaced by build-win64-cli with the
+       ;; shim's address (it needs boot-win64, which loads after this file).
+       ;; Set here, not at top level: init-all-globals resets a top-level setq.
+       "  (setq modus.mvm.x64::*x64-win-shim-va* WIN64-SHIM-VA-PLACEHOLDER)
+  (setq *x64-tls-window* nil)
+  (setq *tls-window* nil)
+  (setq *x64-gc-region-percpu* nil)
   (setq *x64-stw* nil)
   (setq *park-safepoints* nil)
 "

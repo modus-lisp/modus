@@ -190,10 +190,16 @@
 ;; to a virtual address, and the process faults on its first JIT-compiled form.
 ;; Until that is fixed the Windows image is built interpreter-only, and this
 ;; refuses to build the JIT variant rather than ship a binary that faults.
-(unless (equal (sb-ext:posix-getenv "MODUS_NO_JIT") "1")
+(unless (or (equal (sb-ext:posix-getenv "MODUS_NO_JIT") "1")
+            (equal (sb-ext:posix-getenv "MODUS_WIN64_JIT") "1"))   ; experimental opt-in
   (format *error-output* "~&build-win64-cli: set MODUS_NO_JIT=1.  The runtime JIT is~%~
-  not yet correct in a Windows image (JIT-compiled calls fault).~%")
+  not yet verified in a Windows image (MODUS_WIN64_JIT=1 builds it anyway).~%")
   (sb-ext:exit :code 2 :abort t))
+
+;; The runtime JIT's co-init must match this image's settings (no TLS window,
+;; no per-CPU block, no STW): build-cli-common reads this.
+(defvar cl-user::*cli-win64* t)
+(setq cl-user::*cli-win64* t)
 
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
@@ -229,15 +235,55 @@
 (setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::win64-native-code-offset))
 ;; Every syscall the image makes goes through the stub's shim (boot-win64.lisp).
 (setf modus.mvm.x64::*x64-win-shim-va* (modus.mvm::win64-shim-va))
-;; The runtime JIT translates inside the image, where the host's setting above
-;; does not reach.  Without this, JIT-compiled code executes a real SYSCALL
-;; (which on Windows is a Linux syscall under Wine, returning to a garbage RCX).
-;; The baked source sets the same variable at boot, before any form can be JIT'd.
-(setq cl-user::*cli-arch-override-source*
-      (concatenate 'string cl-user::*cli-arch-override-source* (string #\Newline)
-                   (format nil "(setq modus.mvm.x64::*x64-win-shim-va* ~D)"
-                           (modus.mvm::win64-shim-va))
-                   (string #\Newline)))  ; computed from the stub, see boot-linux-x64.lisp
+;; WINDOWS RUNTIME SOURCE, appended to the image's own source.  It must go on
+;; *FULL-SOURCE* itself: that text is assembled when build-cli-common.lisp loads,
+;; so appending to *CLI-ARCH-OVERRIDE-SOURCE* here (after the load) is lost.
+;;
+;; %CLI-COLLECT-ARGV: the stub puts the whole command line (GetCommandLineA)
+;;    in argv[0]; split it with the Windows rules -- whitespace separates outside
+;;    double quotes, a quote toggles quoting, \" is a literal quote.  Characters
+;;    are written as codes (92 backslash, 34 quote, 32 space, 9 tab) to keep the
+;;    text free of escapes.  Last definition wins (the original is overridable).
+(defparameter *win64-runtime-source*
+  (format nil "
+(defun %cli-collect-argv ()
+  (let* ((line (%cli-cstr-at (%cli-read-ptr (%cli-argv-base))))
+         (n (length line)) (acc nil) (out (make-string-output-stream))
+         (in-token nil) (quoted nil) (i 0))
+    (loop
+      (when (>= i n) (return))
+      (let ((c (char-code (char line i))))
+        (cond ((and (= c 92) (< (+ i 1) n) (= (char-code (char line (+ i 1))) 34))
+               (write-char (code-char 34) out) (setq in-token t) (setq i (+ i 1)))
+              ((= c 34) (setq quoted (not quoted)) (setq in-token t))
+              ((and (not quoted) (or (= c 32) (= c 9)))
+               (when in-token
+                 (push (get-output-stream-string out) acc)
+                 (setq in-token nil)))
+              (t (write-char (code-char c) out) (setq in-token t))))
+      (setq i (+ i 1)))
+    (when in-token (push (get-output-stream-string out) acc))
+    (nreverse acc)))
+"))
+(setq cl-user::*full-source*
+      (concatenate 'string cl-user::*full-source* (string #\Newline) *win64-runtime-source*))
+;; The JIT co-init's shim address (build-cli-common, *CLI-WIN64*).  Every copy of
+;; the co-init in the source gets it; with the JIT on there must be at least one.
+(let ((token "WIN64-SHIM-VA-PLACEHOLDER")
+      (value (princ-to-string (modus.mvm::win64-shim-va)))
+      (n 0))
+  (loop
+    (let* ((src cl-user::*full-source*)
+           (at (search token src)))
+      (unless at (return))
+      (incf n)
+      (setq cl-user::*full-source*
+            (concatenate 'string (subseq src 0 at) value
+                         (subseq src (+ at (length token)))))))
+  (format t "~&;; win64: shim address #x~X in ~D JIT co-init cop~:@P~%"
+          (modus.mvm::win64-shim-va) n n)
+  (when (and cl-user::*jit-on* (zerop n))
+    (error "build-win64-cli: the JIT is on but its co-init has no ~A" token)))
 
 ;; NATIVE THREADS, STEP 1: the hosted actor scheduler gets a REAL spinlock.
 ;; net/actors.lisp hands the lock's RELEASE to RESTORE-CONTEXT; with this set,

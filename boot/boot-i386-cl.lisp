@@ -110,6 +110,12 @@
 (defconstant +i386-cl-bootrec+ #x0580
   "scripts/pcboot2.s's boot record: 'PCBT', PM_READ, the image's first sector,
    the drive.")
+(defconstant +i386-cl-v-jitsz+ #x80A8
+  "The native tier's code area (mvm/jit-i386-native.lisp, MODUS_I386_JIT=1): its
+   size, mapped at +I386-CL-JIT-AREA+ from RAM before the heap is sized -- a
+   sixteenth of the RAM, 256 KB to 8 MB.  0: no area (no native tier).")
+(defconstant +i386-cl-jit-area+ #x12000000
+  "jit-i386-native.lisp's +N386-AREA-ADDR+: the hosted layout's code area.")
 (defconstant +i386-cl-v-stacksz+ #x80A4
   "The stack's bytes: 1 MB, or 384 KB on a machine under 16 MB.")
 (defvar *i386-cl-gc-static*
@@ -278,6 +284,31 @@
        (cons #xBF (i386l-le32-list +i386-cl-stack-top+))
        (i386cl-abs '(#x2B #x3D) +i386-cl-v-stacksz+)          ; edi = top - size
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-stacksz+) '(#xC1 #xE9 #x0C) '(:call 0 map)
+       ;; the native tier's code area, a sixteenth of the RAM (256 KB .. 8 MB);
+       ;; none under 16 MB, whose heap cannot spare it (measured: 6 MB QEMU and
+       ;; 8 MB Bochs ran out of young space) -- runtime code stays interpreted
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-jitsz+) (i386l-le32-list 0))
+       (cons :splice
+             (when (and (find-package "MODUS.MVM.I386")
+                        (symbol-value (find-symbol "*I386-NATIVE-TIER*" "MODUS.MVM.I386")))
+               (list (cons #x81 (cons #x3D (append (i386l-le32-list +i386-cl-v-ramend+)
+                                                   (i386l-le32-list #x1000000))))
+                     '(:jcc32 #x72 jit-none)                          ; RAM < 16 MB: none
+                     (i386cl-abs '(#xA1) +i386-cl-v-ramend+)
+                     '(#xC1 #xE8 #x04)                                 ; shr eax, 4
+                     (cons #x3D (i386l-le32-list #x40000)) '(:j8 #x73 jit-min)
+                     (cons #xB8 (i386l-le32-list #x40000))
+                     '(:label jit-min)
+                     (cons #x3D (i386l-le32-list #x800000)) '(:j8 #x76 jit-max)
+                     (cons #xB8 (i386l-le32-list #x800000))
+                     '(:label jit-max)
+                     (cons #x25 (i386l-le32-list #xFFFFF000))
+                     (i386cl-abs '(#xA3) +i386-cl-v-jitsz+)
+                     '(#x89 #xC1) '(:call 0 alloc) '(#x89 #xC6)        ; esi = PA
+                     (cons #xBF (i386l-le32-list +i386-cl-jit-area+))
+                     (i386cl-abs '(#x8B #x0D) +i386-cl-v-jitsz+)
+                     '(#xC1 #xE9 #x0C) '(:call 0 map)
+                     '(:label jit-none))))
        ;; NIL's page, all NIL
        (cons #xB9 (i386l-le32-list 4096)) '(:call 0 alloc)
        '(#x50) '(#x89 #xC7) (cons #xB8 (i386l-le32-list nil-value))

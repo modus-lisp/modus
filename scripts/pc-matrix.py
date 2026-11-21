@@ -43,6 +43,7 @@ FORMS = [
     ('(let ((h (make-hash-table))) (setf (gethash 1 h) 2) (gethash 1 h))', '2'),
 ]
 PROBE = '(list (mem-ref #x8008 :u32) (mem-ref #x8010 :u32) (mem-ref #x8070 :u32))'
+CELL_DEADLINE = 360     # seconds for a whole cell: a stuck one must not hold the run
 
 # ---------------------------------------------------------------- the cells
 def qcell(name, machine='q35', cpu='SandyBridge', mem='64', disk='sata', smp=1, note=''):
@@ -306,7 +307,10 @@ def run_cell(cell, disk, idx, keep, forms=None):
                 txt = m.text(); a = answer_after(txt, form)
                 if a is not None and txt.rstrip().endswith('>') and a != '': break
                 if time.time() - t1 > 300: a = '(no answer in 300 s)'; break
+                if time.time() - t0 > CELL_DEADLINE: a = '(the cell ran out of time)'; break
             log.append('%s => %s  [%.1f s]' % (form, a, time.time() - t1))
+            if a == '(the cell ran out of time)':
+                bad.append('%s => %s' % (form, a)); break
             if want is None:
                 res['probe'] = a
             elif want not in (a or '').split():

@@ -1061,9 +1061,18 @@ the boot stub STAGED into the BSS at `0x10009000` rather than the live initial
 stack (4-byte slots, and the kernel stack at `0x40800390` is above the 2^30
 ceiling a tagged `mem-ref` address can express); and `*cstr-scratch*` /
 `*io-buf-addr*`, which must sit in the `0x10004000..0x10009000` BSS window
-because every syscall address travels as a tagged fixnum. There is **no in-image JIT** on i386 (`*JIT-ON*` is forced NIL) —
-`translate-i386.lisp` builds the image but has no runtime arm; `mvm-eval` falls
-back to `mvm-interpret`, which is correct, just slower.
+because every syscall address travels as a tagged fixnum. i386 has no x64-style
+JIT (`*JIT-ON*` is forced NIL), but it has the **native tier**
+(`mvm/jit-i386-native.lisp`, `MODUS_I386_JIT=1`): the image's own
+`translate-i386` translates a runtime DEFUN at its first call, and a top-level
+form that builds closures, into a code area at `#x12000000` (`fib 25`: 58 s
+interpreted, 0.2 s native, bare metal under QEMU).  Hosted it maps the area with
+`mmap`; the bare PC image's boot stub maps it (1/16 of RAM, 256 KB .. 8 MB) and
+the build overrides `%N386-AREA`.  **A saved core holds the heap, not the code
+area**, so the bare image keeps the tier off while it boots to be saved
+(`%N386-ALLOWED-P`, SAVECORE): before that, every form boot had run natively was
+a pointer into an empty area after the restore.  Without the tier `mvm-eval`
+falls back to `mvm-interpret`, which is correct, just slower.
 
 **THE i386 CL IMAGE USED TO DIE AT ITS FIRST COLLECTION — three defects, all
 fixed (2026-09-26).**  Any `--script` of ~1300 toplevel forms (each allocates

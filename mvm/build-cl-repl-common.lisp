@@ -3335,6 +3335,28 @@
       (format t "~&;; split-dispatch: COMPILE-COMPOUND -> ~D handlers over ~D keys~%"
               handlers keys))))
 
+;;; Bare i386 + MODUS_I386_JIT=1: the native tier (mvm/jit-i386-native.lisp) in
+;;; build-cli-common's late arch slot, its code area the one the boot stub maps
+;;; (a bare PC has no mmap): %N386-AREA, by last-defun-wins.
+(when (and *cl-repl-i386-p* (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1"))
+  (defvar cl-user::*cli-arch-late-source*
+    (concatenate 'string (mvm-text "mvm/jit-i386-native.lisp") "
+(defun %n386-area ()
+  \"Bare metal: the code area boot/boot-i386-cl.lisp mapped at +N386-AREA-ADDR+,
+   its size in the stub's word at #x80A8 (0: none, and runtime code stays
+   interpreted).\"
+  (let ((n (mem-ref #x80A8 :u32)))
+    (when (zerop n) (error \"jit-i386-native: the boot stub mapped no code area\"))
+    (setq *n386-ptr* +n386-area-addr+ *n386-end* (+ +n386-area-addr+ n))))
+(defun %n386-allowed-p ()
+  \"Not while booting to be saved as a core (SAVECORE, scripts/dos386-core.py):
+   the core holds the heap, not the code area, so a function translated now
+   would be a pointer into an empty area after the restore -- measured: every
+   form boot had run natively jumped into zeros.  The restored image starts
+   the tier at its first DEFUN.\"
+  (not (%i386-core-save-requested-p)))
+")))
+
 ;;; :MAC68K + MODUS_68K_JIT=1: the runtime threaded JIT (mvm/jit-68k.lisp) in
 ;;; build-cli-common's late arch slot, with the layout's :JIT-AREA as its code
 ;;; area (a Mac has no mmap).  Layouts without one get no JIT.
@@ -3887,6 +3909,11 @@
            (symbol-value (intern "+LINUX-I386-HEAP-MARGIN-ADDR+" "MODUS.MVM"))
            ;; the clock: the PIT's ticks (a 486 has no RDTSC)
            (symbol-value (intern "+I386-CL-TICK-ADDR+" "MODUS.MVM")))
+  ;; MODUS_I386_JIT=1: the native tier (mvm/jit-i386-native.lisp), as on the
+  ;; hosted CLI -- the image carries the export table and the constant root,
+  ;; and the boot stub maps its code area (boot-i386-cl.lisp +I386-CL-V-JITSZ+)
+  (setf (symbol-value (intern "*I386-NATIVE-TIER*" "MODUS.MVM.I386"))
+        (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1"))
   ;; MODUS_I386_FP=x87: floats on the x87 (a 486DX has no SSE2, nor a CR4 to
   ;; enable it with), as build-i386-cli.lisp reads it
   (let ((v (sb-ext:posix-getenv "MODUS_I386_FP")))
@@ -4567,6 +4594,18 @@
 ;; integer-literal DEFCONSTANT found in the text.  DEFCONSTANT emits no code, so
 ;; the SBCL artifact must be byte-identical with this block (verified by
 ;; test/run-uefi-ddc.sh's md5 of the SBCL image before/after).
+(defun %ddc-in-mvm-package-p (text p)
+  "NIL when position P of TEXT is in a baked TRANSLATOR's package (MODUS.MVM.<arch>,
+   by the nearest (in-package ...) before it).  The forward block hoists into
+   MODUS.MVM, so the i386 translator's constants -- baked under MODUS_I386_JIT=1 --
+   came out defined twice (GLOBAL-COLLISION +I386-EAX+ in MODUS.MVM.I386 and
+   MODUS-INT).  Every other package hoists as it always did."
+  (let ((ip (search "(in-package " text :from-end t :end2 p)))
+    (or (null ip)
+        (let* ((end (position #\) text :start ip))
+               (name (string-downcase (string-trim " :#'" (subseq text (+ ip 12) end)))))
+          (not (and (> (length name) 10) (string= "modus.mvm." name :end2 10)))))))
+
 (defun %ddc-constants-forward-block (text)
   (let ((out (make-string-output-stream)) (n 0) (pos 0))
     (format out "(in-package :modus.mvm)~%;; DDC constants forward block (auto)~%")
@@ -4583,7 +4622,7 @@
         (let* ((close (position #\) text :start p))
                (form (and close (subseq text p (1+ close)))))
           ;; only the simple shape "(defconstant +NAME+ <integer>)" on one line
-          (when (and form (not (find #\Newline form)))
+          (when (and form (not (find #\Newline form)) (%ddc-in-mvm-package-p text p))
             (let* ((sp1 (position #\Space form :start 13))
                    (name (and sp1 (subseq form 13 sp1)))
                    (rest (and sp1 (string-trim " " (subseq form (1+ sp1) (1- (length form)))))))

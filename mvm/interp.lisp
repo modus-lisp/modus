@@ -1068,6 +1068,35 @@
 ;;; working (funcall (lambda …) x) and capturing-closure cases keep their fast
 ;;; in-loop dispatch.
 
+;;; ARITY OF A MODULE FUNCTION.  A trampoline's code is shared by every
+;;; trampoline, so the closure says nothing about which function it runs; the
+;;; module's LAM-OFFSETS does, and keeps each function's (REQUIRED . MAX)
+;;; under the key (- -1 OFFSET) -- negative, so no entry offset can take it,
+;;; and an integer, so a fasl carries it like the rest.  A trampoline asked
+;;; with *%ARITY-PROBE* bound answers that instead of running its function
+;;; (%FUNCTION-ARITY, mvm-eval.lisp).
+(defvar *%arity-probe* nil)
+
+(defun %lam-offsets-note-arity (lam-offsets offset arity)
+  (when (and lam-offsets (integerp offset) arity)
+    (puthash (- -1 offset) lam-offsets arity)))
+
+(defun %module-fn-arity (offset lam-offsets)
+  (and (integerp offset) lam-offsets (hash-table-p lam-offsets)
+       (gethash (- -1 offset) lam-offsets)))
+
+;;; The code objects every trampoline of each kind shares, for %FUNCTION-ARITY
+;;; to know one when it sees it.  Noted by the first one made on the main
+;;; thread (a worker's object must not reach a global; image code is not one).
+(defvar *%trampoline-codes* nil)
+
+(defun %note-trampoline-code (f)
+  (when (%mvm-on-main-thread-p)
+    (let ((c (%prim-aref f 0)))
+      (unless (member c *%trampoline-codes* :test (function eq))
+        (setq *%trampoline-codes* (cons c *%trampoline-codes*)))))
+  f)
+
 (defun %mvm-make-trampoline (bc ftab rt offset env lam-offsets)
   "Return a native Modus closure that re-enters mvm-interpret at OFFSET (a
    bytecode entry) on BC with FTAB/RT, marshalling its call args into a fresh
@@ -1075,7 +1104,10 @@
    Native HOFs (mapcar/reduce/…) funcall this exactly like any other function.
    LAM-OFFSETS is threaded through so a lambda that itself escapes a lambda to a
    native HOF (nested mapcar) keeps working on the re-entry."
+  (%note-trampoline-code
   (lambda (&rest args)
+   (if *%arity-probe*
+    (%module-fn-arity offset lam-offsets)
     ;; Wrap the RESULT like mvm-eval-forms does (%mvm-wrap-escaping-result):
     ;; a body that returns an in-module #x52 lambda closure must hand the
     ;; native caller a re-entrant trampoline, not the raw module closure
@@ -1113,7 +1145,7 @@
                                    (setq acc (cons (%mvm-wrap-escaping-result
                                                     x bc ftab rt lam-offsets)
                                                    acc)))))
-                       (list r)))))))
+                       (list r)))))))))
 
 ;;; NOTE (retired predicate): there used to be a `%mvm-lambda-offset-p' here,
 ;;; used by %MVM-WRAP-ESCAPING to decide whether a BARE FIXNUM argument

@@ -2412,10 +2412,12 @@
   rest-param-p    ; T if function has &rest parameter
   required-count  ; number of required params (before &rest)
   optional-count  ; number of &optional params (between required and &rest)
-  qualified-name) ; #211: "PKG::NAME" when the defun's name symbol has a
+  qualified-name  ; #211: "PKG::NAME" when the defun's name symbol has a
                   ; foldable home package, else NIL.  NAME stays BARE — the
                   ; emitted native FN table and its by-name probes read that.
                   ; See %FN-KEY-PKG-OF / %FN-REGISTER-INFO.
+  (arity nil))    ; (REQUIRED . MAX), MAX NIL for &rest / &key: what the entry
+                  ; check accepts, kept as data for %FUNCTION-ARITY
 
 (defstruct compile-env
   (bindings nil)       ; list of binding structs
@@ -5648,6 +5650,15 @@
                 (nth-value 1 (gethash (normalize-name sym) *global-symbol-macros*)))
            (list sym (gethash (normalize-name sym) *global-symbol-macros*))))))
 
+(defun %boxed-cell-expansion-p (x)
+  "True of the (CAR cell) a cell-boxed LET variable stands for: its cell is
+   the fresh uninterned symbol %COMPILE-LET-1 makes from CELL-VAR-NAME,
+   named %CELL-<var>..."
+  (and (consp x) (eq (car x) 'car) (consp (cdr x)) (null (cddr x))
+       (symbolp (cadr x)) (cadr x) (null (symbol-package (cadr x)))
+       (let ((n (symbol-name (cadr x))))
+         (and (> (length n) 6) (string= n "%CELL-" :end1 6)))))
+
 (defun %variable-information (sym &optional env)
   "What SYM names as a variable in ENV -- SB-CLTL2 VARIABLE-INFORMATION's
    first value: :LEXICAL, :SYMBOL-MACRO, :SPECIAL, :CONSTANT or NIL.  A
@@ -5656,7 +5667,15 @@
    with the name."
   (let ((b (and env (not (consp env)) (symbolp sym) (env-lookup env sym))))
     (cond
-      (b (if (eq (binding-location b) :symbol-macro) :symbol-macro :lexical))
+      ;; A LET variable that is cell-boxed is compiled as a symbol macro for
+      ;; (CAR cell), but it is the program's lexical variable all the same,
+      ;; and SBCL says so.  Answering :SYMBOL-MACRO sent cortez's
+      ;; VARIABLE-LOCATION down its global branch inside the very closure the
+      ;; box was made for.
+      (b (if (and (eq (binding-location b) :symbol-macro)
+                  (not (%boxed-cell-expansion-p (binding-expansion b))))
+             :symbol-macro
+             :lexical))
       ((not (and (symbolp sym) sym)) (if (null sym) :constant nil))
       ((%macro-env-symbol-macro sym env) :symbol-macro)
       ((or (keywordp sym) (eq sym t) (constantp sym)) :constant)
@@ -14271,7 +14290,32 @@
         (scan f)))
     result))
 
+(defun %lexical-macro-env (vars)
+  "The environment a macro expanded inside a LET over VARS sees there: VARS
+   lexical (specials excepted), on top of the one current now.  For the
+   walks that pre-expand a body before it is compiled."
+  (make-compile-env
+   :bindings (mapcar (lambda (v) (make-binding :name v :location :stack))
+                     (remove-if-not (lambda (v) (and (symbolp v) v (not (%runtime-special-p v))))
+                                    vars))
+   :parent (and *%macroexpand-env* (not (consp *%macroexpand-env*)) *%macroexpand-env*)))
+
 (defun %boxed-vars-for-let (scan-forms let-vars)
+  "LET-VARS lexical to every expander the walks below run (run-time compiles;
+   the build never binds the variable): the walks pre-expand the body, and
+   an expander that asks its &ENVIRONMENT must give them the expansion the
+   compile will.  With none, cortez's VARIABLE-LOCATION took a LET variable
+   for a global -- SETF of its SYMBOL-VALUE, no SETQ -- so no walk saw the
+   assignment, the variable was captured by value, and the locative stored
+   into a copy: TI's LOOP ... COLLECT, which collects through a locative to
+   its result variable, returned NIL."
+  (if *mvm-eval-runtime-p*
+      (let ((*%macroexpand-env* (%lexical-macro-env let-vars)))
+        (declare (special *%macroexpand-env*))
+        (%boxed-vars-for-let-1 scan-forms let-vars))
+      (%boxed-vars-for-let-1 scan-forms let-vars)))
+
+(defun %boxed-vars-for-let-1 (scan-forms let-vars)
   "The cell-boxing set for a LET/LET* over LET-VARS with SCAN-FORMS (body,
    plus init forms for LET*): vars mutated INSIDE a closure (the classic
    case), UNION vars READ inside a closure and mutated ANYWHERE (the
@@ -14299,6 +14343,15 @@
                              (not (member v base :test #'name-equal)))
                     (setq base (cons v base))))))))
         base)))
+
+(defun %cell-var-prefix (var)
+  "CELL-VAR-NAME's name, for a cell that is a fresh gensym and needs no symbol
+   of that name: interning one put %CELL-<var> into whatever package was
+   current, a symbol the program never wrote (DO-ALL-SYMBOLS.2, IMPORT.ERROR.4
+   saw it appear mid-test)."
+  (concatenate 'string "%CELL-" (cond ((symbolp var) (symbol-name var))
+                                      ((stringp var) var)
+                                      (t (format nil "~A" var)))))
 
 (defun cell-var-name (var)
   "Generate the cell variable name for a boxed variable."
@@ -15977,7 +16030,7 @@
              ;; quicklisp's PARSE-URLSTRING read an unbound %CELL-POS.
              (cells (mapcar (lambda (b)
                               (let ((var (if (consp b) (car b) b)))
-                                (cons var (%mvm-gensym (symbol-name (cell-var-name var))))))
+                                (cons var (%mvm-gensym (%cell-var-prefix var)))))
                             (remove-if-not (lambda (b)
                                              (member (if (consp b) (car b) b) boxed-vars
                                                      :test #'name-equal))
@@ -16162,7 +16215,7 @@
                         `(let* ,after ,@body-stripped)
                         `(progn ,@body-stripped)))
              ;; A fresh cell symbol: see compile-let.
-             (cell (%mvm-gensym (symbol-name (cell-var-name var)))))
+             (cell (%mvm-gensym (%cell-var-prefix var))))
         (return-from %compile-let*-1
           (compile-form `(let* (,@before (,cell (cons ,init nil)))
                            (symbol-macrolet ((,var (car ,cell)))
@@ -33357,6 +33410,16 @@
                            (let ((q (%fn-key-qualify name bare-name)))
                              (if (equal q bare-name) nil q)))
                     :param-count (length params)
+                    ;; The counts the arity prologue above checks, in its
+                    ;; terms.  After PREPROCESS-PARAMS a &key list is a
+                    ;; REST-SLOT too, so MAX is NIL for both.
+                    :arity (let ((req (cond ((and opt-count (> opt-count 0)) opt-start)
+                                            (rest-slot rest-slot)
+                                            (t (length params)))))
+                             (cons req (cond (rest-slot nil)
+                                             ((and opt-count (> opt-count 0))
+                                              (+ opt-start opt-count))
+                                             (t req))))
                     :bytecode-offset 0
                     :bytecode-length 0
                     :stack-frame-size 0)))

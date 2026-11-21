@@ -5172,8 +5172,14 @@
   (let ((tb *%not-macro*))
     (and tb (member sym (gethash h tb) :test #'eq) t)))
 (defun %note-not-macro (sym h)
-  (let ((tb (or *%not-macro* (setq *%not-macro* (make-hash-table :test 'eql)))))
-    (setf (gethash h tb) (cons sym (gethash h tb)))))
+  ;; MAIN ONLY, as every global cache (%MVM-ON-MAIN-THREAD-P): on a worker the
+  ;; table and the conses are its own objects, and storing them into main's set
+  ;; is refused (x86-64's shared-store guard) -- every SB-THREAD:MAKE-THREAD
+  ;; body, which runs interpreted, died before its first form.  A worker reads
+  ;; main's set and adds nothing to it.
+  (when (%mvm-on-main-thread-p)
+    (let ((tb (or *%not-macro* (setq *%not-macro* (make-hash-table :test 'eql)))))
+      (setf (gethash h tb) (cons sym (gethash h tb))))))
 
 ;;; The memo is keyed by the form's ADDRESS in the image, and the copying
 ;;; collector moves every form: after a GC every entry MISSED (the EQ

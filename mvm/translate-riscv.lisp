@@ -1398,10 +1398,7 @@
                 (rv-emit-ecall buf)
                 (rv-emit-addi buf +rv-sp+ +rv-sp+ 16)
                 (rv-emit-longjmp-to-armed
-                 buf (lambda ()
-                       (rv-emit-addi buf +rv-a0+ +rv-x0+ 139)
-                       (rv-emit-addi buf +rv-a7+ +rv-x0+ 94)   ; exit_group
-                       (rv-emit-ecall buf)))
+                 buf (lambda () (rv-emit-uncaught-fault-report buf)))
                 (rv-patch-jal-here buf skip)
                 (rv-emit-addi buf +rv-sp+ +rv-sp+ -64)
                 (rv-emit-store-word buf +rv-a0+ +rv-sp+ 32)
@@ -3463,6 +3460,48 @@
     (rv-emit-store-word buf +rv-t4+ +rv-t6+ (* 8 i)))
   (rv-emit-jalr buf +rv-x0+ +rv-t0+ 0))
 
+(defun rv-emit-write-stderr (buf text)
+  "Hosted: write TEXT to fd 2.  The bytes follow a JAL that skips them; a1
+   points at them through AUIPC.  Clobbers a0-a2, a7."
+  (let* ((bytes (map 'list #'char-code text))
+         (padded (append bytes (make-list (mod (- (length bytes)) 4) :initial-element 0))))
+    (rv-emit-auipc buf +rv-a1+ 0)
+    (rv-emit-addi buf +rv-a1+ +rv-a1+ 12)
+    (let ((over (rv-current-offset buf)))
+      (rv-emit-jal buf +rv-x0+ 0)
+      (loop for (b0 b1 b2 b3) on padded by #'cddddr
+            do (rv-emit-u32 buf (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
+      (rv-patch-jal-here buf over))
+    (rv-emit-addi buf +rv-a0+ +rv-x0+ 2)
+    (rv-emit-li buf +rv-a2+ (length bytes))
+    (rv-emit-addi buf +rv-a7+ +rv-x0+ 64)                 ; write
+    (rv-emit-ecall buf)))
+
+(defun rv-emit-fatal (buf text status)
+  "Hosted: TEXT on stderr, then exit_group(STATUS).  Never returns."
+  (rv-emit-write-stderr buf text)
+  (rv-emit-li buf +rv-a0+ status)
+  (rv-emit-addi buf +rv-a7+ +rv-x0+ 94)                   ; exit_group
+  (rv-emit-ecall buf))
+
+;;; A HARDWARE FAULT WITH NO HANDLER ARMED SAYS WHAT IT WAS (translate-x64's
+;;; story).  It was exit_group(139) and not a word.  The signal is in the
+;;; pending-fault word the stub just wrote; one line names it, exit 70 as on
+;;; x86-64 and AArch64.  (No address or PC: this port's fault record is the
+;;; one word.)
+(defun rv-emit-uncaught-fault-report (buf)
+  (progn
+    (rv-emit-li buf +rv-t3+ *rv-pending-fault-addr*)
+    (rv-emit-lw buf +rv-t3+ +rv-t3+ 0)
+    (dolist (k '((11 . "memory fault (SIGSEGV)") (7 . "bus error (SIGBUS)")
+                 (8 . "arithmetic fault (SIGFPE)") (4 . "illegal instruction (SIGILL)")))
+      (rv-emit-li buf +rv-t4+ (car k))
+      (let ((next (rv-current-offset buf)))
+        (rv-emit-bne buf +rv-t3+ +rv-t4+ 0)
+        (rv-emit-fatal buf (format nil "~%modus: ~A with no handler armed; stopping.~%" (cdr k)) 70)
+        (rv-patch-branch-here buf next)))
+    (rv-emit-fatal buf (format nil "~%modus: hardware fault with no handler armed; stopping.~%") 70)))
+
 (defun rv-emit-hstack-overflow (buf)
   "The loud end of a push that cannot store its frame.  Record #x0F0F for
    %TAKE-PENDING-FAULT -- the channel a hardware fault uses, since this code
@@ -3474,27 +3513,9 @@
   (rv-emit-longjmp-to-armed
    buf (lambda ()
          (if *riscv-linux-mode*
-             (let* ((msg (format nil "modus: handler-frame stack exhausted ~
-                                      with no handler armed~%"))
-                    (bytes (map 'list #'char-code msg))
-                    (padded (append bytes
-                                    (make-list (mod (- (length bytes)) 4)
-                                               :initial-element 0))))
-               ;; a1 = the message, which follows the JAL that skips it.
-               (rv-emit-auipc buf +rv-a1+ 0)
-               (rv-emit-addi buf +rv-a1+ +rv-a1+ 12)
-               (let ((over (rv-current-offset buf)))
-                 (rv-emit-jal buf +rv-x0+ 0)
-                 (loop for (b0 b1 b2 b3) on padded by #'cddddr
-                       do (rv-emit-u32 buf (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
-                 (rv-patch-jal-here buf over))
-               (rv-emit-addi buf +rv-a0+ +rv-x0+ 2)
-               (rv-emit-addi buf +rv-a2+ +rv-x0+ (length bytes))
-               (rv-emit-addi buf +rv-a7+ +rv-x0+ 64)                 ; write
-               (rv-emit-ecall buf)
-               (rv-emit-addi buf +rv-a0+ +rv-x0+ 70)
-               (rv-emit-addi buf +rv-a7+ +rv-x0+ 94)        ; exit_group
-               (rv-emit-ecall buf))
+             (rv-emit-fatal buf (format nil "modus: handler-frame stack exhausted ~
+                                            with no handler armed~%")
+                            70)
              (progn
                (rv-emit-li buf +rv-a7+ +rv-hstack-overflow-code+)
                (rv-emit-ebreak buf))))))
@@ -4055,9 +4076,14 @@
       (rv-emit-addi buf +rv-sp+ +rv-sp+ frame)
       (rv-emit-jalr buf +rv-x0+ +rv-t1+ 0)
       ;; ---- heap exhausted after a full collection ----
+      ;; HOSTED, SAY SO: this was a bare EBREAK (SIGTRAP, exit 133, not a
+      ;; word) -- what any runaway recursion ends in here, since the
+      ;; interpreter keeps its frames on the heap.  x86-64's text and 137.
       (dolist (p exhausted) (here p))
-      (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0F0)
-      (rv-emit-ebreak buf)
+      (if *riscv-linux-mode*
+          (rv-emit-fatal buf (format nil "~%Modus: heap exhausted -- the live data does not fit the heap after a full collection~%") 137)
+          (progn (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0F0)
+                 (rv-emit-ebreak buf)))
       ;; ================= SCAN(a0 = slot address) =================
       ;; Forward the word at a0 if it points into from-space.  Uses t0-t6,
       ;; a1, a2 only.  State: s1/s2 from bounds, s5 object free, s6 cons low.
@@ -4160,8 +4186,10 @@
               (rv-emit-jalr buf +rv-x0+ +rv-ra+ 0)
               ;; -- to-space overflow: cannot happen if from-space fit --
               (here ovf) (here ovf2)
-              (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0F1)
-              (rv-emit-ebreak buf))))
+              (if *riscv-linux-mode*
+                  (rv-emit-fatal buf (format nil "~%Modus: collector to-space overflow~%") 137)
+                  (progn (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0F1)
+                         (rv-emit-ebreak buf))))))
         (dolist (r rets) (here r))
         (rv-emit-jalr buf +rv-x0+ +rv-ra+ 0)))))
 

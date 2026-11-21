@@ -160,7 +160,7 @@ end
 -- (LINK frames: [A6] the caller's A6, [A6+4] its return address), to
 -- SNAPDIR/prof.txt as "T PC RET1 RET2 ...".  The first line is "BASE b":
 -- ApplLimit ($130), where mac68k-chain.s's relocating load put the map
--- (scripts/mac68k-prof/native.py maps the addresses through cl.map).
+-- (scripts/mac68k-prof/native.lisp maps the addresses through cl.map).
 -- Sampled by a coroutine sleeping on emu.wait (emulated time), NOT a frame
 -- callback: those run at the video frame's end, exactly when the Mac's VBL
 -- interrupt does, and saw almost nothing but its handler.

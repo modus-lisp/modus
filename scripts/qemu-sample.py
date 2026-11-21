@@ -13,7 +13,7 @@ is a SIGUSR1 sent to it instead (SIGWINCH is ignored, so never stops it) -- the 
 resumes it without delivering it.  qemu-system honours the interrupt byte.
 
 The line format is scripts/period-lisps/lisp.lua's PROF format, so
-scripts/mac68k-prof/native.py and tree.native.py read it (no BASE line:
+scripts/mac68k-prof/native.lisp and tree-native.lisp read it (no BASE line:
 a hosted image runs where it is linked).
 
 Why: the compiler's cost is the same on every machine relative to the code

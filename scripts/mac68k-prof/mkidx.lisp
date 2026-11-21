@@ -1,0 +1,33 @@
+;;;; mkidx.lisp BUILDDIR OUTDIR LOAD -- OUTDIR/idx.json: for a paged image
+;;;; (BUILDDIR/cl.bin, its map cl.map, linked at LOAD), each stream's function
+;;;; name ("NAME [chunk]" for a later chunk of one), from the stream-load stubs
+;;;; (MOVEA.L A5,A1; MOVE.W #i,D0) the map's entries start with.  It replaced
+;;;; mkidx.py (2026-11-21).
+(load (merge-pathnames "prof-common.lisp" *load-truename*))
+(in-package #:mac68k-prof)
+(need "json-simple")
+(destructuring-bind (dir out load) (argv)
+  (let* ((load (num load))
+         (img (with-open-file (i (format nil "~A/cl.bin" dir) :element-type '(unsigned-byte 8))
+                (let ((v (make-array (file-length i) :element-type '(unsigned-byte 8)))) (read-sequence v i) v)))
+         (names (make-hash-table)))
+    (flet ((u16 (i) (logior (ash (aref img i) 8) (aref img (1+ i))))
+           (u32 (i) (logior (ash (aref img i) 24) (ash (aref img (+ i 1)) 16) (ash (aref img (+ i 2)) 8) (aref img (+ i 3)))))
+      (loop for (start nil name) across (read-map (format nil "~A/cl.map" dir))
+            do (let ((a (- start load)))
+                 (when (and (<= 0 a) (< a (- (length img) 8))
+                            (equalp (subseq img a (+ a 4)) #(#x22 #x4d #x30 #x3c)))
+                   (let ((i (u16 (+ a 4))))
+                     (unless (nth-value 1 (gethash i names)) (setf (gethash i names) name))))))
+      (let* ((k (search (map 'vector #'char-code "modusPGD") img))
+             (table (u32 (+ k 8))) (cnt (u32 (+ k 12)))
+             (idx (make-hash-table :test 'equal)) (cur "?") (top (make-hash-table :test 'equal)))
+        (dotimes (i cnt)
+          (setf (gethash (princ-to-string i) idx)
+                (multiple-value-bind (nm found) (gethash i names)
+                  (if found (setq cur nm) (concatenate 'string cur " [chunk]")))))
+        (setf (gethash "idx" top) idx (gethash "table" top) table (gethash "cnt" top) cnt)
+        (ensure-directories-exist (format nil "~A/" out))
+        (with-open-file (o (format nil "~A/idx.json" out) :direction :output :if-exists :supersede)
+          (write-string (funcall (find-symbol "STRINGIFY" "JSON-SIMPLE") top) o))
+        (format t "table ~X cnt ~D~%" table cnt)))))

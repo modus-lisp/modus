@@ -10,7 +10,9 @@ user's uploads plus public downloads, and everything built goes under
 |---|---|
 | `build-disks.sh [pearl mcl acl]` | fetches System 6.0.8 (archive.org `macintosh-system-6.0.8-hd.tar`), Debian 12's `unar` (into a private prefix) and `machfs` (into a venv), unpacks the uploads, and builds `disks/WHICH.hd.chd` (System 6.0.8 plus one Lisp, launched at startup) |
 | `mcl-join-cpt.py` | joins the three-segment Compact Pro archive `MCL 2.0.sea` / `.#2` / `.#3` (on MCL floppies 1-3) into one archive `unar` can extract |
-| `ndif.py`, `adouble.py` | Disk Copy 6 NDIF (ADC) decoder for the Allegro disks; AppleDouble reader |
+| `ndif.lisp DATA APPLEDOUBLE OUT` | a Disk Copy 6 NDIF image (the Allegro disks) as the raw disk: fs-apple's `ndif-read` and `appledouble-read`, cram's ADC |
+| `adouble.py` | AppleDouble reader for `mkvol.py`, until `mkvol.py` moves onto fs-apple's HFS (the format itself is fs-apple's `appledouble-read`) |
+| `strip.lisp RUNDIR [Y0 Y1]` | the Listener band of `shot-02.png` .. into `RUNDIR/strip.png`, one image to read every result from (pigment decodes, png-pure encodes) |
 | `mkvol.py APPS OUT.hfv [MB] [START]` | the System volume: `APPS` is a comma list of `pearl,mcl,acl,modus` and `START` picks the one launched at boot. `SYSTEM=753` uses the System Folder of the uploaded System 7.5.3 image instead of 6.0.8, with START's application copied into Startup Items. `MODUS_FORKS=DIR` names the Modus application (`scripts/mac68k-chain.lisp DISK OUT.bin --forks DIR`) |
 | `lisp.lua` | MAME autoboot driver. It waits `DELAY` emulated seconds, then types each `|`-separated form of `MAC_FORMS` plus Return, `GAP` seconds apart, and saves `SNAPDIR/shot-NN.png` before each form and once at the end |
 | `run-lisp.sh WHICH OUTDIR [MACHINE] [RAM]` | boots `disks/WHICH.hd.chd` (or `DISK=`) and types `bench-forms.lisp`, each form wrapped as `(time (eval (quote F)))` (`TIMED=0` to send them as is; `MAC_FORMS=` to override). `shot-(k+1)` shows form k's result |
@@ -36,6 +38,22 @@ sbcl --script scripts/mac68k-hd.lisp mm.hfv mm.hd --chd "env LD_LIBRARY_PATH=/tm
 
 `macqd950` is not in MAME 0.251. `run-lisp.sh` uses the Quadra-only 0.289 build at
 `/mnt/data-fast/claude/rss/msrc/mame/qd` for `macqd*` machines.
+
+## The emulators
+
+Debian bookworm's packages, unpacked into a private prefix (`dpkg-deb -x`) with
+whichever dependencies the host lacked, rather than installed:
+
+- `$RSS/b2/` (Basilisk II): `basilisk2`, and for its headless display `xvfb`,
+  `xserver-common`, `x11-xkb-utils`, `xkb-data`, `xauth`, `libxfont2`, `libgtk2.0-0`,
+  `libgtk2.0-common`, `libtinyxml2-9`.  `scripts/basilisk-unpie.lisp` relinks its JIT
+  binary low (`BasiliskII-jit-lo`).
+- `$RSS/mame/` (MAME 0.251): `mame`, `mame-data`, `mame-tools` (chdman) and the Qt 5,
+  SDL2-ttf, Lua 5.3, PortAudio/PortMidi, libinput and pugixml libraries they pull in.
+  `$RSS/mdev/` holds the development headers the Quadra-only MAME 0.289 build needed.
+- `unar`, for the Lisp archives: `build-disks.sh` step 3.
+
+`scripts/mac68k-prof/romlink.lisp` then gives each machine's ROMs their MAME names.
 
 ## Gotchas
 

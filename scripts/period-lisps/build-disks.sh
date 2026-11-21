@@ -78,7 +78,7 @@ for w in $WHICH; do
     ;;
   acl)
     [ -d acl122 ] || unar -q -k hidden -o acl122 ../in/acl122.hqx
-    for n in 1 2; do $PY $HERE/ndif.py "acl122/acl122/Allegro Common LISP $n.img" "acl122/acl122/._Allegro Common LISP $n.img" acl$n.dsk; done ;;
+    for n in 1 2; do WORKSPACE=${WORKSPACE:-$REPO/..} sbcl --script $HERE/ndif.lisp "acl122/acl122/Allegro Common LISP $n.img" "acl122/acl122/._Allegro Common LISP $n.img" acl$n.dsk; done ;;
   esac
 done
 

@@ -1053,8 +1053,17 @@
       ((null key) nil)
       ;; SYM's own-package expander wins over the legacy bare-name entry.
       ((%macro-pkg-get sym key))
-      ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P).
-      ((%macro-pkg-foreign-p sym key) nil)
+      ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P) --
+      ;; unless SYM is COMMON-LISP's own, exactly as MACRO-FUNCTION exempts
+      ;; it.  Without that, one package DEFMACROing its own DEFVAR (cortez's
+      ;; CORTEZ.GLOBAL:DEFVAR) left CL:DEFVAR and CL:DEFUN with NO expander
+      ;; here, so EVAL's no-compile path (%SIMPLE-OP-P) took them for
+      ;; functions and APPLIED them: (DEFVAR *X* ...) of a bound *X* signalled
+      ;; the compiler-macro shim's PROGRAM-ERROR.
+      ((and (not (let ((p (ignore-errors (symbol-package sym))))
+                   (and p (string= (package-name p) "COMMON-LISP"))))
+            (%macro-pkg-foreign-p sym key))
+       nil)
       ;; A symbol shadowing a CL name with no macro of its own has none: every
       ;; bare-name entry below is CL's (see MACRO-FUNCTION).
       ((%shadows-cl-name-p sym) nil)

@@ -10,6 +10,9 @@
 //                              library re-reads as it draws.
 //   files_copy(src, n, dst, m) the file or folder at src copied to dst, when nothing is there yet: the
 //                              bundle's sample media seeded into Documents.  Returns 1 if it copied.
+//   files_choose_folder()      a Mac's folder chooser, over the window: a handle, and a FOLDER event from it, (h
+//                              path), when a folder is chosen -- the folder itself, opened where it is, not
+//                              copied.  0 on the phone (its sandbox has no folders of the person's to open).
 
 #if os(macOS)
 import AppKit          // the macOS window host builds this file too (host/macos/build-macos.sh gui)
@@ -76,7 +79,25 @@ let filesPick: Call = { p, n, _, _, _, _ in
     }
     return 1
 }
+
+let filesChooseFolder: Call = { _, _, _, _, _, _ in
+    guard let root = rootView(), let window = root.window else { return 0 }
+    let handle = nextHandle
+    nextHandle += 1
+    let panel = NSOpenPanel()
+    panel.canChooseDirectories = true
+    panel.canChooseFiles = false
+    panel.allowsMultipleSelection = false
+    panel.prompt = "Open"
+    panel.beginSheetModal(for: window) { response in
+        guard response == .OK, let url = panel.url else { return }
+        send("FOLDER", [.int(Int(handle)), .string(url.path)])
+    }
+    return handle
+}
 #else
+let filesChooseFolder: Call = { _, _, _, _, _, _ in 0 }
+
 private final class Picked: NSObject, UIDocumentPickerDelegate {
     let into: URL
     init(into: URL) { self.into = into }
@@ -131,4 +152,5 @@ func installFiles() {
     register("files_copy", filesCopy)
     register("files_documents", filesDocuments)
     register("files_pick", filesPick)
+    register("files_choose_folder", filesChooseFolder)
 }

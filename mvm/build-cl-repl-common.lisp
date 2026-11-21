@@ -497,6 +497,23 @@
   nil)
 (defun %monotonic-ns ()
   (floor (* (rdtsc) 1000000000) (cntfrq)))
+;; net/bare-sync.lisp's mutex arena: 32 KB of low RAM nothing else uses (the pcboot shim and
+;; MODUS.COM keep to segments #x1000-#x4000 and #x7000; the stub to #x8000-#x8300, #x1B000-
+;; #x2AFFF and #x90000), identity-mapped by the stub: 511 cells.  The prologue zeroes its
+;; count on every boot, a restored core's included (the arena is not in the core).
+(declaim (overridable %bare-sync-arena))
+(defun %bare-sync-arena () (values #x50000 #x58000))
+;; ... and its cells are handed out round-robin, never exhausted.  bare-sync never reclaims a
+;; cell, and a desk makes framebuffers (two mutexes each) as windows open, so a fixed pool
+;; would run out mid-session.  With one thread a mutex is a flag store and nothing waits, so
+;; two objects sharing a cell cannot block each other.  A cell is zeroed on its first use only.
+(declaim (overridable %sync-cell))
+(defun %sync-cell ()
+  (let* ((n (mem-ref #x50000 :u32))
+         (a (+ #x50000 64 (* (mod n 511) 64))))
+    (when (< n 511) (dotimes (i 8) (%gc-write64 (+ a (* i 8)) 0)))
+    (setf (mem-ref #x50000 :u32) (+ n 1))
+    a))
 "
         "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
@@ -3368,8 +3385,8 @@
    the core holds the heap, not the code area, so a function translated now
    would be a pointer into an empty area after the restore -- measured: every
    form boot had run natively jumped into zeros.  The restored image starts
-   the tier at its first DEFUN.\"
-  (not (%i386-core-save-requested-p)))
+   the tier at its first DEFUN.  SAVELATER the same: the save comes after an install.\"
+  (not (or (%i386-core-save-requested-p) (%i386-core-save-later-p))))
 ")))
 
 ;;; :MAC68K + MODUS_68K_JIT=1: the runtime threaded JIT (mvm/jit-68k.lisp) in
@@ -3753,29 +3770,47 @@
   ;; stub zeroed the whole block on a cold one)
   (let ((at (search "  (write-string-serial \"MODUS-CL\")" *cli-arch-kernel-prologue*)))
     (unless at (error "i386 core: the prologue's banner moved"))
+    ;; THE MUTEX ARENA (net/bare-sync.lisp, %BARE-SYNC-ARENA below) is low RAM, not heap:
+    ;; a core does not carry it, so its cell count is reset on EVERY boot, a restored one
+    ;; included -- a count left in RAM by the firmware would make every MAKE-MUTEX (two per
+    ;; glass framebuffer) answer "arena exhausted".  A restored mutex and a new one may then
+    ;; share a cell; with one thread a lock is a flag store, so that is harmless.
     (setq *cli-arch-kernel-prologue*
-          (concatenate 'string "  (unless (eql (mem-ref #x8024 :u32) 1)
+          (concatenate 'string "  (setf (mem-ref #x50000 :u32) 0)
+  (setf (mem-ref #x50004 :u32) 0)
+  (unless (eql (mem-ref #x8024 :u32) 1)
 " (subseq *cli-arch-kernel-prologue* 0 at) "  )
 " (subseq *cli-arch-kernel-prologue* at))))
   (setq *cli-arch-override-source*
         (concatenate 'string *cli-arch-override-source* "
 (defun %core-requested-p () (eql (mem-ref #x8024 :u32) 1))
+;; What a restored core runs before the REPL: a function designator, set before the save
+;; (kiln t420: (setq modus-int::*core-restart-hook* 'kiln-t420-main)), carried by the heap.
+(defvar *core-restart-hook* nil)
 (defun %core-pre-restore () t)
 (defun %restore-image () nil)
 (defun %core-post-restore () nil)
-(defun %i386-core-save-requested-p ()
-  ;; SAVECORE in the Multiboot command line (QEMU -append), which the entry
-  ;; stub copied to #x8200 (boot-i386-cl.lisp +I386-CL-CMDLINE+).
-  (let ((i 0) (hit nil))
+(defun %i386-cmdline-has-p (word)
+  ;; WORD in the Multiboot command line (QEMU -append), which the entry stub
+  ;; copied to #x8200 (boot-i386-cl.lisp +I386-CL-CMDLINE+).
+  (let ((i 0) (hit nil) (n (length word)))
     (loop
       (when (or hit (>= i 248) (eql (mem-ref (+ #x8200 i) :u8) 0)) (return nil))
-      (when (and (eql (mem-ref (+ #x8200 i) :u8) 83) (eql (mem-ref (+ #x8201 i) :u8) 65)
-                 (eql (mem-ref (+ #x8202 i) :u8) 86) (eql (mem-ref (+ #x8203 i) :u8) 69)
-                 (eql (mem-ref (+ #x8204 i) :u8) 67) (eql (mem-ref (+ #x8205 i) :u8) 79)
-                 (eql (mem-ref (+ #x8206 i) :u8) 82) (eql (mem-ref (+ #x8207 i) :u8) 69))
-        (setq hit t))
+      (let ((k 0))
+        (loop
+          (when (>= k n) (setq hit t) (return nil))
+          (unless (eql (mem-ref (+ #x8200 i k) :u8) (char-code (char word k))) (return nil))
+          (setq k (+ k 1))))
       (setq i (+ i 1)))
     hit))
+(defun %i386-core-save-requested-p ()
+  ;; SAVECORE: save the core as boot init ends, before the REPL
+  (%i386-cmdline-has-p \"SAVECORE\"))
+(defun %i386-core-save-later-p ()
+  ;; SAVELATER: this boot will be saved, but later -- by whoever drives the REPL
+  ;; (kiln t420: install the desk, then (%I386-CORE-SAVE)) -- so the native tier
+  ;; stays off as for SAVECORE, and nothing saves at boot
+  (%i386-cmdline-has-p \"SAVELATER\"))
 (defun %i386-core-save ()
   \"Collect until the live data is at the bottom of the lower semispace, say
    where it ends, and stop: scripts/dos386-core.py reads the guest from here.
@@ -3792,6 +3827,12 @@
     (print-dec (mem-ref #x10000E00 :u32))
     (write-string-serial \" handlers=\")
     (print-dec (mem-ref #x10000400 :u32))
+    ;; the native tier's code in use, from the area's base (#x12000000): a core saved
+    ;; after it ran carries this too, and the stub puts it back where it was
+    (write-string-serial \" jit=\")
+    (print-dec (if (and (boundp (quote *n386-ptr*)) (integerp *n386-ptr*))
+                   (- *n386-ptr* #x12000000)
+                   0))
     (write-char-serial 10)
     (halt)))
 "))
@@ -3805,8 +3846,17 @@
                        "  (when (%i386-core-save-requested-p) (%i386-core-save))
 "
                        (subseq *cli-arch-kernel-epilogue* at))))
+  ;; A restored core runs its restart hook (kiln t420's desk) when it was saved with one, as
+  ;; the Pi's does; the REPL when the hook returns, or when there is none.
   (setq *cli-arch-core-resume* "    (write-string-serial \"MODUS-CORE\")
     (write-char-serial 10)
+    (when (and (boundp (quote *core-restart-hook*)) *core-restart-hook*)
+      (write-string-serial \"CORE-RESTART-HOOK\")
+      (write-char-serial 10)
+      (handler-case (funcall *core-restart-hook*)
+        (t (c) (write-string-serial \"RESTART-HOOK-DIED: \")
+               (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+               (write-char-serial 10))))
     (handler-case (cl-serial-repl)
       (t (c) (write-string-serial \"REPL-DIED: \")
              (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
@@ -3919,6 +3969,11 @@
   (cl-user::mvm-load "boot/boot-linux-i386.lisp")
   (cl-user::mvm-load "boot/boot-i386-cl.lisp")
   (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
+  ;; MODUS_SYMMAP=FILE: the image's symbol map (cross.lisp WRITE-SYMMAP), so a fault
+  ;; address in the image can be named.
+  (let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
+    (when (and sm (plusp (length sm)))
+      (setf (symbol-value (intern "*WRITE-SYMMAP-PATH*" "MODUS.MVM")) sm)))
   (funcall (intern "I386-SET-CL-BARE-MODE" "MODUS.MVM.I386")
            (symbol-value (intern "+LINUX-I386-GLOBALS+" "MODUS.MVM"))
            (symbol-value (intern "+LINUX-I386-HEAP-MARGIN-ADDR+" "MODUS.MVM"))

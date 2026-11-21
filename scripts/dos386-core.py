@@ -89,19 +89,49 @@ def main():
     img = open(image, 'rb').read()
     tmp = tempfile.mkdtemp(prefix='dos386-core-')
     sock = os.path.join(tmp, 'qmp.sock')
-    p = subprocess.Popen(['qemu-system-i386', '-cpu', '486', '-m', os.environ.get('QEMU_MEM', '64'),
+    # CORE_FORMS=FILE: an INSTALL core.  Boot with SAVELATER (the native tier off, nothing
+    # saved at boot), type FILE's lines at the REPL one at a time, each after the previous
+    # prompt, then (%I386-CORE-SAVE): the core carries whatever they loaded.  kiln t420
+    # installs the desk this way.  QEMU_EXTRA adds QEMU arguments (its network), QEMU_CPU
+    # the CPU model, CORE_LOG the serial transcript.
+    forms_path = os.environ.get('CORE_FORMS')
+    forms = []
+    if forms_path:
+        forms = [l.rstrip('\n') for l in open(forms_path)
+                 if l.strip() and not l.lstrip().startswith(';')]
+        forms.append('(modus-int::%i386-core-save)')
+    p = subprocess.Popen(['qemu-system-i386', '-cpu', os.environ.get('QEMU_CPU', '486'),
+                          '-m', os.environ.get('QEMU_MEM', '64'),
                           '-kernel', image, '-display', 'none', '-serial', 'stdio', '-no-reboot',
-                          '-append', 'SAVECORE',
-                          '-qmp', 'unix:%s,server=on,wait=off' % sock],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                          '-append', os.environ.get('CORE_APPEND', 'SAVELATER' if forms else 'SAVECORE'),
+                          '-qmp', 'unix:%s,server=on,wait=off' % sock]
+                         + os.environ.get('QEMU_EXTRA', '').split(),
+                         stdin=subprocess.PIPE if forms else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    log = open(os.environ['CORE_LOG'], 'wb') if os.environ.get('CORE_LOG') else None
     try:
         buf, t0 = b'', time.time()
+        mark = 0                          # where the last form's answer starts
+        limit = float(os.environ.get('CORE_FORM_LIMIT', '3600'))
         while b'CORE-SAVE' not in buf or not buf.split(b'CORE-SAVE', 1)[1].count(b'\n'):
-            if time.time() - t0 > 600 or p.poll() is not None:
+            if time.time() - t0 > (600 + limit * len(forms)) or p.poll() is not None:
                 sys.exit('no CORE-SAVE line; serial said:\n' + buf.decode('latin1')[-2000:])
+            if forms and (b'\n> ' in buf[mark:] or buf[mark:].startswith(b'> ')):
+                if mark and b'\nERROR:' in buf[mark:]:
+                    sys.exit('a form failed; serial said:\n' + buf[mark:].decode('latin1')[-2000:])
+                form = forms.pop(0)
+                print('form %.0fs: %s' % (time.time() - t0, form[:100]))
+                mark = len(buf)
+                p.stdin.write(form.encode() + b'\r')
+                p.stdin.flush()
+            pf = buf.find(b'#PF ', mark)
+            if b'REPL-DIED' in buf[mark:] or (pf >= 0 and b'\n' in buf[pf:]):
+                sys.exit('the guest died; serial said:\n' + buf.decode('latin1')[-2000:])
             r, _, _ = select.select([p.stdout], [], [], 1)
             if r:
-                buf += os.read(p.stdout.fileno(), 65536)
+                d = os.read(p.stdout.fileno(), 65536)
+                buf += d
+                if log: log.write(d); log.flush()
         line = buf.split(b'CORE-SAVE', 1)[1].split(b'\n', 1)[0].decode()
         f = {k: int(v) for k, v in re.findall(r'(\w+)=(-?\d+)', line)}
         print('CORE-SAVE', f, 'boot took %.1f s' % (time.time() - t0))
@@ -142,6 +172,14 @@ def main():
         nbits = (free - page) // 16
         bm1 = clear_from(read(f['bm1'], bm_bytes), nbits)
         bm2 = clear_from(read(f['bm2'], bm_bytes), nbits)
+        # THE NATIVE TIER'S CODE (jit=, %I386-CORE-SAVE): what it translated at
+        # #x12000000.  A core saved after the tier ran points into it (the function
+        # tables, and every closure native code made), so it travels with the heap;
+        # the stub copies it back to the same address (boot-i386-cl.lisp, header +44).
+        jit_bytes = (f.get('jit', 0) + 3) & ~3
+        jit = read(0x12000000, jit_bytes) if jit_bytes > 0 else b''
+        if jit_bytes:
+            print('native code: %d bytes' % jit_bytes)
         live = read(LOAD, len(img))
     finally:
         p.kill()
@@ -188,7 +226,7 @@ def main():
             assert tail_lo >= phi, 'the boot-only tail is inside the gap'
             tail_lo -= gap
             tail_hi -= gap
-    core = low + heap + bm1 + bm2
+    core = low + heap + bm1 + bm2 + jit
     store_pa = 0
     if store:
         store_pa = hdr_pa + 64 + len(core)
@@ -207,8 +245,9 @@ def main():
         n = struct.unpack_from('<I', store, 12)[0]
         index, data = store[:16 + 4 * (n + 1)], store[16 + 4 * (n + 1):]
     version = 5 if disk else 4 if gap else 3 if store else 2
-    hdr = struct.pack('<4sIIIIIIIIII', b'MCOR', version, free,
-                      heap_bytes, bm_bytes, tail_lo, tail_hi, store_pa, pool, gap, 0)
+    hdr = struct.pack('<4sIIIIIIIIIII', b'MCOR', version, free,
+                      heap_bytes, bm_bytes, tail_lo, tail_hi, store_pa, pool, gap, 0,
+                      len(jit))
     body += hdr + b'\0' * (64 - len(hdr)) + core
     if store:
         body += b'\0' * (store_pa - LOAD - len(body))

@@ -116,6 +116,9 @@
    sixteenth of the RAM, 256 KB to 8 MB.  0: no area (no native tier).")
 (defconstant +i386-cl-jit-area+ #x12000000
   "jit-i386-native.lisp's +N386-AREA-ADDR+: the hosted layout's code area.")
+(defconstant +i386-cl-v-jitb+ #x80B0
+  "A restored core's native code bytes (its header +44, scripts/dos386-core.py): copied
+   back to +I386-CL-JIT-AREA+ after the bitmap slices, where the core keeps them.")
 (defconstant +i386-cl-v-netpa+ #x80AC
   "The net block's PHYSICAL address (0: none): RAM mapped at +I386-CL-NET-VA+ on
    a machine of 32 MB or more, for the NIC drivers' state and DMA rings -- a
@@ -740,6 +743,18 @@
        '(#x0F #x20 #xD0) '(:call 0 pf-hex)                    ; cr2
        '(#xB0 #x20) '(:call 0 pf-putc)
        '(#x8B #x44 #x24 #x24) '(:call 0 pf-hex)               ; the faulting EIP
+       ;; ... then its EBP and the top 32 words of its stack (it ran at our privilege level,
+       ;; so its ESP is just above the error code, EIP, CS and EFLAGS): the return addresses
+       ;; there name the callers through MODUS_SYMMAP.  Read at ESP only -- following a
+       ;; possibly broken EBP chain from here could fault inside the fault handler.
+       '(#xB0 #x20) '(:call 0 pf-putc) '(#xB0 #x45) '(:call 0 pf-putc)
+       '(#x8B #x44 #x24 #x08) '(:call 0 pf-hex)               ; EBP, as PUSHAD saved it
+       '(#x8D #x74 #x24 #x30)                                 ; esi = the faulting ESP
+       (cons #xBB (i386l-le32-list 32))                       ; ebx = 32 words
+       '(:label pf-stk)
+       '(#xB0 #x20) '(:call 0 pf-putc)
+       '(#x8B #x06) '(:call 0 pf-hex)                         ; [esi]
+       '(#x83 #xC6 #x04) '(#x4B) '(:jcc32 #x75 pf-stk)        ; esi += 4; --ebx
        '(#xB0 #x0A) '(:call 0 pf-putc)
        '(:label pf-halt) '(#xFA) '(#xF4) '(:j8 #xEB pf-halt)
        '(:label pf-putc)                                      ; AL to COM1
@@ -778,6 +793,7 @@
        (i386cl-abs '(#xA3) +i386-cl-v-count+)
        '(#x8B #x43 #x0C) (i386cl-abs '(#xA3) +i386-cl-v-heapb+)
        '(#x8B #x43 #x10) (i386cl-abs '(#xA3) +i386-cl-v-bmb+)
+       '(#x8B #x43 #x2C) (i386cl-abs '(#xA3) +i386-cl-v-jitb+)   ; native code bytes (0: none)
        (list #x8D #x73 +i386-cl-core-data+)                   ; lea esi, [ebx+64]
        (cons #xBF (i386l-le32-list +i386-cl-low-va+))
        (cons #xB9 (i386l-le32-list (floor +i386-cl-low-size+ 4))) '(#xF3 #xA5)   ; rep movsd
@@ -787,6 +803,18 @@
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-bmb+) '(#xC1 #xE9 #x02) '(#xF3 #xA5)
        (i386cl-abs '(#x8B #x3D) +i386-cl-v-bm2+)
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-bmb+) '(#xC1 #xE9 #x02) '(#xF3 #xA5)
+       ;; the native tier's code, right after the slices: back to the code area it was
+       ;; translated into, which is mapped by now.  A machine whose area is smaller (under
+       ;; 16 MB of RAM there is none) skips the copy: the heap is still restored, but its
+       ;; natively translated functions point at nothing there -- such a core is for
+       ;; machines with the RAM of the one that saved it (kiln t420: 1 GB under QEMU, so
+       ;; the full 8 MB area, as on any machine of 128 MB or more)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-jitb+)
+       '(#x85 #xC9) '(:jcc32 #x74 core-nojit)                 ; none
+       (i386cl-abs '(#x3B #x0D) +i386-cl-v-jitsz+) '(:jcc32 #x77 core-nojit)   ; ja: too big
+       (cons #xBF (i386l-le32-list +i386-cl-jit-area+))
+       '(#xC1 #xE9 #x02) '(#xF3 #xA5)
+       '(:label core-nojit)
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-core+) (i386l-le32-list 1))
        '(:label no-core)
        ;; ---- what the hosted stub does after its mmaps (boot-linux-i386) ----

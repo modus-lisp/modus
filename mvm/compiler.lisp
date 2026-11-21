@@ -4374,6 +4374,17 @@
                   (or (not fallback) (fboundp (car exp))))))
        t))
 
+(defun %setf-site-setter (site name)
+  "Refill a SETF site's cache cons SITE (REGISTRY . SETTER) for accessor NAME, and
+   return the setter (or NIL): the registry as it stands, and what it says for
+   NAME.  The setter is stored before the registry it answers for, so a reader
+   that sees the new head also sees its answer."
+  (let ((reg *setf-function-registry*)
+        (fn (%find-setf-function name)))
+    (setf (cdr site) fn)
+    (setf (car site) reg)
+    fn))
+
 (defun %find-setf-function (name)
   "SETTER-SYMBOL registered for accessor NAME by (defun (setf NAME) …), or
    NIL.  Most-recent registration wins (entries are PUSHed), matching
@@ -7679,14 +7690,29 @@
                  ;; the value.
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
                                        (%setter-pkg (car place)))))
+                   ;;
+                   ;; AND THE LOOKUP IS CACHED AT THE SITE.  Asked on every call, it
+                   ;; was a registry walk per store -- a struct accessor takes this
+                   ;; path, and pigment's JPEG bit reader (INCF / SETF of DEFSTRUCT
+                   ;; slots) went 30x slower.  Each site owns a cons (REGISTRY .
+                   ;; SETTER): the registry is a list every registration pushes a
+                   ;; new head onto, so while its head is EQ the one cached here no
+                   ;; (SETF NAME) has been defined since and SETTER still answers.
+                   ;; It starts :UNSET, which no registry is EQ to; a FASL replays
+                   ;; the cons as a fresh copy, whose car no live registry is EQ to
+                   ;; either, so it refills on first use (%SETF-SITE-SETTER).
                    (if *mvm-eval-runtime-p*
                        (let ((gargs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "SFA"))
                                             (cdr place)))
                              (gval (%mvm-gensym "SFV"))
-                             (gfn (%mvm-gensym "SFF")))
+                             (gfn (%mvm-gensym "SFF"))
+                             (gsite (%mvm-gensym "SFS")))
                          `(let* (,@(mapcar #'list gargs (cdr place))
                                  (,gval ,value)
-                                 (,gfn (%find-setf-function ',(car place))))
+                                 (,gsite (quote ,(cons :unset nil)))
+                                 (,gfn (if (eq (car ,gsite) *setf-function-registry*)
+                                           (cdr ,gsite)
+                                           (%setf-site-setter ,gsite ',(car place)))))
                             (if ,gfn
                                 (funcall ,gfn ,gval ,@gargs)
                                 (,setter ,@gargs ,gval))))

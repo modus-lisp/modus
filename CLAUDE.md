@@ -27,7 +27,10 @@ Mac's floppy runtime (`mvm/mac68k-files.lisp`, `mvm/mac68k-disk-io.lisp`) and it
 assembly -- boot blocks, the LZMA loader and decoder, the cold-code disk driver, disk 2's
 prompt, the SCSI boot, the chain loader (`scripts/mac68k-*.s`, `mac68k-lzma.inc`) -- are
 vessel's too (2026-11-21); the Mac disk scripts assemble them through
-`MAC68K-TOOLS:KERNEL-SOURCE` / `kernel_source`, MODUS-SOURCE's rule.  What
+`MAC68K-TOOLS:KERNEL-SOURCE`, MODUS-SOURCE's rule.  The Mac's emulator workbench -- the
+period-Lisp MAME harness, the profile readers, the screen-console REPL driver -- is vessel's
+`tools/mac68k/`.  (The Mac disk builders, which read the translator's layouts, and the
+68k ladder stay here; all of it Lisp now, no Python.)  What
 hosted modus reads too (`ip`, `ssh`, `crypto*`, `actors`, the `sb-*` shims) stays here.  So
 do the boot descriptors (`boot/*.lisp`), by decision rather than by omission: they are the
 compiler's knowledge of how to emit a freestanding image for each target, `lib/load-mvm.lisp`

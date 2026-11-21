@@ -405,7 +405,7 @@ ID, marked open), adds a locked, non-ejectable drive, and the ROM boots that
 drive's boot blocks.  PRIME reads through the SCSI Manager (Get, Select, READ(6)
 Cmd, RBlind, Complete).  `_SCSIDispatch` is a Toolbox trap: it may clobber
 D0-D2/A0-A1 under Pascal's convention, which first read as a SCSI error of
-5696.  `scripts/mac68k-mame-repl.lua` types forms when the prompt shows and taps
+5696.  vessel's `tools/mac68k/mame-repl.lua` types forms when the prompt shows and taps
 the SCC for what the Mac sends.  Measured, in emulated time: the prompt at
 288 s from power-on, `(+ 1 2)` => 3, `(defun sq ...)` => SQ, `(sq 12)` => 144,
 on the Classic's 1-bit screen.

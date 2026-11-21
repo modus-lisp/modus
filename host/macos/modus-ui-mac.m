@@ -56,6 +56,9 @@ static void queue_event(uint64_t e) {
 }
 
 static void push_pointer(long type, long x, long y) {
+    static int debug = -1;
+    if (debug < 0) debug = getenv("MODUS_UI_DEBUG") != NULL;
+    if (debug) fprintf(stderr, "modus-ui-mac: pointer type %ld at %ld,%ld\n", type, x, y);
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x >= fb_w) x = fb_w - 1;
@@ -103,6 +106,9 @@ static uint32_t special_keysym(unsigned short code) {
 @implementation ModusView
 - (BOOL)isFlipped { return YES; }                  // y grows down, as the framebuffer does
 - (BOOL)acceptsFirstResponder { return YES; }
+// A click on a window that is not key would otherwise only activate it: NSView drops the first
+// mouse-down unless it accepts first mouse.  The desk should react to that first click too.
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
 - (BOOL)wantsUpdateLayer { return NO; }
 
 - (NSPoint)pixelPointOf:(NSEvent *)e {

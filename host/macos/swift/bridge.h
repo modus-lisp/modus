@@ -15,6 +15,11 @@ void *modus_mac_root_view(void);
 // again, and a resize event for the image if either changed.
 void modus_mac_relayout(void);
 
+// The app's own events (modus-ui-mac.m): the hooks the Swift side sets, and the opens kept until it did.
+extern void (*modus_mac_opened_hook)(int kind, const char *url);
+extern int (*modus_mac_quit_hook)(void);
+void modus_mac_opened_flush(void);
+
 // Lock the pointer (1: hidden, held still, its moves sent as motion events, type 13) or let it go (0).
 void modus_mac_pointer_lock(int on);
 

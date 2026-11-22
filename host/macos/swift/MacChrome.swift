@@ -18,6 +18,13 @@
 //                                          unless it has a menu
 //   status_item_title(item, title, len)    its text, changed
 //   status_item_menu(item, menu)           the menu it opens when clicked
+//
+// THE APP'S OWN EVENTS (handle 0): OPENED (a file's path, or a link, opened with the app: Finder's Open With, `open`,
+// the app's URL scheme), DROPPED (a file dropped on the window), APPSTATE ("active", "inactive", "hidden",
+// "shown"), and QUIT once mac_on_quit(1) asked for it -- the app then waits (five seconds at most) for mac_quit_reply.
+//   mac_on_quit(on)   mac_quit_reply()
+//   dock_badge(text, len)                  the Dock icon's badge ("" clears it)
+//   dock_bounce(critical)                  the Dock icon bounces once (until the app is active, if CRITICAL)
 
 import AppKit
 
@@ -153,7 +160,52 @@ let statusItemMenu: Call = { s, m, _, _, _, _ in
     return 1
 }
 
+// ---- the app's own events, and the Dock -------------------------------------------------------------------------------
+
+private var quitWanted = false
+private var appStateObservers: [NSObjectProtocol] = []
+
+let macOnQuit: Call = { on, _, _, _, _, _ in quitWanted = on != 0; return 1 }
+let macQuitReply: Call = { _, _, _, _, _, _ in NSApp.reply(toApplicationShouldTerminate: true); return 1 }
+
+let dockBadge: Call = { p, n, _, _, _, _ in
+    let t = text(p, n)
+    NSApp.dockTile.badgeLabel = t.isEmpty ? nil : t
+    return 1
+}
+
+let dockBounce: Call = { critical, _, _, _, _, _ in
+    NSApp.requestUserAttention(critical != 0 ? .criticalRequest : .informationalRequest)
+    return 1
+}
+
+private func installAppEvents() {
+    modus_mac_opened_hook = { kind, url in
+        guard let url else { return }
+        send(kind == 0 ? "OPENED" : "DROPPED", [.int(0), .string(String(cString: url))])
+    }
+    modus_mac_quit_hook = {
+        guard quitWanted else { return 0 }
+        send("QUIT", [.int(0)])
+        return 1
+    }
+    modus_mac_opened_flush()                          // what was opened before now (at launch)
+    let states: [(Notification.Name, String)] = [
+        (NSApplication.didBecomeActiveNotification, "active"), (NSApplication.didResignActiveNotification, "inactive"),
+        (NSApplication.didHideNotification, "hidden"), (NSApplication.didUnhideNotification, "shown")]
+    for (name, state) in states {
+        appStateObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+            send("APPSTATE", [.int(0), .string(state)])
+        })
+    }
+}
+
 func installChrome() {
+    installAppEvents()
+    register("mac_on_quit", macOnQuit)
+    register("mac_quit_reply", macQuitReply)
+    register("dock_badge", dockBadge)
+    register("dock_bounce", dockBounce)
     register("glass_new", glassNew)
     register("glass_button", glassButton)
     register("menu_new", menuNew)

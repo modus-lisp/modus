@@ -191,6 +191,8 @@ static BOOL moving_window;
 
 @interface ModusView : NSView
 @end
+static void opened(int kind, NSString *url);       // below: a file or link for the image
+
 @implementation ModusView
 - (BOOL)isFlipped { return YES; }                  // y grows down, as the framebuffer does
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -198,8 +200,18 @@ static BOOL moving_window;
 // mouse-down unless it accepts first mouse.  The desk should react to that first click too.
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
 - (BOOL)wantsUpdateLayer { return NO; }
+// FILES DROPPED on the window go to the image (a DROPPED event each), as files opened with the app do.
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info { (void)info; return NSDragOperationCopy; }
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)info {
+    NSArray<NSURL *> *urls = [info.draggingPasteboard readObjectsForClasses:@[ NSURL.class ]
+                                                                    options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }];
+    for (NSURL *u in urls) opened(1, u.path);
+    return urls.count > 0;
+}
+
 // THE POINTER'S MOVES over the view, while the window is key (for hover): a tracking area that follows the view's size
 - (void)viewDidMoveToWindow {
+    if (self.window) [self registerForDraggedTypes:@[ NSPasteboardTypeFileURL ]];
     if (self.window && self.trackingAreas.count == 0)
         [self addTrackingArea:[[NSTrackingArea alloc]
                                   initWithRect:NSZeroRect
@@ -358,6 +370,27 @@ static void command_chord(uint32_t letter) {
 - (void)selectAll:(id)sender { (void)sender; command_chord('a'); }
 @end
 
+// THE APP'S OWN EVENTS, for the image: files and links opened with the app (Finder's Open With, `open`, a link in the
+// app's URL scheme) and files dropped on its window, and a quit the image may hold up to finish what it is doing.
+// The Swift side sets the hooks (host/macos/swift/MacChrome.swift); what comes before it does -- a file opened at
+// launch -- is kept and handed over then (modus_mac_opened_flush).
+void (*modus_mac_opened_hook)(int kind, const char *url);   // KIND 0 opened, 1 dropped
+int (*modus_mac_quit_hook)(void);   // 1: the image is told and answers (Swift's mac_quit_reply); 0: quit now
+static NSMutableArray *pending_opened;
+
+static void opened(int kind, NSString *url) {
+    if (!url) return;
+    if (modus_mac_opened_hook) { modus_mac_opened_hook(kind, url.UTF8String); return; }
+    if (!pending_opened) pending_opened = [NSMutableArray array];
+    [pending_opened addObject:@[ @(kind), url ]];
+}
+
+void modus_mac_opened_flush(void) {
+    if (!modus_mac_opened_hook) return;
+    for (NSArray *a in pending_opened) modus_mac_opened_hook([a[0] intValue], [a[1] UTF8String]);
+    [pending_opened removeAllObjects];
+}
+
 // Modifiers held when the window stops taking keys are released in the image (their releases go elsewhere).
 static void release_modifiers(void) { set_modifiers(0); }
 
@@ -427,6 +460,23 @@ static NSString *app_name(void) {
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app {
     (void)app;
     return YES;
+}
+// A FILE OR LINK OPENED WITH THE APP: a file's path, or a link as it is.
+- (void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls {
+    (void)app;
+    for (NSURL *u in urls) opened(0, u.isFileURL ? u.path : u.absoluteString);
+}
+// A QUIT the image asked to hear of: it finishes what it is doing and says so (mac_quit_reply) -- or, five seconds on,
+// the app quits anyway.
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
+    (void)app;
+    if (modus_mac_quit_hook && modus_mac_quit_hook()) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            [NSApp replyToApplicationShouldTerminate:YES];
+        });
+        return NSTerminateLater;
+    }
+    return NSTerminateNow;
 }
 - (void)applicationWillTerminate:(NSNotification *)n {
     (void)n;

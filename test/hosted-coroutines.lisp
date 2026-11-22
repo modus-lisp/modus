@@ -104,6 +104,25 @@
   (check "and main's own HANDLER-CASE around a transfer still works"
          (eq (handler-case (coroutine-transfer th nil) (error () :wrong)) :again)))
 
+;; 6. Code EVAL runs in a coroutine (the interpreter) sees the coroutine's own
+;; window: its HANDLER-CASE dispatches on the condition it signalled, not on
+;; the last one MAIN handled.  The interpreter used to read window slots at
+;; main's address, take the "main binds shallowly" fast path of a special read,
+;; and see main's *CURRENT-CONDITION*: an ERROR clause bound main's old
+;; condition and a SIMPLE-ERROR clause missed its own SIMPLE-ERROR.
+(handler-case (car (eval 1)) (error () nil))   ; main's last handled condition: a TYPE-ERROR
+(let ((ev (coroutine-create
+           (lambda (v)
+             (declare (ignore v))
+             (list (eval '(handler-case (error "fresh") (error (e) (princ-to-string e))))
+                   (handler-case
+                       (eval '(handler-case (error 'simple-error :format-control "typed")
+                               (simple-error (e) (princ-to-string e))))
+                     (error () :escaped))
+                   (eval '(let ((*probe* :bound-in-eval)) (list *probe*))))))))
+  (check "EVAL'd code in a coroutine sees its own condition, its own clause, its own binding"
+         (equal (coroutine-transfer ev nil) '("fresh" "typed" (:bound-in-eval)))))
+
 (defun deep (n) (if (zerop n) 0 (+ 1 (deep (- n 1)))))
 (let ((dp (coroutine-create (lambda (n) (deep n)))))
   (check "a coroutine recurses 100000 deep on its own stack" (eql (coroutine-transfer dp 100000) 100000)))

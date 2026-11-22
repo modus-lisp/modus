@@ -3887,6 +3887,11 @@
 ;; Narrow AOT string literals (compiler.lisp *NARROW-LITERALS-P*) wherever
 ;; *CL-REPL-RPI-CORE-SOURCE* turns %NARROW-STRINGS-P on.
 (when cl-user::*cl-repl-rpi-p* (setq *narrow-literals-p* t))
+
+;; MODUS_W32_UNSAFE_LIVE=1: the collector rung's NEGATIVE CONTROL -- raw W32
+;; variables are not split around GC points (compiler.lisp *W32-UNSAFE-LIVE*,
+;; test/w32-gc-live.lisp).  Never for a real image.
+(setq modus.mvm::*w32-unsafe-live* (equal (sb-ext:posix-getenv "MODUS_W32_UNSAFE_LIVE") "1"))
 ;; i386: AOT string literals POOLED (compiler.lisp *NARROW-LITERALS-P*), each
 ;; evaluation a %FRESH-STRING copy of the pooled one -- wide here, i386 has no
 ;; narrow strings -- instead of one LI and one OBJ-SET per character: 919 KB of

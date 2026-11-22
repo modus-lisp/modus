@@ -1160,7 +1160,13 @@ block at `#x0C000000`, on machines of 32 MB or more.  Three 32-bit facts it took
   (docs/w32.md M4).  On the 30-bit towers FE-MUL takes a second body in raw 32-bit words
   (`%IF-W32`, W64 pairs, no allocation): bare-i386 X25519 5-6.5 s -> 73 ms,
   arm32 3.9 s -> 55 ms; x64 compiles the generic body, unchanged
-  (docs/w32.md M3b).
+  (docs/w32.md M3b).  (Those were at load ~400: at ~130 both take 13-16 ms.)
+  FE-SQ has its own W32 body (55 products, -17% / -30% per squaring on
+  i386 / arm32, ~1-6% on an X25519).  A LET that keeps raw words declares them
+  `(declare (w32-raw ...))`; the compiler rejects one in any other position,
+  and SPLITS one live across a possible GC point into two 16-bit fixnums.
+  `test/run-w32-gc-live.sh` is the collector check: safe CLIs answer 15,
+  `MODUS_W32_UNSAFE_LIVE=1` ones 11 (docs/w32.md "After M3b").
 - **A 32-bit TCP sequence number is a bignum** (>= 2^29), so ip.lisp's
   `(eq their-seq expected)` was false for most of them: `EQL` now.
 - `*CLI-ARCH*` was `:AARCH64` for this image (machine-type "aarch64", aarch64's

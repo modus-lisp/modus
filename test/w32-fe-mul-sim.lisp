@@ -1,4 +1,4 @@
-;;;; test/w32-fe-mul-sim.lisp -- FE-MUL's W32 body against its generic body, on SBCL
+;;;; test/w32-fe-mul-sim.lisp -- FE-MUL's and FE-SQ's W32 bodies against the generic body, on SBCL
 ;;;;
 ;;;;   sbcl --script test/w32-fe-mul-sim.lisp [N]
 ;;;;
@@ -11,13 +11,16 @@
 ;;; result with the generic body's on N random inputs (default 200000) with
 ;;; limbs drawn below 2^25, 2^26, 2^27 (the W32 guard's bound) and 2^27 + 1
 ;;; (past it: the generic fallback inside the W32 body), each 1 in 8 at its
-;;; top value.  Exit 0 iff every result agrees.  It checks the arithmetic, not
+;;; top value.  FE-SQ's W32 body (55 products) is checked the same way against
+;;; the generic body's f*f, with DST the same vector as F.  Exit 0 iff every
+;;; result agrees.  It checks the arithmetic, not
 ;;; the compiler: the bare X25519 / Ed25519 runs (test/w32-x25519-bare.py)
 ;;; are the check of the compiled code.
 (defpackage :w32-fe-mul-sim (:use :common-lisp))
 (in-package :w32-fe-mul-sim)
 
 (defvar *pick-w32* t)
+(declaim (declaration w32-raw))   ; compiler.lisp's raw-word scope declaration
 (defmacro %if-w32 (w32-form other-form) (if *pick-w32* w32-form other-form))
 (defmacro %w32 (x) x)
 (defmacro w32-raw (x) x)
@@ -52,11 +55,18 @@
     (let ((*pick-w32* t))
       (compile 'fe-mul-w32 `(lambda ,@(cddr fe-mul))))
     (let ((*pick-w32* nil))
-      (compile 'fe-mul-generic `(lambda ,@(cddr fe-mul))))))
+      (compile 'fe-mul-generic `(lambda ,@(cddr fe-mul)))))
+  ;; FE-SQ's W32 body; its fallback calls FE-MUL, here the generic one
+  (let ((fe-sq (find-if (lambda (f) (and (consp f) (eq (car f) 'defun) (eq (cadr f) 'fe-sq)))
+                        forms)))
+    (unless fe-sq (error "no FE-SQ in ~A" *source*))
+    (setf (fdefinition 'fe-mul) (lambda (d f g) (funcall 'fe-mul-generic d f g)))
+    (let ((*pick-w32* t))
+      (compile 'fe-sq-w32 `(lambda ,@(cddr fe-sq))))))
 
 (let* ((n (if (second sb-ext:*posix-argv*) (parse-integer (second sb-ext:*posix-argv*)) 200000))
        (*random-state* (sb-ext:seed-random-state 7))
-       (bad 0) (fast 0))
+       (bad 0) (fast 0) (sq-bad 0) (sq-fast 0))
   (dotimes (k n)
     (let ((lim (case (mod k 4) (0 #x2000000) (1 #x4000000) (2 #x8000000) (t #x8000001)))
           (f (make-array 40 :initial-element 0)) (g (make-array 40 :initial-element 0))
@@ -69,7 +79,15 @@
         (incf fast))
       (funcall 'fe-mul-generic d1 f g)
       (funcall 'fe-mul-w32 d2 f g)
-      (unless (equalp (subseq d1 0 10) (subseq d2 0 10)) (incf bad))))
+      (unless (equalp (subseq d1 0 10) (subseq d2 0 10)) (incf bad))
+      ;; fe-sq's W32 body against the generic f*f (dst aliasing f, as callers do)
+      (let ((s1 (make-array 40 :initial-element 0)) (s2 (copy-seq f)))
+        (when (every (lambda (x) (< x #x8000000)) (subseq f 0 10)) (incf sq-fast))
+        (funcall 'fe-mul-generic s1 f f)
+        (funcall 'fe-sq-w32 s2 s2)
+        (unless (equalp (subseq s1 0 10) (subseq s2 0 10)) (incf sq-bad)))))
   (format t "fe-mul W32 body vs generic: ~D inputs (~D inside the W32 guard), ~D differ~%"
           n fast bad)
-  (sb-ext:exit :code (if (zerop bad) 0 1)))
+  (format t "fe-sq W32 body vs generic f*f: ~D inputs (~D inside the W32 guard), ~D differ~%"
+          n sq-fast sq-bad)
+  (sb-ext:exit :code (if (and (zerop bad) (zerop sq-bad)) 0 1)))

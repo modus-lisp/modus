@@ -11,6 +11,9 @@
 //   spatial_stop(voice)
 //   spatial_volume(permille)           everything's loudness, 0..1000
 //   spatial_head(on)                   follow the listener's head (AirPods) or not; off until asked
+//   spatial_head_attitude(three)        the head's yaw, pitch and roll (radians; yaw from where it was when following
+//                                      began, positive turning left; pitch positive up) into three single-floats;
+//                                      1 while the headphones report it, else 0
 //   spatial_head_permission()          0 not asked yet, 1 allowed, 2 refused, 3 none needed (a TV): an app can say
 //                                      what the system's question is for before it is asked
 //
@@ -35,7 +38,7 @@ private var spatialVoices: [UInt: AVAudioPlayerNode] = [:]
 // environment's own is used.
 #if os(iOS) || os(macOS)
 private let headphones = CMHeadphoneMotionManager()
-private var headYaw = 0.0, headPitch = 0.0
+private var headYaw = 0.0, headPitch = 0.0, headRoll = 0.0
 private var headYawAtStart: Double?
 
 private func startHeadTracking() {
@@ -49,6 +52,7 @@ private func startHeadTracking() {
         if headYawAtStart == nil { headYawAtStart = a.yaw }
         headYaw = a.yaw - (headYawAtStart ?? 0)
         headPitch = a.pitch
+        headRoll = a.roll
     }
 }
 #endif
@@ -161,12 +165,23 @@ let spatialHead: Call = { on, _, _, _, _, _ in
         startHeadTracking()                   // the first time, the system asks for Motion & Fitness
     } else {
         headphones.stopDeviceMotionUpdates()
-        headYaw = 0; headPitch = 0
+        headYaw = 0; headPitch = 0; headRoll = 0
     }
     #else
     if #available(tvOS 18.0, *) { environment.isListenerHeadTrackingEnabled = on != 0 }
     #endif
     return 1
+}
+
+let spatialHeadAttitude: Call = { p, _, _, _, _, _ in
+    guard let f = UnsafeMutablePointer<Float>(bitPattern: p) else { return 0 }
+    #if os(iOS) || os(macOS)
+    f[0] = Float(headYaw); f[1] = Float(headPitch); f[2] = Float(headRoll)
+    return headphones.isDeviceMotionActive ? 1 : 0
+    #else
+    f[0] = 0; f[1] = 0; f[2] = 0
+    return 0
+    #endif
 }
 
 let spatialHeadPermission: Call = { _, _, _, _, _, _ in
@@ -184,6 +199,7 @@ let spatialHeadPermission: Call = { _, _, _, _, _, _ in
 func installSpatial() {
     register("spatial_head", spatialHead)
     register("spatial_head_permission", spatialHeadPermission)
+    register("spatial_head_attitude", spatialHeadAttitude)
     register("spatial_start", spatialStart)
     register("spatial_sound", spatialSound)
     register("spatial_voice", spatialVoice)

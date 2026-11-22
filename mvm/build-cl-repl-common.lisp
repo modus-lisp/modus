@@ -1763,6 +1763,33 @@
               (*cl-repl-rpi-p* (%rpi-net-text "hwrng-bcm2835.lisp"))
               (t "")) (string #\Newline)
         "(defun native-eval (form) (eval form))"  (string #\Newline)
+        ;; :I386: SSH's waits on the PIT clock (GET-INTERNAL-REAL-TIME), not
+        ;; poll counts alone -- ssh-x64-cl.lisp's policy, with the PIT for the
+        ;; TSC.  The default version wait is 50 polls of one packet each; after
+        ;; a connection, the NE2000 ring still holds its tail (the client's last
+        ;; segments, slirp's retransmits), and the 50 polls went on those: the
+        ;; next client's version arrived 6 ms after the banner and the server
+        ;; had already given up ("#VX 51 0 0": 51 polls, buffer empty, peer
+        ;; open).  Every connection after the first failed that way once the
+        ;; key exchange stopped taking long enough for the ring to drain.
+        (if *cl-repl-i386-p*
+            "(defun %i386-ssh-clock () (get-internal-real-time))
+(defun %i386-ssh-wait-expired-p (count limit since)
+  (or (modus.ssh:ssh-peer-closed-p)
+      (and (> count limit)
+           (> (- (get-internal-real-time) since) (* 15 internal-time-units-per-second)))))
+(defun %i386-ssh-version-wait-expired-p (count since)
+  (or (modus.ssh:ssh-peer-closed-p)
+      (and (> count 50)
+           (> (- (get-internal-real-time) since) (* 2 internal-time-units-per-second)))))
+(defun %bind-i386-ssh-seams ()
+  (setf (fdefinition 'modus.ssh:ssh-preauth-clock) (function %i386-ssh-clock))
+  (setf (fdefinition 'modus.ssh:ssh-wait-expired-p) (function %i386-ssh-wait-expired-p))
+  (setf (fdefinition 'modus.ssh:ssh-version-wait-expired-p)
+        (function %i386-ssh-version-wait-expired-p)))
+"
+            "")
+        (string #\Newline)
         ;; ssh-handle-connection fix + trace live in net/ssh.lisp.
         ;; FIX: single-threaded server handles ONE connection at a time.  Guard
         ;; against RE-ENTRANT net-accept-connection: while inside a connection
@@ -2125,9 +2152,11 @@
                      ;; the SSH interface (net/ssh.lisp): its defaults, then
                      ;; what this image's adapters replace
                      (if *ssh-build-p*
-                         (format nil "  (modus.ssh::%bind-ssh-seams)~%~A~A"
+                         (format nil "  (modus.ssh::%bind-ssh-seams)~%~A~A~A"
                                  (if (or *cl-repl-x64-p* *cl-repl-rpi-p*)
                                      (format nil "  (modus.board::%bind-board-ssh-seams)~%") "")
+                                 (if *cl-repl-i386-p*
+                                     (format nil "  (%bind-i386-ssh-seams)~%") "")
                                  (if *ssh-isolated-p*
                                      (format nil "  (%bind-isolated-ssh-seams)~%") ""))
                          ""))))

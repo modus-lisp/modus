@@ -1145,8 +1145,10 @@ writes to bignums.  **A byte vector's payload is NOT at word+7 on i386** — a
 on 32 bits.
 
 **SSH (`MODUS_SSH_BUILD=1`, `(ssh-boot)` at the REPL) works: a real OpenSSH
-client gets `= 3` over curve25519 / Ed25519 / ChaCha20-Poly1305, ~60 s a
-connection (x64: ~50 s).  Three 32-bit facts it took:**
+client gets `= 3` over curve25519 / Ed25519 / ChaCha20-Poly1305, 3-4 s a
+connection since W32 M3b (it was ~60 s; x64: ~50 s).  The boot stub maps the
+NIC/SSH state it lives in: a 4 MB net block at `#x04000000` and a 4 MB SSH
+block at `#x0C000000`, on machines of 32 MB or more.  Three 32-bit facts it took:**
 - **crypto-fast's limbs are FIXNUMS IN THE VECTOR'S SLOTS, not raw u32
   words behind a computed address.**  On 30-bit fixnums the 26x26-bit limb
   products are bignums, so a collection inside `fe-mul` moved the arrays under
@@ -1165,13 +1167,15 @@ connection (x64: ~50 s).  Three 32-bit facts it took:**
   layout co-init); `:I386` now.  And a `:U64` store is ONE 32-bit store here,
   so the net/SSH texts' 8-byte-stride zero loops are rewritten for i386.
 
-**OPEN: a reconnect can fail.**  The first connection after `(ssh-boot)`
-works in every run; a later one sometimes closes right after the client's
-KEXINIT, which run moves (2 failing, 3 failing, or both).  The server never
-sees the client's version-string segment (only pure ACKs reach
-NET-DELIVER-DATA).  Suspect, not finding: between sessions the server spends
-tens of seconds recomputing ephemeral keys while SYN retransmits fill the
-NE2000's 32 KB ring, and `ne2k-receive` has no ring-overflow (OVW) recovery.
+**Reconnects (fixed 2026-11-22).**  A later connection used to close right
+after the client's version line.  The cause was the version wait: 50 polls of
+one packet each, with no clock, while the NE2000 ring still held the last
+connection's tail (the client's final segments, slirp's retransmits).  The
+server gave up with an empty buffer 6 ms before the client's version arrived
+(an instrumented build printed 51 polls, 0 bytes, peer open).  i386's SSH waits
+now also need wall time on the PIT clock (`%BIND-I386-SSH-SEAMS`,
+build-cl-repl-common; ssh-x64-cl.lisp's policy): 10 of 10 back-to-back
+connections get `= 3`.
 
 Debugging it: `qemu -s -S` + gdb-multiarch with `hbreak` on an address from
 `MODUS_SYMMAP`, walking the EBP chain.  A CONDITIONAL hbreak on a hot function

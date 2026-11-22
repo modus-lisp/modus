@@ -1389,7 +1389,27 @@ class MVM {
         if (g) { this.contDepth = d; f = g; L = 0; ebp = this.ebp; }   // keep contDepth live: a JS stand-in (e.g. the intern memo) may run() a nested activation
         else {
           this.contDepth = d;
-          this.run();                           // interpreted callee, pops its frame
+          // Interpreted callee, pops its frame.  A longjmp out of it that its
+          // own run() does not take lands in a translated frame of THIS
+          // driver's segment (a THROW from an interpreted function to a CATCH
+          // in a translated caller), so it is recovered here exactly as one
+          // out of f(this, L) is.  Left to propagate, the enclosing run() --
+          // the interpreted caller of this whole segment -- took it: it ran
+          // the translated function's frame on interpreted from the resume
+          // pc, and that frame's return then ended the CALLER's loop, its
+          // remaining work skipped and its registers whatever the callee
+          // left.
+          try { this.run(); }
+          catch (e) {
+            if (!(e instanceof LongJmp)) throw e;
+            let found = false;
+            while (!found && d > base) {
+              d--;
+              if (ce[d] === this.ebp && cf[d].RES && cf[d].RES[e.ip] !== undefined) { f = cf[d]; L = cf[d].RES[e.ip]; ebp = ce[d]; found = true; }
+            }
+            if (!found) throw e;
+            continue;
+          }
           if (d === base) return;
           d--; f = cf[d]; L = cl[d]; ebp = ce[d];
         }

@@ -351,7 +351,7 @@
       (unless (gethash (+ +mvm-runtime-call-base+ n) runtime-table) (return n))
       (setq n (+ n 1)))))
 
-(defun %mvm-rt-entry (runtime-table bc pc)
+(defun %mvm-rt-entry-1 (runtime-table n)
   "The runtime stub the CALL / FN-ADDR target at PC names, as (NAME . CELL),
    from a vector RUNTIME-TABLE keeps under :RT-VEC, indexed by the stub's
    number.  The target itself is +MVM-RUNTIME-CALL-BASE+ + n: a BIGNUM on a
@@ -360,10 +360,7 @@
    comes from the bytes; an entry is made on the stub's first call.  The FASL
    writer keeps only positive integer keys and the JIT's callee scan only
    string values, so neither sees the vector."
-  (declare (type (simple-array (unsigned-byte 8) (*)) bc))
-  (let ((n (+ (* (- (aref bc (+ pc 3)) #x40) 16777216) (* (aref bc (+ pc 2)) 65536)
-              (* (aref bc (+ pc 1)) 256) (aref bc pc)))
-        (vec (gethash :rt-vec runtime-table)))
+  (let ((vec (gethash :rt-vec runtime-table)))
     (unless (and (simple-vector-p vec) (< n (length vec)))
       (let ((new (make-array (max (+ n 1) (%rt-stub-count runtime-table)) :initial-element nil)))
         (when (simple-vector-p vec) (replace new vec))
@@ -373,6 +370,35 @@
         (let ((target (+ +mvm-runtime-call-base+ n)))
           (setf (svref vec n)
                 (cons (gethash target runtime-table) (gethash (- target) runtime-table)))))))
+
+;;; A WORKER FILLS A SHARED MODULE'S STUB CACHE UNDER THE RUNTIME LOCK, as it makes a
+;;; shared table's pair (prelude.lisp, %HT-DICT-PAIR).  A module's RUNTIME-TABLE is
+;;; the thread's that compiled it -- main's, for a DEFUN of the script -- and its
+;;; :RT-VEC vector and (NAME . CELL) entries are made on a stub's FIRST call.  When
+;;; that call came on a worker they were the worker's own objects stored into main's
+;;; table, which the shared-store guard refuses ("a thread stored one of its own
+;;; objects into shared memory" at %MVM-RT-ENTRY): measured on AArch64, a thread
+;;; started from a DEFVAR's initform, whose body was even (+ 1 2), died before its
+;;; first form, while the same thread started from a LET -- after main had already
+;;; called through those stubs -- ran.  Inside the lock the vector and conses come
+;;; from the lock arena; a hit needs no lock, and main, a process with no threads,
+;;; and a worker's own table are unchanged.
+(defun %mvm-rt-entry (runtime-table bc pc)
+  "The runtime stub the CALL / FN-ADDR target at PC names, as (NAME . CELL) --
+   %MVM-RT-ENTRY-1, under the runtime lock when a worker fills a table not its
+   own."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bc))
+  (let* ((n (+ (* (- (aref bc (+ pc 3)) #x40) 16777216) (* (aref bc (+ pc 2)) 65536)
+               (* (aref bc (+ pc 1)) 256) (aref bc pc)))
+         (vec (gethash :rt-vec runtime-table)))
+    (or (and (simple-vector-p vec) (< n (length vec)) (svref vec n))
+        (if (or (eql (mem-ref #x10000DB8 :u32) 0) (eql (%dynb-block) 0)
+                (%own-region-object-p runtime-table))
+            (%mvm-rt-entry-1 runtime-table n)
+            (progn
+              (%rt-enter)
+              (unwind-protect (%mvm-rt-entry-1 runtime-table n)
+                (%rt-leave)))))))
 
 (defun %mvm-rt-target-p (runtime-table bc pc)
   "Is the u32 target at PC a runtime stub (>= +MVM-RUNTIME-CALL-BASE+, #x40000000)?

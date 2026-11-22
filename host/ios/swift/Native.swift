@@ -2145,7 +2145,13 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         vc.view.addSubview(pagesView)
         buildPane()
         vc.onLayout = { [weak self] in self?.layout() }
+        // A TAP ON THE TITLE (the path): a TITLE event, for the app's menu of what to do with where it is -- copy
+        // the path, go somewhere by typing it.  The title's parts are labels, so nothing in it takes the tap.
+        title.isUserInteractionEnabled = true
+        title.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(titleTapped)))
     }
+
+    @objc func titleTapped() { send("TITLE", [.int(Int(handle)), .int(0)]) }
 
     var width: CGFloat { pagesView.bounds.width }
     var landscape: Bool { vc.view.bounds.width > vc.view.bounds.height }
@@ -3585,6 +3591,11 @@ final class NativeStatus {
     var clearing: DispatchWorkItem?              // taking it away, shortly: a status that follows at once stays
     private var spinning = false
     private var lastFill: CGFloat = 0
+    private var finishing: Timer?                // the last stretch of the ring, filling before the checkmark
+
+    /// How much of the ring a measured progress fills: all the work is 95% of it, so a nearly finished one does
+    /// not look done; the last 5% fills when it is (FINISH).
+    static let measured: CGFloat = 0.95
 
     init() {
         item.accessibilityLabel = "Status"
@@ -3593,12 +3604,14 @@ final class NativeStatus {
 
     /// PROGRESS 0-1, or nil: no measure (turning arrows); DONE: a checkmark.  The ring fills forward only.
     func show(progress: Double?, done: Bool) {
+        finishing?.invalidate()
+        finishing = nil
         if done {
             stopSpinning()
-            item.image = UIImage(systemName: "checkmark.circle")
+            if lastFill > 0 { finish() } else { item.image = UIImage(systemName: "checkmark.circle") }
         } else if let p = progress {
             stopSpinning()
-            let v = max(lastFill, CGFloat(max(0, min(1, p))))
+            let v = max(lastFill, CGFloat(max(0, min(1, p))) * NativeStatus.measured)
             lastFill = v
             item.image = StatusRingImage.make(v)
         } else {
@@ -3610,7 +3623,24 @@ final class NativeStatus {
             }
         }
     }
-    func reset() { lastFill = 0; stopSpinning() }
+    /// A ring that was filling: its rest filled in a quarter of a second, then the checkmark.
+    private func finish() {
+        let from = lastFill, start = CACurrentMediaTime(), length = 0.25
+        lastFill = 0
+        finishing = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            let k = min(1, (CACurrentMediaTime() - start) / length)
+            if k < 1 {
+                self.item.image = StatusRingImage.make(from + (1 - from) * CGFloat(k))
+            } else {
+                t.invalidate()
+                self.finishing = nil
+                self.item.image = UIImage(systemName: "checkmark.circle")
+            }
+            self.refresh()
+        }
+    }
+    func reset() { lastFill = 0; finishing?.invalidate(); finishing = nil; stopSpinning() }
     /// Its island button, if it is in one, given what the item now is.
     func refresh() { refreshIsland(item) }
     private func stopSpinning() {

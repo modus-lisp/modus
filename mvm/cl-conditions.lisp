@@ -3104,6 +3104,8 @@
     (dolist (n (quote ("SYS-EXIT" "SAVE-AND-DIE" "INSTALL-TARBALL"
                        "ACTORS-SPAWN" "ACTORS-SEND" "ACTORS-RECEIVE" "ACTORS-RECEIVE-IF"
                        "ACTORS-SELF" "ACTORS-YIELD" "ACTORS-START" "ACTORS-STOP"
+                       "COROUTINES-START" "COROUTINE-CREATE" "COROUTINE-TRANSFER"
+                       "COROUTINE-CURRENT" "COROUTINE-DONE-P"
                        "SPAWN-LINK" "LINK"
                        "SOCKET-CONNECT" "SOCKET-LISTEN" "SOCKET-LISTEN-ON"
                        "SOCKET-LISTEN-PORT" "SOCKET-ACCEPT" "SOCKET-SEND"

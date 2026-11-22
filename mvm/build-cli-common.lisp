@@ -1670,6 +1670,12 @@
                    ;; neither of which resolves as a forward reference.
                    (mvm-text "net/hosted-actor-runtime.lisp")
                    (string #\Newline)
+                   ;; COROUTINES (docs/coroutines.md): the actor runtime's
+                   ;; window, stack and parked-scan machinery in region 0 on
+                   ;; the main thread.  After it: it calls %WITH-COMPUTATION-
+                   ;; STATE, %HA-CARVE and %RT-THREADS-ON, none forward.
+                   (mvm-text "net/hosted-coroutines.lisp")
+                   (string #\Newline)
                    ;; THE AOT HALF OF AN A/B.  test/hosted-intern-layers.lisp's
                    ;; `low' arm — a worker interning fresh symbols through
                    ;; %INTERN-SYMBOL-PKG — dies about half the time while its
@@ -2414,7 +2420,12 @@
                      (cons \"ACTORS-RECEIVE-IF\" (function actors-receive-if))
                      (cons \"ACTORS-YIELD\" (function actors-yield))
                      (cons \"ACTORS-SELF\" (function actors-self))
-                     (cons \"ACTORS-LINK\" (function actors-link))))
+                     (cons \"ACTORS-LINK\" (function actors-link))
+                     (cons \"COROUTINES-START\" (function coroutines-start))
+                     (cons \"COROUTINE-CREATE\" (function coroutine-create))
+                     (cons \"COROUTINE-TRANSFER\" (function coroutine-transfer))
+                     (cons \"COROUTINE-CURRENT\" (function coroutine-current))
+                     (cons \"COROUTINE-DONE-P\" (function coroutine-done-p))))
       ;; 0: not linked into this image (the aarch64 CLI has no hosted actors)
       (unless (eql (cdr e) 0)
         (set-symbol-function (intern (car e) pk) (cdr e))

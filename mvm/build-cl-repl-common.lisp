@@ -3011,6 +3011,19 @@
         (format nil "~%(defun e1000-state-base () #x0F900000)~%~
                      (defun fe-scratch-base () #x0F900900)~%~
                      (defun usb-keepalive () 0)~%")
+        ;; The two byte-buffer helpers crypto.lisp takes from net/ip.lisp (not
+        ;; in this image: it is the IP stack).  Copies of ip.lisp's, same names
+        ;; and results, as net/hosted-ssh.lisp carries for the same reason; the
+        ;; SHA-256/512 vectors on the arm32 crypto image are their check.
+        "(defun buf-read-u32 (buf off)
+  (logior (ash (aref buf off) 24) (ash (aref buf (+ off 1)) 16)
+          (ash (aref buf (+ off 2)) 8) (aref buf (+ off 3))))
+(defun buf-write-u32 (buf off val)
+  (aset buf off (logand (ash val -24) #xFF))
+  (aset buf (+ off 1) (logand (ash val -16) #xFF))
+  (aset buf (+ off 2) (logand (ash val -8) #xFF))
+  (aset buf (+ off 3) (logand val #xFF)))
+"
         (%rpi-net-text "crypto.lisp")        (string #\Newline)
         (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
       ""))

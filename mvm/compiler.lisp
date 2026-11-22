@@ -13342,7 +13342,9 @@
               (cdr e)))))
 (defun %test-operand-width (x env)
   "%expr-width extended to integer literals (a fixnum literal is a fixnum)."
-  (cond ((integerp x) (and (<= (integer-length x) 61) (+ 1 (integer-length x))))
+  ;; a FIXNUM literal of THIS target: 61 bits on x64; the literal 61 treated
+  ;; -27907941364 as a fixnum on the 30-bit towers (ANSI MISC.509, i386 native)
+  (cond ((integerp x) (and (<= (integer-length x) (- (ct-fixnum-bits) 1)) (+ 1 (integer-length x))))
         ((or (and x (symbolp x)) (consp x)) (%expr-width x env))
         (t nil)))
 (defun %operand-reg (form env)
@@ -24156,7 +24158,7 @@
              (or (/= dest +vreg-vr+)
                  (and leaf (< *temp-reg-counter* 5)
                       (or (symbolp arg)
-                          (and (integerp arg) (<= (integer-length arg) 60)))))))
+                          (and (integerp arg) (<= (integer-length arg) (- (ct-fixnum-bits) 2))))))))
       ;; Leaf / pure right operand: no push/mov/pop round trip is needed.
       (let ((temp (alloc-temp-reg)))
         (compile-form arg env temp)
@@ -28061,7 +28063,12 @@
     ;; inline fixnum fast path, with BIGNUM-ASH kept as the out-of-line slow
     ;; path.  See %COMPILE-ASH-VAR-FAST.  (setq *cg-var-ash* :off) at runtime
     ;; restores the plain call, for A/B in one binary.
+    ;; 64-BIT FIXNUMS, asked of the compile target: *JIT-TARGET-ARCH* is :X64 by
+    ;; default on every image, so the i386 and 68k CLIs' native tiers took this
+    ;; path with 30-bit fixnums and (ash 1 31) came out -2^30 (ANSI MISC.461,
+    ;; and the OPEN.* element-size masks).
     ((and (null count) *mvm-eval-runtime-p*
+          (> (ct-fixnum-bits) 32)
           (boundp (quote *jit-target-arch*))
           (let ((a (symbol-value (quote *jit-target-arch*))))
             (or (eq a :x64) (eq a :aarch64)))
@@ -31896,7 +31903,7 @@
       (if (and *mvm-eval-runtime-p* (numberp dest)
                (%cg-on-p (quote *cg-minmax-lit*))
                (%expr-width x env)
-               (<= (integer-length lit) 61))
+               (<= (integer-length lit) (- (ct-fixnum-bits) 1)))
           (let ((tmp (alloc-temp-reg))
                 (skip (make-compiler-label)))
             (compile-form x env dest)

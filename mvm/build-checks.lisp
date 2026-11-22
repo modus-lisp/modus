@@ -439,7 +439,7 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
 ;;; ============================================================
 
 (defun %gck-mode ()
-  (let ((v (sb-ext:posix-getenv "MODUS_GLOBAL_CHECK")))
+  (let ((v (modus.image-config:getenv-unrecorded "MODUS_GLOBAL_CHECK")))
     (cond ((null v) :error)
           ((string= v "0") :off)
           ((string-equal v "warn") :warn)
@@ -480,7 +480,7 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
    That — not the target keyword — is the identity of an image here: #242 was
    two build scripts for the SAME target disagreeing about whether an
    initialiser gets called."
-  (or (sb-ext:posix-getenv "MODUS_GLOBAL_CHECK_LABEL")
+  (or (modus.image-config:getenv-unrecorded "MODUS_GLOBAL_CHECK_LABEL")
       ;; `sbcl --script foo.lisp' leaves *POSIX-ARGV* = (\"sbcl\") — the script
       ;; path is NOT in it (measured).  It IS in the SB-IMPL::PROCESS-SCRIPT
       ;; stack frame, and that is the OUTERMOST script, which is what we want:
@@ -506,7 +506,7 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
   (let ((mode (%gck-mode)))
     (when (eq mode :off) (return-from check-global-inits nil))
     (when (eq mode :dump)
-      (let ((out (or (sb-ext:posix-getenv "MODUS_GLOBAL_CHECK_OUT")
+      (let ((out (or (modus.image-config:getenv-unrecorded "MODUS_GLOBAL_CHECK_OUT")
                      "/tmp/modus-blob.lisp")))
         (with-open-file (s out :direction :output :if-exists :supersede
                              :if-does-not-exist :create)
@@ -1490,7 +1490,7 @@ that no list has ***~%" (length missing))
   (let ((cnt (symbol-value (find-symbol "*GV-CACHE-COUNT*" :modus.mvm)))
         (ix  (symbol-value (find-symbol "*GV-CACHE-INDEX*" :modus.mvm)))
         (nm  (symbol-value (find-symbol "*GV-CACHE-NAMES*" :modus.mvm)))
-        (dump (sb-ext:posix-getenv "MODUS_GVCACHE_DUMP")))
+        (dump (modus.image-config:getenv-unrecorded "MODUS_GVCACHE_DUMP")))
     (format t "~&;; gv-cache: ~D global slots assigned~%" cnt)
     (when (and dump (plusp (length dump)) ix)
       (with-open-file (o dump :direction :output :if-exists :supersede)
@@ -1504,7 +1504,7 @@ that no list has ***~%" (length missing))
 (defun %gck-redef-mode ()
   "MODUS_REDEF_CHECK: unset or error = an undeclared redefinition fails the
    build; warn = report it and build anyway; 0 = say nothing."
-  (let ((v (sb-ext:posix-getenv "MODUS_REDEF_CHECK")))
+  (let ((v (modus.image-config:getenv-unrecorded "MODUS_REDEF_CHECK")))
     (cond ((equal v "warn") :warn) ((equal v "0") :off) (t :error))))
 
 (defun check-undeclared-redefinitions ()
@@ -1530,7 +1530,7 @@ that no list has ***~%" (length missing))
    current BUILD-IMAGE, newest first.  Host-side only (see below).")
 
 (defun %gck-defun-inventory-path ()
-  (let ((path (sb-ext:posix-getenv "MODUS_DEFUN_INVENTORY")))
+  (let ((path (modus.image-config:getenv-unrecorded "MODUS_DEFUN_INVENTORY")))
     (and path (plusp (length path)) path)))
 
 (defun %gck-defun-inventory ()
@@ -1561,7 +1561,7 @@ that no list has ***~%" (length missing))
    it means.  Filled only under MODUS_FN_FALLBACK_CENSUS=FILE.")
 
 (defun %gck-fallback-census-path ()
-  (let ((p (sb-ext:posix-getenv "MODUS_FN_FALLBACK_CENSUS")))
+  (let ((p (modus.image-config:getenv-unrecorded "MODUS_FN_FALLBACK_CENSUS")))
     (and p (plusp (length p)) p)))
 
 (defvar *gck-registered-keys* (make-hash-table :test 'equal)
@@ -1593,7 +1593,7 @@ that no list has ***~%" (length missing))
 (defun %gck-pkg-check-mode ()
   "MODUS_PKG_CHECK: unset or error = a cross-package call that resolved only
    through the bare-name fallback fails the build; warn = report; 0 = silent."
-  (let ((v (sb-ext:posix-getenv "MODUS_PKG_CHECK")))
+  (let ((v (modus.image-config:getenv-unrecorded "MODUS_PKG_CHECK")))
     (cond ((equal v "warn") :warn) ((equal v "0") :off) (t :error))))
 
 (defun check-cross-package-calls ()
@@ -1653,7 +1653,7 @@ that no list has ***~%" (length missing))
                 (second c) (first c) (third c)))
       (dolist (c coll)
         (format t ";;   GLOBAL-COLLISION ~A defined in ~{~A~^, ~}~%" (first c) (second c)))
-      (when (and (not (member (sb-ext:posix-getenv "MODUS_GLOBAL_PKG_CHECK")
+      (when (and (not (member (modus.image-config:getenv-unrecorded "MODUS_GLOBAL_PKG_CHECK")
                               '("warn" "0") :test 'equal))
                  (or cross coll))
         (error "global-pkg-check: ~D cross-package global reference~:P, ~D collision~:P"
@@ -1685,7 +1685,7 @@ that no list has ***~%" (length missing))
       (dolist (s split)
         (format t ";;   QUOTE-SPLIT ~A in ~{~A~^, ~}~%" (first s) (second s)))
       (when (and split
-                 (not (member (sb-ext:posix-getenv "MODUS_QUOTE_PKG_CHECK")
+                 (not (member (modus.image-config:getenv-unrecorded "MODUS_QUOTE_PKG_CHECK")
                               '("warn" "0") :test 'equal)))
         (error "quote-pkg-check: ~D name~:P quoted in two kernel packages (first: ~A in ~{~A~^, ~})"
                (length split) (first (first split)) (second (first split)))))))
@@ -1724,7 +1724,7 @@ that no list has ***~%" (length missing))
     (dolist (c coll)
       (format t ";;   FUNCTION-COLLISION ~A in ~{~A~^, ~}~%" (first c) (second c)))
     (when (and coll
-               (not (member (sb-ext:posix-getenv "MODUS_FN_COLLISION_CHECK")
+               (not (member (modus.image-config:getenv-unrecorded "MODUS_FN_COLLISION_CHECK")
                             '("warn" "0") :test 'equal)))
       (error "fn-collision-check: ~D function name~:P defined in two kernel packages (first: ~A in ~{~A~^, ~})"
              (length coll) (first (first coll)) (second (first coll))))))
@@ -2154,7 +2154,7 @@ that no list has ***~%" (length missing))
         (format *ir-dump-stream* "@FN ~S~%~S~%"
                 (function-info-name (car r)) (%ir-norm-fn (cdr r)))))))
 
-(let ((path (sb-ext:posix-getenv "MODUS_IR_DUMP")))
+(let ((path (modus.image-config:getenv-unrecorded "MODUS_IR_DUMP")))
   (when (and path (> (length path) 0))
     (setf *ir-dump-stream* (open path :direction :output :if-exists :append
                                       :if-does-not-exist :create))

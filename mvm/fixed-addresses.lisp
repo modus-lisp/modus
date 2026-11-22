@@ -231,20 +231,10 @@
 ;;; ------------------------------------------------------------------
 
 (defun %fa-getenv (name)
-  "getenv(3) DIRECTLY, not SB-EXT:POSIX-GETENV.  lib/image-config.lisp wraps
-   POSIX-GETENV to record every MODUS_* knob a build reads INTO the image, so
-   merely reading these two would add two entries to every image's
-   configuration record.  They cannot change a byte of an image -- the check
-   passes a build or stops it -- so, like output paths, they stay out of the
-   record, and a build with this file is byte-identical to one without it."
-  #+sbcl
-  (sb-alien:alien-funcall
-   (sb-alien:extern-alien "getenv" (function sb-alien:c-string sb-alien:c-string))
-   name)
-  ;; elsewhere: the POSIX-GETENV lib/image-config.lisp's recorder wraps
-  #-sbcl
-  (let ((u (find-symbol "*GETENV-UNWRAPPED*" "MODUS.IMAGE-CONFIG")))
-    (funcall (or (and u (boundp u) (symbol-value u)) #'sb-ext:posix-getenv) name)))
+  "MODUS_FIXED_ADDR_* without a knob-record entry: they cannot change a byte of an
+   image (the check passes a build or stops it), so, like output paths, they stay
+   out of the record (lib/image-config.lisp GETENV-UNRECORDED)."
+  (modus.image-config:getenv-unrecorded name))
 
 (defun %fa-mode ()
   (let ((v (%fa-getenv "MODUS_FIXED_ADDR_CHECK")))

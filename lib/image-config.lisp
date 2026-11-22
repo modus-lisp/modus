@@ -27,7 +27,8 @@
 
 (defpackage :modus.image-config
   (:use :common-lisp)
-  (:export #:image-configuration-text #:finalize-image-configuration #:*knob-reads*))
+  (:export #:image-configuration-text #:finalize-image-configuration #:*knob-reads*
+           #:getenv-unrecorded))
 (in-package :modus.image-config)
 
 (defvar *tree* (namestring (truename (merge-pathnames "../" (directory-namestring *load-truename*))))
@@ -57,6 +58,17 @@
     (setq *getenv-unwrapped* orig)
     (setf (fdefinition 'sb-ext:posix-getenv)
           (lambda (name) (%record-knob-read orig name)))))
+
+;; A knob that cannot change a byte of an image -- a build check's mode, a diagnostic
+;; dump's path -- is read with this, and stays out of the record, which holds the
+;; inputs of the image only.  (mvm/build-checks.lisp, mvm/fixed-addresses.lisp)
+(defun getenv-unrecorded (name)
+  #+sbcl
+  (sb-alien:alien-funcall
+   (sb-alien:extern-alien "getenv" (function sb-alien:c-string sb-alien:c-string))
+   name)
+  #-sbcl
+  (funcall (or *getenv-unwrapped* (function sb-ext:posix-getenv)) name))
 
 (defparameter *image-configuration-flags*
   '((:aarch64 "MODUS-INT" "*AARCH64-GC-NATIVE-MCGC*")

@@ -100,7 +100,14 @@ let windowPointerLock: Call = { on, _, _, _, _, _ in
     return 1
 }
 
+/// window_pointer_shape(kind): the pointer's shape over the window (bridge.h has the kinds).
+let windowPointerShape: Call = { kind, _, _, _, _, _ in
+    modus_mac_pointer_shape(Int32(min(kind, 8)))
+    return 1
+}
+
 func installWindow() {
+    register("window_pointer_shape", windowPointerShape)
     register("window_pointer_lock", windowPointerLock)
     register("window_title", windowTitle)
     register("window_chrome", windowChrome)

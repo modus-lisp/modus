@@ -193,6 +193,10 @@ static BOOL moving_window;
 @end
 static void opened(int kind, NSString *url);       // below: a file or link for the image
 
+// THE POINTER'S SHAPE over the window, as the image last said (modus_mac_pointer_shape); the arrow until it does.
+static NSCursor *pointer_shape;
+static NSView *fb_view_for_cursor;
+
 @implementation ModusView
 - (BOOL)isFlipped { return YES; }                  // y grows down, as the framebuffer does
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -200,6 +204,9 @@ static void opened(int kind, NSString *url);       // below: a file or link for 
 // mouse-down unless it accepts first mouse.  The desk should react to that first click too.
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
 - (BOOL)wantsUpdateLayer { return NO; }
+- (void)resetCursorRects {
+    [self addCursorRect:self.bounds cursor:pointer_shape ? pointer_shape : NSCursor.arrowCursor];
+}
 // FILES DROPPED on the window go to the image (a DROPPED event each), as files opened with the app do.
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info { (void)info; return NSDragOperationCopy; }
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)info {
@@ -394,6 +401,25 @@ void modus_mac_opened_flush(void) {
 // Modifiers held when the window stops taking keys are released in the image (their releases go elsewhere).
 static void release_modifiers(void) { set_modifiers(0); }
 
+// The pointer's shape over the window: 0 arrow, 1 I-beam (text), 2 pointing hand (a link, a button), 3 open hand
+// (something that can be dragged), 4 closed hand (being dragged), 5 crosshair, 6 resize left-right, 7 resize
+// up-down, 8 not allowed.  Main thread.
+void modus_mac_pointer_shape(int kind) {
+    NSArray<NSCursor *> *all = @[ NSCursor.arrowCursor, NSCursor.IBeamCursor, NSCursor.pointingHandCursor,
+                                  NSCursor.openHandCursor, NSCursor.closedHandCursor, NSCursor.crosshairCursor,
+                                  NSCursor.resizeLeftRightCursor, NSCursor.resizeUpDownCursor,
+                                  NSCursor.operationNotAllowedCursor ];
+    NSCursor *c = all[(kind >= 0 && kind < (int)all.count) ? kind : 0];
+    if (c == pointer_shape) return;
+    pointer_shape = c;
+    if (fb_view_for_cursor) [fb_view_for_cursor.window invalidateCursorRectsForView:fb_view_for_cursor];
+    // and now, if the pointer is already over the window (cursor rects take effect as it moves)
+    if (fb_view_for_cursor && !pointer_locked) {
+        NSPoint p = [fb_view_for_cursor convertPoint:fb_view_for_cursor.window.mouseLocationOutsideOfEventStream fromView:nil];
+        if (NSPointInRect(p, fb_view_for_cursor.bounds)) [c set];
+    }
+}
+
 // Lock the pointer (ON) or let it go.  Main thread.  The window losing the keyboard lets it go too: a locked,
 // hidden pointer must never be left behind in another app.
 void modus_mac_pointer_lock(int on) {
@@ -518,6 +544,7 @@ static NSString *app_name(void) {
     v.layer.masksToBounds = YES;                   // the window cuts off the rest of the (larger) surface
     if (show_surface) v.layer.contents = (__bridge id)show_surface;
     fb_view = v;
+    fb_view_for_cursor = v;
     window.contentView = v;
     if (show_surface) v.layer.contents = (__bridge id)show_surface;   // again: the view joined a window
     [window makeFirstResponder:v];

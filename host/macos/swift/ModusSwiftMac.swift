@@ -122,6 +122,7 @@ func titlesOf(_ p: UInt, _ n: UInt) -> [String] {
 
 func plainLabel(_ s: String, _ frame: CGRect, size: CGFloat = 18) -> NSTextField {
     let label = NSTextField(wrappingLabelWithString: s)
+    label.isSelectable = false            // text to read, as a phone's label is: no I-beam, no selection
     label.frame = frame
     label.font = .systemFont(ofSize: size)
     label.textColor = .white

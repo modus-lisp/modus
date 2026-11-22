@@ -4602,6 +4602,8 @@
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
+  (let ((rw (%w32-raw-scope-rewrite 'let bindings body)))
+    (when rw (return-from compile-let (compile-form rw env dest))))
   (let ((level (%body-safety body)))
     (if level
         (%compile-let-at-safety level bindings body env dest)
@@ -4612,6 +4614,8 @@
 (defun compile-let* (bindings body env dest)
   "Compile (let* ((var val)*) body*).
    Values are evaluated sequentially; each can see earlier bindings."
+  (let ((rw (%w32-raw-scope-rewrite 'let* bindings body)))
+    (when rw (return-from compile-let* (compile-form rw env dest))))
   (let ((level (%body-safety body)))
     (if level
         (%compile-let*-at-safety level bindings body env dest)
@@ -26117,11 +26121,195 @@
            (free-temp-reg))
          (emit-li-tagged dest 0)))
       ;; (w32-raw W): the RAW word in DEST -- only as the value of a SETQ of a
-      ;; variable read back by (w32-ref ...), with no GC point while it is live
-      ;; (spec C3): the caller's obligation, not checked here.
-      ((and name (string= name "W32-RAW"))
+      ;; variable a (declare (w32-raw ...)) LET binds, which
+      ;; %W32-RAW-SCOPE-REWRITE has checked and turned into W32-RAW-CHECKED
+      ;; (spec C3: split around every GC point while it is live).
+      ((and name (string= name "W32-RAW-CHECKED"))
        (%w32-node (cadr tree) env dest))
+      ((and name (string= name "W32-RAW"))
+       (error "%W32: (w32-raw ...) outside a LET that declares its variable (declare (w32-raw V)): ~S" tree))
       (t (error "%W32: the root must be w32-hi16/lo16/ltu/lts/eq/store/raw: ~S" tree)))))
+
+;;; ---- RAW WORDS IN VARIABLES: THE (DECLARE (W32-RAW V ...)) SCOPE ---------
+;;; (docs/w32.md, "Raw words and the collector").  M3b keeps raw 32-bit words
+;;; in lexical variables between %W32 trees: (setq v (%w32 (w32-raw W))) then
+;;; (w32-ref v).  A raw word in a slot the collector scans is only safe while
+;;; no GC point can run (spec C3): a word whose bits happen to be a tagged
+;;; from-space address is "forwarded" by the collector, and the arithmetic
+;;; reads back the new address.  So such variables must be DECLARED, on the
+;;; LET or LET* that binds them, and the compiler checks the body:
+;;;
+;;;   (let ((w 0) ...) (declare (w32-raw w ...)) FORM*)
+;;;
+;;; * FORM* is flattened: each form is macroexpanded at its top and PROGNs are
+;;;   spliced (a form whose expansion touches no %W32 and no raw variable is
+;;;   kept as written).  A flat form is a W32 FORM -- (setq X (%w32 ROOT)) or
+;;;   (%w32 ROOT) -- or anything else, which counts as a GC POINT.
+;;; * A raw variable may appear only in W32 forms.  Anywhere else (a call
+;;;   argument, a closure, a nested IF) is a compile-time error: the analysis is
+;;;   over the flat sequence only, so a raw word cannot hide inside a form.
+;;; * (w32-raw W) is legal only as the root of a SETQ of a declared variable in
+;;;   such a body; anywhere else it is an error.
+;;; * Liveness, backwards over the flat forms: a raw variable read (anywhere in
+;;;   ROOT) after a GC point, and not set in between, is LIVE across it.  Each
+;;;   live variable is SPLIT around that point -- its high half into a hidden
+;;;   variable, its low half into itself, both 16-bit fixnums (no allocation,
+;;;   nothing for the collector to mistake), and joined again after -- so the
+;;;   value reads back unchanged.  fe-mul has no GC point while a raw word is
+;;;   live, so nothing is split there and its code is as before.
+;;; * MODUS_W32_UNSAFE_LIVE=1 (build time, *W32-UNSAFE-LIVE*) skips the split:
+;;;   the negative control of the collector rung (test/w32-gc-live.lisp), which
+;;;   must then FAIL.
+(defvar *w32-unsafe-live* nil
+  "T: do not split raw W32 variables live across a GC point (the collector
+   rung's negative control; MODUS_W32_UNSAFE_LIVE=1, set by the build).")
+
+(defun %w32-raw-decl-vars (body)
+  "The variables BODY's leading declarations name in (W32-RAW ...) specs."
+  (let ((vars nil))
+    (loop
+      (if (and (consp body) (consp (car body)) (symbolp (caar body))
+               (name-eq (caar body) "DECLARE"))
+          (progn
+            (dolist (spec (cdar body))
+              (when (and (consp spec) (symbolp (car spec)) (name-eq (car spec) "W32-RAW"))
+                (dolist (v (cdr spec)) (push v vars))))
+            (setq body (cdr body)))
+          (return (nreverse vars))))))
+
+(defun %w32-strip-raw-decl (body)
+  "BODY with every (W32-RAW ...) spec removed from its leading declarations;
+   (values declarations forms)."
+  (let ((decls nil))
+    (loop
+      (if (and (consp body) (consp (car body)) (symbolp (caar body))
+               (name-eq (caar body) "DECLARE"))
+          (let ((keep nil))
+            (dolist (spec (cdar body))
+              (unless (and (consp spec) (symbolp (car spec)) (name-eq (car spec) "W32-RAW"))
+                (push spec keep)))
+            (when keep (push (cons (caar body) (nreverse keep)) decls))
+            (setq body (cdr body)))
+          (return (values (nreverse decls) body))))))
+
+(defun %w32-tree-mentions (tree vars)
+  "The members of VARS that occur anywhere in TREE (as atoms)."
+  (let ((found nil) (stack (list tree)))
+    (loop
+      (when (null stack) (return found))
+      (let ((x (pop stack)))
+        (cond ((consp x) (push (car x) stack) (push (cdr x) stack))
+              ((and x (symbolp x) (member x vars) (not (member x found)))
+               (push x found)))))))
+
+(defun %w32-tree-has-op (tree name)
+  "True when an operator named NAME heads some cons in TREE."
+  (let ((stack (list tree)))
+    (loop
+      (when (null stack) (return nil))
+      (let ((x (pop stack)))
+        (when (consp x)
+          (when (and (symbolp (car x)) (car x) (string= (symbol-name (car x)) name))
+            (return t))
+          (push (car x) stack) (push (cdr x) stack))))))
+
+(defun %w32-form-root (f)
+  "For a W32 form (setq X (%w32 ROOT)) or (%w32 ROOT): (values ROOT X-or-NIL);
+   otherwise NIL."
+  (cond ((and (consp f) (symbolp (car f)) (name-eq (car f) "%W32")
+              (consp (cdr f)) (null (cddr f)))
+         (values (cadr f) nil))
+        ((and (consp f) (symbolp (car f)) (name-eq (car f) "SETQ")
+              (consp (cdr f)) (symbolp (cadr f)) (consp (cddr f)) (null (cdddr f))
+              (consp (caddr f)) (symbolp (car (caddr f))) (name-eq (car (caddr f)) "%W32")
+              (consp (cdr (caddr f))) (null (cddr (caddr f))))
+         (values (cadr (caddr f)) (cadr f)))
+        (t nil)))
+
+(defun %w32-flatten (forms raw)
+  "FORMS macroexpanded at their tops with PROGNs spliced; a form whose
+   expansion has no %W32 and mentions no RAW variable is kept as written."
+  (let ((out nil))
+    (dolist (f forms)
+      (let ((e (if (consp f) (macroexpand-mvm f) f)))
+        (cond ((and (consp e) (symbolp (car e)) (name-eq (car e) "PROGN"))
+               (dolist (g (%w32-flatten (cdr e) raw)) (push g out)))
+              ((or (%w32-tree-has-op e "%W32") (%w32-tree-mentions e raw))
+               (push e out))
+              (t (push f out)))))
+    (nreverse out)))
+
+(defun %w32-raw-scope-rewrite (head bindings body)
+  "For a LET / LET* (HEAD) whose body declares (W32-RAW ...): the checked,
+   split form to compile instead (see the block comment); NIL otherwise."
+  (let ((raw (%w32-raw-decl-vars body)))
+    (when raw
+      (dolist (v raw)
+        (unless (and (symbolp v) v
+                     (member v (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)))
+          (error "W32-RAW: ~S is not bound by this ~A" v head)))
+      (multiple-value-bind (decls forms) (%w32-strip-raw-decl body)
+        (let* ((flat (%w32-flatten forms raw))
+               (n (length flat))
+               (kinds (make-array n :initial-element nil)) (uses (make-array n :initial-element nil))
+               (defs (make-array n :initial-element nil))
+               (i 0))
+          ;; classify
+          (dolist (f flat)
+            (multiple-value-bind (root target) (%w32-form-root f)
+              (cond
+                (root
+                 (let ((rname (%w32-op-name root)))
+                   (when (and rname (string= rname "W32-RAW")
+                              (not (and target (member target raw))))
+                     (error "W32-RAW: (w32-raw ...) must be the value of a SETQ of a declared variable: ~S" f))
+                   (when (%w32-tree-has-op (cdr root) "W32-RAW")
+                     (error "W32-RAW: a nested (w32-raw ...): ~S" f))
+                   (setf (aref kinds i) (if (and rname (string= rname "W32-RAW")) :raw :w32))
+                   (setf (aref uses i) (%w32-tree-mentions root raw))
+                   (setf (aref defs i) (and target (member target raw) target))))
+                (t
+                 (let ((m (%w32-tree-mentions f raw)))
+                   (when m
+                     (error "W32-RAW: raw variable ~S used outside a W32 form: ~S" (car m) f)))
+                 (when (%w32-tree-has-op f "W32-RAW")
+                   (error "W32-RAW: (w32-raw ...) inside a compound form: ~S" f))
+                 (setf (aref kinds i) :gc))))
+            (setq i (+ i 1)))
+          (when (and (> n 0) (eq (aref kinds (- n 1)) :raw))
+            (error "W32-RAW: the ~A's value would be a raw word: ~S" head (car (last flat))))
+          ;; liveness, backwards: LIVE-OUT of each GC point
+          (let ((live nil) (split (make-array n :initial-element nil)))
+            (setq i (- n 1))
+            (loop
+              (when (< i 0) (return))
+              (when (eq (aref kinds i) :gc) (setf (aref split i) live))
+              (when (aref defs i) (setq live (remove (aref defs i) live)))
+              (dolist (u (aref uses i)) (unless (member u live) (push u live)))
+              (setq i (- i 1)))
+            ;; rebuild, splitting around each GC point (unless the knob says not to)
+            (let ((his nil) (out nil))
+              (setq i 0)
+              (dolist (f flat)
+                (let ((l (if *w32-unsafe-live* nil (aref split i))))
+                  (dolist (v l)
+                    (let ((h (or (cdr (assoc v his))
+                                 (let ((g (%mvm-gensym "W32H"))) (push (cons v g) his) g))))
+                      (push (list 'setq h (list '%w32 (list 'w32-hi16 (list 'w32-ref v)))) out)
+                      (push (list 'setq v (list '%w32 (list 'w32-lo16 (list 'w32-ref v)))) out)))
+                  (push (if (eq (aref kinds i) :raw)
+                            (list 'setq (cadr f)
+                                  (list '%w32 (cons 'w32-raw-checked (cdr (cadr (caddr f))))))
+                            f)
+                        out)
+                  (dolist (v l)
+                    (push (list 'setq v (list '%w32 (list 'w32-raw-checked
+                                                          (list 'w32-join (cdr (assoc v his)) v))))
+                          out)))
+                (setq i (+ i 1)))
+              (list* head
+                     (append bindings (mapcar (lambda (p) (list (cdr p) 0)) (reverse his)))
+                     (append decls (nreverse out))))))))))
 
 ;;; ---- THE W32 EXPRESSION REWRITE (docs/w32.md, M3a) -----------------------
 ;;; On a W32-capable target, an integer expression whose value is provably a

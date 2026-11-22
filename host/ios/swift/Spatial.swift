@@ -44,16 +44,21 @@ private var headYaw = 0.0, headPitch = 0.0, headRoll = 0.0
 // all measured from there (CMAttitude.multiply(byInverseOf:)), so the screen in front of the person -- a laptop they
 // look down at -- is straight ahead.
 private var headReference: CMAttitude?
+// THE FIRST HALF SECOND SETTLES IT: the headphones' first reports are still finding the head, so the neutral pose
+// follows them until then, rather than keeping the very first -- the person is taken to face the screen when they
+// turn following on, without recentering after.
+private var headSettleUntil = Date.distantPast
 
 private func startHeadTracking() {
     guard headphones.isDeviceMotionAvailable, !headphones.isDeviceMotionActive else { return }
     headReference = nil                       // the neutral pose is where the head is now
+    headSettleUntil = Date().addingTimeInterval(0.5)
     headphones.startDeviceMotionUpdates(to: .main) { motion, error in
         guard let a = motion?.attitude else {
             if let error { NSLog("modus spatial: headphone motion: \(error)") }
             return
         }
-        if headReference == nil { headReference = a.copy() as? CMAttitude }
+        if headReference == nil || Date() < headSettleUntil { headReference = a.copy() as? CMAttitude }
         guard let reference = headReference, let relative = a.copy() as? CMAttitude else { return }
         relative.multiply(byInverseOf: reference)
         headYaw = relative.yaw
@@ -192,7 +197,8 @@ let spatialHeadAttitude: Call = { p, _, _, _, _, _ in
 
 let spatialHeadRecenter: Call = { _, _, _, _, _, _ in
     #if os(iOS) || os(macOS)
-    headReference = nil                         // the next report sets it
+    headReference = nil                         // the next reports set it
+    headSettleUntil = Date().addingTimeInterval(0.5)
     #endif
     return 1
 }

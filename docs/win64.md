@@ -176,6 +176,48 @@ not used: the window manager repaints the whole box, and only a diff against a
 snapshot -- a Lisp loop as slow as the copy -- could say which moved pixels are
 unchanged.
 
+**The speaker** (`net/win32-audio.lisp`): `W32-AUDIO-OPEN` / `-WRITE` / `-QUEUED` /
+`-CLOSE`, kiln's speaker on waveOut (WINMM loaded at the first open).  The default
+output is whatever Windows plays to, Bluetooth headphones included.
+
+**The Windows Runtime** (`net/win32-winrt.lisp`, `net/win32-winrt-ids.lisp`).  WinRT
+is COM with HSTRINGs: `WRT-OPEN` loads combase and joins the multithreaded apartment,
+`WRT-CALL` calls vtable slot N, `WRT-FACTORY` / `WRT-ACTIVATE` make objects,
+`WRT-OP-STATE` looks at an asynchronous operation without waiting.  The slots and
+IIDs are GENERATED from Windows' own metadata by `scripts/gen-winrt-ids.py`
+(Microsoft's `.winmd` files are not in the repository; any Windows 10+ has them in
+`System32\WinMetadata`): methods by their ABI names, `[Overload]` included, and the
+`TypedEventHandler<S,A>` IIDs by WinRT's parameterized-IID rule (SHA-1 name-based
+UUID), checked against IVector<String>'s published IID before anything is written.
+An event handler is a native COM object (`WIN64-COM-DELEGATE-ITEMS`): its Invoke
+runs on a Windows thread-pool thread, AddRefs the sender and arguments and appends
+`(id sender args)` to a ring in the context's block, which `WRT-EVENTS` drains; no
+Lisp runs in a callback.  Everything Windows touches lives in that one VirtualAlloc'd
+block, and the context is the caller's vector -- on modus a worker thread may not
+store its own objects where another can reach them.
+
+**Bluetooth LE** (`net/win32-ble.lisp`): a mesh radio in the shape of kiln's
+`Bluetooth.swift`, so chirp (bitchat's protocol) runs unchanged on Windows.  One
+service, one characteristic; this machine is both CENTRAL (an advertisement watcher
+filtered on the service; each peer found becomes a chain device -> service ->
+characteristic -> subscribe -> session MTU, up to 6) and PERIPHERAL (a
+GattServiceProvider offering a read/write/write-without-response/notify
+characteristic, advertised connectable).  `W32-BLE-START SERVICE CHAR` -> a radio;
+`W32-BLE-POLL` -> events `(:state ON)` `(:link LINK UP MAX)` `(:data LINK BYTES)`
+`(:log TEXT)`; `W32-BLE-SEND RADIO LINK BYTES` writes (without response when it
+fits) or notifies; `W32-BLE-STOP`; `W32-BLE-STATE`.  Nothing waits: each step is an
+operation the next poll looks at, so a window's tick can drive it.
+`W32-BLE-SELFTEST` checks every layer below the radio; `test/win64/ble-test.lisp`
+runs it, then the radio with bitchat's service, printing every event.  Measured on
+Server 2022 (no Bluetooth in the guest): WinRT, activation, the advertisement
+handler's registration (S_OK -- a wrong IID is E_NOINTERFACE), the watcher's start
+and abort, an IBuffer round trip, the adapter query to its end, and the
+no-adapter path.  The radio itself needs a machine with Bluetooth.
+
+**Random bytes** (`net/win32-entropy.lisp`): `%MODUS-HARDWARE-ENTROPY` is
+BCryptGenRandom (system-preferred RNG), the name natrium's DRBG looks for when there
+is no `/dev/urandom` -- without it no key could be made on Windows.
+
 ## Testing
 
 - `test/win64/cases.sh` holds the checks (arithmetic, bignums, printing,

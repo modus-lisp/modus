@@ -1263,7 +1263,12 @@ and per-CPU bases are TEB TLS slots, not FS/GS** (a user FS base is lost at a co
 Windows; Wine keeps it): with `*X64-WIN-TLS*`, every FS/GS-prefixed access the translator emits is
 captured and rewritten by `EMIT-BYTE` (`MODUS.ASM:%SEG-BEGIN`).  A hand-counted byte distance across
 such an access must be measured (`X64-TLS-INSN-LENGTH`).  **The boot stub is assembled at emit time**: an
-early copy baked the default allocation limit and the collector never ran.
+early copy baked the default allocation limit and the collector never ran.  **WinRT is
+callable** (`net/win32-winrt.lisp`; slots and IIDs generated from Windows' metadata by
+`scripts/gen-winrt-ids.py`, event handlers are native COM objects that ring events), and on it
+`net/win32-ble.lisp`, a Bluetooth LE mesh radio in `Bluetooth.swift`'s shape (`W32-BLE-START` /
+`-POLL` / `-SEND` / `-STOP`) for chirp.  natrium's entropy there is `%MODUS-HARDWARE-ENTROPY`
+(BCryptGenRandom, `net/win32-entropy.lisp`).
 
 ### Pi Zero 2 W (real hardware)
 The Zero runs the same board image as above (USB host + a USB NIC, HDMI

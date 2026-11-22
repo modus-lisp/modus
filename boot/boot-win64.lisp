@@ -1300,6 +1300,8 @@
     (:align 16)
     ,@(win64-wndproc-items)
     (:align 16)
+    ,@(win64-com-delegate-items)
+    (:align 16)
     ,@(win64-prologue-items)))
 
 (defun win64-wndproc-items ()
@@ -1377,6 +1379,100 @@
     (:bytes #x48 #x83 #xC4 #x30)                 ; add rsp,0x30
     (:bytes #x5F #x5E #x5B)                      ; pop rdi/rsi/rbx
     (:bytes #xC3)))                              ; ret
+
+(defun w64-guid-qwords (text)
+  "The GUID TEXT (\"8-4-4-4-12\") as the two little-endian qwords it occupies in memory."
+  (let* ((h (remove #\- text))
+         (d1 (parse-integer h :start 0 :end 8 :radix 16))
+         (d2 (parse-integer h :start 8 :end 12 :radix 16))
+         (d3 (parse-integer h :start 12 :end 16 :radix 16))
+         (bytes (append (loop for i below 4 collect (ldb (byte 8 (* 8 i)) d1))
+                        (loop for i below 2 collect (ldb (byte 8 (* 8 i)) d2))
+                        (loop for i below 2 collect (ldb (byte 8 (* 8 i)) d3))
+                        (loop for i from 16 below 32 by 2
+                              collect (parse-integer h :start i :end (+ i 2) :radix 16)))))
+    (flet ((q (from) (loop for i below 8 sum (ash (nth (+ from i) bytes) (* 8 i)))))
+      (values (q 0) (q 8)))))
+
+(defun win64-com-delegate-items ()
+  "A COM object of the runtime's for WinRT to call back: an event handler (TypedEventHandler).
+   net/win32-winrt.lisp lays the object out in raw memory and points it at these four:
+     +0 the vtable (QueryInterface AddRef Release Invoke)  +16 a handler id  +24 its ring
+     +32 the IID it answers to (16 bytes)
+   Invoke runs on a Windows thread-pool thread and no Lisp runs in it: it AddRefs the sender
+   and the event arguments and appends (id sender args) to the ring -- +0 a lock (a qword: the
+   Lisp side's XCHG-MEM is 64-bit, this one exchanges its low half), +8 the count, +12 the
+   capacity, 24-byte entries from +16 -- or Releases both when it is full.
+   The objects live as long as the ring's block, so AddRef and Release count nothing.
+   QueryInterface answers IUnknown, IAgileObject (any thread may call it) and the object's own
+   IID, and E_NOINTERFACE to anything else -- IMarshal above all."
+  (multiple-value-bind (unk0 unk1) (w64-guid-qwords "00000000-0000-0000-C000-000000000046")
+    (multiple-value-bind (agl0 agl1) (w64-guid-qwords "94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90")
+      `((:label :com-qi)                           ; rcx this, rdx riid, r8 ppv
+        (:bytes #x48 #x8B #x02)                    ; mov rax,[rdx]
+        (:bytes #x4C #x8B #x4A #x08)               ; mov r9,[rdx+8]
+        (:bytes #x49 #xBA ,@(w64-le64 unk0))       ; mov r10,IUnknown lo
+        (:bytes #x4C #x39 #xD0) (:jcc 5 :cq-agile) ; cmp rax,r10 / jne
+        (:bytes #x49 #xBA ,@(w64-le64 unk1))       ; mov r10,IUnknown hi
+        (:bytes #x4D #x39 #xD1) (:jcc 4 :cq-yes)   ; cmp r9,r10 / je
+        (:label :cq-agile)
+        (:bytes #x49 #xBA ,@(w64-le64 agl0))       ; mov r10,IAgileObject lo
+        (:bytes #x4C #x39 #xD0) (:jcc 5 :cq-own)
+        (:bytes #x49 #xBA ,@(w64-le64 agl1))
+        (:bytes #x4D #x39 #xD1) (:jcc 4 :cq-yes)
+        (:label :cq-own)
+        (:bytes #x48 #x3B #x41 #x20) (:jcc 5 :cq-no)   ; cmp rax,[rcx+32]
+        (:bytes #x4C #x3B #x49 #x28) (:jcc 4 :cq-yes)  ; cmp r9,[rcx+40]
+        (:label :cq-no)
+        (:bytes #x49 #xC7 #x00 0 0 0 0)            ; mov qword [r8],0
+        (:bytes #xB8 #x02 #x40 #x00 #x80)          ; mov eax,E_NOINTERFACE
+        (:bytes #xC3)
+        (:label :cq-yes)
+        (:bytes #x49 #x89 #x08)                    ; mov [r8],rcx
+        (:bytes #x31 #xC0 #xC3)                    ; xor eax,eax / ret
+        (:label :com-addref)                       ; AddRef and Release: the object
+        (:label :com-release)                      ; outlives every caller
+        (:bytes #xB8 #x01 #x00 #x00 #x00 #xC3)     ; mov eax,1 / ret
+        (:label :com-invoke)                       ; rcx this, rdx sender, r8 args
+        (:bytes #x53 #x56 #x57 #x41 #x54)          ; push rbx/rsi/rdi/r12
+        (:bytes #x48 #x83 #xEC #x28)               ; sub rsp,0x28
+        (:bytes #x48 #x89 #xCB #x48 #x89 #xD6 #x4C #x89 #xC7) ; rbx=this rsi=sender rdi=args
+        (:bytes #x48 #x85 #xF6) (:jcc 4 :ci-a1)    ; test rsi,rsi / je
+        (:bytes #x48 #x89 #xF1 #x48 #x8B #x01 #xFF #x50 #x08) ; sender->AddRef()
+        (:label :ci-a1)
+        (:bytes #x48 #x85 #xFF) (:jcc 4 :ci-a2)
+        (:bytes #x48 #x89 #xF9 #x48 #x8B #x01 #xFF #x50 #x08) ; args->AddRef()
+        (:label :ci-a2)
+        (:bytes #x4C #x8B #x63 #x18)               ; mov r12,[rbx+24]   the ring
+        (:label :ci-lock)
+        (:bytes #xB8 #x01 #x00 #x00 #x00)          ; mov eax,1
+        (:bytes #x41 #x87 #x04 #x24)               ; xchg [r12],eax
+        (:bytes #x85 #xC0) (:jcc 4 :ci-got)        ; test eax,eax / je
+        (:bytes #xF3 #x90) (:jmp :ci-lock)         ; pause
+        (:label :ci-got)
+        (:bytes #x41 #x8B #x44 #x24 #x08)          ; mov eax,[r12+8]   count
+        (:bytes #x41 #x3B #x44 #x24 #x0C)          ; cmp eax,[r12+12]  capacity
+        (:jcc 3 :ci-full)                          ; jae
+        (:bytes #x48 #x6B #xC0 #x18)               ; imul rax,rax,24
+        (:bytes #x48 #x8B #x4B #x10)               ; mov rcx,[rbx+16]   id
+        (:bytes #x49 #x89 #x4C #x04 #x10)          ; mov [r12+rax+16],rcx
+        (:bytes #x49 #x89 #x74 #x04 #x18)          ; mov [r12+rax+24],rsi
+        (:bytes #x49 #x89 #x7C #x04 #x20)          ; mov [r12+rax+32],rdi
+        (:bytes #x41 #xFF #x44 #x24 #x08)          ; inc dword [r12+8]
+        (:bytes #x41 #xC7 #x04 #x24 0 0 0 0)       ; mov dword [r12],0   unlock
+        (:jmp :ci-done)
+        (:label :ci-full)
+        (:bytes #x41 #xC7 #x04 #x24 0 0 0 0)       ; unlock
+        (:bytes #x48 #x85 #xF6) (:jcc 4 :ci-f1)
+        (:bytes #x48 #x89 #xF1 #x48 #x8B #x01 #xFF #x50 #x10) ; sender->Release()
+        (:label :ci-f1)
+        (:bytes #x48 #x85 #xFF) (:jcc 4 :ci-done)
+        (:bytes #x48 #x89 #xF9 #x48 #x8B #x01 #xFF #x50 #x10) ; args->Release()
+        (:label :ci-done)
+        (:bytes #x31 #xC0)                         ; xor eax,eax  S_OK
+        (:bytes #x48 #x83 #xC4 #x28)               ; add rsp,0x28
+        (:bytes #x41 #x5C #x5F #x5E #x5B)          ; pop r12/rdi/rsi/rbx
+        (:bytes #xC3)))))
 
 (defvar *win64-stub-cache* nil
   "(stub-bytes shim-offset iat-offset), assembled once per process: the LAYOUT
@@ -1809,10 +1905,12 @@
                 name (+ +win64-call-base+ (win64-import-slot name)))))
     ;; The window procedure (WIN64-WNDPROC-ITEMS), for net/win32-window.lisp.
     (format o "(defconstant +w32-wndproc-va+ ~D)~%" (win64-label-va :wndproc))
-    (dolist (l '(:wp-getwlp :wp-defwp :wp-validate))
+    (dolist (l '(:wp-getwlp :wp-defwp :wp-validate :com-qi :com-addref :com-release :com-invoke))
       (format o "(defconstant +w32-~(~A~)-va+ ~D)~%" l (win64-label-va l)))))
 
-(defparameter *win64-platform-files* '("net/win32-window.lisp" "net/win32-audio.lisp")
+(defparameter *win64-platform-files* '("net/win32-window.lisp" "net/win32-audio.lisp"
+                                        "net/win32-winrt-ids.lisp" "net/win32-winrt.lisp"
+                                        "net/win32-ble.lisp" "net/win32-entropy.lisp")
   "The Windows platform's runtime files: appended to the image here, and their names handed to
    the scanners by build-generic-cli.lisp (*CLI-SCAN-EXTRA-SOURCE*), which keeps its own copy of
    this list -- it reads them before this file is loaded.")

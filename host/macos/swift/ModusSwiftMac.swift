@@ -1146,6 +1146,8 @@ public func modusSwiftInstall() {
     installGamepad()                               // Gamepad.swift: game controllers
     installSpatial()                               // Spatial.swift: sound placed in three dimensions
     installNotify()                                // Notify.swift: the system's notifications
+    installMotion()                                // Motion.swift: how the device itself is turned
+    installLink()                                  // Link.swift: messages to and from the watch
     installChrome()                                // MacChrome.swift: glass, menus, status items
     installNative()                                // NativeMac.swift: app-grade components (an app, not the desk)
     installWindow()                                // MacWindow.swift: the window's title, chrome and size

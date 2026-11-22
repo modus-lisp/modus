@@ -1895,6 +1895,8 @@ public func modusSwiftInstall() {
     installGamepad()                               // Gamepad.swift: game controllers
     installSpatial()                               // Spatial.swift: sound placed in three dimensions
     installNotify()                                // Notify.swift: the system's notifications
+    installMotion()                                // Motion.swift: how the device itself is turned
+    installLink()                                  // Link.swift: messages to and from the watch
     installNative()                                // Native.swift: app-grade components (an app, not the desk)
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)

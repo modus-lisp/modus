@@ -124,6 +124,7 @@ if [ "$KIND" = gui ]; then
     "$HERE/../ios/swift/Bluetooth.swift" "$HERE/../ios/swift/Files.swift" "$HERE/../ios/swift/Camera.swift" \
     "$HERE/../ios/swift/Microphone.swift" "$HERE/../ios/swift/NowPlaying.swift" \
     "$HERE/../ios/swift/Gamepad.swift" "$HERE/../ios/swift/Spatial.swift" "$HERE/../ios/swift/Notify.swift" \
+    "$HERE/../ios/swift/Motion.swift" "$HERE/../ios/swift/Link.swift" \
     "$HERE"/swift/*.swift
   LINKX=""
   for W in $WHERE; do

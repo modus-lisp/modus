@@ -138,6 +138,9 @@ JSON
   /usr/libexec/PlistBuddy -c "Merge $OBJS/icon.plist" "$OUT/Info.plist" > /dev/null
 fi
 for f in ${MODUS_IOS_FILES:-}; do cp -R "$f" "$OUT/"; done
+# THE WATCH APP that goes with it (MODUS_IOS_WATCH_APP, already signed: build-watch.sh), in Watch/, where the phone
+# looks for its companion -- installed beside it on the paired watch, and linked to it (WatchConnectivity)
+if [ -n "${MODUS_IOS_WATCH_APP:-}" ]; then mkdir -p "$OUT/Watch"; cp -R "$MODUS_IOS_WATCH_APP" "$OUT/Watch/"; fi
 if [ -n "$PROFILE" ]; then cp "$PROFILE" "$OUT/embedded.mobileprovision"; fi
 if [ -n "$IDENT" ]; then
   ENT=$(mktemp); security cms -D -i "$PROFILE" > "$ENT.plist" 2>/dev/null && \

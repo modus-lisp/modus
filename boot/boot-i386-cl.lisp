@@ -49,10 +49,11 @@
 (defconstant +i386-cl-low-va+     #x10000000)
 (defconstant +i386-cl-low-size+   #x20000 "+linux-i386-bss-end+ - #x10000000.")
 (defconstant +i386-cl-pt-reserve+ #x40000 "RAM kept back for the heap's page tables.")
-(defconstant +i386-cl-fb-window+ #x0C000000
+(defconstant +i386-cl-fb-window+ #x0E000000
   "VA of the 16 MB framebuffer window: four page tables at +I386-CL-FB-PTS+,
    empty until the image's own Lisp has set a VBE mode and fills them with
-   its framebuffer's pages.")
+   its framebuffer's pages.  Not #x0C000000, where it was: that is the shared
+   network code's SSH state (net/arch-x86-cl.lisp), which bare i386 maps too.")
 (defconstant +i386-cl-fb-pts+ #x20000
   "PA (= VA: the low megabyte is identity-mapped) of the framebuffer window's
    four page tables -- where MODUS.COM ran, which nothing uses once the image

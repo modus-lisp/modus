@@ -113,8 +113,9 @@ def main():
         buf, t0 = b'', time.time()
         mark = 0                          # where the last form's answer starts
         limit = float(os.environ.get('CORE_FORM_LIMIT', '3600'))
+        deadline = 600 + limit * len(forms)    # from the count at the START: FORMS empties
         while b'CORE-SAVE' not in buf or not buf.split(b'CORE-SAVE', 1)[1].count(b'\n'):
-            if time.time() - t0 > (600 + limit * len(forms)) or p.poll() is not None:
+            if time.time() - t0 > deadline or p.poll() is not None:
                 sys.exit('no CORE-SAVE line; serial said:\n' + buf.decode('latin1')[-2000:])
             if forms and (b'\n> ' in buf[mark:] or buf[mark:].startswith(b'> ')):
                 if mark and b'\nERROR:' in buf[mark:]:

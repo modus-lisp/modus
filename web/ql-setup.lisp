@@ -50,6 +50,14 @@
 
 (defvar *ql-systems-dir* "systems/")
 
+;;; Standard CL only: this file is loaded into CL-USER, which does not see the
+;;; image's internals (WRITE-STRING-SERIAL, %SYS-STAT-EXISTS live in MODUS-INT).
+(defun %mql-say (&rest strings)
+  "One line of STRINGS to *STANDARD-OUTPUT*."
+  (dolist (s strings) (write-string s))
+  (terpri)
+  (force-output))
+
 (defun ql-set-systems-dir (dir)
   "Set the directory quickload looks in for <name>.tar archives.  DIR should
    end with a trailing slash."
@@ -73,13 +81,11 @@
    Runs on the baked install-tarball / tar-extract pipeline."
   (let* ((nm (%ql-name-string name))
          (path (%ql-tar-path nm)))
-    (write-string-serial "; loading ") (write-string-serial nm)
-    (write-string-serial " from ") (write-string-serial path) (write-char-serial 10)
-    (if (%sys-stat-exists path)
+    (%mql-say "; loading " nm " from " path)
+    (if (probe-file path)
         (progn (install-tarball path nm) nm)
         (progn
-          (write-string-serial "; ql:quickload: no tarball at ")
-          (write-string-serial path) (write-char-serial 10)
+          (%mql-say "; ql:quickload: no tarball at " path)
           (error "ql:quickload: system not found")))))
 
 (defun %ql-init ()
@@ -94,14 +100,11 @@
           (export sym "QL")
           (setf (symbol-function sym) (function %ql-quickload))))
     (t (c)
-      (write-string-serial "; %ql-init failed") (write-char-serial 10))))
+      (%mql-say "; %ql-init failed: " (princ-to-string c)))))
 
 ;;; --- driver: run the whole setup at (load) time -----------------------------
 ;;; *ql-systems-dir* points at the bundled systems/ under the repo root.
 
 (setq *ql-systems-dir* (%mql-path "systems/"))
 (%ql-init)
-(write-string-serial "; modus-quicklisp: ql:quickload ready (systems dir ")
-(write-string-serial *ql-systems-dir*)
-(write-string-serial ")")
-(write-char-serial 10)
+(%mql-say "; modus-quicklisp: ql:quickload ready (systems dir " *ql-systems-dir* ")")

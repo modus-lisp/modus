@@ -2852,24 +2852,46 @@
         do (a64-movz buf +a64-x16+ (char-code ch) 0)
            (a64-exhausted-put-x16 buf)))
 
-(defun emit-aarch64-gc-exhausted (buf)
-  "Print GC: HEAP EXHAUSTED and stop: exit_group(137) hosted, WFE forever on
-   bare metal.  The message NAMES THE HEAP: the semispace size of the region
-   being collected (x25), in hex -- with threads, which region ran out is the
-   first question (a phone's 16 MB and 64 MB worker regions, region 0's young
-   space), and the process ends here with nothing else said."
-  (a64-exhausted-put-string buf (format nil "~%GC: HEAP EXHAUSTED (live data > one semispace of 0x"))
-  ;; eight hex digits of x25 (space_size): x16 = (x25 << (32+4k)) >> 60, then to ASCII
+(defun a64-exhausted-put-hex (buf reg)
+  "Eight hex digits of the low 32 bits of REG, through w16: x16 = (REG << (32+4k)) >> 60,
+   then to ASCII.  REG must not be one A64-EXHAUSTED-PUT-X16 clobbers (x0-x2, x8, x15, x16,
+   x17)."
   (dotimes (k 8)
     (let ((digit (incf *mvm-label-counter*)))
-      (a64-lsl-imm buf +a64-x16+ +a64-x25+ (+ 32 (* 4 k)))
+      (a64-lsl-imm buf +a64-x16+ reg (+ 32 (* 4 k)))
       (a64-lsr-imm buf +a64-x16+ +a64-x16+ 60)
       (a64-add-imm buf +a64-x16+ +a64-x16+ 48)                          ; '0'..
       (a64-cmp-imm buf +a64-x16+ 58)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i digit :bcond)) ; < ':' : a digit
       (a64-add-imm buf +a64-x16+ +a64-x16+ 39)                          ; 'a'..'f'
       (a64-set-label buf digit)
-      (a64-exhausted-put-x16 buf)))
+      (a64-exhausted-put-x16 buf))))
+
+(defun emit-aarch64-gc-exhausted (buf)
+  "Print GC: HEAP EXHAUSTED and stop: exit_group(137) hosted, WFE forever on
+   bare metal.  Reached from COPY_OBJECT's room check (EMIT-AARCH64-GC-ROOM-CHECK):
+   x21 is to-space's free pointer, x22 its start, x15 the size that did not fit and
+   x25 the semispace's size.  The message says all three, in hex:
+
+     GC: HEAP EXHAUSTED (0x14f2c010 bytes copied, then 0x00001010 more,
+                         > one semispace of 0x157fe000 bytes)
+
+   The semispace NAMES THE HEAP -- with threads, which region ran out is the first
+   question (a phone's 16 MB and 64 MB worker regions, region 0's young space).  The
+   copied amount is what this collection found live before it stopped, so a live set
+   the size of the whole semispace reads as one, and a single object too large for
+   a small worker heap reads as that.  The first version printed the semispace
+   alone, and its live data > one semispace, over 40 MB of a program's own arrays,
+   sent a session looking for a collector bug when ~300 MB of world was live."
+  ;; x14 = the size (the bare-metal put clobbers x15), x13 = copied = free - to_start
+  (a64-mov-reg buf +a64-x14+ +a64-x15+)
+  (a64-sub-reg buf +a64-x13+ +a64-x21+ +a64-x22+ 0 0)
+  (a64-exhausted-put-string buf (format nil "~%GC: HEAP EXHAUSTED (0x"))
+  (a64-exhausted-put-hex buf +a64-x13+)
+  (a64-exhausted-put-string buf " bytes copied, then 0x")
+  (a64-exhausted-put-hex buf +a64-x14+)
+  (a64-exhausted-put-string buf " more, > one semispace of 0x")
+  (a64-exhausted-put-hex buf +a64-x25+)
   (a64-exhausted-put-string buf (format nil " bytes)~%"))
   (if *aarch64-linux-mode*
       (progn (a64-load-imm64 buf +a64-x0+ 137)

@@ -26400,20 +26400,27 @@
 ;;; arithmetic plus at most one %MAKE-BIGNUM -- no generic arithmetic, which is
 ;;; what the M3a first cut called (%W32-HI-OF / -LO-OF / -BOX in the prelude:
 ;;; measured 11% SLOWER on SHA-256 and 1.8x slower on ChaCha20 than the bignum
-;;; code it replaced).
+;;; code it replaced).  The limbs are read and written with %WORD-AREF /
+;;; %WORD-ASET, not %PRIM-AREF / %PRIM-ASET: the argument is always a bignum, a
+;;; word object, and %PRIM-AREF compiles a dispatch on the array's kind (byte,
+;;; 32-bit lane, word) at every use, whose bignum arm is %WORD-AREF anyway.
+;;; Measured: a (LOGAND (+ A B) #xFFFFFFFF) DEFUN over two declared words
+;;; compiles in 28 ms instead of 62 on the hosted 68k CLI (undeclared, 3 ms) --
+;;; what the Mac pays at its REPL -- and ChaCha20 runs 38-46% faster, SHA-256
+;;; 6-19% (riscv32, arm32, i386), since the dispatch ran on every bignum leaf.
 (defun %w32-hi-form (g)
   "Bits 31..16 of integer G (a fixnum or a small bignum), as a fixnum."
   (let ((lb (ct-limb-bits)))
     (list 'if (list 'fixnump g)
           (list 'logand (list 'ash g -16) #xFFFF)
-          (list 'logand (list 'logior (list 'ash (list '%prim-aref g 1) (- lb 16))
-                              (list 'ash (list '%prim-aref g 0) -16))
+          (list 'logand (list 'logior (list 'ash (list '%word-aref g 1) (- lb 16))
+                              (list 'ash (list '%word-aref g 0) -16))
                 #xFFFF))))
 (defun %w32-lo-form (g)
   "Bits 15..0 of integer G (a fixnum or a small bignum), as a fixnum."
   (list 'if (list 'fixnump g)
         (list 'logand g #xFFFF)
-        (list 'logand (list '%prim-aref g 0) #xFFFF)))
+        (list 'logand (list '%word-aref g 0) #xFFFF)))
 (defun %w32-box-form (hi lo)
   "The non-negative integer HI*2^16 + LO (HI, LO forms yielding fixnums
    0..65535): a fixnum when it is one, else a small bignum built directly."
@@ -26423,9 +26430,9 @@
           (list 'if (list '< bh (ash 1 k))
                 (list 'logior (list 'ash bh 16) bl)
                 (list 'let (list (list b (list '%make-bignum)))
-                      (list '%prim-aset b 0
+                      (list '%word-aset b 0
                             (list 'logior (list 'ash (list 'logand bh (- (ash 1 k) 1)) 16) bl))
-                      (list '%prim-aset b 1 (list 'ash bh (- 0 k)))
+                      (list '%word-aset b 1 (list 'ash bh (- 0 k)))
                       b)))))
 
 (defvar *w32-leaves* nil)

@@ -110,6 +110,13 @@
 ;;; init (its toplevel: serial REPL + halt).  "" = no bare-metal core support.
 (defvar *cli-arch-core-resume* "")
 
+;; The build's helpers and the knob recorder (lib/image-config.lisp) before the first
+;; MODUS_* read: a knob read earlier is missing from the image's record.  A wrapper that
+;; loaded them already is not loaded twice.
+(unless (fboundp (find-symbol "MVM-TEXT" "COMMON-LISP-USER"))
+  (load (merge-pathnames "../lib/load-mvm.lisp"
+                         (directory-namestring (truename *load-truename*)))))
+
 ;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-test-aux.lisp
 ;;; (the ANSI-test helpers; the CL runtime it once shared a file with is in
 ;;; mvm/cl-*.lisp) from *BRIDGE-SOURCE*.  It exists for the Pi chain-load path,
@@ -127,6 +134,20 @@
 (when *small-image*
   (format t "~&;; MODUS_SMALL_IMAGE: boot tables from packed text, no ansi-test-aux~%"))
 (defvar *cli-omit-ansi-test-aux* *small-image*)
+;;; MODUS_PACKED_TABLES=1/0 (default: on for the x64 CLI and MODUS_SMALL_IMAGE): the small image's boot TABLES on
+;;; any image -- the symbol names, the function table and the opcode table from packed
+;;; text, and the DEFVAR init thunks run in batches -- with none of its other trade-offs.
+;;; Same tables, same order; measured on the x64 CLI, the per-entry code was 57% of the
+;;; native image (the symbol names alone 26 MB, ~1.6 KB of code a name).
+(defvar *packed-boot-tables*
+  (let ((v (sb-ext:posix-getenv "MODUS_PACKED_TABLES")))
+    (if (and v (plusp (length v)))
+        (string/= v "0")
+        ;; DEFAULT ON for the x64 CLI (2026-11-22): 65.5 MB -> 32.0 MB, boot time
+        ;; unchanged (~1.46 s both), upstream ANSI 21681/21681 on both with identical
+        ;; pass sets.  Other CLIs keep the small-image rule until the secondary suite
+        ;; (scripts/allarch-ansi.sh) has run them packed.
+        (or *small-image* (and (boundp (quote *cli-arch*)) (eq *cli-arch* :x64))))))
 ;;; MODUS_NO_SURFACES=1: the Genera, SBCL (SB-THREAD, SB-BSD-SOCKETS, gray
 ;;; streams, SB-MOP) and ASDF surfaces are left out at BUILD time -- their
 ;;; baked source text (~440 KB of literals) and the cooperative atomics with
@@ -168,9 +189,7 @@
 ;; Asked as "are the build's helpers loaded", not "does MODUS.MVM exist": in a modus
 ;; image MODUS.MVM is always there (the kernel's own package's nickname), and a build on
 ;; a modus host still needs load-mvm.lisp's helpers (MVM-TEXT ...), if not its compiler.
-(unless (fboundp (find-symbol "MVM-TEXT" "COMMON-LISP-USER"))
-  (load (merge-pathnames "../lib/load-mvm.lisp"
-                         (directory-namestring (truename *load-truename*)))))
+;; (load-mvm.lisp is loaded at the top of this file: the knob recorder must see every read)
 
 (format t "~%=== Building generic Modus image ===~%")
 
@@ -1293,7 +1312,7 @@
 ;; host table and trigger it via a defparameter init-thunk (those DO run).
 (defvar *opcode-table-init-source*
   (with-output-to-string (s)
-   (if cl-user::*small-image*
+   (if cl-user::*packed-boot-tables*
     ;; MODUS_SMALL_IMAGE: the table as one text literal (a pooled constant), a
     ;; line an opcode -- "CODE NAME OPERAND... <tab>", no description -- parsed at
     ;; boot, instead of a SETF and a MAKE-OPCODE-INFO with its description built
@@ -3205,7 +3224,7 @@
 
 ;; MODUS_SMALL_IMAGE: the globals' init thunks run in batches through one
 ;; guarded loop, not a HANDLER-CASE's code each (compiler.lisp *INIT-GLOBALS-BATCHED*).
-(when cl-user::*small-image* (setq modus.mvm::*init-globals-batched* t))
+(when cl-user::*packed-boot-tables* (setq modus.mvm::*init-globals-batched* t))
 ;; MODUS_SMALL_ACCESS (default: MODUS_SMALL_IMAGE): a quoted symbol's site is
 ;; one call (compiler.lisp *STATIC-SYMBOL-ONE-CALL*) and a global read or write
 ;; is one call (*GV-CACHE-MODE* :CALL), not the inline loads.  Measured on the
@@ -3266,7 +3285,7 @@
               (%init-only (format nil "~{~A~^ ~}" *all-global-names*))))))
 
 (defvar *sft-auto-source*
-  (if cl-user::*small-image*
+  (if cl-user::*packed-boot-tables*
       (emit-sft-auto-packed *all-defun-names* 200)
       (emit-sft-auto *all-defun-names* 200)))
 (format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))
@@ -3430,7 +3449,7 @@
             (member "" names :test #'string=))))
 
 (defvar *sym-name-auto-source*
-  (if cl-user::*small-image*
+  (if cl-user::*packed-boot-tables*
       (emit-sym-name-auto-packed *all-symbol-names*)
       (emit-sym-name-auto *all-symbol-names* 200)))
 

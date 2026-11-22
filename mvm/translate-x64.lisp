@@ -1175,11 +1175,10 @@
       (emit-label buf db-done))))
 
 (defvar *x64-fault-dump*
-  ;; NOTE the shape: `(and #+sbcl (getenv ...) t)' would read as `(and t)' — i.e.
-  ;; ON — on any host that is not SBCL, because the reader DELETES the guarded
-  ;; form rather than yielding NIL.  Bind first, then test.
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_FAULT_DUMP") #-sbcl nil))
-    (if v t nil))
+  ;; MODUS_FAULT_DUMP: read by lib/load-mvm.lisp on every host -- a knob read here, at
+  ;; LOAD time, was read only by a host that loads this file (never a modus host), and
+  ;; its #+SBCL form compiled into the image as a call to SB-EXT:POSIX-GETENV.
+  nil
   "TEMPORARY DIAGNOSTIC, off unless MODUS_FAULT_DUMP is set in the build
    environment.  When on, the SIGSEGV/SIGBUS/SIGFPE/SIGILL stub's
    no-handler-active path writes its six captured diagnostic words (RIP, RSP,
@@ -8916,8 +8915,7 @@
     (emit-label buf db-done)))
 
 (defvar *x64-stw-scan-mode*
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_STW_SCANMODE") #-sbcl nil))
-    (if (and v (plusp (length v))) (parse-integer v) 1))
+  1   ; MODUS_STW_SCANMODE (read by lib/load-mvm.lisp, every host)
   "Which of the pieces ported from operandi's own STW thread scan
    EMIT-X64-STW-EXTRA-ROOTS emits: bit 1 = a thread running an actor is
    scanned over the ACTOR's stack (window +0x50C0/+0x50C8), bit 2 = its
@@ -9120,7 +9118,7 @@
       (emit-label buf skip))))
 
 (defvar *x64-stw-verify*
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_STW_VERIFY") #-sbcl nil)) (if v t nil))
+  nil   ; MODUS_STW_VERIFY (read by lib/load-mvm.lisp, every host)
   "DIAGNOSTIC, off unless MODUS_STW_VERIFY is set at build time: after a
    stop-the-world collection, walk the extra roots again and count every word
    still pointing into the old from-space (table +0x68 count, +0x70 first

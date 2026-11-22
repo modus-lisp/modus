@@ -39,6 +39,11 @@
 
 ;;; On a modus host (no SBCL), the SB-EXT entry points this script and the build call.
 #+modus (load (merge-pathnames "../lib/host-modus.lisp" (directory-namestring (truename *load-truename*))))
+;; The build's helpers and the knob recorder (lib/image-config.lisp) BEFORE the first
+;; MODUS_* read below: a knob read earlier is missing from the image's record, and was
+;; on SBCL and CCL while ABCL's driver (which loads this first) recorded it.
+(unless (fboundp (find-symbol "MVM-TEXT" "COMMON-LISP-USER"))
+  (load (merge-pathnames "../lib/load-mvm.lisp" (directory-namestring (truename *load-truename*)))))
 
 (defvar *cli-arch* :x64)
 
@@ -193,7 +198,7 @@
 ;;; 6. Build the image
 ;;; ============================================================
 
-#-modus (mvm-load "boot/boot-linux-x64.lisp")   ; a modus host has it (lib/load-mvm.lisp)
+(mvm-load "boot/boot-linux-x64.lisp")   ; a modus host adopts its constants (MVM-LOAD)
 
 (in-package :modus.mvm)
 

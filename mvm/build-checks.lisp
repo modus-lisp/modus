@@ -1166,11 +1166,48 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
   "CHECK E is tree-wide, not blob-wide, so it is worth running once per SBCL
    process — not once per BUILD-IMAGE call (the fixpoint build makes several).")
 
+(defun %gck-ensure-qualified-names (path stub-sink)
+  "Before reading PATH: every PKG:NAME / PKG::NAME token in it names a package that
+   exists and, for an SB- package, a NAME it exports.  A missing package is made
+   (and handed to STUB-SINK for deletion, as the retry below does); a missing SB-
+   external is interned and exported.  SBCL's own SB- packages export everything a
+   first-party file names (SBCL reads these files), so there this does nothing;
+   CCL's and ABCL's shims export only what the build CALLS, and their readers do
+   not all signal the PACKAGE-ERROR the retry recovers from.  The sweep checks
+   parens and strings, the same on every host -- not which SBCL symbols exist."
+  (let ((text (with-open-file (f path) (let ((s (make-string (file-length f))))
+                                         (subseq s 0 (read-sequence s f)))))
+        (i 0))
+    (flet ((token-char-p (c) (or (alphanumericp c) (find c "+-*/%.<>=!?&_$^~"))))
+      (loop
+        (let ((colon (position #\: text :start i)))
+          (unless colon (return))
+          (setq i (1+ colon))
+          (let ((ps colon))
+            (loop while (and (> ps 0) (token-char-p (char text (1- ps)))) do (decf ps))
+            (when (and (< ps colon) (alpha-char-p (char text ps))
+                       (or (= ps 0) (find (char text (1- ps)) '(#\( #\Space #\Newline #\Tab #\' #\` #\, #\#))))
+              (let* ((pkg (string-upcase (subseq text ps colon)))
+                     (ns (if (and (< (1+ colon) (length text)) (char= (char text (1+ colon)) #\:))
+                             (+ colon 2) (1+ colon)))
+                     (ne (or (position-if-not #'token-char-p text :start ns) (length text)))
+                     (name (string-upcase (subseq text ns ne))))
+                (when (plusp (length name))
+                  (unless (find-package pkg)
+                    (make-package pkg :use '(:cl))
+                    (funcall stub-sink pkg))
+                  (when (and (= ns (1+ colon)) (eql 0 (search "SB-" pkg)))
+                    (multiple-value-bind (s status) (find-symbol name pkg)
+                      (declare (ignore s))
+                      (unless (eq status :external)
+                        (ignore-errors (export (intern name pkg) pkg))))))))))))))
+
 (defun %gck-parse-one (path stub-sink)
   "Read PATH the way CHECK-PARSES does.  Returns NIL on success or a one-line
    description of the reader error.  A `package X does not exist' error is not
    a parse failure — create X, hand its name to STUB-SINK for later deletion,
    and retry the file."
+  (%gck-ensure-qualified-names path stub-sink)
   (loop for attempt from 0 below 16 do
     (let ((outcome
             (handler-case

@@ -46,7 +46,7 @@
   ;; makes a hosted library load collect several times with a large live set,
   ;; the way the 104 MB bare-x64 heap does -- the shape the default below was
   ;; chosen to avoid.  Must be a multiple of 1024 (see +linux-x64-heap-alloc-start+).
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_X64_MIDPOINT")))
+  (let ((v (sb-ext:posix-getenv "MODUS_X64_MIDPOINT")))
     (if (and v (plusp (length v))) (parse-integer v) #x38000000)))  ; 896MB semispace (2x orig): self-compile ~580MB total alloc fits WITHOUT a collection (avoids the large-working-set-collection corruption). Total mmap 2x896MB+guard ~1.8GB < 2GB imm32 cap.
 (defconstant +linux-x64-heap-data-size+ (+ (* 2 +linux-x64-gc-midpoint+) +linux-x64-gc-guard+))  ; 2 semispaces + 16MB guard
 ;; #x400 AND NOT #x200, WHICH IS A GC CONCURRENCY FIX, NOT A COSMETIC ONE.

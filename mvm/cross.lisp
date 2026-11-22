@@ -2193,10 +2193,12 @@
 (defun read-all-forms (source-text)
   "Read all Lisp forms from SOURCE-TEXT string.
    Returns a list of forms."
-  (with-input-from-string (stream source-text)
-    (loop for form = (read stream nil :eof)
-          until (eq form :eof)
-          collect form)))
+  (let ((*readtable* (or (%image-source-readtable) *readtable*))
+        (*features* (%image-source-features)))
+    (with-input-from-string (stream source-text)
+      (loop for form = (read stream nil :eof)
+            until (eq form :eof)
+            collect form))))
 
 (defun %skip-blank-and-comments (text pos)
   "The index of the first character at or after POS in TEXT that is not
@@ -2214,6 +2216,50 @@
              (let ((end (search "|#" text :start2 (+ pos 2))))
                (setq pos (if end (+ end 2) n))))
             (t (return pos))))))
+
+;;; THE IMAGE SOURCE'S BACKQUOTE, ON EVERY HOST.  The compiler expands backquote
+;;; itself, from either of two shapes: SBCL's (SB-INT:QUASIQUOTE x) with comma
+;;; structs, or modus's own reader's (BACKQUOTE x) with (COMMA x) / (COMMA-AT x) /
+;;; (COMMA-DOT x) -- and the self-hosted DDCs prove the two compile alike.  Other
+;;; hosts' readers EXPAND backquote at read time instead (CCL into LIST* / APPEND,
+;;; ABCL into its own BACKQ- operators), so the compiler would see different code
+;;; for the same text.  So a host that is neither reads image source with modus's
+;;; shape: this readtable, bound only where the image source is read.  SBCL and
+;;; modus keep their own readers (NIL here).
+(defun %image-source-readtable ()
+  #+(or sbcl modus) nil
+  #-(or sbcl modus)
+  (let ((rt (copy-readtable nil)))
+    (set-macro-character
+     #\` (lambda (stream char)
+           (declare (ignore char))
+           (list 'backquote (read stream t nil t)))
+     nil rt)
+    (set-macro-character
+     #\, (lambda (stream char)
+           (declare (ignore char))
+           (let ((next (peek-char nil stream t nil t)))
+             (cond ((char= next #\@) (read-char stream t nil t)
+                    (list 'comma-at (read stream t nil t)))
+                   ((char= next #\.) (read-char stream t nil t)
+                    (list 'comma-dot (read stream t nil t)))
+                   (t (list 'comma (read stream t nil t))))))
+     nil rt)
+    rt))
+
+;;; THE IMAGE SOURCE'S FEATURES, ON EVERY HOST.  #+/#- in image source is decided by
+;;; the READER, so it would answer for the HOST: translate-x64's
+;;; (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_FAULT_DUMP") #-sbcl nil)) ...) compiled
+;;; a call to an SB-EXT function the image does not have when SBCL built it, and NIL
+;;; when CCL did.  Image source is read as what it is -- modus -- with this list.
+(defun %image-source-features () (list :modus :common-lisp :ansi-cl))
+
+;;; ... and those forms are not only compiled: the build also EVALUATES some of them
+;;; on the host (an image macro expands on the host while compiling the image), so
+;;; the host must read (BACKQUOTE x) as the backquote it is -- through the compiler's
+;;; own EXPAND-BACKQUOTE, which is the expansion the image gets.
+#-(or sbcl modus)
+(defmacro backquote (template) (expand-backquote template 1))
 
 (defun read-all-forms-with-locations (source-text)
   "Read all Lisp forms from SOURCE-TEXT, tracking line numbers.
@@ -2263,7 +2309,9 @@
         ;; (#.+op-nop+ ...) case keys) resolves in the package where load-mvm
         ;; bound them.  Symbols are name-hashed by the compiler (package-
         ;; independent), so this doesn't change how the cl-* runtime compiles.
-        (*package* (or (find-package :modus.mvm) *package*)))
+        (*package* (or (find-package :modus.mvm) *package*))
+        (*readtable* (or (%image-source-readtable) *readtable*))
+        (*features* (%image-source-features)))
     (with-input-from-string (stream source-text)
       (loop
         (let ((pos (%skip-blank-and-comments source-text (file-position stream))))

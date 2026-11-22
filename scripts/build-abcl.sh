@@ -9,10 +9,10 @@
 # Set ABCL_JAR (default $HOME/abcl-bin-1.9.2/abcl.jar) and JAVA_XMX (default 6g).
 # Output path follows the build script's own default (`modus`).
 #
-# MODUS_GLOBAL_CHECK defaults to `warn` here: ABCL's stricter reader turns the
-# host-side check-source-parses sweep of two baked-as-source files (which name
-# in-image-only packages UIOP/SCL/ASDF/…) into false positives.  The image is
-# unaffected — see the note in lib/abcl-host-compat.lisp.
+# No knob is set here: every MODUS_* read goes into the image's configuration
+# record, so a driver that set one would build different bytes from SBCL.  (It
+# used to set MODUS_GLOBAL_CHECK=warn for the parse sweep's in-image-only
+# packages; mvm/build-checks.lisp %GCK-ENSURE-QUALIFIED-NAMES handles those.)
 #
 # Verified with ABCL 1.9.2 on OpenJDK 17.
 set -euo pipefail
@@ -23,7 +23,6 @@ cd "$here"
 ABCL_JAR="${ABCL_JAR:-$HOME/abcl-bin-1.9.2/abcl.jar}"
 JAVA_XMX="${JAVA_XMX:-6g}"
 export MODUS_ABCL_BUILD_SCRIPT="${1:-mvm/build-generic-cli.lisp}"
-export MODUS_GLOBAL_CHECK="${MODUS_GLOBAL_CHECK:-warn}"
 
 if [ ! -f "$ABCL_JAR" ]; then
   echo "error: abcl.jar not found at: $ABCL_JAR" >&2

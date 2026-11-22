@@ -53,6 +53,14 @@
                     (if *vessel-base* (merge-pathnames "kernel/" *vessel-base*) "no checkout found"))))))
 
 (defun mvm-load (relative-path)
+  "LOAD a first-party file.  On a modus host a compiler, boot or translator file
+   (mvm/, boot/) is NOT loaded -- the running image is made of it already, and
+   loading it would redefine the live compiler (lib/load-mvm.lisp's note below) --
+   but its constants are adopted (%HOST-ADOPT-CONSTANTS), which is all of it a
+   build script can see that the image does not already answer."
+  #+modus
+  (when (or (eql 0 (search "mvm/" relative-path)) (eql 0 (search "boot/" relative-path)))
+    (return-from mvm-load (%host-adopt-constants relative-path)))
   (load (modus-source relative-path) :verbose nil :print nil))
 
 ;;; ON A MODUS HOST: the ISA's constants, as values.  The sources read them at READ
@@ -64,30 +72,41 @@
   "The opcode table read from mvm/mvm.lisp's DEFOPCODE forms, in the file's order.")
 ;;; Every host reads the opcode table this way (%OPCODE-ENTRIES); a host that has
 ;;; loaded mvm/mvm.lisp has every constant bound already, so it only collects.
-(defun %host-bind-isa-constants ()
-  (let ((*package* (find-package "COMMON-LISP-USER")) (n 0))
-    (with-open-file (in (modus-source "mvm/mvm.lisp"))
-      (loop for form = (read in nil in)
+(defun %host-adopt-constants (relative-path)
+  "READ RELATIVE-PATH and evaluate each DEFCONSTANT whose symbol is unbound, in the
+   file's order (later ones are computed from earlier ones); collect mvm/mvm.lisp's
+   DEFOPCODE forms.  Nothing else in the file is evaluated.  Returns the number bound.
+   A form that does not read or evaluate is reported, not fatal: what a script then
+   misses is an unbound variable naming itself."
+  (let ((*package* (find-package "COMMON-LISP-USER")) (n 0)
+        (opcodes (string= relative-path "mvm/mvm.lisp")) (entries nil))
+    (with-open-file (in (modus-source relative-path))
+      (loop for form = (handler-case (read in nil in)
+                         (error (e)
+                           (format t "~&;; modus host: ~A stops reading: ~A~%" relative-path e)
+                           in))
             until (eq form in)
             do (cond ((and (consp form) (eq (car form) 'in-package))
                       (setq *package* (find-package (cadr form))))
                      ((and (consp form) (eq (car form) 'defconstant)
                            (not (boundp (cadr form))))
-                      (eval form)
-                      (incf n))
+                      (handler-case (progn (eval form) (incf n))
+                        (error (e)
+                          (format t "~&;; modus host: ~A ~S: ~A~%" relative-path (cadr form) e))))
                      ;; (DEFOPCODE name code operands description): the opcode table,
                      ;; as the data %OPCODE-ENTRIES answers, in the file's order
-                     ((and (consp form) (symbolp (car form))
+                     ((and opcodes (consp form) (symbolp (car form))
                            (string= (symbol-name (car form)) "DEFOPCODE"))
                       (destructuring-bind (name code operands description) (cdr form)
-                        (let ((hit (assoc code *host-opcode-entries*)))
+                        (let ((hit (assoc code entries)))
                           (if hit
                               (setf (cdr hit) (list name operands description))
-                              (push (list code name operands description) *host-opcode-entries*))))))))
-    (setq *host-opcode-entries* (nreverse *host-opcode-entries*))
+                              (push (list code name operands description) entries))))))))
+    (when opcodes (setq *host-opcode-entries* (nreverse entries)))
     n))
-#+modus
-(format t "~&;; modus host: ~D ISA constants bound from mvm/mvm.lisp~%" (%host-bind-isa-constants))
+
+(defun %host-bind-isa-constants () (%host-adopt-constants "mvm/mvm.lisp"))
+;; (a modus host: MVM-LOAD below adopts each file's constants instead of loading it)
 
 ;; HOST-ONLY: record every MODUS_* variable this build reads, FIRST, so the knobs
 ;; the compiler and translators read while loading are in the record too.  The
@@ -111,47 +130,61 @@
 ;;; packages the build would load them into (MODUS-INT, MODUS.ASM, MODUS.MVM.X64 ...),
 ;;; because a baked symbol records its home by package NAME.  Loading this tree's copy
 ;;; over them would redefine the running compiler in place (a DEFSTRUCT of a live
-;;; kernel struct kills the process), so a modus host USES its own: the forms marked
-;;; #-modus below are what it skips.  That is the two-stage bootstrap -- a release image
+;;; kernel struct kills the process), so a modus host USES its own: MVM-LOAD adopts
+;;; each file's constants and loads nothing else, and the forms marked #-modus below
+;;; are what it skips outright.  That is the two-stage bootstrap -- a release image
 ;;; builds a stage-1 image from this tree, and stage 1, whose compiler IS this tree's,
 ;;; builds again (docs: project memory "build without SBCL").
 (with-compilation-unit ()
 
 ;; Packages and x86-64 assembler
-#-modus (mvm-load "mvm/packages.lisp")
-#-modus (mvm-load "mvm/x64-asm.lisp")
+(mvm-load "mvm/packages.lisp")
+(mvm-load "mvm/x64-asm.lisp")
 
 ;; MVM core
-#-modus (mvm-load "mvm/mvm.lisp")
+(mvm-load "mvm/mvm.lisp")
 ;; the kernel's packages beyond MODUS-INT (builder packages step 3), made now
 ;; so the build can read source into them
-#-modus (mvm-load "mvm/kernel-packages.lisp")
+(mvm-load "mvm/kernel-packages.lisp")
 #-modus (funcall (find-symbol "%ENSURE-KERNEL-PACKAGES" "MODUS.MVM"))
-#-modus (mvm-load "mvm/target.lisp")
-#-modus (mvm-load "mvm/compiler.lisp")
-#-modus (mvm-load "mvm/interp.lisp")
+(mvm-load "mvm/target.lisp")
+(mvm-load "mvm/compiler.lisp")
+(mvm-load "mvm/interp.lisp")
 
 ;; Boot descriptors (all architectures)
-#-modus (mvm-load "boot/boot-uefi-snp.lisp")
-#-modus (mvm-load "boot/boot-x64.lisp")
-#-modus (mvm-load "boot/boot-riscv.lisp")
-#-modus (mvm-load "boot/boot-aarch64.lisp")
-#-modus (mvm-load "boot/boot-rpi.lisp")
-#-modus (mvm-load "boot/boot-ppc64.lisp")
-#-modus (mvm-load "boot/boot-ppc32.lisp")
-#-modus (mvm-load "boot/boot-i386.lisp")
-#-modus (mvm-load "boot/boot-68k.lisp")
-#-modus (mvm-load "boot/boot-arm32.lisp")
-#-modus (mvm-load "boot/boot-uefi-x64.lisp")
+(mvm-load "boot/boot-uefi-snp.lisp")
+(mvm-load "boot/boot-x64.lisp")
+(mvm-load "boot/boot-riscv.lisp")
+(mvm-load "boot/boot-aarch64.lisp")
+(mvm-load "boot/boot-rpi.lisp")
+(mvm-load "boot/boot-ppc64.lisp")
+(mvm-load "boot/boot-ppc32.lisp")
+(mvm-load "boot/boot-i386.lisp")
+(mvm-load "boot/boot-68k.lisp")
+(mvm-load "boot/boot-arm32.lisp")
+(mvm-load "boot/boot-uefi-x64.lisp")
 
 ;; Architecture translators
-#-modus (mvm-load "mvm/translate-x64.lisp")
-#-modus (mvm-load "mvm/translate-riscv.lisp")
-#-modus (mvm-load "mvm/translate-aarch64.lisp")
-#-modus (mvm-load "mvm/translate-ppc.lisp")
-#-modus (mvm-load "mvm/translate-i386.lisp")
-#-modus (mvm-load "mvm/translate-68k.lisp")
-#-modus (mvm-load "mvm/translate-arm32.lisp")
+(mvm-load "mvm/translate-x64.lisp")
+(mvm-load "mvm/translate-riscv.lisp")
+(mvm-load "mvm/translate-aarch64.lisp")
+(mvm-load "mvm/translate-ppc.lisp")
+(mvm-load "mvm/translate-i386.lisp")
+(mvm-load "mvm/translate-68k.lisp")
+(mvm-load "mvm/translate-arm32.lisp")
+
+;; The x64 translator's build-time knobs, read HERE on every host (a modus host never
+;; loads translate-x64.lisp, so a read inside it was SBCL's alone, and so was the entry
+;; in the image's knob record).
+(flet ((set-x64 (name value)
+         (let ((s (find-symbol name "MODUS.MVM.X64")))
+           (when s (setf (symbol-value s) value)))))
+  (let ((v (sb-ext:posix-getenv "MODUS_FAULT_DUMP")))
+    (set-x64 "*X64-FAULT-DUMP*" (if v t nil)))
+  (let ((v (sb-ext:posix-getenv "MODUS_STW_SCANMODE")))
+    (set-x64 "*X64-STW-SCAN-MODE*" (if (and v (plusp (length v))) (parse-integer v) 1)))
+  (let ((v (sb-ext:posix-getenv "MODUS_STW_VERIFY")))
+    (set-x64 "*X64-STW-VERIFY*" (if v t nil))))
 
 ;; The image code that runs the x64 JIT is read in MODUS.MVM (mvm-eval.lisp's
 ;; page translator, the %JIT-BOOT-INIT glue) and calls the assembler and the
@@ -202,20 +235,20 @@
       (import (find-symbol n x64) mvm))))
 
 ;; Cross-compilation pipeline
-#-modus (mvm-load "mvm/cross.lisp")
+(mvm-load "mvm/cross.lisp")
 
 ;; HOST-ONLY build-time sanity checks (never baked into an image).  Installs
 ;; an encapsulation around BUILD-IMAGE that audits the assembled blob for
 ;; globals whose initialisation never runs in that particular image —
 ;; CLAUDE.md Active Limitation #7.  Must load AFTER cross.lisp, which defines
 ;; BUILD-IMAGE.  See mvm/build-checks.lisp.
-#-modus (mvm-load "mvm/build-checks.lisp")
+(mvm-load "mvm/build-checks.lisp")
 
 ;; HOST-ONLY: the fixed-address registry (low-block words, window slots,
 ;; per-port extension words) and CHECK H -- two features claiming the same
 ;; address fail the build here, naming both owners.  See
 ;; mvm/fixed-addresses.lisp and docs/fixed-addresses.md.
-#-modus (mvm-load "mvm/fixed-addresses.lisp")
+(mvm-load "mvm/fixed-addresses.lisp")
 
 ;; HOST-ONLY: MODUS_A64_NO_FRAME_RECORDS=1 builds AArch64 code without frame
 ;; records (translate-aarch64.lisp, A64-FRAME-RECORDS-P), for A/B comparison.

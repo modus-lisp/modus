@@ -82,6 +82,7 @@ case $KIND in
   <key>NSSpeechRecognitionUsageDescription</key><string>Listen: what you say becomes text.</string>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Chat: messages travel to nearby devices over Bluetooth.</string>
   <key>NSCameraUsageDescription</key><string>Camera: photos and video, taken here.</string>
+  <key>NSMotionUsageDescription</key><string>Your head, followed through your headphones, so a sound stays where it is as you turn.</string>
 </dict>
 </plist>
 PLIST

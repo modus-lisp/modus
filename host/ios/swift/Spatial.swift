@@ -11,13 +11,13 @@
 //   spatial_stop(voice)
 //   spatial_volume(permille)           everything's loudness, 0..1000
 //   spatial_head(on)                   follow the listener's head (AirPods) or not; off until asked
-//   spatial_head_permission()          0 not asked yet, 1 allowed, 2 refused, 3 none needed (a Mac): an app can say
+//   spatial_head_permission()          0 not asked yet, 1 allowed, 2 refused, 3 none needed (a TV): an app can say
 //                                      what the system's question is for before it is asked
 //
 // Coordinates are a right-handed world, y up, as the GPU's are: what a game draws where is heard there.
 
 import AVFoundation
-#if os(iOS)
+#if os(iOS) || os(macOS)
 import CoreMotion
 #endif
 
@@ -27,12 +27,13 @@ private var spatialStarted = false
 private var spatialSounds: [UInt: AVAudioPCMBuffer] = [:]
 private var spatialVoices: [UInt: AVAudioPlayerNode] = [:]
 
-// THE HEAD, ON THE PHONE: the environment's own head tracking turns a Mac's listener, but on iOS it does not engage
-// for an app's own renderer (Control Center's spatial control is offered for what the system spatializes, not for
-// this).  So the AirPods' attitude is read here (CMHeadphoneMotionManager) and the listener turned by it: yaw from
-// where the head was when tracking began, and pitch.  The first use asks for Motion & Fitness (Info.plist's
-// NSMotionUsageDescription).
-#if os(iOS)
+// THE HEAD, READ HERE: the AirPods' attitude (CMHeadphoneMotionManager) turns the listener -- yaw from where the head
+// was when tracking began, and pitch.  The environment's own head tracking is not relied on: on iOS it does not
+// engage for an app's own renderer (Control Center's spatial control is for what the system spatializes), and on a
+// Mac it takes effect only if set before the engine starts, not when switched while it runs.  The first use asks
+// for Motion & Fitness (Info.plist's NSMotionUsageDescription).  A TV has no headphone motion: there the
+// environment's own is used.
+#if os(iOS) || os(macOS)
 private let headphones = CMHeadphoneMotionManager()
 private var headYaw = 0.0, headPitch = 0.0
 private var headYawAtStart: Double?
@@ -56,7 +57,7 @@ private func startHeadTracking() {
 /// listener's right (positive: looking up).  Identity where nothing tracks the head here.
 private func turnedByHead(_ f: (Float, Float, Float), _ u: (Float, Float, Float))
     -> ((Float, Float, Float), (Float, Float, Float)) {
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     let yaw = Float(headYaw), pitch = Float(headPitch)
     guard yaw != 0 || pitch != 0 else { return (f, u) }
     // left = up x forward
@@ -155,7 +156,7 @@ let spatialVolume: Call = { permille, _, _, _, _, _ in
 }
 
 let spatialHead: Call = { on, _, _, _, _, _ in
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     if on != 0 {
         startHeadTracking()                   // the first time, the system asks for Motion & Fitness
     } else {
@@ -163,13 +164,13 @@ let spatialHead: Call = { on, _, _, _, _, _ in
         headYaw = 0; headPitch = 0
     }
     #else
-    if #available(macOS 15.0, tvOS 18.0, *) { environment.isListenerHeadTrackingEnabled = on != 0 }
+    if #available(tvOS 18.0, *) { environment.isListenerHeadTrackingEnabled = on != 0 }
     #endif
     return 1
 }
 
 let spatialHeadPermission: Call = { _, _, _, _, _, _ in
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     switch CMHeadphoneMotionManager.authorizationStatus() {
     case .notDetermined: return 0
     case .authorized: return 1

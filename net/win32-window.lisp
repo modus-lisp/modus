@@ -41,7 +41,10 @@
 ;;;; is DPI-aware, so Windows does not scale it again), StretchDIBits magnifies each rectangle
 ;;;; on the way out -- nearest-pixel when the factor is whole (crisp at 200%), halftone when
 ;;;; it is not -- and pointer positions and sizes come back divided by it.  MODUS_W32_DPI
-;;;; overrides the display's DPI.
+;;;; overrides the display's DPI.  A host that handles density itself -- glass's window
+;;;; manager draws its chrome at *WM-SCALE* and magnifies apps by whole numbers -- asks
+;;;; W32-DISPLAY-DPI and opens the window with DEVICE true: its sizes are then device pixels
+;;;; and nothing is magnified here.
 ;;;;
 ;;;; A window is a vector:
 ;;;;   0 hwnd  1 hdc  2 block  3 width  4 height  5 button mask  6 last x  7 last y
@@ -108,8 +111,24 @@
 
 (defconstant +w32-window-style+ #x00CF0000)   ; WS_OVERLAPPEDWINDOW: resizable, maximizable
 
-(defun w32-window-open (width height title)
-  "Open a WIDTH x HEIGHT window titled TITLE on this thread; the window, or NIL."
+(defun w32-display-dpi ()
+  "The display's DPI (96 is 100%; MODUS_W32_DPI overrides), or 96 when there is no display."
+  (let ((e (%cli-getenv "MODUS_W32_DPI")))
+    (or (let ((v (and e (> (length e) 0) (parse-integer e :junk-allowed t))))
+          (and (integerp v) (>= v 48) (<= v 960) v))
+        (let ((block (syscall6 9 0 #x20000 3 34 -1 0)) (d 96))
+          (when (and (integerp block) (> block 0))
+            (when (%ww-load-procs block)
+              (let* ((sdc (%ww-call block 9 0))                          ; GetDC(NULL)
+                     (v (logand (%ww-call block 21 sdc 88) #xFFFF)))     ; LOGPIXELSX
+                (%ww-call block 10 0 sdc)
+                (when (and (>= v 48) (<= v 960)) (setq d v))))
+            (syscall6 11 block #x20000 0 0 0 0))
+          d))))
+
+(defun w32-window-open (width height title &optional device)
+  "Open a WIDTH x HEIGHT window titled TITLE on this thread; the window, or NIL.  DEVICE:
+   WIDTH and HEIGHT (and everything after) are device pixels, magnified by nothing."
   (let* ((bytes (+ #x20000 (* 4 width height)))
          (block (syscall6 9 0 bytes 3 34 -1 0)))
     (when (or (not (integerp block)) (<= block 0))
@@ -122,13 +141,7 @@
     (%ww-put64 +w32-wp-defwp-va+ (%ww-get64 (+ block #x10800 (* 8 2))))
     (%ww-put64 +w32-wp-validate-va+ (%ww-get64 (+ block #x10800 (* 8 11))))
     (%ww-call block 19)                                   ; SetProcessDPIAware
-    (let* ((dpi (let ((e (%cli-getenv "MODUS_W32_DPI")))
-                  (or (and e (> (length e) 0) (parse-integer e :junk-allowed t))
-                      (let* ((sdc (%ww-call block 9 0))                 ; GetDC(NULL): the screen
-                             (d (logand (%ww-call block 21 sdc 88) #xFFFF))) ; LOGPIXELSX
-                        (%ww-call block 10 0 sdc)
-                        d))))
-           (dpi (if (and (integerp dpi) (>= dpi 48) (<= dpi 960)) dpi 96))
+    (let* ((dpi (if device 96 (w32-display-dpi)))
            (hinst (syscall6 +w32-getmodulehandlea+ 0 0 0 0 0 0))
            (wc (+ block #x10000))
            (class (%ww-put-cstr (+ block #x10700) "ModusWindow"))

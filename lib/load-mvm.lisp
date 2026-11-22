@@ -79,9 +79,9 @@
         (t nil)))
 
 (defun %host-adopt-constants (relative-path)
-  "READ RELATIVE-PATH and evaluate each DEFCONSTANT whose symbol is unbound, in the
-   file's order (later ones are computed from earlier ones); collect mvm/mvm.lisp's
-   DEFOPCODE forms.  Nothing else in the file is evaluated.  Returns the number bound.
+  "READ RELATIVE-PATH and evaluate its DEFPACKAGEs, each DEFCONSTANT whose symbol is
+   unbound, in the file's order (later ones are computed from earlier ones), and each
+   DEFVAR / DEFPARAMETER that reads a knob; collect mvm/mvm.lisp's DEFOPCODE forms.  Nothing else in the file is evaluated.  Returns the number bound.
    A form that does not read or evaluate is reported, not fatal: what a script then
    misses is an unbound variable naming itself."
   (let ((*package* (find-package "COMMON-LISP-USER")) (n 0)
@@ -94,6 +94,17 @@
             until (eq form in)
             do (cond ((and (consp form) (eq (car form) 'in-package))
                       (setq *package* (find-package (cadr form))))
+                     ;; the file's packages as a loading host has them -- their exports and
+                     ;; uses.  DEFPACKAGE of an existing package updates it in place
+                     ;; (CLHS 11.1.1.1; mvm/cl-packages.lisp), so the running image's own
+                     ;; packages gain what the build's reader expects of them: MODUS.ASM's
+                     ;; exported register names, which MODUS.MVM.X64 then inherits, as on
+                     ;; SBCL (without them the builder read 'RAX there as a new symbol --
+                     ;; 17 extra static-literal slots).
+                     ((and (consp form) (eq (car form) 'defpackage))
+                      (handler-case (eval form)
+                        (error (e)
+                          (format t "~&;; modus host: ~A DEFPACKAGE ~S: ~A~%" relative-path (cadr form) e))))
                      ((and (consp form) (eq (car form) 'defconstant)
                            (not (boundp (cadr form))))
                       (handler-case (progn (eval form) (incf n))

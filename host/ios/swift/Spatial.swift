@@ -14,12 +14,59 @@
 // Coordinates are a right-handed world, y up, as the GPU's are: what a game draws where is heard there.
 
 import AVFoundation
+#if os(iOS)
+import CoreMotion
+#endif
 
 private let spatialEngine = AVAudioEngine()
 private let environment = AVAudioEnvironmentNode()
 private var spatialStarted = false
 private var spatialSounds: [UInt: AVAudioPCMBuffer] = [:]
 private var spatialVoices: [UInt: AVAudioPlayerNode] = [:]
+
+// THE HEAD, ON THE PHONE: the environment's own head tracking turns a Mac's listener, but on iOS it does not engage
+// for an app's own renderer (Control Center's spatial control is offered for what the system spatializes, not for
+// this).  So the AirPods' attitude is read here (CMHeadphoneMotionManager) and the listener turned by it: yaw from
+// where the head was when tracking began, and pitch.  The first use asks for Motion & Fitness (Info.plist's
+// NSMotionUsageDescription).
+#if os(iOS)
+private let headphones = CMHeadphoneMotionManager()
+private var headYaw = 0.0, headPitch = 0.0
+private var headYawAtStart: Double?
+
+private func startHeadTracking() {
+    guard headphones.isDeviceMotionAvailable, !headphones.isDeviceMotionActive else { return }
+    headphones.startDeviceMotionUpdates(to: .main) { motion, error in
+        guard let a = motion?.attitude else {
+            if let error { NSLog("modus spatial: headphone motion: \(error)") }
+            return
+        }
+        if headYawAtStart == nil { headYawAtStart = a.yaw }
+        headYaw = a.yaw - (headYawAtStart ?? 0)
+        headPitch = a.pitch
+    }
+}
+#endif
+
+/// FORWARD and UP turned by the head: by its yaw about UP (positive: the head turned left), then its pitch about the
+/// listener's right (positive: looking up).  Identity where nothing tracks the head here.
+private func turnedByHead(_ f: (Float, Float, Float), _ u: (Float, Float, Float))
+    -> ((Float, Float, Float), (Float, Float, Float)) {
+    #if os(iOS)
+    let yaw = Float(headYaw), pitch = Float(headPitch)
+    guard yaw != 0 || pitch != 0 else { return (f, u) }
+    // left = up x forward
+    let l = (u.1 * f.2 - u.2 * f.1, u.2 * f.0 - u.0 * f.2, u.0 * f.1 - u.1 * f.0)
+    let (cy, sy) = (cos(yaw), sin(yaw))
+    let f1 = (f.0 * cy + l.0 * sy, f.1 * cy + l.1 * sy, f.2 * cy + l.2 * sy)
+    let (cp, sp) = (cos(pitch), sin(pitch))
+    let f2 = (f1.0 * cp + u.0 * sp, f1.1 * cp + u.1 * sp, f1.2 * cp + u.2 * sp)
+    let u2 = (u.0 * cp - f1.0 * sp, u.1 * cp - f1.1 * sp, u.2 * cp - f1.2 * sp)
+    return (f2, u2)
+    #else
+    return (f, u)
+    #endif
+}
 
 let spatialStart: Call = { _, _, _, _, _, _ in
     if spatialStarted { return 1 }
@@ -32,9 +79,13 @@ let spatialStart: Call = { _, _, _, _, _, _ in
     d.maximumDistance = 80
     d.rolloffFactor = 1
     // the head followed: AirPods' motion turns the listener, so a sound stays where it is in the world
-    if #available(macOS 15.0, iOS 18.0, tvOS 18.0, *) {
+    #if os(iOS)
+    startHeadTracking()                       // the phone: the head read here, and the listener turned by it
+    #else
+    if #available(macOS 15.0, tvOS 18.0, *) {
         environment.isListenerHeadTrackingEnabled = true
     }
+    #endif
     #if os(iOS) || os(tvOS)
     try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
     try? AVAudioSession.sharedInstance().setActive(true)
@@ -88,8 +139,9 @@ let spatialPlace: Call = { v, p, _, _, _, _ in
 let spatialListener: Call = { p, _, _, _, _, _ in
     guard let f = UnsafePointer<Float>(bitPattern: p) else { return 0 }
     environment.listenerPosition = AVAudio3DPoint(x: f[0], y: f[1], z: f[2])
+    let (fw, up) = turnedByHead((f[3], f[4], f[5]), (f[6], f[7], f[8]))
     environment.listenerVectorOrientation = AVAudio3DVectorOrientation(
-        forward: AVAudio3DVector(x: f[3], y: f[4], z: f[5]), up: AVAudio3DVector(x: f[6], y: f[7], z: f[8]))
+        forward: AVAudio3DVector(x: fw.0, y: fw.1, z: fw.2), up: AVAudio3DVector(x: up.0, y: up.1, z: up.2))
     return 1
 }
 

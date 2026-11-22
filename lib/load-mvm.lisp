@@ -302,3 +302,19 @@
     (nreverse r))
   #-sbcl
   *host-opcode-entries*)
+
+(defun host-build-image (&rest args)
+  "BUILD-IMAGE as a build script calls it, on either host.  SBCL: the compiler's
+   own BUILD-IMAGE, through mvm/build-checks.lisp's encapsulation (which fills
+   the image-configuration placeholder).  A modus host -- the builder CLI,
+   MODUS_BUILDER=1: the placeholder is filled here, and %BUILDER-BUILD-IMAGE
+   (mvm/builder.lisp) runs the image's own BUILD-IMAGE with this image's
+   runtime settings out of the way."
+  #+sbcl (apply 'modus.mvm::build-image args)
+  #-sbcl
+  (let* ((args (copy-list args))
+         (src (getf args :source-text)))
+    (when (stringp src)
+      (setf (getf args :source-text)
+            (modus.image-config:finalize-image-configuration src (getf args :target))))
+    (apply #'modus-int::%builder-build-image args)))

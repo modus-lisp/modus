@@ -920,6 +920,24 @@
                (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32 or :68k)"
               *cli-arch*))))
 
+;;; THE BUILDER CLI (MODUS_BUILDER=1, x64 with the JIT): the same CLI plus the
+;;; cross tooling modus-sh carries -- targets, cross.lisp's BUILD-IMAGE, the boot
+;;; descriptors, the AArch64 and RV32 translators (mvm/selfhost-tooling.lisp) --
+;;; and mvm/builder.lisp's %BUILDER-BUILD-IMAGE, which a build script calls in
+;;; place of BUILD-IMAGE on a modus host.  So this image runs the build scripts
+;;; that SBCL runs, with a JIT for the scripts' own code, and builds modus.
+;;; Spliced into the translator slot: after the x64 translator it needs, and
+;;; inside the text the defun scanner registers.
+(defvar *cli-builder-p*
+  (and *jit-on* (eq *cli-arch* :x64)
+       (equal (sb-ext:posix-getenv "MODUS_BUILDER") "1")))
+(when *cli-builder-p*
+  (load (merge-pathnames "selfhost-tooling.lisp" (merge-pathnames "mvm/" *modus-base*)))
+  (setf *cli-arch-jit-translator-source*
+        (concatenate 'string *cli-arch-jit-translator-source*
+                     *selfhost-cross-tooling-source*
+                     (mvm-text "mvm/builder.lisp") (string #\Newline))))
+
 ;;; ARCH SLOT — boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins
 ;;; over mvm-eval.lisp's base version (last-defun-wins).  When JIT is OFF both
 ;;; defuns are inert; the two tiny defuns are ALWAYS baked (an empty string here
@@ -948,6 +966,13 @@
     ((not *jit-on*)
      "
 (defun %jit-boot-init () nil)
+")
+    ((and (eq *cli-arch* :x64) *cli-builder-p*)
+     ;; the builder CLI also configures its foreign translators at boot, as
+     ;; modus-sh does (their globals' DEFVAR inits never run in-image)
+     "
+(defun %jit-boot-init () (%init-x64-translator) (%builder-boot-init) (setq *use-jit* t) t)
+(defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))
 ")
     ((eq *cli-arch* :x64)
      "
@@ -1310,10 +1335,13 @@
       (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%"))
    (progn
     (format s "(defun %~A-opcode-table ()~%" "populate")
-    (dolist (e (cl-user::%opcode-entries))
-      (destructuring-bind (code name operands description) e
-        (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
-                code code name operands description)))
+    ;; Not pretty-printed: SBCL's pretty printer breaks long lines at its right
+    ;; margin and a modus host's does not, so the text would depend on the host.
+    (let ((*print-pretty* nil))
+      (dolist (e (cl-user::%opcode-entries))
+        (destructuring-bind (code name operands description) e
+          (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
+                  code code name operands description))))
     (format s "  t)~%")
     ;; defparameter init-thunk runs %populate-opcode-table at boot, AFTER the
     ;; *opcode-table* defparameter (earlier in source order) creates the table.
@@ -1485,6 +1513,21 @@
 ;;; a reader error that names anything else.  (modus:image-configuration) does not list it;
 ;;; (modus.runtime::%ucn-present-p) answers.
 (load (merge-pathnames "lib/unicode-names-gen.lisp" *modus-base*))
+;;; The data is checked in (a modus host cannot generate it); SBCL regenerates it and
+;;; compares, so a different SBCL or a generator change is reported, not silently baked.
+#+sbcl
+(defun %check-unicode-names-data ()
+  (let* ((path (modus-source "mvm/cl-unicode-names-data.lisp"))
+         (fresh (modus.unicode-names-gen::unicode-names-source :stream *standard-output*))
+         (have (and (probe-file path) (read-file-text path))))
+    (cond ((equal fresh have))
+          ((equal (sb-ext:posix-getenv "MODUS_UNICODE_NAMES_REGEN") "1")
+           (with-open-file (o path :direction :output :if-exists :supersede :external-format :utf-8)
+             (write-string fresh o))
+           (format t "~&;; unicode names: rewrote ~A~%" path))
+          (t (format t "~&;; WARNING unicode names: this SBCL's CHAR-NAME table differs from ~
+                        mvm/cl-unicode-names-data.lisp; the image bakes the checked-in one ~
+                        (MODUS_UNICODE_NAMES_REGEN=1 rewrites it)~%")))))
 (defvar *cli-unicode-names*
   (modus.unicode-names-gen::unicode-names-wanted-p (not *cli-bare-metal*)))
 (defvar *unicode-names-source*
@@ -1492,9 +1535,8 @@
       (concatenate 'string
                    (mvm-text "mvm/cl-unicode-names.lisp")
                    (string #\Newline)
-                   (modus.mvm::%build-package-scoped-source
-                    (modus.unicode-names-gen::unicode-names-source :stream *standard-output*)
-                    "mvm/cl-unicode-names-data.lisp"))
+                   (progn #+sbcl (%check-unicode-names-data)
+                          (mvm-text "mvm/cl-unicode-names-data.lisp")))
       (progn
         (format t "~&;; unicode names: no table (MODUS_UNICODE_NAMES / bare metal)~%")
         (mvm-text "mvm/cl-unicode-names-absent.lisp"))))
@@ -3534,7 +3576,6 @@
 ;;; takes ~20s instead of a ~10min image build.  Placed AFTER assembly and
 ;;; BEFORE build-image so it cannot perturb what it measures -- and before the
 ;;; blob read check, so a blob that does not read can still be dumped and read.
-#+sbcl
 (let ((p (sb-ext:posix-getenv "MODUS_DUMP_FULL_SOURCE")))
   (when (and p (plusp (length p)))
     (with-open-file (o p :direction :output :if-exists :supersede

@@ -204,7 +204,8 @@
 (when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
   (setq *narrow-literals-p* t))
 
-(funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
+;; a modus host registered its targets at boot (mvm/builder.lisp %BUILDER-BOOT-INIT)
+#+sbcl (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
 (setf modus.mvm.x64::*x64-linux-mode* t)
 ;; Boot preamble for linux-x64 ends 541 bytes into the file (397 before the
 ;; save-and-die fixed-mapping block, which is padded to 144 = 9*16) (ELF header
@@ -371,8 +372,8 @@
 (format t "~%Compiling generic image (~D chars)...~%"
         (length cl-user::*full-source*))
 
-(let ((image (build-image :target :linux-x64
-                          :source-text cl-user::*full-source*)))
+(let ((image (cl-user::host-build-image :target :linux-x64
+                                         :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CLI_OUT") "modus")))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
@@ -392,6 +393,7 @@
       (format t "  native code: ~D bytes -> ~A.native~%"
               (length (kernel-image-native-code image)) path))
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
+    #-sbcl (funcall (find-symbol "CHMOD" "SB-POSIX") path #o755)
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
     (format t "Usage: ~A <script.lisp>~%" path)))

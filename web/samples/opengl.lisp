@@ -136,13 +136,14 @@
 ;; Native float bridge: instead of formatting the mvp matrix to a decimal string
 ;; every frame (the expensive path), write each element's raw IEEE-754 double
 ;; bits into a scratch buffer and let the page reinterpret those bytes as a
-;; Float64Array.  ieee-float-{lo,hi}32 give the two 32-bit halves of the double;
+;; Float64Array.  ieee-float-{lo,hi}32 give the two 32-bit halves of the double
+;; (the image's own, mvm/float-slot-overrides.lisp, in MODUS-INT -- not CL-USER);
 ;; mem-ref :u32 writes them little-endian, so the 8 bytes are a valid LE double.
 (defconstant +fbuf+ #x10015000)   ; scratch below the gui command buffer; snapshot in host-browser.js guiSend
 (defvar *foff* 0)                 ; rolling byte offset into +fbuf+, reset each flush
 (defun %fput (addr x)
-  (setf (cl-user::mem-ref addr :u32) (cl-user::ieee-float-lo32 x))
-  (setf (cl-user::mem-ref (+ addr 4) :u32) (cl-user::ieee-float-hi32 x)))
+  (setf (cl-user::mem-ref addr :u32) (modus-int::ieee-float-lo32 x))
+  (setf (cl-user::mem-ref (+ addr 4) :u32) (modus-int::ieee-float-hi32 x)))
 (defun %mvp-bin (m off)           ; write m's 16 doubles at +fbuf+ + off; return off
   (dotimes (i 16) (%fput (+ +fbuf+ off (* i 8)) (aref m i)))
   off)

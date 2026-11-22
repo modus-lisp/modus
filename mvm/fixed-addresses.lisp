@@ -1434,6 +1434,10 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
 (define-fixed-word :web-scratch #x10010000 #x5000 :kind :region :images (:web)
   :owner "mvm/build-web.lisp" :doc "*CSTR-SCRATCH* #x10010000, *IO-BUF-ADDR* #x10014000.")
 
+(define-fixed-word :web-gl-float-scratch #x10015000 #x1000 :kind :region :images (:web)
+  :owner "web/samples/opengl.lisp, web/host-browser.js"
+  :doc "+FBUF+: matrices as raw IEEE-754 doubles; guiSend snapshots it with each command batch.")
+
 ;;; ==================================================================
 ;;; Run H1-H3 now: every build loads this file, so an overlap introduced in
 ;;; the registry fails the build before anything compiles.  H4 (the tree scan)

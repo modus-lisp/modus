@@ -1828,9 +1828,9 @@
     ;; name or an existing nickname of any OTHER package.  (CLHS:
     ;; defpackage may rename the package itself, but reusing some
     ;; other package's nickname is a package-error.)  We resolve
-    ;; conflicts against find-package before the existing-package
-    ;; delete-and-recreate step below, since defpackage is allowed to
-    ;; replace ITS OWN earlier definition.
+    ;; conflicts against find-package before an existing package is
+    ;; updated in place below, since defpackage may of course redefine
+    ;; ITS OWN earlier definition.
     (dolist (nk nicknames)
       (let ((nk-str (%pkg-string-designator nk)))
         (let ((existing (find-package nk-str)))
@@ -1838,14 +1838,39 @@
                      (not (%pkg-string= (%pkg-name existing) name-str)))
             (%signal-package-error)))))
 
-    ;; --- Delete existing same-name package if any ---
-    (let ((existing (find-package name-str)))
-      (when existing (safely-delete-package existing)))
-
-    ;; --- Build the package ---
-    (let ((pkg (make-package name-str
-                 :nicknames nicknames
-                 :use (if use-provided use-list nil))))
+    ;; --- An EXISTING package is brought up to date IN PLACE, not rebuilt ---
+    ;; CLHS 11.1.1.1: DEFPACKAGE of a name that already refers to a package
+    ;; leaves the name-to-package mapping unchanged and modifies that package
+    ;; to agree with the options.  This used to DELETE it and make a new one,
+    ;; so every symbol interned before was lost: a system whose DEFPACKAGE was
+    ;; evaluated again (reloading it) lost its functions' symbols, and a build
+    ;; running on modus that evaluated mvm.lisp's (DEFPACKAGE :MODUS-INT ...)
+    ;; deleted the running kernel's own package -- FIND-SYMBOL of a name
+    ;; interned a moment earlier answered NIL.  Kept, as SBCL keeps them: the
+    ;; symbols, the nicknames (new ones are added) and the use list (new ones
+    ;; are used); the options below then apply to it as to a new package.
+    (let* ((existing (find-package name-str))
+           (pkg (if existing
+                    (progn
+                      (let ((add (remove-if (lambda (nk)
+                                              (member (%pkg-string-designator nk)
+                                                      (cons (package-name existing)
+                                                            (package-nicknames existing))
+                                                      :test (function string=)))
+                                            nicknames)))
+                        (when add
+                          (rename-package existing (package-name existing)
+                                          (append (package-nicknames existing)
+                                                  (mapcar (function %pkg-string-designator) add)))))
+                      (when use-provided
+                        (dolist (u use-list)
+                          (let ((up (find-package u)))
+                            (when (and up (not (member up (package-use-list existing))))
+                              (use-package up existing)))))
+                      existing)
+                    (make-package name-str
+                                  :nicknames nicknames
+                                  :use (if use-provided use-list nil)))))
       ;; Shadow
       (when shadow-names
         (shadow shadow-names pkg))

@@ -10,9 +10,14 @@
 //                              library re-reads as it draws.
 //   files_copy(src, n, dst, m) the file or folder at src copied to dst, when nothing is there yet: the
 //                              bundle's sample media seeded into Documents.  Returns 1 if it copied.
-//   files_choose_folder()      a Mac's folder chooser, over the window: a handle, and a FOLDER event from it, (h
-//                              path), when a folder is chosen -- the folder itself, opened where it is, not
-//                              copied.  0 on the phone (its sandbox has no folders of the person's to open).
+//   files_choose_folder(k, n)  a folder chooser: a handle, and a FOLDER event from it, (h path), when a folder is
+//                              chosen -- the folder itself, opened where it is, not copied.  On a Mac, the Open
+//                              panel over the window.  On the phone, the document picker for folders (iCloud
+//                              Drive and every other provider), and the choice is KEPT under the key k (n bytes;
+//                              none: not kept) as a security-scoped bookmark, for files_folder_path to reopen.
+//   files_folder_path(k, n, buf, cap)  the phone: the folder kept under key k, opened for this run (its access
+//                              begun, never ended), its path into buf as files_documents does -- 0 when nothing
+//                              is kept or it can no longer be reached.  0 on a Mac.
 
 #if os(macOS)
 import AppKit          // the macOS window host builds this file too (host/macos/build-macos.sh gui)
@@ -96,7 +101,65 @@ let filesChooseFolder: Call = { _, _, _, _, _, _ in
     return handle
 }
 #else
-let filesChooseFolder: Call = { _, _, _, _, _, _ in 0 }
+// A folder of the person's, chosen once and kept: the document picker for folders hands back a URL that is the
+// app's only while it is "accessing" it, so what is kept is its security-scoped bookmark (UserDefaults, under
+// the caller's key), and FILES_FOLDER_PATH resolves it again on a later run.  Writing into it is then ordinary
+// file I/O -- the image's own open and write -- for as long as the app runs.
+private final class FolderPicked: NSObject, UIDocumentPickerDelegate {
+    let handle: UInt
+    let key: String
+    init(handle: UInt, key: String) { self.handle = handle; self.key = key }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        folderPicking = nil
+        guard let url = urls.first else { return }
+        _ = url.startAccessingSecurityScopedResource()          // kept open: the app writes there from now on
+        if !key.isEmpty, let mark = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil,
+                                                          relativeTo: nil) {
+            UserDefaults.standard.set(mark, forKey: "folder." + key)
+        }
+        send("FOLDER", [.int(Int(handle)), .string(url.path)])
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        folderPicking = nil
+        send("FOLDER", [.int(Int(handle)), .string("")])          // "" : nothing was chosen
+    }
+}
+
+private var folderPicking: FolderPicked?
+
+let filesChooseFolder: Call = { k, n, _, _, _, _ in
+    let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
+    guard var top = (windows.first { $0.isKeyWindow } ?? windows.first)?.rootViewController else { return 0 }
+    while let shown = top.presentedViewController { top = shown }
+    if folderPicking != nil || picking != nil { return 0 }
+    let handle = nextHandle
+    nextHandle += 1
+    let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder])
+    picker.allowsMultipleSelection = false
+    let delegate = FolderPicked(handle: handle, key: n > 0 ? text(k, n) : "")
+    folderPicking = delegate
+    picker.delegate = delegate
+    top.present(picker, animated: true)
+    return handle
+}
+
+private var foldersOpen: [String: URL] = [:]       // key -> the URL whose access this run has begun
+
+let filesFolderPath: Call = { k, n, buf, cap, _, _ in
+    let key = text(k, n)
+    if let open = foldersOpen[key] { return filesCopyOut(open.path, buf, cap) }
+    guard let mark = UserDefaults.standard.data(forKey: "folder." + key) else { return 0 }
+    var stale = false
+    guard let url = try? URL(resolvingBookmarkData: mark, options: [], relativeTo: nil, bookmarkDataIsStale: &stale),
+          url.startAccessingSecurityScopedResource() else { return 0 }
+    if stale, let fresh = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+        UserDefaults.standard.set(fresh, forKey: "folder." + key)
+    }
+    foldersOpen[key] = url
+    return filesCopyOut(url.path, buf, cap)
+}
 
 private final class Picked: NSObject, UIDocumentPickerDelegate {
     let into: URL
@@ -153,4 +216,7 @@ func installFiles() {
     register("files_documents", filesDocuments)
     register("files_pick", filesPick)
     register("files_choose_folder", filesChooseFolder)
+    #if !os(macOS)
+    register("files_folder_path", filesFolderPath)
+    #endif
 }

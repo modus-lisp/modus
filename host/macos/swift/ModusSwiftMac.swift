@@ -964,7 +964,9 @@ let imageNew: Call = { p, n, x, y, w, h in
 // plain view's subviews.
 let addChild: Call = { parent, child, _, _, _, _ in
     guard let c = views[child] else { return 0 }
-    if let content = scrollContent[parent] {
+    if let inside = glassContent[parent] {
+        inside.addSubview(c)                // a glass panel's: its x and y are now from the panel's top left
+    } else if let content = scrollContent[parent] {
         content.addArrangedSubview(c)
     } else if let document = scrollDocuments[parent] {
         document.addSubview(c)          // a paging scroll view's pages, each at its own x (ModusSwiftMac2.swift)
@@ -1142,6 +1144,7 @@ public func modusSwiftInstall() {
     installNowPlaying()                            // NowPlaying.swift: Now Playing and the media keys
     installGamepad()                               // Gamepad.swift: game controllers
     installSpatial()                               // Spatial.swift: sound placed in three dimensions
+    installChrome()                                // MacChrome.swift: glass, menus, status items
     installNative()                                // NativeMac.swift: app-grade components (an app, not the desk)
     installWindow()                                // MacWindow.swift: the window's title, chrome and size
     register("ui_label_new", labelNew)

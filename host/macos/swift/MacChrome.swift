@@ -20,7 +20,9 @@
 //   status_item_menu(item, menu)           the menu it opens when clicked
 //
 // WINDOWS, more than the one the desk is in:
-//   window_new(title, len, w, h)            a window, W x H points, centred, shown; a UI handle -- what ui_add puts in
+//   window_new(title, len, w, h, palette)   a window, W x H points, centred, shown -- PALETTE 1 a floating palette
+//                                          (a small-titled panel over the app's windows, hidden while another app is
+//                                          in front); a UI handle -- what ui_add puts in
 //                                          it sits inside, placed from its top left (a view that fills its parent fills
 //                                          the window).  Closed by its button, a WINCLOSE event (handle), and it is
 //                                          hidden, not gone: window_show brings it back.  Resized, WINRESIZE (handle
@@ -195,10 +197,20 @@ private final class WindowDelegate: NSObject, NSWindowDelegate {
     }
 }
 
-let windowNew: Call = { p, n, w, h, _, _ in
-    let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: Int(max(w, 100)), height: Int(max(h, 80))),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
+let windowNew: Call = { p, n, w, h, palette, _ in
+    let frame = CGRect(x: 0, y: 0, width: Int(max(w, 100)), height: Int(max(h, 80)))
+    let window: NSWindow
+    if palette != 0 {
+        let panel = NSPanel(contentRect: frame, styleMask: [.titled, .closable, .resizable, .utilityWindow],
+                            backing: .buffered, defer: false)
+        panel.isFloatingPanel = true             // over the app's own windows
+        panel.hidesOnDeactivate = true            // and gone while another app is in front
+        panel.becomesKeyOnlyIfNeeded = true       // the keys stay with the main window
+        window = panel
+    } else {
+        window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
+    }
     window.title = text(p, n)
     window.isReleasedWhenClosed = false
     window.appearance = darkAppearance

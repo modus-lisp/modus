@@ -3073,6 +3073,11 @@
 ;; MODUS_SMALL_IMAGE: the globals' init thunks run in batches through one
 ;; guarded loop, not a HANDLER-CASE's code each (compiler.lisp *INIT-GLOBALS-BATCHED*).
 (when cl-user::*small-image* (setq modus.mvm::*init-globals-batched* t))
+
+;; MODUS_W32_UNSAFE_LIVE=1: the collector rung's NEGATIVE CONTROL -- raw W32
+;; variables are not split around GC points (compiler.lisp *W32-UNSAFE-LIVE*,
+;; test/w32-gc-live.lisp).  Never for a real image.
+(setq modus.mvm::*w32-unsafe-live* (equal (sb-ext:posix-getenv "MODUS_W32_UNSAFE_LIVE") "1"))
 ;; MODUS_SMALL_ACCESS (default: MODUS_SMALL_IMAGE): a quoted symbol's site is
 ;; one call (compiler.lisp *STATIC-SYMBOL-ONE-CALL*) and a global read or write
 ;; is one call (*GV-CACHE-MODE* :CALL), not the inline loads.  Measured on the

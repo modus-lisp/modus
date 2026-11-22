@@ -1145,8 +1145,10 @@ writes to bignums.  **A byte vector's payload is NOT at word+7 on i386** — a
 on 32 bits.
 
 **SSH (`MODUS_SSH_BUILD=1`, `(ssh-boot)` at the REPL) works: a real OpenSSH
-client gets `= 3` over curve25519 / Ed25519 / ChaCha20-Poly1305, ~60 s a
-connection (x64: ~50 s).  Three 32-bit facts it took:**
+client gets `= 3` over curve25519 / Ed25519 / ChaCha20-Poly1305, 3-4 s a
+connection since W32 M3b (it was ~60 s; x64: ~50 s).  The boot stub maps the
+NIC/SSH state it lives in: a 4 MB net block at `#x04000000` and a 4 MB SSH
+block at `#x0C000000`, on machines of 32 MB or more.  Three 32-bit facts it took:**
 - **crypto-fast's limbs are FIXNUMS IN THE VECTOR'S SLOTS, not raw u32
   words behind a computed address.**  On 30-bit fixnums the 26x26-bit limb
   products are bignums, so a collection inside `fe-mul` moved the arrays under

@@ -1107,7 +1107,7 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         infoLabel.font = .preferredFont(forTextStyle: .footnote)
         infoLabel.textColor = .secondaryLabel
         infoLabel.numberOfLines = 0
-        // a tap on it is an INFO event (ferry: the folder's usage)
+        // a tap on it is an INFO event (an app shows more about it: a folder's usage, say)
         infoLabel.isUserInteractionEnabled = true
         infoLabel.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(infoTapped)))
         header.addSubview(infoLabel)

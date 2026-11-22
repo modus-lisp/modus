@@ -72,6 +72,12 @@
   "The opcode table read from mvm/mvm.lisp's DEFOPCODE forms, in the file's order.")
 ;;; Every host reads the opcode table this way (%OPCODE-ENTRIES); a host that has
 ;;; loaded mvm/mvm.lisp has every constant bound already, so it only collects.
+(defun %form-reads-env-p (x)
+  "Does form X call POSIX-GETENV (any package)?"
+  (cond ((symbolp x) (and x (string= (symbol-name x) "POSIX-GETENV")))
+        ((consp x) (or (%form-reads-env-p (car x)) (%form-reads-env-p (cdr x))))
+        (t nil)))
+
 (defun %host-adopt-constants (relative-path)
   "READ RELATIVE-PATH and evaluate each DEFCONSTANT whose symbol is unbound, in the
    file's order (later ones are computed from earlier ones); collect mvm/mvm.lisp's
@@ -91,6 +97,16 @@
                      ((and (consp form) (eq (car form) 'defconstant)
                            (not (boundp (cadr form))))
                       (handler-case (progn (eval form) (incf n))
+                        (error (e)
+                          (format t "~&;; modus host: ~A ~S: ~A~%" relative-path (cadr form) e))))
+                     ;; a DEFVAR / DEFPARAMETER whose initform reads a MODUS_* knob: a
+                     ;; host that LOADS this file reads it there (and records it in the
+                     ;; image's knob record); so does this one, and the image's own
+                     ;; variable gets the value a fresh load would give it
+                     ((and (not opcodes) (consp form) (member (car form) '(defvar defparameter))
+                           (consp (cdr form)) (consp (cddr form))
+                           (%form-reads-env-p (caddr form)))
+                      (handler-case (setf (symbol-value (cadr form)) (eval (caddr form)))
                         (error (e)
                           (format t "~&;; modus host: ~A ~S: ~A~%" relative-path (cadr form) e))))
                      ;; (DEFOPCODE name code operands description): the opcode table,
@@ -337,9 +353,7 @@
    runtime settings out of the way."
   #-modus (apply 'modus.mvm::build-image args)
   #+modus
-  (let* ((args (copy-list args))
-         (src (getf args :source-text)))
-    (when (stringp src)
-      (setf (getf args :source-text)
-            (modus.image-config:finalize-image-configuration src (getf args :target))))
-    (apply #'modus-int::%builder-build-image args)))
+  (apply #'modus-int::%builder-build-image
+         :finalize (lambda (src target)
+                     (modus.image-config:finalize-image-configuration src target))
+         args))

@@ -91,9 +91,18 @@
   "BUILD-IMAGE as the SBCL host runs it: compiler tables empty, this image's
    runtime-JIT settings at their DEFVAR defaults.  Everything is put back on
    the way out, so the calling script keeps evaluating.  ARGS are
-   BUILD-IMAGE's: :TARGET and :SOURCE-TEXT."
-  (let ((target (getf args :target))
-        (src (getf args :source-text)))
+   BUILD-IMAGE's -- :TARGET and :SOURCE-TEXT -- and :FINALIZE, a function of
+   (SOURCE TARGET) that fills the image-configuration record once the flags are
+   the compile's.  A flag a build script sets (*X64-GEN-GC*, *TLS-WINDOW* ...)
+   is the script's and is not touched here."
+  (let* ((finalize (getf args :finalize))
+         (args (let ((out nil) (l args))
+                 (loop (when (null l) (return (nreverse out)))
+                       (unless (eq (car l) :finalize)
+                         (setq out (cons (cadr l) (cons (car l) out))))
+                       (setq l (cddr l)))))
+         (target (getf args :target))
+         (src (getf args :source-text)))
     (%builder-mirror-host-packages)
     (when (stringp src) (%builder-prebind-constants src))
     (%builder-prepare-target target)
@@ -108,7 +117,7 @@
           (s-use-jit *use-jit*) (s-linkage *jit-linkage-cells*)
           (s-park *park-safepoints*) (s-jit-mode *x64-jit-mode*)
           (s-cv-full *x64-jit-constvec-full-p*) (s-xerr *jit-xlate-err-info*)
-          (s-gen-gc modus.mvm.x64::*x64-gen-gc*) (s-hc-fixup *hc-fault-fixup*)
+          (s-hc-fixup *hc-fault-fixup*)
           (s-runtime-p *mvm-eval-runtime-p*) (s-halves *mvm-emit-halves*)
           (s-static *static-build-p*))
       (unwind-protect
@@ -135,11 +144,14 @@
              (setq *x64-jit-mode* nil)
              (setq *x64-jit-constvec-full-p* nil)
              (setq *jit-xlate-err-info* nil)
-             (setq modus.mvm.x64::*x64-gen-gc* nil)
              (setq *hc-fault-fixup* nil)
              (setq *mvm-eval-runtime-p* nil)
              (setq *mvm-emit-halves* nil)
              (setq *static-build-p* nil)
+             ;; the image's configuration record is taken HERE, after the reset,
+             ;; so it names the flags this compile uses (SBCL's are its defaults)
+             (when (and finalize (stringp src))
+               (setf (getf args :source-text) (funcall finalize src target)))
              (apply #'build-image args))
         (setq *functions* s-functions *function-table* s-function-table
               *globals* s-globals *constants* s-constants
@@ -152,6 +164,6 @@
               *use-jit* s-use-jit *jit-linkage-cells* s-linkage
               *park-safepoints* s-park *x64-jit-mode* s-jit-mode
               *x64-jit-constvec-full-p* s-cv-full *jit-xlate-err-info* s-xerr
-              modus.mvm.x64::*x64-gen-gc* s-gen-gc *hc-fault-fixup* s-hc-fixup
+              *hc-fault-fixup* s-hc-fixup
               *mvm-eval-runtime-p* s-runtime-p *mvm-emit-halves* s-halves
               *static-build-p* s-static)))))

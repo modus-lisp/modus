@@ -369,6 +369,12 @@
 (defun %seam-cell (key)
   (and *seams* (gethash key *seams*)))
 
+;;; A runtime tier that binds a call to a name in a cell of its own (the i386 native
+;;; tier, mvm/jit-i386-native.lisp) is told here when a name's definition changes by
+;;; (SETF FDEFINITION) / (SETF SYMBOL-FUNCTION), which a DEFUN's own hook never sees.
+(declaim (overridable %fn-binding-changed))
+(defun %fn-binding-changed (name) name nil)
+
 (defun set-symbol-function (sym fn)
   "Set the function cell of SYM to FN.  Updates both the name-keyed
    table (CL-symbol path) and the hash-keyed table (native MVM symbol
@@ -402,6 +408,7 @@
         (puthash name *%e2-set-function-names* t))
       (when *native-sym-function-table*
         (puthash hash *native-sym-function-table* fn))
+      (when (> (length name) 0) (%fn-binding-changed name))
       fn)))
 
 (defun %check-setf-function-name (x)

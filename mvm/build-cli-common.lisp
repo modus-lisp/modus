@@ -117,6 +117,23 @@
   (load (merge-pathnames "../lib/load-mvm.lisp"
                          (directory-namestring (truename *load-truename*)))))
 
+;;; THE RUNTIME NATIVE TIERS, ON BY DEFAULT on the CLIs that have one (2026-11-22):
+;;; i386 (mvm/jit-i386-native.lisp) and 68k (mvm/jit-68k.lisp, jit-68k-native.lisp).
+;;; MODUS_I386_JIT=0 / MODUS_68K_JIT=0 builds the interpret-only image.  The bare Mac
+;;; (build-cl-repl-common) keeps its own rule: its map needs a :JIT-AREA.
+(defun %cli-tier-knob (name)
+  (let ((v (sb-ext:posix-getenv name)))
+    (if (and v (plusp (length v))) (string= v "1") t)))
+(defvar *cli-68k-jit*
+  (and (boundp '*cli-arch*) (eq *cli-arch* :68k) (%cli-tier-knob "MODUS_68K_JIT")))
+(defvar *cli-i386-jit*
+  (and (boundp '*cli-arch*) (eq *cli-arch* :i386) (%cli-tier-knob "MODUS_I386_JIT")))
+;; translate-68k.lisp decided *68K-JIT-SHAPES* from MODUS_68K_JIT when it loaded
+;; (it serves the bare Mac too); the CLI's default is decided here.
+(when *cli-68k-jit*
+  (setf (symbol-value (find-symbol "*68K-JIT-SHAPES*" "MODUS.MVM"))
+        (not (equal (sb-ext:posix-getenv "MODUS_68K_JIT_SHAPES") "0"))))
+
 ;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-test-aux.lisp
 ;;; (the ANSI-test helpers; the CL runtime it once shared a file with is in
 ;;; mvm/cl-*.lisp) from *BRIDGE-SOURCE*.  It exists for the Pi chain-load path,
@@ -877,7 +894,7 @@
 ;;; stand-in; the emitter's settings are filled in when BUILD-IMAGE compiles,
 ;;; after the target is configured (cross.lisp LATE-SOURCE-FILL).
 (defun %68k-native-tier-p ()
-  (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+  (and *cli-68k-jit*
        (not (equal (sb-ext:posix-getenv "MODUS_68K_NATIVE") "0"))))
 
 (defun %68k-native-tier-source ()
@@ -899,7 +916,7 @@
 ;;; compiles (I386-NATIVE-COINIT-TEXT).  build-i386-cli.lisp sets
 ;;; *I386-NATIVE-TIER* so the image carries the export table and the root.
 (defun %i386-native-tier-p ()
-  (and (eq *cli-arch* :i386) (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1")))
+  *cli-i386-jit*)
 
 (defun %i386-native-tier-source ()
   (pushnew (cons "'(:n386-coinit :pending)" 'modus.mvm.i386::i386-native-coinit-text)
@@ -2914,7 +2931,7 @@
               before (reduce #'+ vars :key (lambda (v) (length (symbol-value v))))))))
 
 (defvar *cli-arch-late-source*
-  (if (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+  (if (and *cli-68k-jit*
            (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
       (mvm-text "mvm/jit-68k.lisp")
       (if (%i386-native-tier-p) (mvm-text "mvm/jit-i386-native.lisp") ""))
@@ -3071,7 +3088,7 @@
 
 ;;; THE BUILDER'S STRUCT FUNCTIONS.  The symbol-function table is how evaluated
 ;;; code reaches a kernel function, and it is generated from the source's DEFUN
-;;; TEXT, so a DEFSTRUCT's constructor, accessors, predicate and copier -- real
+;;; TEXT, so a DEFSTRUCT's accessors, predicate and copier -- real
 ;;; functions in the image, but written nowhere as "(defun" -- are not in it:
 ;;; (modus-int::make-mvm-buffer) from a script is UNDEFINED-FUNCTION.  The
 ;;; builder CLI runs build scripts that call the cross tooling's structs
@@ -3121,13 +3138,10 @@
                      (named (opt options :named))
                      (out nil))
                 (setf (gethash sname slots-of) all)
-                (let ((ctors (opt options :constructor)))
-                  (if (null ctors)
-                      (push (concatenate 'string "MAKE-" sname) out)
-                      (dolist (c ctors)
-                        (cond ((or (keywordp c) (null (cdr c)))
-                               (push (concatenate 'string "MAKE-" sname) out))
-                              ((cadr c) (push (nm (cadr c)) out))))))
+                ;; NOT the constructors: in an image (MAKE-X ...) is expanded by the
+                ;; compiler into a call of the internal %%STRUCT-CTOR-X, and no
+                ;; function is named MAKE-X -- registering #'MAKE-X baked a NIL
+                ;; sentinel for each (check-compiler-warns: unresolved-function)
                 (let ((pr (car (opt options :predicate))))
                   (cond ((and typed (not named)))
                         ((or (null pr) (keywordp pr) (null (cdr pr)))

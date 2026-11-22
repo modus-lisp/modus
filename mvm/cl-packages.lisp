@@ -2264,7 +2264,7 @@
                   (if (eq v (%word->val #x0BADB0B5))
                       (if (integerp name-or-hash)
                           nil
-                          (error 'unbound-variable :name name-or-hash))
+                          (%unbound-variable-error name-or-hash))
                       (values v)))))))))
     ;; The unbound marker (prelude %UNBOUND-MARKER) reads as an absent pair.
     (let ((tbl (%globals-table)))
@@ -2278,8 +2278,18 @@
                 v
                 (if (integerp name-or-hash)
                     nil
-                    (error 'unbound-variable :name name-or-hash))))
+                    (%unbound-variable-error name-or-hash))))
           nil))))
+
+(defun %unbound-variable-error (sym)
+  "SYMBOL-VALUE of an unbound SYM: UNBOUND-VARIABLE with the restarts SBCL
+   gives it -- CONTINUE reads it again, USE-VALUE answers with a value this
+   once, STORE-VALUE sets it and answers with it (see
+   %E2-SYMBOL-VALUE-CHECKED, the compiled read's twin)."
+  (restart-case (error 'unbound-variable :name sym)
+    (continue () :report "Read the variable again." (symbol-value sym))
+    (use-value (v) :report "Use a value this time." v)
+    (store-value (v) :report "Set the variable and use its new value." (set sym v) v)))
 
 (defun boundp (sym)
   "True if SYM has a value in the global symbol-value alist (#x10000080).

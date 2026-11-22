@@ -325,22 +325,19 @@
            (declare (ignore args))
            (error 'undefined-function :name sym)))
         (t
-          (let ((c (%make-condition 'undefined-function (list :name sym))))
-            ;; PUBLISH the condition before unwinding — same sequence as the
-            ;; unbound-variable path above.  The old code longjmp'd with C
-            ;; never stored in *current-condition*, so the handler-case that
-            ;; caught it received whatever condition was caught LAST (a stale
-            ;; FILE-ERROR / cabinet NOT-FOUND): quickload's real
-            ;; UNDEFINED-FUNCTION on bare metal reported as NOT-FOUND
-            ;; "/ql/local-init", and a direct probe reproduced it on x64.
-            (setq *current-condition* c)
-            (%associate-active-restart-frames c)
-            (let ((handled (%signal-condition c)))
-              (if handled
-                  nil
-                  (if (%error-handler-active-p)
-                      (%hc-longjmp)
-                      (progn (error "undefined function") nil))))))))))
+         ;; The restarts SBCL gives an undefined function, as for an unbound
+         ;; variable in %E2-SYMBOL-VALUE-CHECKED: CONTINUE looks again (a
+         ;; handler that defined it resumes in place), USE-VALUE supplies the
+         ;; function this once, STORE-VALUE installs it.
+         ;; Through ERROR, which publishes the condition before it unwinds
+         ;; (the stale-condition bug the hand-rolled sequence here once had,
+         ;; quickload's UNDEFINED-FUNCTION reported as NOT-FOUND), inside the
+         ;; image's RESTART-CASE, which links only around a signalling form.
+         (restart-case (error 'undefined-function :name sym)
+           (continue () :report "Look the function up again." (symbol-function sym))
+           (use-value (f) :report "Call a function given now instead." f)
+           (store-value (f) :report "Define it as a function given now, and call that."
+             (setf (fdefinition sym) f) f)))))))
 
 (defvar *%e2-set-function-names* nil
   "Names (strings) whose definition was stored with (SETF SYMBOL-FUNCTION) /
@@ -1845,17 +1842,23 @@
                   (t (%word->val #x0BADB0B5)))))
    (if (not (eq v (%word->val #x0BADB0B5)))
       v
-      (let ((c (%make-condition 'unbound-variable (list :name sym))))
-        ;; Publish + run handler-bind stack first, then longjmp to the
-        ;; nearest handler-case — same sequence as %eval-sym-lookup.
-        (setq *current-condition* c)
-        (%associate-active-restart-frames c)
-        (let ((handled (%signal-condition c)))
-          (if handled
-              nil
-              (if (%error-handler-active-p)
-                  (%hc-longjmp)
-                  nil)))))))
+      ;; THE RESTARTS SBCL GIVES, around the signal (CLHS UNBOUND-VARIABLE
+      ;; is the ERROR the standard's restarts are for): CONTINUE reads it
+      ;; again, USE-VALUE answers with a value this once, STORE-VALUE sets it
+      ;; and answers with it.  A handler that makes the variable bound --
+      ;; cortez's resolver loads the file that defines it -- resumes the read
+      ;; in place with CONTINUE; without them it could only unwind, and the
+      ;; read it had fixed died anyway ("The variable ... is unbound" after
+      ;; the DEFVAR had run).
+      ;; Through ERROR, which publishes the condition and finds the nearest
+      ;; handler as the hand-rolled sequence here used to, and inside the
+      ;; image's RESTART-CASE, which links only around a signalling form.
+      (restart-case (error 'unbound-variable :name sym)
+        (continue () :report "Read the variable again."
+          (%e2-symbol-value-checked hash sym))
+        (use-value (v) :report "Use a value this time." v)
+        (store-value (v) :report "Set the variable and use its new value."
+          (set sym v) v)))))
 
 (defun %do-funcall (fn args)
   "Call FN with ARGS list."

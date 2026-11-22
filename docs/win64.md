@@ -212,7 +212,10 @@ runs it, then the radio with bitchat's service, printing every event.  Measured 
 Server 2022 (no Bluetooth in the guest): WinRT, activation, the advertisement
 handler's registration (S_OK -- a wrong IID is E_NOINTERFACE), the watcher's start
 and abort, an IBuffer round trip, the adapter query to its end, and the
-no-adapter path.  The radio itself needs a machine with Bluetooth.
+no-adapter path.  On a Windows PC with Bluetooth (2026-11-22): the adapter reports LE,
+central and peripheral; chirp's glass window (`chirp/glass`) and bitchat on a phone see each
+other, link both ways (two links to one phone: each side connects to the other, and the mesh
+drops the duplicates), and exchange messages.
 
 **Random bytes** (`net/win32-entropy.lisp`): `%MODUS-HARDWARE-ENTROPY` is
 BCryptGenRandom (system-preferred RNG), the name natrium's DRBG looks for when there

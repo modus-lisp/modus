@@ -356,6 +356,28 @@ let buttonNew: Call = { p, n, x, y, w, h in
     return handle
 }
 
+// symbol_button_new(name, len, x, y, w, h): a button showing the SF Symbol NAME, a toggle's look: plain when off,
+// filled with the accent colour when on (symbol_button_set).  A tap is a TAP event; Lisp says whether it is on.
+let symbolButtonNew: Call = { p, n, x, y, w, h in
+    let name = text(p, n)
+    let image = NSImage(systemSymbolName: name, accessibilityDescription: name) ?? NSImage()
+    let button = NSButton(image: image, target: nil, action: nil)
+    button.bezelStyle = .rounded
+    button.frame = rect(x, y, w, h)
+    let handle = adopt(button)
+    wire(button, handle) { _ in send("TAP", [.int(Int(handle))]) }
+    return handle
+}
+
+let symbolButtonSet: Call = { h, on, _, _, _, _ in
+    guard let button = views[h] as? NSButton else { return 0 }
+    // a rounded button shows a tint on its symbol faintly at best: on is the bezel filled, as an engaged toggle is
+    button.bezelColor = on != 0 ? .controlAccentColor : nil
+    button.contentTintColor = on != 0 ? .white : nil
+    button.state = on != 0 ? .on : .off
+    return 1
+}
+
 // switch_new(on, x, y): a switch; its frame is its own size.
 let switchNew: Call = { on, x, y, _, _, _ in
     let sw = NSSwitch()
@@ -1124,6 +1146,8 @@ public func modusSwiftInstall() {
     installWindow()                                // MacWindow.swift: the window's title, chrome and size
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
+    register("ui_symbol_button_new", symbolButtonNew)
+    register("ui_symbol_button_set", symbolButtonSet)
     register("ui_switch_new", switchNew)
     register("ui_slider_new", sliderNew)
     register("ui_text_field_new", textFieldNew)

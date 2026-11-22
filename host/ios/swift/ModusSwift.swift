@@ -176,6 +176,27 @@ let buttonNew: Call = { p, n, x, y, w, h in
     return handle
 }
 
+// symbol_button_new(name, len, x, y, w, h): a button showing the SF Symbol NAME, a toggle's look: plain when off,
+// filled when on (symbol_button_set).  A tap is a TAP event; Lisp says whether it is on.
+let symbolButtonNew: Call = { p, n, x, y, w, h in
+    var c = UIButton.Configuration.gray()
+    c.image = UIImage(systemName: text(p, n))
+    let button = UIButton(configuration: c)
+    button.frame = rect(x, y, w, h)
+    let handle = adopt(button)
+    button.addAction(UIAction { _ in send("TAP", [.int(Int(handle))]) }, for: .touchUpInside)
+    return handle
+}
+
+let symbolButtonSet: Call = { h, on, _, _, _, _ in
+    guard let button = views[h] as? UIButton else { return 0 }
+    let image = button.configuration?.image
+    var c: UIButton.Configuration = on != 0 ? .filled() : .gray()
+    c.image = image
+    button.configuration = c
+    return 1
+}
+
 // switch_new(on, x, y): a switch; its frame is its own size.
 let switchNew: Call = { on, x, y, _, _, _ in
     let sw = UISwitch()
@@ -1876,6 +1897,8 @@ public func modusSwiftInstall() {
     installNative()                                // Native.swift: app-grade components (an app, not the desk)
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
+    register("ui_symbol_button_new", symbolButtonNew)
+    register("ui_symbol_button_set", symbolButtonSet)
     register("ui_switch_new", switchNew)
     register("ui_slider_new", sliderNew)
     register("ui_text_field_new", textFieldNew)

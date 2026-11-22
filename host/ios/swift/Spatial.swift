@@ -10,6 +10,9 @@
 //   spatial_listener(nine)             the listener: position, forward and up vectors, nine single-floats
 //   spatial_stop(voice)
 //   spatial_volume(permille)           everything's loudness, 0..1000
+//   spatial_head(on)                   follow the listener's head (AirPods) or not; off until asked
+//   spatial_head_permission()          0 not asked yet, 1 allowed, 2 refused, 3 none needed (a Mac): an app can say
+//                                      what the system's question is for before it is asked
 //
 // Coordinates are a right-handed world, y up, as the GPU's are: what a game draws where is heard there.
 
@@ -36,6 +39,7 @@ private var headYawAtStart: Double?
 
 private func startHeadTracking() {
     guard headphones.isDeviceMotionAvailable, !headphones.isDeviceMotionActive else { return }
+    headYawAtStart = nil                      // "ahead" is where the head is now
     headphones.startDeviceMotionUpdates(to: .main) { motion, error in
         guard let a = motion?.attitude else {
             if let error { NSLog("modus spatial: headphone motion: \(error)") }
@@ -79,13 +83,6 @@ let spatialStart: Call = { _, _, _, _, _, _ in
     d.maximumDistance = 80
     d.rolloffFactor = 1
     // the head followed: AirPods' motion turns the listener, so a sound stays where it is in the world
-    #if os(iOS)
-    startHeadTracking()                       // the phone: the head read here, and the listener turned by it
-    #else
-    if #available(macOS 15.0, tvOS 18.0, *) {
-        environment.isListenerHeadTrackingEnabled = true
-    }
-    #endif
     #if os(iOS) || os(tvOS)
     try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
     try? AVAudioSession.sharedInstance().setActive(true)
@@ -157,7 +154,35 @@ let spatialVolume: Call = { permille, _, _, _, _, _ in
     return 1
 }
 
+let spatialHead: Call = { on, _, _, _, _, _ in
+    #if os(iOS)
+    if on != 0 {
+        startHeadTracking()                   // the first time, the system asks for Motion & Fitness
+    } else {
+        headphones.stopDeviceMotionUpdates()
+        headYaw = 0; headPitch = 0
+    }
+    #else
+    if #available(macOS 15.0, tvOS 18.0, *) { environment.isListenerHeadTrackingEnabled = on != 0 }
+    #endif
+    return 1
+}
+
+let spatialHeadPermission: Call = { _, _, _, _, _, _ in
+    #if os(iOS)
+    switch CMHeadphoneMotionManager.authorizationStatus() {
+    case .notDetermined: return 0
+    case .authorized: return 1
+    default: return 2
+    }
+    #else
+    return 3
+    #endif
+}
+
 func installSpatial() {
+    register("spatial_head", spatialHead)
+    register("spatial_head_permission", spatialHeadPermission)
     register("spatial_start", spatialStart)
     register("spatial_sound", spatialSound)
     register("spatial_voice", spatialVoice)

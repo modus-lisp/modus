@@ -191,7 +191,7 @@
 (when cl-user::*cli-win64*
   (dolist (f '("net/win32-window.lisp" "net/win32-audio.lisp" "net/win32-winrt-ids.lisp"
                "net/win32-winrt.lisp" "net/win32-ble.lisp"
-               "net/win32-entropy.lisp"))
+               "net/win32-entropy.lisp" "net/win32-time.lisp"))
     (setq *cli-scan-extra-source*
           (concatenate 'string *cli-scan-extra-source*
                        (with-open-file (s (merge-pathnames (concatenate 'string "../" f)

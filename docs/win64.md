@@ -221,6 +221,15 @@ drops the duplicates), and exchange messages.
 BCryptGenRandom (system-preferred RNG), the name natrium's DRBG looks for when there
 is no `/dev/urandom` -- without it no key could be made on Windows.
 
+**The time zone** (`net/win32-time.lisp`): `W32-UTC-OFFSET` is seconds east of UTC now,
+from GetTimeZoneInformation (the bias plus the standard or daylight bias in effect), or 0.
+modus has no zone database (`DECODE-UNIVERSAL-TIME` with no zone is GMT), so an app with a
+clock asks for this by name and adds it itself; chirp's Bitchat window does.  Checked on a
+PC set to Eastern time in November: -18000.  To try a change without a rebuild, define the
+two folded call numbers first -- `(defconstant +w32-loadlibrarya+ #x1022)` and
+`(defconstant +w32-getprocaddress+ #x1023)` in MODUS-INT (KERNEL32 slots 34 and 35 of
+`*WIN64-IMPORTS*`, + `#x1000`) -- then `load` the file.
+
 ## Testing
 
 - `test/win64/cases.sh` holds the checks (arithmetic, bignums, printing,

@@ -1910,7 +1910,8 @@
 
 (defparameter *win64-platform-files* '("net/win32-window.lisp" "net/win32-audio.lisp"
                                         "net/win32-winrt-ids.lisp" "net/win32-winrt.lisp"
-                                        "net/win32-ble.lisp" "net/win32-entropy.lisp")
+                                        "net/win32-ble.lisp" "net/win32-entropy.lisp"
+                                        "net/win32-time.lisp")
   "The Windows platform's runtime files: appended to the image here, and their names handed to
    the scanners by build-generic-cli.lisp (*CLI-SCAN-EXTRA-SOURCE*), which keeps its own copy of
    this list -- it reads them before this file is loaded.")

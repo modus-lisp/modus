@@ -1860,6 +1860,7 @@
           (puthash name *kernel-redirects* pad)
           t)))))
 
+(declaim (overridable %kernel-redirect-hook))   ; the web arm (build-web.lisp): no pads
 (defun %kernel-redirect-hook (name)
   "From %JIT-FNADDR-THUNK-INVALIDATE, before NAME's binding changes."
   (when (and (stringp name) (> (length name) 0) (%jit-enabled-p)

@@ -14,6 +14,8 @@
 ;;;;   4. Frame slots 129+ were the homes of V3 and V5..V8.
 ;;;;   5. alloc-f32 and the FP register ops were unimplemented: a single-float
 ;;;;      MAKE-ARRAY stopped the VM, float pages ran on the Lisp interpreter.
+;;;;   6. DEFUN of an image function tried to patch a native call pad and failed
+;;;;      with PROGRAM-ERROR (Gray streams, so every ASDF load).
 ;;;;
 ;;;;   node web/run-node.js --mvmw web/modus.mvmw --load test/web-mvm-calls.lisp --quit
 ;;;;
@@ -98,5 +100,12 @@
   (wmc-check "double vector" (wmc-dsum (make-array 4 :element-type 'double-float :initial-contents '(1d0 2d0 3d0 4d0))) 5d0)
   (wmc-check "single tree" (wmc-single 2.5f0 2f0) (list 7.5f0 nil 0.5f0 2.5f0 2))
   (wmc-check "double tree" (wmc-double 1.5d0 3) (list 7.875d0 nil 1 -2d0)))
+
+;;; 6. DEFUN replacing an image function, then calling the original through it
+(let ((orig (symbol-function 'lisp-implementation-version)))
+  (wmc-check "redefine an image function"
+             (progn (eval `(defun lisp-implementation-version () (funcall ,orig)))
+                    (lisp-implementation-version))
+             (funcall orig)))
 
 (format t "~&WEB-MVM-CALLS ~a (~d failed)~%" (if (eql *wmc-bad* 0) "PASS" "FAIL") *wmc-bad*)

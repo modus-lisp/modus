@@ -345,6 +345,15 @@
 (defun %host-string-to-ip (host)
   (%string-to-cstr host *cstr-scratch*)
   (syscall3 4242 *cstr-scratch* (length host) 0))
+;; NO CALL PADS.  The x64-target guard in mvm-eval.lisp's hook admits this image
+;; (its JIT is on and its target arch is :X64), but the code it would patch is
+;; bytecode the JS MVM runs, not x64 with KPAD prologues: reading the pad faulted,
+;; and the fault escaped the DEFUN as a bare PROGRAM-ERROR -- so no DEFUN could
+;; replace an image function (sb-gray's 31 %GRAY-WRAP wrappers: Gray streams, and
+;; with them every ASDF load, failed in the browser).  A redefinition reaches what
+;; looks the name up (FUNCALL, the REPL, translated pages); the image's own direct
+;; callers keep the original, as on a read-only native image.
+(defun %kernel-redirect-hook (name) nil)
 (defun %jit-install-native-fns (base fnoffs names)
   (let ((n 0))
     (dolist (e fnoffs)

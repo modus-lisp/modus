@@ -241,13 +241,18 @@
 (defvar *gc-source*       (mvm-text "mvm/gc.lisp"))
 ;;; NATIVE BULK MEMORY (mvm/native-bulk.lisp): REPLACE / FILL's four inner loops
 ;;; as BULK-MOVE / BULK-FILL instructions -- only where the translator has them,
-;;; aarch64 and x64 (the i386 bare REPL reuses *CLI-ARCH* :AARCH64, hence its
-;;; own test).  Spliced after the overrides, last-defun-wins.
+;;; aarch64, x64 and i386 (kinds 0 and 1: REP MOVS / STOS; the i386 bare REPL
+;;; reuses *CLI-ARCH* :AARCH64, and gets them as i386).  Spliced after the
+;;; overrides, last-defun-wins.
 (defvar *cli-native-bulk-source*
-  (if (and (member *cli-arch* '(:x64 :aarch64))
-           (not (and (boundp 'cl-user::*cl-repl-i386-p*)
-                     (symbol-value 'cl-user::*cl-repl-i386-p*))))
+  (if (member *cli-arch* '(:x64 :aarch64 :i386))
       (concatenate 'string (mvm-text "mvm/native-bulk.lisp")
+                   (if (member *cli-arch* '(:x64 :aarch64))
+                       (if (and (boundp 'cl-user::*cl-repl-i386-p*)
+                                (symbol-value 'cl-user::*cl-repl-i386-p*))
+                           ""                         ; bare i386 says :AARCH64
+                           (mvm-text "mvm/native-bulk-u32.lisp"))
+                       "")
                    ;; HOSTED x86-64 only: the socket and RFB loops on BULK-MOVE kinds 2-4
                    ;; and KERNEL.  Not bare metal: the UEFI image's source is what the
                    ;; aarch64 DDC compiles, and the aarch64 translator has no arm for them.

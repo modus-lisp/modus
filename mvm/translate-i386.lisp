@@ -5717,6 +5717,48 @@ modus: heap exhausted -- this machine needs more RAM
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
 
+;; ---- BULK-MOVE Vdst Vdi Vsrc Vsi Vn kind / BULK-FILL Varr Vi Vn Vval kind ----
+        ;; REPLACE and FILL's inner loops (native-bulk.lisp) as REP MOVS / STOS.  Element I of
+        ;; a word vector is at Varr - 5 + 4I, byte I of a byte vector at Varr - 5 + I (as
+        ;; U8-REF); indices, counts and the fill value arrive TAGGED.  KIND 0 words, 1 bytes;
+        ;; the copy is a memmove (backward only when the destination starts inside the source).
+        ;; Every register is saved (PUSHAL): the operands are pushed through SCRATCH0, which no
+        ;; vreg lives in, then popped into the string registers.  No write barrier: i386 has
+        ;; no generational collector and bare metal has one thread.  Source: bulk.s in the
+        ;; commit that added these, `as --32'.
+        ((op= +op-bulk-move+)
+         (let ((kind (sixth operands)))
+           (unless (member kind '(0 1))
+             (error "MVM i386: BULK-MOVE kind ~D not implemented" kind))
+           (i386-emit-byte buf #x60)                                   ; pushal
+           (dolist (v (subseq operands 0 5))
+             (i386-load-vreg buf +scratch0+ v)
+             (i386-emit-push-reg buf +scratch0+))
+           (dolist (b (if (= kind 0)
+                          '(#x59 #x58 #x5E #x5A #x5F #x8D #x74 #x46 #xFB #x8D #x7C #x57 #xFB #xD1 #xF9
+                            #x39 #xF7 #x76 #x15 #x8D #x04 #x8E #x39 #xC7 #x73 #x0E #x8D #x74 #x8E #xFC
+                            #x8D #x7C #x8F #xFC #xFD #xF3 #xA5 #xFC #xEB #x03 #xFC #xF3 #xA5 #x61)
+                          '(#x59 #x58 #x5E #x5A #x5F #xD1 #xF8 #x8D #x74 #x06 #xFB #xD1 #xFA #x8D #x7C
+                            #x17 #xFB #xD1 #xF9 #x39 #xF7 #x76 #x15 #x8D #x04 #x0E #x39 #xC7 #x73 #x0E
+                            #x8D #x74 #x0E #xFF #x8D #x7C #x0F #xFF #xFD #xF3 #xA4 #xFC #xEB #x03 #xFC
+                            #xF3 #xA4 #x61)))
+             (i386-emit-byte buf b))
+           (setf *i386-last-store* nil)))
+        ((op= +op-bulk-fill+)
+         (let ((kind (fifth operands)))
+           (unless (member kind '(0 1))
+             (error "MVM i386: BULK-FILL kind ~D not implemented" kind))
+           (i386-emit-byte buf #x60)                                   ; pushal
+           (dolist (v (subseq operands 0 4))
+             (i386-load-vreg buf +scratch0+ v)
+             (i386-emit-push-reg buf +scratch0+))
+           (dolist (b (if (= kind 0)
+                          '(#x58 #x59 #x5A #x5F #x8D #x7C #x57 #xFB #xD1 #xF9 #xFC #xF3 #xAB #x61)
+                          '(#x58 #x59 #x5A #x5F #xD1 #xFA #x8D #x7C #x17 #xFB #xD1 #xF9 #xD1 #xF8 #xFC
+                            #xF3 #xAA #x61)))
+             (i386-emit-byte buf b))
+           (setf *i386-last-store* nil)))
+
         ;; ---- U8-REF Vd, Varr, Vidx ----
         ;; Byte address = (Varr - 9) + 4 + real_idx = Varr + real_idx - 5.
         ;; Vidx is TAGGED (real_idx*2); result is TAGGED (byte << 1), matching

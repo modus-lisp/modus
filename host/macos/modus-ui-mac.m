@@ -98,6 +98,23 @@ static void push_motion(double dx, double dy) {
     queue_event(((uint64_t)13 << 40) | (((uint64_t)y & 0xFFFFF) << 20) | ((uint64_t)x & 0xFFFFF));
 }
 
+// A TRACKPAD GESTURE (type 15): which, in bits 32-35 -- 0 pinch (magnification), 1 rotation, 2 smart zoom (two
+// fingers double-tapped), 3 swipe -- its phase in bits 36-37 (0 began, 1 changed, 2 ended), and its amount, a signed
+// 32-bit number in the low bits: a pinch's change in thousandths (positive spreading), a rotation's in thousandths of
+// a degree (positive counter-clockwise), a swipe's direction (1 left, 2 right, 3 up, 4 down).  The pointer's place is
+// where it was last sent.
+static void push_gesture(int kind, int phase, double amount) {
+    long a = lround(amount);
+    queue_event(((uint64_t)15 << 40) | ((uint64_t)(phase & 3) << 36) | ((uint64_t)(kind & 15) << 32)
+                | (uint32_t)(int32_t)a);
+}
+
+static int gesture_phase(NSEventPhase p) {
+    if (p & NSEventPhaseBegan) return 0;
+    if (p & (NSEventPhaseEnded | NSEventPhaseCancelled)) return 2;
+    return 1;
+}
+
 static void push_resize(long w, long h) {
     queue_event(((uint64_t)6 << 40) | ((uint64_t)h << 20) | (uint64_t)w);
 }
@@ -281,6 +298,13 @@ static NSView *fb_view_for_cursor;
 // SCROLLING, as the wheel's notches: a press and a release of its button each.  A mouse wheel counts in lines, a
 // trackpad in points (about 16 to a notch); the sign is the person's own (natural scrolling or not): content that
 // should move down is the wheel turned up.
+- (void)magnifyWithEvent:(NSEvent *)e { push_gesture(0, gesture_phase(e.phase), e.magnification * 1000); }
+- (void)rotateWithEvent:(NSEvent *)e { push_gesture(1, gesture_phase(e.phase), e.rotation * 1000); }
+- (void)smartMagnifyWithEvent:(NSEvent *)e { (void)e; push_gesture(2, 2, 0); }
+- (void)swipeWithEvent:(NSEvent *)e {
+    int dir = e.deltaX > 0 ? 1 : e.deltaX < 0 ? 2 : e.deltaY > 0 ? 3 : e.deltaY < 0 ? 4 : 0;
+    if (dir) push_gesture(3, 2, dir);
+}
 - (void)scrollWheel:(NSEvent *)e {
     static double acc_y, acc_x;
     double per = e.hasPreciseScrollingDeltas ? 16 : 1;

@@ -3084,6 +3084,10 @@ private final class MacStatusBar: FillView {
     var onChange: (() -> Void)?
     private var lastFill = 0.0
     private var measured = false
+    private var finishing: DispatchWorkItem?
+    /// How much of the meter a measured progress fills: all the work is 95% of it, so a nearly finished one does not
+    /// look done; the last 5% fills when it is, then the checkmark -- as the phone's status ring (Native.swift).
+    static let measuredShare = 0.95
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -3124,16 +3128,40 @@ private final class MacStatusBar: FillView {
         }
         text.attributedStringValue = s
         text.toolTip = message
-        icon.isHidden = !done
+        finishing?.cancel()
+        finishing = nil
+        let wasMeasured = measured && lastFill > 0
         cancel.isHidden = done
         ok.isHidden = !done
         measured = !done && progress != nil
+        if done && wasMeasured {
+            // the meter's last stretch filled, then the checkmark
+            spinner.stopAnimation(nil)
+            icon.isHidden = true
+            meter.isHidden = false
+            NSAnimationContext.runAnimationGroup { c in
+                c.duration = 0.25
+                self.meter.animator().doubleValue = 1
+            }
+            lastFill = 0
+            let show = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.finishing = nil
+                self.meter.isHidden = true
+                self.icon.isHidden = false
+            }
+            finishing = show
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: show)
+            relayout()
+            return
+        }
+        icon.isHidden = !done
         meter.isHidden = !measured
         if done {
             spinner.stopAnimation(nil)
         } else if let p = progress {
             spinner.stopAnimation(nil)
-            lastFill = max(lastFill, max(0, min(1, p)))
+            lastFill = max(lastFill, max(0, min(1, p)) * MacStatusBar.measuredShare)
             meter.doubleValue = lastFill
         } else {
             lastFill = 0

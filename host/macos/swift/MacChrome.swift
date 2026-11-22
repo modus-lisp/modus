@@ -150,7 +150,12 @@ let statusItemNew: Call = { p, n, sp, sn, _, _ in
 
 let statusItemTitle: Call = { s, p, n, _, _, _ in
     guard let button = statusItems[s]?.button else { return 0 }
-    button.title = text(p, n)
+    let title = text(p, n)
+    // digits of one width, so a number that changes does not make the item jitter; and with an icon, the icon
+    // then the text (made with no text, it was the icon alone, and text drawn later went under it)
+    button.attributedTitle = NSAttributedString(string: title, attributes: [
+        .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)])
+    if button.image != nil { button.imagePosition = title.isEmpty ? .imageOnly : .imageLeading }
     return 1
 }
 

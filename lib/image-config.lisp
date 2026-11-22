@@ -42,9 +42,21 @@
       (setf (gethash name *knob-reads*) v))
     v))
 
+#+sbcl
 (unless (sb-int:encapsulated-p 'sb-ext:posix-getenv 'modus-knob-recorder)
   (sb-ext:without-package-locks
     (sb-int:encapsulate 'sb-ext:posix-getenv 'modus-knob-recorder #'%record-knob-read)))
+;; ON MODUS (a build that runs on modus itself): SB-EXT:POSIX-GETENV is the shim's
+;; ordinary function, so it is wrapped by replacing its definition -- once, the
+;; wrapper remembering the original.
+#-sbcl
+(defvar *getenv-unwrapped* nil)
+#-sbcl
+(unless *getenv-unwrapped*
+  (let ((orig (fdefinition 'sb-ext:posix-getenv)))
+    (setq *getenv-unwrapped* orig)
+    (setf (fdefinition 'sb-ext:posix-getenv)
+          (lambda (name) (%record-knob-read orig name)))))
 
 (defparameter *image-configuration-flags*
   '((:aarch64 "MODUS-INT" "*AARCH64-GC-NATIVE-MCGC*")
@@ -88,7 +100,43 @@
     (or (let ((n (length name))) (and (> n 4) (string= "_OUT" name :start2 (- n 4))))
         (has "DUMP") (has "SYMMAP") (has "INVENTORY") (has "_LOG") (has "WORK"))))
 
+(defun %file-first-line (path)
+  (with-open-file (f path :if-does-not-exist nil)
+    (and f (let ((l (read-line f nil nil))) (and l (string-trim '(#\Space #\Tab #\Return) l))))))
+
+(defun %git-dir ()
+  "The tree's git directory: .git, or the directory a worktree's .git FILE names."
+  (let* ((dot (concatenate 'string *tree* ".git"))
+         (l (ignore-errors (%file-first-line dot))))
+    (cond ((and l (> (length l) 8) (string= "gitdir: " l :end2 8))
+           (let ((d (subseq l 8))) (if (char= (char d (1- (length d))) #\/) d (concatenate 'string d "/"))))
+          (t (concatenate 'string dot "/")))))
+
+(defun %git-head-from-files ()
+  "HEAD's commit read from the git directory's own files -- HEAD, the loose ref, then
+   packed-refs (a worktree's refs live in its common directory) -- for a build with no
+   git to run: a modus image, or a browser.  \"\" when it cannot be found."
+  (or (ignore-errors
+       (let* ((gd (%git-dir))
+              (head (%file-first-line (concatenate 'string gd "HEAD"))))
+         (if (and head (> (length head) 5) (string= "ref: " head :end2 5))
+             (let* ((ref (subseq head 5))
+                    (common (let ((c (%file-first-line (concatenate 'string gd "commondir"))))
+                              (if c (if (char= (char c 0) #\/) (concatenate 'string c "/")
+                                        (concatenate 'string gd c "/"))
+                                  gd))))
+               (or (%file-first-line (concatenate 'string gd ref))
+                   (%file-first-line (concatenate 'string common ref))
+                   (with-open-file (f (concatenate 'string common "packed-refs") :if-does-not-exist nil)
+                     (and f (loop for l = (read-line f nil nil) while l
+                                  when (and (> (length l) 41) (string= ref l :start2 41))
+                                    return (subseq l 0 40))))))
+             head)))
+      ""))
+
 (defun %git-line (&rest args)
+  #-sbcl (if (equal args '("rev-parse" "HEAD")) (%git-head-from-files) "")
+  #+sbcl
   (handler-case
       (let* ((s (with-output-to-string (o)
                   (sb-ext:run-program "git" (list* "-C" *tree* args)

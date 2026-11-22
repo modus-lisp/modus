@@ -2691,8 +2691,10 @@
 ;; An autostart SSH image is a server: it has no library to fetch, and on a
 ;; real network the slirp address the fetch targets does not exist, so the
 ;; attempt only delays the SSH server.
+;; ... nor does an image that only wants the network up (MODUS_NET_NOFETCH=1: kiln t420's desk,
+;; whose pipeline otherwise spent two TCP timeouts on a slirp address at every boot).
 (defvar *net-x64-fetch-block*
-  (if *ssh-autostart-p*
+  (if (or *ssh-autostart-p* (equal (sb-ext:posix-getenv "MODUS_NET_NOFETCH") "1"))
       "          (write-string-serial \"NET-FETCH-SKIPPED\") (write-char-serial 10))))"
       "          (handler-case (ql-net-setup) (t (c) nil))
           (net-install-and-call (%net-fetch-url)))))"))

@@ -4012,7 +4012,7 @@
   ;; (%CONV-ADDR K), or a number that only looks like one.  Listed after the build.
   (when (let ((v (sb-ext:posix-getenv "MODUS_CONV_VALUE_AUDIT"))) (and v (string/= v "0")))
     (defparameter cl-user::*conv-value-hits* (make-hash-table :test 'equal))
-    (sb-int:encapsulate (intern "COMPILE-INTEGER" "MODUS.MVM") 'conv-value-audit
+    (modus.mvm::%gck-encapsulate (intern "COMPILE-INTEGER" "MODUS.MVM") 'conv-value-audit
       (lambda (f value dest)
         (when (and (integerp value) (<= #x10000000 value #x1001FFFF))
           (push value (gethash (symbol-value (intern "*CURRENT-FUNCTION-NAME*" "MODUS.MVM"))

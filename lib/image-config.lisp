@@ -154,7 +154,12 @@
 
 (defun %image-build-script ()
   "The build script, relative to the tree: the first argument naming a .lisp file
-   under mvm/, from /proc/self/cmdline (SBCL's *POSIX-ARGV* drops --script's file)."
+   under mvm/, from /proc/self/cmdline (SBCL's *POSIX-ARGV* drops --script's file).
+   A host driver that LOADs the script itself (scripts/build-ccl.sh, build-abcl-driver)
+   names it in CL-USER::*IMAGE-BUILD-SCRIPT*, so every host records the same script."
+  (let ((v (find-symbol "*IMAGE-BUILD-SCRIPT*" "COMMON-LISP-USER")))
+    (when (and v (boundp v) (stringp (symbol-value v)))
+      (return-from %image-build-script (symbol-value v))))
   (let ((args (handler-case
                   (with-open-file (f "/proc/self/cmdline")
                     (let ((acc nil) (cur (make-string-output-stream)))

@@ -2159,7 +2159,7 @@
 ;; kernel-main: single-form resolution for the spin-point bisect, without a
 ;; named point per line.  The line must exist (else the build stops); unset,
 ;; *DRIVER-SOURCE* is untouched.
-(let ((v #+sbcl (sb-ext:posix-getenv "MODUS_LISP_SPIN_AFTER") #-sbcl nil))
+(let ((v (sb-ext:posix-getenv "MODUS_LISP_SPIN_AFTER")))
   (when (and v (plusp (length v)))
     (let* ((needle (format nil "  ~A~%" v))
            (km (search "(defun kernel-main ()" *driver-source*))
@@ -3049,6 +3049,97 @@
                                      (find c "+-*/<=>?!@$%^&_:|.~")))
                                s)))
                  (scan-defuns *all-runtime-source*)))
+
+;;; THE BUILDER'S STRUCT FUNCTIONS.  The symbol-function table is how evaluated
+;;; code reaches a kernel function, and it is generated from the source's DEFUN
+;;; TEXT, so a DEFSTRUCT's constructor, accessors, predicate and copier -- real
+;;; functions in the image, but written nowhere as "(defun" -- are not in it:
+;;; (modus-int::make-mvm-buffer) from a script is UNDEFINED-FUNCTION.  The
+;;; builder CLI runs build scripts that call the cross tooling's structs
+;;; (KERNEL-IMAGE-IMAGE-BYTES, MAKE-MVM-BUFFER ...), so in builder mode every
+;;; DEFSTRUCT in the ISA and the cross tooling is READ and its functions named by
+;;; the CLHS rules.  On a host that loaded these files (any CL but modus), every
+;;; name must be FBOUNDP, so a wrong rule fails the build here.
+(defun %scan-defstruct-fn-names (text)
+  (let ((names nil) (slots-of (make-hash-table :test 'equal))
+        (pos 0) (pkgs (%scan-in-packages text)) (pkg "MODUS.MVM")
+        (code (%code-mask text)))
+    (labels ((nm (x) (if (stringp x) x (symbol-name x)))
+             (opt (options key)
+               (remove-if-not (lambda (o) (or (eq o key) (and (consp o) (eq (car o) key))))
+                              options))
+             (qualify (s)
+               (if (or (string= pkg "MODUS.MVM") (not (find-package pkg)))
+                   s
+                   (let ((q (concatenate 'string pkg "::" s)))
+                     (setf (gethash q *scan-defuns-qualified*) s)
+                     q))))
+      (loop
+        (let ((p (loop (let ((q (search "(defstruct " text :start2 pos)))
+                         (when (or (null q) (= 1 (sbit code q))) (return q))
+                         (setq pos (1+ q))))))
+          (unless p (return))
+          (loop while (and pkgs (< (car (first pkgs)) p))
+                do (setq pkg (cdr (pop pkgs))))
+          (setq pos (1+ p))
+          (let ((form (ignore-errors
+                       (let ((*package* (or (find-package pkg) (find-package "MODUS.MVM")))
+                             (*read-eval* nil))
+                         (read-from-string text t nil :start p)))))
+            (when (and (consp form) (consp (cdr form)))
+              (let* ((head (cadr form))
+                     (sname (nm (if (consp head) (car head) head)))
+                     (options (if (consp head) (cdr head) nil))
+                     (body (if (stringp (caddr form)) (cdddr form) (cddr form)))
+                     (own (mapcar (lambda (s) (nm (if (consp s) (car s) s))) body))
+                     (inc (car (opt options :include)))
+                     (all (append (and (consp inc) (gethash (nm (cadr inc)) slots-of)) own))
+                     (cn (car (opt options :conc-name)))
+                     (conc (cond ((null cn) (concatenate 'string sname "-"))
+                                 ((or (keywordp cn) (null (cadr cn))) "")
+                                 (t (nm (cadr cn)))))
+                     (typed (opt options :type))
+                     (named (opt options :named))
+                     (out nil))
+                (setf (gethash sname slots-of) all)
+                (let ((ctors (opt options :constructor)))
+                  (if (null ctors)
+                      (push (concatenate 'string "MAKE-" sname) out)
+                      (dolist (c ctors)
+                        (cond ((or (keywordp c) (null (cdr c)))
+                               (push (concatenate 'string "MAKE-" sname) out))
+                              ((cadr c) (push (nm (cadr c)) out))))))
+                (let ((pr (car (opt options :predicate))))
+                  (cond ((and typed (not named)))
+                        ((or (null pr) (keywordp pr) (null (cdr pr)))
+                         (push (concatenate 'string sname "-P") out))
+                        ((cadr pr) (push (nm (cadr pr)) out))))
+                (let ((cp (car (opt options :copier))))
+                  (cond ((or (null cp) (keywordp cp) (null (cdr cp)))
+                         (push (concatenate 'string "COPY-" sname) out))
+                        ((cadr cp) (push (nm (cadr cp)) out))))
+                (dolist (s all) (push (concatenate 'string conc s) out))
+                (dolist (n (nreverse out))
+                  #-modus
+                  (let ((sym (find-symbol n (or (find-package pkg) "MODUS.MVM"))))
+                    (unless (and sym (fboundp sym))
+                      (error "builder struct scan: ~A::~A is not a function -- the ~
+                              DEFSTRUCT rules here are wrong for ~A" pkg n sname)))
+                  (push (qualify n) names)))))))
+      (nreverse names))))
+
+(when *cli-builder-p*
+  (let* ((have (make-hash-table :test 'equal))
+         (new (remove-if (lambda (n) (gethash n have))
+                         (remove-duplicates
+                          (%scan-defstruct-fn-names
+                           (concatenate 'string *isa-source* (string #\Newline)
+                                        *selfhost-cross-tooling-source*))
+                          :test #'equal :from-end t))))
+    (dolist (n *all-defun-names*) (setf (gethash n have) t))
+    (setq new (remove-if (lambda (n) (gethash n have)) new))
+    (format t "  builder: ~D struct functions registered~%" (length new))
+    (setq *all-defun-names* (append *all-defun-names* new))))
 
 (format t "  defuns found: ~D~%" (length *all-defun-names*))
 

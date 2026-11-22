@@ -100,6 +100,17 @@
 ;;;; do not assume: `cmp modus <pristine>' after building both.
 
 (in-package :modus.mvm)
+;;; ENCAPSULATE on any host.  SBCL's SB-INT:ENCAPSULATE (looked up at run time, so
+;;; no other reader ever sees the symbol); elsewhere the function cell is replaced
+;;; by a wrapper over the old definition, which is what an encapsulation is.
+(defun %gck-encapsulate (name tag fn)
+  (let ((enc (and (find-package "SB-INT") (find-symbol "ENCAPSULATE" "SB-INT"))))
+    (if (and enc (fboundp enc))
+        (funcall enc name tag fn)
+        (let ((orig (fdefinition name)))
+          (setf (fdefinition name)
+                (lambda (&rest args) (apply fn orig args)))))))
+
 
 ;;; ------------------------------------------------------------------
 ;;; REPRODUCIBILITY — no pin needed here any more (task #251)
@@ -475,9 +486,13 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
       ;; stack frame, and that is the OUTERMOST script, which is what we want:
       ;; *LOAD-TRUENAME* here would say \"build-ansi-common\" for all four ANSI
       ;; gate runners, collapsing four distinct images into one label.
-      (let ((frames (ignore-errors (sb-debug:list-backtrace :count 400))))
+      (let ((frames (ignore-errors
+                     (let ((bt (and (find-package "SB-DEBUG")
+                                    (find-symbol "LIST-BACKTRACE" "SB-DEBUG"))))
+                       (and bt (fboundp bt) (funcall bt :count 400)))))
+            (ps (and (find-package "SB-IMPL") (find-symbol "PROCESS-SCRIPT" "SB-IMPL"))))
         (dolist (f frames)
-          (when (and (consp f) (eq (car f) 'sb-impl::process-script)
+          (when (and (consp f) ps (eq (car f) ps)
                      (stringp (cadr f)))
             (let ((n (pathname-name (pathname (cadr f)))))
               (when n (return-from %gck-build-label n))))))
@@ -1496,7 +1511,7 @@ that no list has ***~%" (length missing))
           (format o "~A~C~A~%" (car e) #\Tab (or (cdr e) "?")))))))
 
 (when (%gck-defun-inventory-path)
-  (sb-int:encapsulate 'mvm-compile-function 'defun-inventory
+  (%gck-encapsulate 'mvm-compile-function 'defun-inventory
     (lambda (f name &rest args)
       (push (cons name *current-source-location*) *gck-defun-log*)
       (apply f name args))))
@@ -1521,12 +1536,12 @@ that no list has ***~%" (length missing))
 (progn
   ;; Always on: the census is also the enforcement (CHECK-CROSS-PACKAGE-CALLS).
   (setf *gck-fallback-census* (make-hash-table :test 'equal))
-  (sb-int:encapsulate '%fn-register-info 'fallback-census
+  (%gck-encapsulate '%fn-register-info 'fallback-census
     (lambda (f info)
       (let ((q (function-info-qualified-name info)))
         (when q (setf (gethash q *gck-registered-keys*) t)))
       (funcall f info)))
-  (sb-int:encapsulate '%fn-info-for-key 'fallback-census
+  (%gck-encapsulate '%fn-info-for-key 'fallback-census
     (lambda (f key)
       (let ((r (funcall f key)))
         (when (and r *functions* (not (gethash key *functions*)))
@@ -2106,7 +2121,7 @@ that no list has ***~%" (length missing))
   (when (and path (> (length path) 0))
     (setf *ir-dump-stream* (open path :direction :output :if-exists :append
                                       :if-does-not-exist :create))
-    (sb-int:encapsulate 'mvm-compile-toplevel 'ir-dump
+    (%gck-encapsulate 'mvm-compile-toplevel 'ir-dump
       (lambda (f form &rest args)
         (let ((*ir-dump-depth* (1+ *ir-dump-depth*)))
           (let ((r (apply f form args)))
@@ -2118,11 +2133,14 @@ that no list has ***~%" (length missing))
     ;; global reference added anywhere earlier renumbers every later one.
     ;; Write the build's whole map (slot -> name key) at exit, so the
     ;; comparing script (scripts/irdiff.py) can read slot operands as names.
-    (push (lambda ()
+    ;; (SBCL's exit hooks; another host just has no slot map in the dump)
+    (let ((hooks (and (find-package "SB-EXT") (find-symbol "*EXIT-HOOKS*" "SB-EXT"))))
+     (when hooks
+      (push (lambda ()
             (when (and *ir-dump-stream* (hash-table-p *gv-cache-index*))
               (maphash (lambda (key slot)
                          (format *ir-dump-stream* "~&@GVMAP ~D ~D~%" slot key))
                        *gv-cache-index*)
               (finish-output *ir-dump-stream*)))
-          sb-ext:*exit-hooks*)
+          (symbol-value hooks))))
     (format t "~&;; MODUS_IR_DUMP -> ~A~%" path)))

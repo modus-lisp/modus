@@ -53,7 +53,11 @@
        (consp (cadr form)) (consp (caadr form))
        (let ((v (cadr (caadr form))))
          (and (consp v) (symbolp (car v))
-              (string= (symbol-name (car v)) "BUILD-IMAGE")))))
+              (member (symbol-name (car v)) (quote ("BUILD-IMAGE" "HOST-BUILD-IMAGE")) :test (function string=))))))
+
+;; the script the image's configuration record names (lib/image-config.lisp)
+(defparameter *image-build-script*
+  (or (ext:getenv "MODUS_ABCL_BUILD_SCRIPT") "mvm/build-generic-cli.lisp"))
 
 (let* ((script (or (ext:getenv "MODUS_ABCL_BUILD_SCRIPT")
                    "mvm/build-generic-cli.lisp"))

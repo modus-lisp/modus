@@ -31,4 +31,6 @@ if [ ! -f "$ABCL_JAR" ]; then
   exit 1
 fi
 
-java "-Xmx${JAVA_XMX}" -jar "$ABCL_JAR" --batch --load scripts/build-abcl-driver.lisp
+# UTF-8 whatever the locale: the JVM takes its default from it, and LANG=C reads
+# every source as ASCII (an em dash became three U+FFFD).
+java "-Xmx${JAVA_XMX}" -Dfile.encoding=UTF-8 -jar "$ABCL_JAR" --batch --load scripts/build-abcl-driver.lisp

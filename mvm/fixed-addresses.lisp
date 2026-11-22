@@ -237,9 +237,14 @@
    configuration record.  They cannot change a byte of an image -- the check
    passes a build or stops it -- so, like output paths, they stay out of the
    record, and a build with this file is byte-identical to one without it."
+  #+sbcl
   (sb-alien:alien-funcall
    (sb-alien:extern-alien "getenv" (function sb-alien:c-string sb-alien:c-string))
-   name))
+   name)
+  ;; elsewhere: the POSIX-GETENV lib/image-config.lisp's recorder wraps
+  #-sbcl
+  (let ((u (find-symbol "*GETENV-UNWRAPPED*" "MODUS.IMAGE-CONFIG")))
+    (funcall (or (and u (boundp u) (symbol-value u)) #'sb-ext:posix-getenv) name)))
 
 (defun %fa-mode ()
   (let ((v (%fa-getenv "MODUS_FIXED_ADDR_CHECK")))

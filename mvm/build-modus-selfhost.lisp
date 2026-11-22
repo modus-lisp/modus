@@ -1175,13 +1175,10 @@
 (defvar *opcode-table-init-source*
   (with-output-to-string (s)
     (format s "(defun %~A-opcode-table ()~%" "populate")
-    (maphash (lambda (code info)
-               (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
-                       code code
-                       (modus.mvm::opcode-info-name info)
-                       (modus.mvm::opcode-info-operands info)
-                       (modus.mvm::opcode-info-description info)))
-             modus.mvm::*opcode-table*)
+    (dolist (e (cl-user::%opcode-entries))
+      (destructuring-bind (code name operands description) e
+        (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
+                code code name operands description)))
     (format s "  t)~%")
     ;; defparameter init-thunk runs %populate-opcode-table at boot, AFTER the
     ;; *opcode-table* defparameter (earlier in source order) creates the table.

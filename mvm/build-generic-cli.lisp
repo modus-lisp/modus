@@ -37,6 +37,9 @@
 ;;; add a CAPABILITY there (both arches get it), add a HARDWARE FACT here.
 ;;; ============================================================
 
+;;; On a modus host (no SBCL), the SB-EXT entry points this script and the build call.
+#-sbcl (load (merge-pathnames "../lib/host-modus.lisp" (directory-namestring (truename *load-truename*))))
+
 (defvar *cli-arch* :x64)
 
 ;; ABI FACT, and it was WRONG here until the image grew threads: on x86-64

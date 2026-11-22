@@ -165,7 +165,10 @@
 ;;; second time is ~20s of pure waste and doubles every build warning.  Hosted
 ;;; wrappers do not pre-load, so the package does not exist and this loads
 ;;; exactly as it always did.
-(unless (find-package "MODUS.MVM")
+;; Asked as "are the build's helpers loaded", not "does MODUS.MVM exist": in a modus
+;; image MODUS.MVM is always there (the kernel's own package's nickname), and a build on
+;; a modus host still needs load-mvm.lisp's helpers (MVM-TEXT ...), if not its compiler.
+(unless (fboundp (find-symbol "MVM-TEXT" "COMMON-LISP-USER"))
   (load (merge-pathnames "../lib/load-mvm.lisp"
                          (directory-namestring (truename *load-truename*)))))
 
@@ -1272,16 +1275,16 @@
     ;; a character at a time for each.  Names and operands are keywords: INTERN
     ;; returns the static keyword objects, seeded before the globals' thunks run.
     (let ((lines nil))
-      (maphash (lambda (code info)
-                 (progn
-                   ;; no description: nothing in an image reads one, and their
-                   ;; em dashes kept this whole literal wide (4 bytes a char)
-                   (push (format nil "~D ~A~{ ~A~}~C" code
-                                 (symbol-name (modus.mvm::opcode-info-name info))
-                                 (mapcar #'symbol-name (modus.mvm::opcode-info-operands info))
-                                 #\Tab)
-                         lines)))
-               modus.mvm::*opcode-table*)
+      (dolist (e (cl-user::%opcode-entries))
+        (destructuring-bind (code name operands description) e
+          (declare (ignore description))
+          ;; no description: nothing in an image reads one, and their
+          ;; em dashes kept this whole literal wide (4 bytes a char)
+          (push (format nil "~D ~A~{ ~A~}~C" code
+                        (symbol-name name)
+                        (mapcar #'symbol-name operands)
+                        #\Tab)
+                lines)))
       (format s "(defun %populate-opcode-table ()
   (let ((text ~S) (i 0))
     (let ((n (length text)))
@@ -1307,13 +1310,10 @@
       (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%"))
    (progn
     (format s "(defun %~A-opcode-table ()~%" "populate")
-    (maphash (lambda (code info)
-               (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
-                       code code
-                       (modus.mvm::opcode-info-name info)
-                       (modus.mvm::opcode-info-operands info)
-                       (modus.mvm::opcode-info-description info)))
-             modus.mvm::*opcode-table*)
+    (dolist (e (cl-user::%opcode-entries))
+      (destructuring-bind (code name operands description) e
+        (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
+                code code name operands description)))
     (format s "  t)~%")
     ;; defparameter init-thunk runs %populate-opcode-table at boot, AFTER the
     ;; *opcode-table* defparameter (earlier in source order) creates the table.

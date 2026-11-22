@@ -14,6 +14,7 @@
 //   spatial_head_attitude(three)        the head's yaw, pitch and roll (radians; yaw from where it was when following
 //                                      began, positive turning left; pitch positive up) into three single-floats;
 //                                      1 while the headphones report it, else 0
+//   spatial_head_recenter()            "ahead" is where the head faces now
 //   spatial_head_permission()          0 not asked yet, 1 allowed, 2 refused, 3 none needed (a TV): an app can say
 //                                      what the system's question is for before it is asked
 //
@@ -184,6 +185,13 @@ let spatialHeadAttitude: Call = { p, _, _, _, _, _ in
     #endif
 }
 
+let spatialHeadRecenter: Call = { _, _, _, _, _, _ in
+    #if os(iOS) || os(macOS)
+    headYawAtStart = nil                        // the next report sets it
+    #endif
+    return 1
+}
+
 let spatialHeadPermission: Call = { _, _, _, _, _, _ in
     #if os(iOS) || os(macOS)
     switch CMHeadphoneMotionManager.authorizationStatus() {
@@ -200,6 +208,7 @@ func installSpatial() {
     register("spatial_head", spatialHead)
     register("spatial_head_permission", spatialHeadPermission)
     register("spatial_head_attitude", spatialHeadAttitude)
+    register("spatial_head_recenter", spatialHeadRecenter)
     register("spatial_start", spatialStart)
     register("spatial_sound", spatialSound)
     register("spatial_voice", spatialVoice)

@@ -13354,6 +13354,21 @@
   "Compile TEST so that control falls through when it is true and branches
    to FALSE-LABEL when it is false.  DEST is scratch."
   (cond
+    ;; NOT ONE OF OURS: COMPILE-COMPOUND's shadowing guards, applied here too.
+    ;; Every clause below matches the head by NAME (NOT, ZEROP, EQ, AND, OR,
+    ;; and %COMPILE-PREDICATE-BRANCH's CHARACTERP, CONSP ...), so a head that
+    ;; shadows a CL external, or a user package's own function named like an
+    ;; intrinsic, got the intrinsic whenever it was an IF test -- and the very
+    ;; same call as a value got the program's function.  cortez's CHARACTERP
+    ;; (true of the integers it reads characters as) answered NIL in TI's
+    ;; (IF (CHARACTERP NAME) ...), and their editor's comtabs failed to build.
+    ;; The ordinary value path, which applies those guards, then a NIL test.
+    ((and (consp test) (symbolp (car test))
+          (or (%shadows-cl-p (car test))
+              (and *mvm-eval-runtime-p* (fboundp '%user-own-function-p)
+                   (funcall '%user-own-function-p (car test)))))
+     (compile-form test env dest)
+     (emit-ir :bnull dest false-label))
     ((and (consp test) (symbolp (car test)) (consp (cdr test)) (null (cddr test))
           (or (name-eq (car test) "NOT") (name-eq (car test) "NULL")))
      ;; (not X): X true ⇒ branch to FALSE-LABEL; X false ⇒ fall through.

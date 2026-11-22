@@ -1,5 +1,5 @@
-;;;; test/web-mvm-calls.lisp -- the JS MVM (web/mvm.js) on calls the gate's
-;;;; (* 6 7) never makes.  Two bugs it let through, both web-only:
+;;;; test/web-mvm-calls.lisp -- the JS MVM (web/mvm.js) on what the gate's
+;;;; (* 6 7) never runs.  Bugs it let through, all web-only:
 ;;;;
 ;;;;   1. AREF on VFP.  The &rest prologue's loop walks frame slots with
 ;;;;      (:aref val VFP idx); mvm.js read the frame as a vector, so every call
@@ -9,6 +9,11 @@
 ;;;;      escaped DRIVE() and was taken by the caller's interpreter loop, which
 ;;;;      then ended as if the caller had returned.  Seen as the FASL cache
 ;;;;      failing to record any toplevel EVAL-WHEN (so any DEFPACKAGE).
+;;;;   3. SHLV / SARV shifted by the TAGGED count: every runtime (ash x n) with a
+;;;;      variable N went 2N bits (sha1's ROTATE-WORD; 06d2bd84, 2026-10-13).
+;;;;   4. Frame slots 129+ were the homes of V3 and V5..V8.
+;;;;   5. alloc-f32 and the FP register ops were unimplemented: a single-float
+;;;;      MAKE-ARRAY stopped the VM, float pages ran on the Lisp interpreter.
 ;;;;
 ;;;;   node web/run-node.js --mvmw web/modus.mvmw --load test/web-mvm-calls.lisp --quit
 ;;;;
@@ -58,5 +63,40 @@
     (setq completed (+ completed 1)))
   ;; the bug ended THIS loop early, its caller's work silently skipped
   (wmc-check "caller loop ran to the end" completed 60))
+
+;;; 3. ASH by a variable count (runtime-compiled: the count is a register)
+(defun wmc-ash (x n) (ash x n))
+(defun wmc-rotl (w bits) (logior (logand (ash w (- bits 32)) (1- (ash 1 bits))) (logand (ash w bits) #xffffffff)))
+(dotimes (i 30)
+  (wmc-check "ash left" (wmc-ash 1 5) 32)
+  (wmc-check "ash right" (wmc-ash -1000 -3) -125)
+  (wmc-check "ash to a bignum" (wmc-ash 3 70) (* 3 (expt 2 70)))
+  (wmc-check "rotate-word" (wmc-rotl #x80000001 1) 3)
+  (wmc-check "rotate-word 30" (wmc-rotl #xefcdab89 30) #x7bf36ae2))
+
+;;; 4. a frame of more than 129 slots: 160 locals live across a call
+(defmacro wmc-big-let (n)
+  (let ((vars (loop for i below n collect (intern (format nil "WMC-B~d" i)))))
+    `(lambda (seed)
+       (let* ,(loop for v in vars for i from 0 collect `(,v (+ seed ,i)))
+         (funcall (lambda (x) x) seed)
+         (list ,@vars)))))
+(let ((f (eval '(wmc-big-let 160))))
+  (dotimes (j 25)
+    (wmc-check "160-slot frame" (funcall f (* j 1000)) (loop for i below 160 collect (+ (* j 1000) i)))))
+
+;;; 5. floats: packed single-float vectors, unboxed single and double trees
+(defun wmc-f32 (v) (declare (type (simple-array single-float (*)) v))
+  (dotimes (i (length v)) (setf (aref v i) (* (aref v i) 1.5f0)))
+  (list (aref v 0) (aref v 2) (length v)))
+(defun wmc-dsum (v) (declare (type (simple-array double-float (*)) v))
+  (let ((s 0d0)) (declare (double-float s)) (dotimes (i (length v) s) (incf s (* (aref v i) 0.5d0)))))
+(defun wmc-single (a b) (declare (single-float a b)) (list (+ (* a 2f0) b 0.5f0) (< a b) (abs (- a 3f0)) (max (* a 1f0) (* b 1f0)) (round (* a 1f0))))
+(defun wmc-double (a n) (declare (double-float a) (fixnum n)) (list (+ (* a 3.25d0) n) (<= (* a a) 2d0) (floor (* a 1d0)) (min (* a 1d0) -2d0)))
+(dotimes (i 30)
+  (wmc-check "f32 vector" (wmc-f32 (make-array 3 :element-type 'single-float :initial-contents '(1f0 2f0 -4f0))) (list 1.5f0 -6f0 3))
+  (wmc-check "double vector" (wmc-dsum (make-array 4 :element-type 'double-float :initial-contents '(1d0 2d0 3d0 4d0))) 5d0)
+  (wmc-check "single tree" (wmc-single 2.5f0 2f0) (list 7.5f0 nil 0.5f0 2.5f0 2))
+  (wmc-check "double tree" (wmc-double 1.5d0 3) (list 7.875d0 nil 1 -2d0)))
 
 (format t "~&WEB-MVM-CALLS ~a (~d failed)~%" (if (eql *wmc-bad* 0) "PASS" "FAIL") *wmc-bad*)

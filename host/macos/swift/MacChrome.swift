@@ -35,6 +35,9 @@
 //   mac_on_quit(on)   mac_quit_reply()
 //   dock_badge(text, len)                  the Dock icon's badge ("" clears it)
 //   dock_bounce(critical)                  the Dock icon bounces once (until the app is active, if CRITICAL)
+//
+// PRINTING: print_window(title, len)      the window's picture (the desk's framebuffer) to the print panel; a GPU
+//                                          view's frame prints with gpu_view_print (GPU.swift)
 
 import AppKit
 
@@ -288,7 +291,14 @@ private func installAppEvents() {
     }
 }
 
+let printWindow: Call = { p, n, _, _, _, _ in
+    guard let image = modus_mac_snapshot() else { return 0 }
+    printImage(image, title: text(p, n).isEmpty ? "Window" : text(p, n))
+    return 1
+}
+
 func installChrome() {
+    register("print_window", printWindow)
     register("window_new", windowNew)
     register("window_show", windowShow)
     register("window_hide", windowHide)

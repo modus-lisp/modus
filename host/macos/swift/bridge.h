@@ -15,6 +15,10 @@ void *modus_mac_root_view(void);
 // again, and a resize event for the image if either changed.
 void modus_mac_relayout(void);
 
+// The window's picture as last shown (its framebuffer), to print: released by the caller (Swift does).
+#include <CoreGraphics/CoreGraphics.h>
+CGImageRef modus_mac_snapshot(void) CF_RETURNS_RETAINED;
+
 // The app's own events (modus-ui-mac.m): the hooks the Swift side sets, and the opens kept until it did.
 extern void (*modus_mac_opened_hook)(int kind, const char *url);
 extern int (*modus_mac_quit_hook)(void);

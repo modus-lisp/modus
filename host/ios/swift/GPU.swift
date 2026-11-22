@@ -24,6 +24,7 @@
 //                                            copied now, so the next draw's do not race the GPU
 //   gpu_texture_new(rgba, width, height)     an RGBA8 texture from WIDTH x HEIGHT pixels, mipmapped
 //   gpu_set_texture(pass, texture, index, stage)   and a sampler at the same index: linear, mipmapped, repeating
+//   gpu_view_print(view)                     its next frame, copied out of the GPU, to the system's print panel
 //   gpu_draw_indexed(pass, primitive, indices, count, first, wide)   COUNT indices from FIRST in the buffer
 //                                            INDICES: 16-bit, or 32-bit when WIDE is 1
 //
@@ -69,7 +70,7 @@ final class GPUView: NSView {
         let layer = CAMetalLayer()
         layer.device = device
         layer.pixelFormat = .bgra8Unorm
-        layer.framebufferOnly = true
+        layer.framebufferOnly = false            // a frame can be copied out (gpu_view_print)
         return layer
     }
 
@@ -94,7 +95,7 @@ final class GPUView: UIView {
         super.init(frame: frame)
         metalLayer.device = device
         metalLayer.pixelFormat = .bgra8Unorm
-        metalLayer.framebufferOnly = true
+        metalLayer.framebufferOnly = false       // a frame can be copied out (gpu_view_print)
         isUserInteractionEnabled = false
     }
     required init?(coder: NSCoder) { fatalError("no coder") }
@@ -135,11 +136,54 @@ private final class Pass {
     let drawable: CAMetalDrawable
     let commands: MTLCommandBuffer
     let encoder: MTLRenderCommandEncoder
+    var view: UInt = 0
     init(_ drawable: CAMetalDrawable, _ commands: MTLCommandBuffer, _ encoder: MTLRenderCommandEncoder) {
         self.drawable = drawable
         self.commands = commands
         self.encoder = encoder
     }
+}
+
+/// Views whose next frame is to be printed.
+private var printNext: Set<UInt> = []
+
+/// The frame in TEXTURE (BGRA), copied into BUFFER by the GPU, as an image.
+private func frameImage(_ buffer: MTLBuffer, _ w: Int, _ h: Int) -> CGImage? {
+    let bytes = Data(bytes: buffer.contents(), count: w * h * 4)
+    guard let provider = CGDataProvider(data: bytes as CFData) else { return nil }
+    return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                   space: CGColorSpaceCreateDeviceRGB(),
+                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue
+                                            | CGBitmapInfo.byteOrder32Little.rawValue),
+                   provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+}
+
+/// IMAGE to the system's print panel, fitted to the page.
+func printImage(_ image: CGImage, title: String) {
+    #if os(macOS)
+    let size = NSSize(width: image.width, height: image.height)
+    let view = NSImageView(frame: NSRect(origin: .zero, size: size))
+    view.image = NSImage(cgImage: image, size: size)
+    view.imageScaling = .scaleProportionallyUpOrDown
+    let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+    info.horizontalPagination = .fit
+    info.verticalPagination = .fit
+    info.orientation = image.width > image.height ? .landscape : .portrait
+    info.isHorizontallyCentered = true
+    info.isVerticallyCentered = true
+    let op = NSPrintOperation(view: view, printInfo: info)
+    op.jobTitle = title
+    if let window = rootView()?.window { op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil) }
+    else { op.run() }
+    #else
+    let controller = UIPrintInteractionController.shared
+    let info = UIPrintInfo(dictionary: nil)
+    info.jobName = title
+    info.outputType = .photo
+    controller.printInfo = info
+    controller.printingItem = UIImage(cgImage: image)
+    controller.present(animated: true)
+    #endif
 }
 
 private var gpuViews: [UInt: GPUView] = [:]
@@ -158,6 +202,12 @@ let gpuViewNew: Call = { x, y, w, h, _, _ in
     }
     gpuViews[handle] = view
     return handle
+}
+
+let gpuViewPrint: Call = { v, _, _, _, _, _ in
+    guard gpuViews[v] != nil else { return 0 }
+    printNext.insert(v)
+    return 1
 }
 
 let gpuViewSize: Call = { v, _, _, _, _, _ in
@@ -240,7 +290,9 @@ let gpuPassBegin: Call = { v, rgb, _, _, _, _ in
     // COUNTER-CLOCKWISE IS THE FRONT, as Lisp's geometry is wound (OpenGL's way)
     encoder.setFrontFacing(.counterClockwise)
     encoder.setCullMode(.none)
-    return keep(Pass(drawable, commands, encoder))
+    let pass = Pass(drawable, commands, encoder)
+    pass.view = v
+    return keep(pass)
 }
 
 let gpuSetPipeline: Call = { p, pipe, _, _, _, _ in
@@ -326,6 +378,24 @@ let gpuDrawIndexed: Call = { p, primitive, ib, count, first, wide in
 let gpuPassEnd: Call = { p, _, _, _, _, _ in
     guard let pass = objects.removeValue(forKey: p) as? Pass else { return 0 }
     pass.encoder.endEncoding()
+    // A FRAME TO PRINT: copied out of the drawable before it is presented, and printed once the GPU has done
+    if printNext.remove(pass.view) != nil, let device {
+        let t = pass.drawable.texture
+        if let buffer = device.makeBuffer(length: t.width * t.height * 4, options: .storageModeShared),
+           let blit = pass.commands.makeBlitCommandEncoder() {
+            blit.copy(from: t, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: t.width, height: t.height, depth: 1), to: buffer,
+                      destinationOffset: 0, destinationBytesPerRow: t.width * 4,
+                      destinationBytesPerImage: t.width * t.height * 4)
+            blit.endEncoding()
+            let w = t.width, h = t.height
+            pass.commands.addCompletedHandler { _ in
+                DispatchQueue.main.async {
+                    if let image = frameImage(buffer, w, h) { printImage(image, title: "Picture") }
+                }
+            }
+        }
+    }
     pass.commands.present(pass.drawable)
     pass.commands.commit()
     return 1
@@ -343,6 +413,7 @@ func installGPU() {
     register("gpu_draw", gpuDraw)
     register("gpu_pass_end", gpuPassEnd)
     register("gpu_view_size", gpuViewSize)
+    register("gpu_view_print", gpuViewPrint)
     register("gpu_set_depth", gpuSetDepth)
     register("gpu_set_cull", gpuSetCull)
     register("gpu_set_bytes", gpuSetBytes)

@@ -630,6 +630,26 @@ static void build_menu(void) {
 static void wait_ui(void);
 void modus_mac_wait_ready(void) { if (ui_ready) wait_ui(); }
 
+// The window's picture as the image last shown, fb_w x fb_h pixels (the framebuffer, not the native views over it): to
+// print it.  The caller releases it.  Main thread.
+CGImageRef modus_mac_snapshot(void) {
+    if (!show_fb || fb_w <= 0 || fb_h <= 0) return NULL;
+    size_t row = (size_t)fb_w * 4;
+    NSMutableData *pixels = [NSMutableData dataWithLength:row * (size_t)fb_h];
+    IOSurfaceLock(show_surface, kIOSurfaceLockReadOnly, NULL);
+    for (long y = 0; y < fb_h; y++)
+        memcpy((uint8_t *)pixels.mutableBytes + (size_t)y * row, show_fb + y * show_stride, row);
+    IOSurfaceUnlock(show_surface, kIOSurfaceLockReadOnly, NULL);
+    CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)pixels);
+    CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+    CGImageRef image = CGImageCreate((size_t)fb_w, (size_t)fb_h, 8, 32, row, rgb,
+                                     kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little, provider, NULL, true,
+                                     kCGRenderingIntentDefault);
+    CGColorSpaceRelease(rgb);
+    CGDataProviderRelease(provider);
+    return image;
+}
+
 // The window's content view, for the native components (host/macos/swift/): they are its subviews, over the
 // framebuffer.  Main thread only, as AppKit is; NULL before the window is up.
 void *modus_mac_root_view(void) { return (__bridge void *)fb_view; }

@@ -1894,6 +1894,7 @@ public func modusSwiftInstall() {
     installNowPlaying()                            // NowPlaying.swift: Now Playing and the media keys
     installGamepad()                               // Gamepad.swift: game controllers
     installSpatial()                               // Spatial.swift: sound placed in three dimensions
+    installNotify()                                // Notify.swift: the system's notifications
     installNative()                                // Native.swift: app-grade components (an app, not the desk)
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)

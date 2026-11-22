@@ -1145,6 +1145,7 @@ public func modusSwiftInstall() {
     installNowPlaying()                            // NowPlaying.swift: Now Playing and the media keys
     installGamepad()                               // Gamepad.swift: game controllers
     installSpatial()                               // Spatial.swift: sound placed in three dimensions
+    installNotify()                                // Notify.swift: the system's notifications
     installChrome()                                // MacChrome.swift: glass, menus, status items
     installNative()                                // NativeMac.swift: app-grade components (an app, not the desk)
     installWindow()                                // MacWindow.swift: the window's title, chrome and size

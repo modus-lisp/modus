@@ -13,7 +13,8 @@
 ;;;; framebuffer, whose word order is exactly a 32-bit Windows DIB's.  The events are
 ;;;; RFB's, so a glass presenter hands them on unchanged: (:key DOWN KEYSYM) with an X
 ;;;; keysym, (:pointer BUTTON-MASK X Y) with RFB's mask (1 left, 2 middle, 4 right,
-;;;; 8/16 wheel), and (:paint) and (:close).
+;;;; 8/16 wheel), (:resize W H) when the user resizes the window (its new client size), and
+;;;; (:paint) and (:close).
 ;;;;
 ;;;; USER32 AND GDI32 ARE LOADED HERE, not imported: a console modus.exe never maps them
 ;;;; (LoadLibraryA + GetProcAddress at W32-WINDOW-OPEN; the addresses go in the window's
@@ -35,10 +36,18 @@
 ;;;; blitted from there.  The wait for messages IS GC-safe (%GC-SAFE-BLOCK-6), so a window
 ;;;; thread idling in it never holds up a collection.
 ;;;;
+;;;; DPI: WIDTH, HEIGHT and every coordinate here are LOGICAL -- glass's pixels.  The window's
+;;;; client area is that times the display's DPI / 96 (the Windows scale factor; the process
+;;;; is DPI-aware, so Windows does not scale it again), StretchDIBits magnifies each rectangle
+;;;; on the way out -- nearest-pixel when the factor is whole (crisp at 200%), halftone when
+;;;; it is not -- and pointer positions and sizes come back divided by it.  MODUS_W32_DPI
+;;;; overrides the display's DPI.
+;;;;
 ;;;; A window is a vector:
 ;;;;   0 hwnd  1 hdc  2 block  3 width  4 height  5 button mask  6 last x  7 last y
 ;;;;   8 control held  9 presents  10 pixels presented  11 internal time presenting
-;;;;   12 always copy (MODUS_W32_COPY)  -- 9-11 since the last W32-WINDOW-STATS
+;;;;   12 always copy (MODUS_W32_COPY)  13 the back buffer's pixels  14 DPI  -- 9-11 since
+;;;;   the last W32-WINDOW-STATS.  3 and 4 follow the window's client size (WM_SIZE), logical.
 ;;;; Block layout: +0 the event ring (count dword, capacity dword at +8, 24-byte entries
 ;;;; from +16); +#x10000 WNDCLASSEXA, +#x10100 MSG, +#x10200 BITMAPINFOHEADER,
 ;;;; +#x10300 RECT, +#x10400 the argument vector of a call, +#x10600 the title,
@@ -74,7 +83,11 @@
     ("user32.dll" "DestroyWindow") ("user32.dll" "SetWindowTextA")            ; 14 15
     ("user32.dll" "GetWindowLongPtrA") ("user32.dll" "SetWindowLongPtrA")     ; 16 17
     ("user32.dll" "SetForegroundWindow") ("user32.dll" "SetProcessDPIAware")  ; 18 19
-    ("gdi32.dll" "StretchDIBits")))                                           ; 20
+    ("gdi32.dll" "StretchDIBits") ("gdi32.dll" "GetDeviceCaps")               ; 20 21
+    ("gdi32.dll" "SetStretchBltMode") ("gdi32.dll" "SetBrushOrgEx")))         ; 22 23
+
+(defun %ww-up (v dpi) (floor (* v dpi) 96))        ; logical -> physical
+(defun %ww-down (v dpi) (floor (* v 96) dpi))      ; physical -> logical
 
 (defun %ww-load-procs (block)
   "Look every %WW-PROCS function up into BLOCK; NIL if one is missing."
@@ -93,7 +106,7 @@
     (dolist (x args) (%ww-put64 (+ a (* 8 n)) x) (setq n (+ n 1)))
     (syscall3 #x3000 (%ww-get64 (+ block #x10800 (* 8 i))) a n)))
 
-(defconstant +w32-window-style+ #x00CA0000)   ; WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX
+(defconstant +w32-window-style+ #x00CF0000)   ; WS_OVERLAPPEDWINDOW: resizable, maximizable
 
 (defun w32-window-open (width height title)
   "Open a WIDTH x HEIGHT window titled TITLE on this thread; the window, or NIL."
@@ -109,7 +122,14 @@
     (%ww-put64 +w32-wp-defwp-va+ (%ww-get64 (+ block #x10800 (* 8 2))))
     (%ww-put64 +w32-wp-validate-va+ (%ww-get64 (+ block #x10800 (* 8 11))))
     (%ww-call block 19)                                   ; SetProcessDPIAware
-    (let* ((hinst (syscall6 +w32-getmodulehandlea+ 0 0 0 0 0 0))
+    (let* ((dpi (let ((e (%cli-getenv "MODUS_W32_DPI")))
+                  (or (and e (> (length e) 0) (parse-integer e :junk-allowed t))
+                      (let* ((sdc (%ww-call block 9 0))                 ; GetDC(NULL): the screen
+                             (d (logand (%ww-call block 21 sdc 88) #xFFFF))) ; LOGPIXELSX
+                        (%ww-call block 10 0 sdc)
+                        d))))
+           (dpi (if (and (integerp dpi) (>= dpi 48) (<= dpi 960)) dpi 96))
+           (hinst (syscall6 +w32-getmodulehandlea+ 0 0 0 0 0 0))
            (wc (+ block #x10000))
            (class (%ww-put-cstr (+ block #x10700) "ModusWindow"))
            (text (%ww-put-cstr (+ block #x10600) title))
@@ -129,7 +149,7 @@
       (%ww-call block 0 wc)                               ; RegisterClassExA
       ;; the outer size whose client area is WIDTH x HEIGHT
       (%ww-put32 rect 0) (%ww-put32 (+ rect 4) 0)
-      (%ww-put32 (+ rect 8) width) (%ww-put32 (+ rect 12) height)
+      (%ww-put32 (+ rect 8) (%ww-up width dpi)) (%ww-put32 (+ rect 12) (%ww-up height dpi))
       (%ww-call block 12 rect +w32-window-style+ 0 0)     ; AdjustWindowRectEx
       (let* ((ow (- (%ww-s32 (%ww-get32 (+ rect 8))) (%ww-s32 (%ww-get32 rect))))
              (oh (- (%ww-s32 (%ww-get32 (+ rect 12))) (%ww-s32 (%ww-get32 (+ rect 4)))))
@@ -149,7 +169,7 @@
           (%ww-put32 bmi 40)
           (%ww-put16 (+ bmi 12) 1)
           (%ww-put16 (+ bmi 14) 32))
-        (let ((win (make-array 13 :initial-element 0))
+        (let ((win (make-array 15 :initial-element 0))
               (copy (%cli-getenv "MODUS_W32_COPY")))
           (setf (aref win 0) hwnd
                 (aref win 1) (%ww-call block 9 hwnd)              ; GetDC
@@ -157,18 +177,30 @@
                 (aref win 3) width
                 (aref win 4) height
                 (aref win 8) nil
-                (aref win 12) (and copy (> (length copy) 0) (not (string= copy "0"))))
+                (aref win 12) (and copy (> (length copy) 0) (not (string= copy "0")))
+                (aref win 13) (* width height)
+                (aref win 14) dpi)
+          ;; COLORONCOLOR (nearest) for a whole factor, HALFTONE (which wants the brush
+          ;; origin set after it) for a fractional one
+          (if (= 0 (mod dpi 96))
+              (%ww-call block 22 (aref win 1) 3)
+              (progn (%ww-call block 22 (aref win 1) 4)
+                     (%ww-call block 23 (aref win 1) 0 0 0)))
           win)))))
 
-(defun %ww-blit-in-place (win pixels x0 y0 rw rh)
-  "StretchDIBits straight from PIXELS (packed, as wide as WIN): rows Y0.. as the DIB."
-  (let* ((block (aref win 2)) (w (aref win 3)) (a (+ block #x10400)) (bmi (+ block #x10200))
-         (scratch (+ block #x10B00))
+(defun %ww-blit-in-place (win pixels w x0 y0 rw rh)
+  "StretchDIBits straight from PIXELS (packed, W pixels to a row): rows Y0.. as the DIB,
+   magnified by the window's DPI / 96."
+  (let* ((block (aref win 2)) (a (+ block #x10400)) (bmi (+ block #x10200))
+         (scratch (+ block #x10B00)) (dpi (aref win 14))
+         (dx0 (%ww-up x0 dpi)) (dy0 (%ww-up y0 dpi))
+         (dx1 (%ww-up (+ x0 rw) dpi)) (dy1 (%ww-up (+ y0 rh) dpi))
          (fn (%ww-get64 (+ block #x10800 (* 8 20)))))
     (%ww-put32 (+ bmi 4) w)
     (%ww-put32 (+ bmi 8) (- 0 rh))
     (%ww-put64 a (aref win 1))
-    (%ww-put64 (+ a 8) x0) (%ww-put64 (+ a 16) y0) (%ww-put64 (+ a 24) rw) (%ww-put64 (+ a 32) rh)
+    (%ww-put64 (+ a 8) dx0) (%ww-put64 (+ a 16) dy0)
+    (%ww-put64 (+ a 24) (- dx1 dx0)) (%ww-put64 (+ a 32) (- dy1 dy0))
     (%ww-put64 (+ a 40) x0) (%ww-put64 (+ a 48) 0) (%ww-put64 (+ a 56) rw) (%ww-put64 (+ a 64) rh)
     (%ww-put64 (+ a 80) bmi) (%ww-put64 (+ a 88) 0) (%ww-put64 (+ a 96) #x00CC0020)
     ;; LAST, and nothing allocates from here to the end of the call: the vector's address
@@ -180,19 +212,26 @@
 (defun w32-window-present (win pixels pw x0 y0 x1 y1)
   "Show the rectangle [X0,X1) x [Y0,Y1) of PIXELS (PW pixels to a row) at the same
    place in WIN."
-  (let* ((w (aref win 3)) (h (aref win 4))
-         (x0 (max 0 x0)) (y0 (max 0 y0)) (x1 (min w x1)) (y1 (min h y1))
+  ;; Clipped to the window's client area and to PIXELS: either may be the larger while a
+  ;; resize is under way (the window has its new size before the picture does).
+  ;; A fractional factor is magnified with HALFTONE, which filters each rectangle on its own:
+  ;; its edge pixels came out a little unlike a whole-frame blit's, and a closed menu left
+  ;; its outline behind.  Two pixels of margin put the edge on unchanged pixels, where the
+  ;; filter reproduces what is already there.
+  (let* ((w (min (aref win 3) pw)) (h (min (aref win 4) (floor (length pixels) pw)))
+         (m (if (= 0 (mod (aref win 14) 96)) 0 2))
+         (x0 (max 0 (- x0 m))) (y0 (max 0 (- y0 m))) (x1 (min w (+ x1 m))) (y1 (min h (+ y1 m)))
          (t0 (get-internal-real-time)))
     (when (and (< x0 x1) (< y0 y1)
-               (not (aref win 12)) (= pw w) (eql (obj-subtag pixels) #x17))
-      (%ww-blit-in-place win pixels x0 y0 (- x1 x0) (- y1 y0))
+               (not (aref win 12)) (eql (obj-subtag pixels) #x17))
+      (%ww-blit-in-place win pixels pw x0 y0 (- x1 x0) (- y1 y0))
       (setf (aref win 9) (+ (aref win 9) 1)
             (aref win 10) (+ (aref win 10) (* (- x1 x0) (- y1 y0)))
             (aref win 11) (+ (aref win 11) (- (get-internal-real-time) t0)))
       (return-from w32-window-present t))
-    (when (and (< x0 x1) (< y0 y1))
+    (when (and (< x0 x1) (< y0 y1) (<= (* pw y1) (aref win 13)))
       (let* ((block (aref win 2)) (buf (+ block #x20000)) (bmi (+ block #x10200))
-             (rw (- x1 x0)) (rh (- y1 y0)))
+             (rw (- x1 x0)) (rh (- y1 y0)) (w pw))
         (do ((y y0 (+ y 1))) ((>= y y1))
           (let ((src (* y pw)) (dst (+ buf (* 4 (* y w)))))
             (do ((x x0 (+ x 1))) ((>= x x1))
@@ -201,8 +240,11 @@
         ;; rectangle's Y is 0 whatever StretchDIBits makes of a top-down origin.
         (%ww-put32 (+ bmi 4) w)
         (%ww-put32 (+ bmi 8) (- 0 rh))
-        (%ww-call block 20 (aref win 1) x0 y0 rw rh x0 0 rw rh   ; StretchDIBits
-                  (+ buf (* 4 (* y0 w))) bmi 0 #x00CC0020)
+        (let* ((dpi (aref win 14))
+               (dx0 (%ww-up x0 dpi)) (dy0 (%ww-up y0 dpi)))
+          (%ww-call block 20 (aref win 1) dx0 dy0                ; StretchDIBits
+                    (- (%ww-up x1 dpi) dx0) (- (%ww-up y1 dpi) dy0) x0 0 rw rh
+                    (+ buf (* 4 (* y0 w))) bmi 0 #x00CC0020))
         (setf (aref win 9) (+ (aref win 9) 1)
               (aref win 10) (+ (aref win 10) (* rw rh))
               (aref win 11) (+ (aref win 11) (- (get-internal-real-time) t0)))))
@@ -244,10 +286,17 @@
              (m (%ww-get32 e))
              (wp (%ww-get64 (+ e 8)))
              (lp (%ww-get64 (+ e 16)))
-             (x (%ww-s16 lp))
-             (y (%ww-s16 (ash lp -16))))
+             (x (%ww-down (%ww-s16 lp) (aref win 14)))
+             (y (%ww-down (%ww-s16 (ash lp -16)) (aref win 14))))
         (cond
           ((= m #x0F) (push (list :paint) out))
+          ((= m #x05)                                    ; WM_SIZE, unless minimized
+           (unless (= (logand wp #xFFFF) 1)
+             (let ((cw (%ww-down (logand lp #xFFFF) (aref win 14)))
+                   (ch (%ww-down (logand (ash lp -16) #xFFFF) (aref win 14))))
+               (when (and (> cw 0) (> ch 0))
+                 (setf (aref win 3) cw (aref win 4) ch)
+                 (push (list :resize cw ch) out)))))
           ((= m #x10) (push (list :close) out))
           ((or (= m #x200) (= m #x201) (= m #x202) (= m #x204) (= m #x205)
                (= m #x207) (= m #x208))

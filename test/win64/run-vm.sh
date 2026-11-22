@@ -20,6 +20,8 @@
 # session, so a program's windows are on the guest's screen.  VM_DURING is a host
 # command run while the guest is up, with QMP set to its QMP socket (screenshots,
 # input); the guest still powers off when its command file ends.
+# VM_AUDIO_WAV=FILE gives the guest a sound card (Intel HDA, line out) whose output QEMU
+# records to FILE.
 # VM_WORK keeps the work directory (default: a temporary one, removed);
 # VM_RUN_TIMEOUT bounds the whole boot-run-shutdown (default 1200 s).  While it
 # runs, test/win64/vm-screen.py WORK/vm.qmp OUT.png shows the screen.
@@ -83,6 +85,7 @@ mcopy -i "$part" "$stage"/* :: || exit 1
 # ---- boot a throwaway overlay of the installed disk -----------------------
 qemu-img create -q -f qcow2 -b "$base" -F qcow2 "$work/run.qcow2" || exit 1
 net="-nic none"
+sound=""; [ -n "${VM_AUDIO_WAV:-}" ] && sound="-audiodev wav,id=snd0,path=$VM_AUDIO_WAV -device ich9-intel-hda -device hda-output,audiodev=snd0"
 tablet=""; [ -n "${VM_UI:-}" ] && tablet="-device qemu-xhci -device usb-tablet"   # absolute pointer for QMP input
 [ -n "${VM_FWD:-}" ] && net="-nic user,model=e1000e,hostfwd=$VM_FWD"
 echo "booting $(basename "$base") with $n cases (typically 2-5 minutes)"
@@ -98,7 +101,7 @@ timeout ${VM_RUN_TIMEOUT:-1200} qemu-system-x86_64 \
   -device ahci,id=ahci \
   -device ide-hd,drive=hd,bus=ahci.0 \
   -device ide-hd,drive=data,bus=ahci.1 \
-  $net $tablet -display none -vga std \
+  $net $tablet $sound -display none -vga std \
   -qmp unix:"$work/vm.qmp",server=on,wait=off
 rc=$?
 echo "guest ran $(( $(date +%s) - t0 )) s (qemu exit $rc)"

@@ -9,6 +9,9 @@
 # attached drive (test/win64/run-vm.sh), and shuts down at its first logon --
 # which is how this script knows the install finished.  Needs KVM.
 #
+# VM_IMAGE picks the image in the ISO: 1 Server Core (the default; no audio stack at all), 2
+# with the Desktop Experience (audio, and closer to a desktop Windows).
+#
 # While it runs: VM_QMP (default DISK.qmp) is a QMP socket, so
 #   test/win64/vm-screen.py DISK.qmp /tmp/screen.png
 # shows the screen.
@@ -18,7 +21,9 @@ disk=${2:?}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-cp "$here/vm/autounattend.xml" "$work/"
+sed "s|<Key>/IMAGE/INDEX</Key><Value>1</Value>|<Key>/IMAGE/INDEX</Key><Value>${VM_IMAGE:-1}</Value>|" \
+  "$here/vm/autounattend.xml" > "$work/autounattend.xml"
+grep -q "<Value>${VM_IMAGE:-1}</Value>" "$work/autounattend.xml" || { echo "VM_IMAGE not applied" >&2; exit 1; }
 genisoimage -quiet -o "$work/answer.iso" -J -r -V ANSWER "$work/autounattend.xml"
 qemu-img create -q -f qcow2 "$disk" 40G
 echo "installing into $disk (typically 10-20 minutes with KVM)"

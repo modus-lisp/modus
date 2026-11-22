@@ -1812,6 +1812,19 @@
     (dolist (l '(:wp-getwlp :wp-defwp :wp-validate))
       (format o "(defconstant +w32-~(~A~)-va+ ~D)~%" l (win64-label-va l)))))
 
+(defparameter *win64-platform-files* '("net/win32-window.lisp" "net/win32-audio.lisp")
+  "The Windows platform's runtime files: appended to the image here, and their names handed to
+   the scanners by build-generic-cli.lisp (*CLI-SCAN-EXTRA-SOURCE*), which keeps its own copy of
+   this list -- it reads them before this file is loaded.")
+
+(defun win64-platform-source ()
+  (apply (function concatenate) 'string
+         (loop for f in *win64-platform-files*
+               collect (with-open-file (s (cl-user::modus-source f))
+                         (let ((b (make-string (file-length s))))
+                           (concatenate 'string (subseq b 0 (read-sequence b s))
+                                        (string #\Newline)))))))
+
 (defun win64-configure-build ()
   "Point the translator at this image's layout and add the Windows runtime
    source.  Called by build-generic-cli.lisp in place of the Linux native-code
@@ -1824,9 +1837,7 @@
         (concatenate 'string cl-user::*full-source* (string #\Newline)
                      (win64-import-constants-source) *win64-runtime-source*
                      (string #\Newline)
-                     (with-open-file (s (cl-user::modus-source "net/win32-window.lisp"))
-                       (let ((b (make-string (file-length s))))
-                         (subseq b 0 (read-sequence b s))))))
+                     (win64-platform-source)))
   ;; The JIT co-init's shim address (build-cli-common, *CLI-WIN64*).  Every copy of
   ;; the co-init in the source gets it; with the JIT on there must be at least one.
   (let ((token "WIN64-SHIM-VA-PLACEHOLDER")

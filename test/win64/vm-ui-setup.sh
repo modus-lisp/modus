@@ -7,7 +7,9 @@
 # written).  Booted once here with a RUN.CMD that sets automatic logon as
 # Administrator (the answer file's password) at every boot, and adds a logon task
 # that runs C:\modus-ui.cmd in that session: it finds UI.CMD on an attached drive,
-# runs it, and powers off.  Then `VM_UI=1 test/win64/run-vm.sh UI.qcow2 ...' puts a
+# runs it, and powers off.  With the Desktop Experience (vm-install.sh VM_IMAGE=2) it also keeps
+# Server Manager from opening at logon and starts Windows Audio, disabled on a server by default
+# (on Server Core neither exists, and those lines fail harmlessly).  Then `VM_UI=1 test/win64/run-vm.sh UI.qcow2 ...' puts a
 # program's windows on the guest's screen, where vm-screen.py and QMP input reach
 # them.  The boot-time RUN.CMD task stays: a disk with RUN.CMD still runs it.
 set -eu
@@ -27,6 +29,10 @@ wl='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
     'echo @echo off> C:\modus-ui.cmd' \
     'echo for %%%%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %%%%d:\UI.CMD (cd /d %%%%d:\ ^& call %%%%d:\UI.CMD ^& shutdown /s /t 0 /f)>> C:\modus-ui.cmd' \
     'type C:\modus-ui.cmd >> setup.log' \
+    'reg add "HKLM\SOFTWARE\Microsoft\ServerManager" /v DoNotOpenServerManagerAtLogon /t REG_DWORD /d 1 /f >> setup.log 2>&1' \
+    'schtasks /change /tn "Microsoft\Windows\Server Manager\ServerManager" /disable >> setup.log 2>&1' \
+    'sc config AudioEndpointBuilder start= auto >> setup.log 2>&1' \
+    'sc config Audiosrv start= auto >> setup.log 2>&1' \
     'schtasks /create /tn modus-ui /sc onlogon /ru Administrator /rp Modus-Test-2026 /it /rl highest /tr C:\modus-ui.cmd /f >> setup.log 2>&1' \
     'echo done>> setup.log'; } > "$work/RUN.CMD"
 disk="$work/data.img"

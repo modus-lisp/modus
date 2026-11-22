@@ -186,7 +186,9 @@ field layer spliced into i386 with its limb offset patched by text
 replacement), which existed because crypto-fast cached raw limb addresses
 across its bignum products.  crypto-fast no longer takes a raw address at
 all -- its limbs are fixnums in the vector's slots -- so it is correct on
-every tower.
+every tower.  On those towers its FE-MUL compiles a second body in raw 32-bit
+words (64-bit column sums as word pairs, no allocation), chosen by
+`%IF-W32`: bare-i386 X25519 73 ms, arm32 55 ms (docs/w32.md, M3b).
 
 #### Fast field arithmetic (`net/crypto-fast.lisp`)
 

@@ -5,7 +5,8 @@
 
 Boots IMAGE -- a bare CL image built with MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1
 MODUS_NET_NOAUTO=1 (crypto in, the NIC left alone) -- under qemu-system-i386,
-or qemu-system-arm (QEMU virt) with W32_X25519_ARCH=arm32; waits for the REPL
+or qemu-system-arm (QEMU virt) with W32_X25519_ARCH=arm32 -- an arm32 image is
+built with MODUS_CRYPTO_BUILD=1 instead, since arm32 has no NIC; waits for the REPL
 prompt, and evaluates one form that runs RFC 7748 section 5.2's first vector
 once (warm-up, and the correctness check), then N more times between two
 markers.  Two clocks: the image's own GET-INTERNAL-REAL-TIME and the HOST's

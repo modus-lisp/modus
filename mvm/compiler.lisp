@@ -10295,7 +10295,7 @@
     "LIDT" "NCONCING" "SYMBOLS" "STRINGP"
     "ACROSS" "<" "DEFPACKAGE" "%FLOAT-TO-INT"
     "NULL" "ROTATEF" "MUL26LO" "PERCPU-REF" "%APPLY-SPREAD"
-    "%MUL-SPLIT-LO" "%MUL-SPLIT-HI" "%W32"
+    "%MUL-SPLIT-LO" "%MUL-SPLIT-HI" "%W32" "%IF-W32"
     "GET-ALLOC-LIMIT" "BLOCK" ">" "COLLECTING"
     "USE-PACKAGE" "DOTIMES" "MEMORY-BARRIER" "%MAKE-FLOAT"
     "FIXNUMP" "EVAL-WHEN" "BIGNUMP" "ALWAYS"
@@ -11564,6 +11564,8 @@
       ((= op-name #.(compute-name-hash "%MUL-SPLIT-HI")) (compile-mul-split (cdr form) env dest t))
       ;; W32 M2: the test-only intrinsic (see COMPILE-W32)
       ((= op-name #.(compute-name-hash "%W32")) (compile-w32 (cdr form) env dest))
+      ;; W32 M3b: (%IF-W32 W32-FORM OTHER-FORM), chosen by the compilation's target
+      ((= op-name #.(compute-name-hash "%IF-W32")) (compile-if-w32 (cdr form) env dest))
       ((= op-name 13026604224746835194) (compile-mul64lo (cdr form) env dest))
       ((= op-name 12591721202407133616) (compile-mul64hi (cdr form) env dest))
       ((= op-name 920227542902379435) (compile-acc128 (cdr form) env dest))
@@ -26021,6 +26023,13 @@
       ((string= name "W32-FROM-FIX")
        (%w32-leaf (cadr node) env dst)
        (emit-ir :w32-from-fix dst dst))
+      ;; (w32-ref V): V's slot read RAW -- V holds a W32 word a (w32-raw ...)
+      ;; root stored there (M3b: a raw word kept in a variable between trees).
+      ((string= name "W32-REF")
+       (let ((v (cadr node)))
+         (unless (and (symbolp v) v (not (eq v t)))
+           (error "%W32: w32-ref needs a variable: ~S" node))
+         (compile-form v env dst)))
       ((string= name "W32-JOIN")
        (%w32-leaf (cadr node) env dst)
        (let ((tmp (alloc-temp-reg)))
@@ -26051,6 +26060,19 @@
          (free-temp-reg)))
       (t (error "%W32: unknown W32 form ~S" node)))))
 
+;;; (%IF-W32 W32-FORM OTHER-FORM): W32-FORM when this compilation's target is
+;;; W32-capable (CT-W32-CAPABLE-P: the 30-bit towers), else OTHER-FORM -- and
+;;; only that one is compiled, so a 64-bit image's code is OTHER-FORM's exactly
+;;; (spec C1).  The choice is the target descriptor's (C2), never the running
+;;; image's.  This is how one source carries a field operation written in W32
+;;; words for the 32-bit targets beside its fixnum form (net/crypto-fast.lisp
+;;; FE-MUL, docs/w32.md M3b): W32-FORM may use %W32, which is an error on a
+;;; 64-bit target.
+(defun compile-if-w32 (args env dest)
+  (unless (= (length args) 2)
+    (error "%IF-W32 takes exactly two forms: ~S" args))
+  (compile-form (if (ct-w32-capable-p) (first args) (second args)) env dest))
+
 (defun compile-w32 (args env dest)
   "(%W32 TREE) -- see the block comment above."
   (unless (ct-w32-capable-p)
@@ -26079,7 +26101,12 @@
            (emit-ir :w32-store dest tmp off)
            (free-temp-reg))
          (emit-li-tagged dest 0)))
-      (t (error "%W32: the root must be w32-hi16/lo16/ltu/lts/eq/store: ~S" tree)))))
+      ;; (w32-raw W): the RAW word in DEST -- only as the value of a SETQ of a
+      ;; variable read back by (w32-ref ...), with no GC point while it is live
+      ;; (spec C3): the caller's obligation, not checked here.
+      ((and name (string= name "W32-RAW"))
+       (%w32-node (cadr tree) env dest))
+      (t (error "%W32: the root must be w32-hi16/lo16/ltu/lts/eq/store/raw: ~S" tree)))))
 
 ;;; ---- THE W32 EXPRESSION REWRITE (docs/w32.md, M3a) -----------------------
 ;;; On a W32-capable target, an integer expression whose value is provably a

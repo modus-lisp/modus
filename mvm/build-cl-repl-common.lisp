@@ -1949,6 +1949,15 @@
 ;;; block and arch-aarch64's 0x41000000 block both land INSIDE this ~57 MB
 ;;; kernel image, so the NIC would DMA over native code.  See each -cl file's
 ;;; header.
+;; :ARM32 has no NIC adapter: arch-arm32 went with the mini-Lisp (d4ae00fe),
+;; and the fall-through below is the Raspberry Pi board stack -- DWC2, R8152,
+;; the VideoCore mailbox at #x3F00B880 -- which on QEMU virt data-aborts at the
+;; first mailbox read (HDMI-RD) and, with no abort handler, loops at the vector
+;; right after "DTB ptr".  Refuse rather than build that image.
+(when (and *net-build-p* *cl-repl-arm32-p*)
+  (error "MODUS_NET_BUILD=1 on :ARM32: there is no arm32 NIC adapter (the Pi's ~
+          board stack is the only fall-through, and it cannot run on QEMU virt). ~
+          For the crypto layer alone: MODUS_CRYPTO_BUILD=1."))
 (defvar *net-nic-source*
   (if (not *net-build-p*)
       ""
@@ -2977,12 +2986,55 @@
           (%rpi-net-text "snp-ghcb.lisp") (string #\Newline))
         "")))
 
+;;; MODUS_CRYPTO_BUILD=1 -- the crypto layer (crypto.lisp + crypto-fast.lisp)
+;;; WITHOUT a NIC, for a platform that has no network adapter: today :ARM32,
+;;; whose net adapter went with the mini-Lisp (d4ae00fe).  The one thing crypto
+;;; needs from an adapter is its fixed state block: the SHA-256 K table at
+;;; (e1000-state-base)+0x100, the Ed25519 constants, and FE-SCRATCH-BASE.  On
+;;; arm32 that is VA #x0F900000 -- mapped DRAM between the L1 table
+;;; (#x0F800000, 16 KB) and the I/O scratch pages (#x0FE00000), below 2^29, and
+;;; not heap memory, so nothing moves it.  test/w32-x25519-bare.py uses it
+;;; (W32_X25519_ARCH=arm32) for the 30-bit collector check of crypto-fast.
+(defvar *crypto-only-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_CRYPTO_BUILD")))
+    (and v (string= v "1"))))
+(when (and *crypto-only-p* *net-build-p*)
+  (error "MODUS_CRYPTO_BUILD=1 is crypto WITHOUT the net stack; MODUS_NET_BUILD=1 ~
+          MODUS_SSH_BUILD=1 already includes it."))
+(when (and *crypto-only-p* (not *cl-repl-arm32-p*))
+  (error "MODUS_CRYPTO_BUILD=1: only :ARM32 has a state block defined for it; ~
+          this platform has a NIC adapter -- MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 ~
+          MODUS_NET_NOAUTO=1 builds crypto in without starting the NIC."))
+(defvar *crypto-only-source*
+  (if *crypto-only-p*
+      (concatenate 'string
+        (format nil "~%(defun e1000-state-base () #x0F900000)~%~
+                     (defun fe-scratch-base () #x0F900900)~%~
+                     (defun usb-keepalive () 0)~%")
+        ;; The two byte-buffer helpers crypto.lisp takes from net/ip.lisp (not
+        ;; in this image: it is the IP stack).  Copies of ip.lisp's, same names
+        ;; and results, as net/hosted-ssh.lisp carries for the same reason; the
+        ;; SHA-256/512 vectors on the arm32 crypto image are their check.
+        "(defun buf-read-u32 (buf off)
+  (logior (ash (aref buf off) 24) (ash (aref buf (+ off 1)) 16)
+          (ash (aref buf (+ off 2)) 8) (aref buf (+ off 3))))
+(defun buf-write-u32 (buf off val)
+  (aset buf off (logand (ash val -24) #xFF))
+  (aset buf (+ off 1) (logand (ash val -16) #xFF))
+  (aset buf (+ off 2) (logand (ash val -8) #xFF))
+  (aset buf (+ off 3) (logand val #xFF)))
+"
+        (%rpi-net-text "crypto.lisp")        (string #\Newline)
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
+      ""))
+
 (defvar *cli-bare-metal-net-source*
   ;; *cl-repl-jit-region-source* LAST: its %jit-exec-* defuns must come after
   ;; translate-aarch64.lisp's defaults so last-defun-wins picks the :virt DRAM
   ;; window.  Empty string on :rpi, which keeps the translator's own values.
   (concatenate 'string *snp-ghcb-source*
-               *net-source* *net-url-source* *net-driver-source*
+               *net-source* *crypto-only-source*
+               *net-url-source* *net-driver-source*
                *rpi-jit-coinit-override* *cl-repl-jit-region-source*
                *snp-attest-source* *ssh-key-override-source*))
 

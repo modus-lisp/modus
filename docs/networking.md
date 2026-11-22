@@ -174,27 +174,30 @@ Full implementations of the SSH-2.0 cipher suite:
 - **X25519**: Elliptic curve Diffie-Hellman on Curve25519 (Montgomery ladder, 255 iterations)
 - **Ed25519**: EdDSA signatures (scalar multiplication on twisted Edwards curve)
 
-#### 32-bit (`net/crypto-32.lisp` + `net/crypto-w32.lisp`, 1252 lines)
+#### 32-bit targets (i386, arm32, riscv32, 68k)
 
-i386 and ARM32 have 30-bit fixnums (31-bit word, tag bit steals 1 bit). SHA-256/512 and ChaCha20 values are split into `(hi16 . lo16)` cons pairs:
-```lisp
-;; 0xDEADBEEF represented as:
-(cons #xDEAD #xBEEF)
-```
+These have 30-bit fixnums, so many 32-bit crypto quantities are bignums.  They
+run the SAME sources as the 64-bit images -- `net/crypto.lisp` and
+`net/crypto-fast.lisp` -- and the compiler's W32 support (docs/w32.md)
+compiles integer expressions provably 32 bits wide to native 32-bit words.
+The earlier per-port copies are deleted: `crypto-32.lisp` / `crypto-w32.lisp`
+(cons-pair arithmetic, mini-Lisp era) and `crypto-32-fast.lisp` (a cons-free
+field layer spliced into i386 with its limb offset patched by text
+replacement), which existed because crypto-fast cached raw limb addresses
+across its bignum products.  crypto-fast no longer takes a raw address at
+all -- its limbs are fixnums in the vector's slots -- so it is correct on
+every tower.
 
-Pair arithmetic functions (`w32-add`, `w32-mul`, `w32-shr`, etc.) propagate carries through the pair structure. Triple carry direction is critical: `(cons 0 (cons hi mid))` not `(cons hi (cons mid 0))`.
+#### Fast field arithmetic (`net/crypto-fast.lisp`)
 
-#### Fast field arithmetic (`net/crypto-fast.lisp` + `net/crypto-32-fast.lisp`)
-
-Optimization layer replacing cons-based field elements with direct `mem-ref :u32` scratch memory access. Scratch memory at `fe-scratch-base()` (architecture-specific, ~256 bytes).
-
-**64-bit** (`crypto-fast.lisp`): Direct memory field element operations, 2–5× speedup for X25519/Ed25519.
-
-**32-bit** (`crypto-32-fast.lisp`, ~990 lines): Complete cons-free field arithmetic and X25519 for 30-bit fixnum targets. Key techniques:
-- **3-word accumulators**: Each h[k] uses (hi2, hi, lo) at 12 bytes, with each word kept < 2^26 via immediate carry propagation. Prevents 30-bit fixnum overflow during fe-mul accumulation.
-- **Hardware multiply**: `mul26lo`/`mul26hi` MVM opcodes for unsigned 32×32→64 multiply. Used both for field element multiply and for ×19 reduction (avoids IMUL overflow on `19 × 2^26`).
-- **Split x25519/fe-invert**: Original `x25519` has 20-binding `let` and `fe-invert` has ~25 sequential forms — both exceed MVM compiler limits on 32-bit. Split into small functions (x25-alloc-ctx, x25-ladder-step, x25-step-mid, x25-step-fin, fe-invert-p1/p2/p3) matching ARM32's proven implementation.
-- **tb-merge/fb-merge4 helpers**: Avoid 3+ level nested logior/logand/ash which silently clobbers on i386 (4 GPRs).
+Field elements as 40-slot SIMPLE-VECTORs whose slots 0..9 hold the ten
+limbs as fixnums, read and written with `svref` under a local
+`(safety 0)` (every vector is the layer's own), 2-5x faster than
+crypto.lisp's generic version for X25519 / Ed25519.  It used to store raw u32
+limbs through `mem-ref` at an address computed from the vector; that is only
+correct while nothing can move the vector, and on a 30-bit tower the limb
+products are bignums -- docs/w32.md M4 has the measurements.  Do not bring raw
+addresses back: tagged slots are what the collector can see.
 
 #### Performance
 
@@ -375,9 +378,9 @@ Each platform provides a thin adapter file (~200 lines) in `net/` implementing:
 
 Source load order determines which `defun` wins (last-defun-wins):
 ```
-arch-* → [actors] → NIC driver → ip → crypto → [crypto-32] → [crypto-w32] →
+arch-* → [actors] → NIC driver → ip → crypto →
 ssh → [http] → [http-client] → [actors-net-overrides] →
-[32bit-overrides] → [crypto-fast] → [crypto-32-fast] → [isolated-cl]
+[32bit-overrides] → [crypto-fast] → [isolated-cl]
 ```
 
 Files in brackets are loaded only for specific builds. Later files override earlier defuns of the same name. This is how 32-bit crypto, actor-aware I/O, and isolation are layered without modifying shared code.

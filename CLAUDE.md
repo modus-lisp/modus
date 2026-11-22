@@ -89,7 +89,7 @@ net/            Networking, crypto, USB, actor system
   usb-hid-split.lisp   USB keyboard console (the Pi board image)
   ip.lisp              ARP/IP/TCP/UDP/DHCP/DNS
   crypto.lisp          SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519
-  crypto-fast.lisp     limb-vector field arithmetic;  crypto-32-fast.lisp: 32-bit
+  crypto-fast.lisp     limb-vector field arithmetic (all widths; docs/w32.md M4)
   ssh.lisp             SSH-2 server (key exchange, auth, channels)
   ne2000.lisp          NE2000 ISA NIC driver (i386)
   http-client.lisp     HTTP client (URL parsing, GET, fetch)
@@ -1147,16 +1147,15 @@ on 32 bits.
 **SSH (`MODUS_SSH_BUILD=1`, `(ssh-boot)` at the REPL) works: a real OpenSSH
 client gets `= 3` over curve25519 / Ed25519 / ChaCha20-Poly1305, ~60 s a
 connection (x64: ~50 s).  Three 32-bit facts it took:**
-- **crypto-fast's field arithmetic caches RAW limb addresses across
-  ALLOCATION.**  `(+ (ash (logand fe (- 0 4)) 1) 8)` is computed once per call;
-  on 30-bit fixnums the 26x26-bit limb products are bignums, so a collection
-  inside `fe-mul` moves the arrays under the cached address.  Measured:
-  `ed25519-public-key` right in every run with no collection, wrong in exactly
-  the run where `%GC-EPOCH` moved.  The i386 build splices
-  `net/crypto-32-fast.lisp` (cons-free, `MUL26LO`/`MUL26HI`, scratch at
-  `FE-SCRATCH-BASE`) after crypto-fast, its limb offset rewritten to
-  crypto-fast's.  **Any 32-bit CL target running crypto-fast has this bug** —
-  bare arm32 next.
+- **crypto-fast's limbs are FIXNUMS IN THE VECTOR'S SLOTS, not raw u32
+  words behind a computed address.**  On 30-bit fixnums the 26x26-bit limb
+  products are bignums, so a collection inside `fe-mul` moved the arrays under
+  a cached address: every bare-i386 X25519 that saw a collection was wrong.
+  Taking each address after the last allocation cut that to 4 in 154 but not
+  to zero; with `svref` (declared `simple-vector`, local `(safety 0)`) it is
+  0 in 300, one source serves every width, and x64 got faster (1.50 -> 0.99 ms
+  per X25519).  The old i386 splice, `crypto-32-fast.lisp`, is deleted
+  (docs/w32.md M4).
 - **A 32-bit TCP sequence number is a bignum** (>= 2^29), so ip.lisp's
   `(eq their-seq expected)` was false for most of them: `EQL` now.
 - `*CLI-ARCH*` was `:AARCH64` for this image (machine-type "aarch64", aarch64's
@@ -1209,8 +1208,8 @@ needed a bare variant.  Bare clock: CNTVCT >> 16 (#x0310) and CNTFRQ >> 16
 three syscall traps, signal-handler install and the four JIT/mmap traps are
 hosted-only and become an unhandled SWI on bare metal; nothing in boot or the
 REPL reaches them.  **The 32-bit lessons from i386 apply here unchanged before
-networking or SSH is added**: a byte vector's payload is at word−5, crypto-fast
-must be replaced by crypto-32-fast, and TCP sequence numbers are bignums.
+networking or SSH is added**: a byte vector's payload is at word−5, and TCP sequence
+numbers are bignums.
 
 ### QEMU x64 / i386 PC images (Multiboot) — SSH over E1000 / NE2000
 ```bash

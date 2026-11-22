@@ -287,7 +287,7 @@
 
 ;; Net source files that run on bare metal (most important to check)
 (defparameter *net-files*
-  '("net/ip.lisp" "net/crypto.lisp" "net/crypto-fast.lisp" "net/crypto-32-fast.lisp"
+  '("net/ip.lisp" "net/crypto.lisp" "net/crypto-fast.lisp"
     "net/ssh.lisp" "net/http-client.lisp"
     "net/e1000.lisp" "net/dwc2.lisp" "net/usb.lisp" "net/cdc-ether.lisp"
     "net/term.lisp" "net/actors.lisp" "net/ne2000.lisp"

@@ -1646,25 +1646,14 @@
   (if *ssh-build-p*
       (concatenate 'string
         (%rpi-net-text "crypto.lisp")        (string #\Newline)
-        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline)
-        ;; :I386 -- crypto-fast's field arithmetic reaches a field element's
-        ;; limbs through a RAW address computed once per call, and on 30-bit
-        ;; fixnums its 26x26-bit limb products are BIGNUMS: an allocation, so a
-        ;; collection can move the arrays under the cached address.  Measured:
-        ;; ed25519-public-key correct in every run with no collection, wrong in
-        ;; exactly the run where %GC-EPOCH moved.  crypto-32-fast.lisp is the
-        ;; cons-free 32-bit field layer (MUL26LO/MUL26HI, intermediates in fixed
-        ;; scratch at FE-SCRATCH-BASE): nothing in a field operation allocates,
-        ;; so nothing moves.  Its limb offset is rewritten from the mini-Lisp's
-        ;; header (+4) to crypto-fast's (+8), so every field function in the
-        ;; image agrees on where limb 0 is (inside the 40-slot array either way).
-        (if *cl-repl-i386-p*
-            (concatenate 'string
-              (%replace-all (%rpi-net-text "crypto-32-fast.lisp")
-                            "(- 0 4)) 1) 4)" "(- 0 4)) 1) 8)")
-              (string #\Newline))
-            ""))
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
       ""))
+;; (:I386 used to splice net/crypto-32-fast.lisp here, with its limb offset
+;; rewritten by %REPLACE-ALL: crypto-fast cached raw limb addresses across its
+;; bignum products, which a 30-bit tower makes an allocation.  crypto-fast
+;; now keeps its limbs as fixnums in the vector's slots and takes no raw
+;; address at all (docs/w32.md, M4), so every image runs the one field source
+;; and crypto-32-fast.lisp is deleted.)
 
 ;; Actor/SSH address map for the CL host image's memory layout.  The legacy
 ;; block (arch-raspi3b) sits at 0x0200_0000/0x0600_0000, which lands INSIDE this

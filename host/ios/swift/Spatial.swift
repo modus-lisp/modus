@@ -5,7 +5,8 @@
 //
 //   spatial_start()                    the engine and its listener; 1, or 0 when there is no output
 //   spatial_sound(samples, frames, rate)   a sound: FRAMES mono single-floats at RATE, copied; a handle
-//   spatial_voice(sound, loop)         a voice playing SOUND (looping when LOOP is 1), placed at the listener; a handle
+//   spatial_voice(sound, loop)         a voice of SOUND (looping when LOOP is 1), playing from its first spatial_place;
+//                                      a handle
 //   spatial_place(voice, xyzg)         the voice at x y z (metres), at gain g: four single-floats at XYZG
 //   spatial_listener(nine)             the listener: position, forward and up vectors, nine single-floats
 //   spatial_stop(voice)
@@ -135,7 +136,8 @@ let spatialVoice: Call = { s, loop, _, _, _, _ in
     player.sourceMode = .pointSource
     player.position = environment.listenerPosition
     player.scheduleBuffer(buffer, at: nil, options: loop != 0 ? .loops : [], completionHandler: nil)
-    player.play()
+    // NOT PLAYED YET: placed first (spatial_place), or it starts inside the listener's head and sweeps out to where
+    // it is
     let handle = nextHandle
     nextHandle += 1
     spatialVoices[handle] = player
@@ -146,6 +148,7 @@ let spatialPlace: Call = { v, p, _, _, _, _ in
     guard let player = spatialVoices[v], let f = UnsafePointer<Float>(bitPattern: p) else { return 0 }
     player.position = AVAudio3DPoint(x: f[0], y: f[1], z: f[2])
     player.volume = max(0, f[3])
+    if !player.isPlaying { player.play() }      // its first place: it starts where it is
     return 1
 }
 

@@ -11,10 +11,10 @@
 //   spatial_stop(voice)
 //   spatial_volume(permille)           everything's loudness, 0..1000
 //   spatial_head(on)                   follow the listener's head (AirPods) or not; off until asked
-//   spatial_head_attitude(three)        the head's yaw, pitch and roll (radians; yaw from where it was when following
-//                                      began, positive turning left; pitch positive up) into three single-floats;
+//   spatial_head_attitude(three)        the head's yaw, pitch and roll (radians, from its pose when following began or
+//                                      was recentered; yaw positive turning left, pitch positive up) into three floats;
 //                                      1 while the headphones report it, else 0
-//   spatial_head_recenter()            "ahead" is where the head faces now
+//   spatial_head_recenter()            the head's pose now is neutral: its turn, nod and tilt are measured from it
 //   spatial_head_permission()          0 not asked yet, 1 allowed, 2 refused, 3 none needed (a TV): an app can say
 //                                      what the system's question is for before it is asked
 //
@@ -40,20 +40,25 @@ private var spatialVoices: [UInt: AVAudioPlayerNode] = [:]
 #if os(iOS) || os(macOS)
 private let headphones = CMHeadphoneMotionManager()
 private var headYaw = 0.0, headPitch = 0.0, headRoll = 0.0
-private var headYawAtStart: Double?
+// THE HEAD'S NEUTRAL POSE: where it was when following began, or when last recentered.  Its turn, nod and tilt are
+// all measured from there (CMAttitude.multiply(byInverseOf:)), so the screen in front of the person -- a laptop they
+// look down at -- is straight ahead.
+private var headReference: CMAttitude?
 
 private func startHeadTracking() {
     guard headphones.isDeviceMotionAvailable, !headphones.isDeviceMotionActive else { return }
-    headYawAtStart = nil                      // "ahead" is where the head is now
+    headReference = nil                       // the neutral pose is where the head is now
     headphones.startDeviceMotionUpdates(to: .main) { motion, error in
         guard let a = motion?.attitude else {
             if let error { NSLog("modus spatial: headphone motion: \(error)") }
             return
         }
-        if headYawAtStart == nil { headYawAtStart = a.yaw }
-        headYaw = a.yaw - (headYawAtStart ?? 0)
-        headPitch = a.pitch
-        headRoll = a.roll
+        if headReference == nil { headReference = a.copy() as? CMAttitude }
+        guard let reference = headReference, let relative = a.copy() as? CMAttitude else { return }
+        relative.multiply(byInverseOf: reference)
+        headYaw = relative.yaw
+        headPitch = relative.pitch
+        headRoll = relative.roll
     }
 }
 #endif
@@ -187,7 +192,7 @@ let spatialHeadAttitude: Call = { p, _, _, _, _, _ in
 
 let spatialHeadRecenter: Call = { _, _, _, _, _, _ in
     #if os(iOS) || os(macOS)
-    headYawAtStart = nil                        // the next report sets it
+    headReference = nil                         // the next report sets it
     #endif
     return 1
 }

@@ -637,6 +637,32 @@
                                             i))
                           (logand (ash val (* i -8)) #xFF))))))
 
+;;; A THREAD-LOCAL ACCESS IN THE INTERPRETER.  Native code reaches a window
+;;; slot (+WIDTH-TLS-BIT+: handler frames, the dynamic-binding block, the self
+;;; slot at #x10000C30 that says whose window this is) through its segment
+;;; base, which is this computation's window offset; the interpreter used to
+;;; drop the bit and read the slot at its plain address -- MAIN's window.  So
+;;; on a worker thread or a coroutine, interpreted code saw main's self slot
+;;; (zero), took the "main binds shallowly" fast path of every special read,
+;;; and read the global cell straight through the computation's own binding:
+;;; a HANDLER-CASE that EVAL ran in a coroutine dispatched on main's
+;;; *CURRENT-CONDITION* -- the last condition main had handled -- and a clause
+;;; for the real condition's type never matched.  The offset is what native
+;;; code itself reads at the self slot (zero on main, and when threads were
+;;; never armed); the MV slots the interpreter models itself stay as they are.
+(defun %interp-tls-addr (addr width)
+  "ADDR as native code reaches it with WIDTH: with +WIDTH-TLS-BIT+, plus this
+   computation's window offset; otherwise ADDR."
+  (if (or (eql (logand width +width-tls-bit+) 0)
+          (eql (mem-ref #x10000DB8 :u32) 0)
+          (%mv-slot-index addr (logand width 3)))
+      addr
+      (let ((lo (mem-ref #x10000C30 :u32))
+            (hi (mem-ref #x10000C34 :u32)))
+        (cond ((and (eql hi 0) (eql lo 0)) addr)
+              ((>= hi #x80000000) (+ addr (+ (* (* (- hi 4294967296) 65536) 65536) lo)))
+              (t (+ addr (+ (* (* hi 65536) 65536) lo)))))))
+
 ;; VALUE-domain load/store — what OP-LOAD and OP-STORE actually need.
 ;;
 ;; A register slot holds a VALUE whose native WORD is what the machine
@@ -2504,11 +2530,13 @@
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vaddr npc2) (%ifetch-reg bc npc)
                (multiple-value-bind (width npc3) (%ifetch-byte bc npc2)
-                 ;; Mask +WIDTH-TLS-BIT+: the interpreter simulates ONE
-                 ;; address space with one thread, so a thread-local width is
-                 ;; the plain width.  See mvm/mvm.lisp.
-                 (setf width (logand width 3))
-                 (let ((addr (reg-get regs vaddr)))
+                 ;; +WIDTH-TLS-BIT+: a slot of THIS computation's window, at
+                 ;; the address native code reaches through its segment base
+                 ;; (%INTERP-TLS-ADDR).  It used to be masked off -- "one
+                 ;; thread" -- so interpreted code on a worker or a coroutine
+                 ;; read MAIN's window.  See mvm/mvm.lisp.
+                 (let ((addr (%interp-tls-addr (reg-get regs vaddr) width)))
+                  (setf width (logand width 3))
                    ;; compile-mem-ref already untags the address (:shr addr 1),
                    ;; so the reg holds the raw address VALUE.  reg-get's %val->word
                    ;; restores the full address word; do NOT untag again (that
@@ -2527,8 +2555,8 @@
            (multiple-value-bind (vaddr npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
                (multiple-value-bind (width npc3) (%ifetch-byte bc npc2)
-                 (setf width (logand width 3))   ; +WIDTH-TLS-BIT+: see op-load
-                 (let ((addr (reg-get regs vaddr)) (val (reg-get regs vs)))
+                 (let ((addr (%interp-tls-addr (reg-get regs vaddr) width)) (val (reg-get regs vs)))
+                  (setf width (logand width 3))   ; +WIDTH-TLS-BIT+: see op-load
                    ;; See op-load: the address is already untagged by compile-
                    ;; mem-ref's :shr; reg-get restores its word — do NOT untag
                    ;; again (the extra halving collapsed MV slot spacing 4x).

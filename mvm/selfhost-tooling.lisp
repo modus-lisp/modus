@@ -333,6 +333,9 @@
   (setq *aarch64-gc-bitmap-enabled* nil)
   (setq *aarch64-gc-native-mcgc* nil)
   (setq *aarch64-force-absolute-inmodule-calls* nil)
+  ;; boot/boot-aarch64.lisp's DEFVAR: unbound here, and an image's configuration
+  ;; record lists every flag that is bound (SBCL's has it, as NIL)
+  (setq *aarch64-fixpoint-threads* nil)
   ;; Bare-metal-only hooks that must stay off in a Linux image.
   (setq *aarch64-sched-lock-addr* nil)
   (setq *aarch64-setup-irq-enable* nil)

@@ -71,6 +71,64 @@
 
 (defvar *builder-targets-ready* nil)
 
+;;; THE COMPILER'S WORKING STATE AT SBCL'S BUILD CALL, measured: every DEFVAR /
+;;; DEFPARAMETER of compiler.lisp, translate-x64.lisp, cross.lisp and x64-asm.lisp,
+;;; dumped at build-generic-cli's BUILD-IMAGE call on SBCL and on this image, and
+;;; diffed.  These are the ones that differ: this image's runtime compiler and JIT
+;;; have filled the tables, advanced the counters (*KW-REST-COUNTER* and
+;;; *UWP-SEQ-COUNTER* name generated functions) and left translator state behind
+;;; (*X64-LAST-SET-NARGS* lets the translator drop a repeated SET-NARGS).  None is
+;;; set by a build script.  (NAME PACKAGE SBCL-VALUE): NIL, 0 or -1.
+(defparameter *builder-fresh-state*
+  '(("*%NOT-MACRO*" "MODUS.MVM" nil) ("*%SHADOWS-CL-FN*" "MODUS.MVM" nil)
+    ("*%SOLE-EVAL-FORM*" "MODUS.MVM" nil)
+    ("*BOOTSTRAP-MACRO-TEMPLATE*" "MODUS.MVM" nil)
+    ("*CLHS-STANDARD-SPECIALS-HASHES*" "MODUS.MVM" nil)
+    ("*COMPOUND-DISPATCH-HASHES*" "MODUS.MVM" nil)
+    ("*DEFSTRUCT-EFF-RO*" "MODUS.MVM" nil) ("*DEFSTRUCT-EFF-SLOTS*" "MODUS.MVM" nil)
+    ("*E2-GF-NAME-MEMO*" "MODUS.MVM" nil)
+    ("*FASL-TAINT*" "MODUS.MVM" nil) ("*FASL-TAINT-WHO*" "MODUS.MVM" nil)
+    ("*FUNCTION-TABLE*" "MODUS.MVM" nil)
+    ("*GLOBAL-SYMBOL-MACROS*" "MODUS.MVM" nil) ("*GLOBAL-SYMBOL-MACROS-PKG*" "MODUS.MVM" nil)
+    ("*GV-CACHE-NAMES*" "MODUS.MVM" nil) ("*HASH-DISPATCH-TABLE*" "MODUS.MVM" nil)
+    ("*HC-FAULT-FIXUP*" "MODUS.MVM" nil)
+    ("*KW-REST-COUNTER*" "MODUS.MVM" 0) ("*LABEL-COUNTER*" "MODUS.MVM" 0)
+    ("*LET-SPECIAL-SITES*" "MODUS.MVM" nil) ("*MACRO-DEFS-EPOCH*" "MODUS.MVM" nil)
+    ("*MACRO-NAME-TABLE*" "MODUS.MVM" nil) ("*MEXP-MEMO-GC*" "MODUS.MVM" -1)
+    ("*MVM-EMIT-HALVES*" "MODUS.MVM" nil) ("*MVM-EVAL-RUNTIME-P*" "MODUS.MVM" nil)
+    ("*PARK-SAFEPOINTS*" "MODUS.MVM" nil)
+    ("*RUNTIME-CONSTANTS*" "MODUS.MVM" nil) ("*RUNTIME-SPECIAL-NAMES*" "MODUS.MVM" nil)
+    ("*SETF-EXPANDERS-PKG*" "MODUS.MVM" nil) ("*SETF-FUNCTION-REGISTRY*" "MODUS.MVM" nil)
+    ("*STRUCT-ACCESSORS*" "MODUS.MVM" nil) ("*UWP-SEQ-COUNTER*" "MODUS.MVM" 0)
+    ("*CF-TRACE*" "MODUS.MVM" nil) ("*CF-TRACE-I*" "MODUS.MVM" 0)
+    ("*REG-INFO-TABLE*" "MODUS.ASM" nil)
+    ("*MCGC-CONS-BIT-LABEL*" "MODUS.MVM.X64" nil)
+    ("*X64-CALL-RELOC-NARGS*" "MODUS.MVM.X64" nil) ("*X64-CALL-RELOCS*" "MODUS.MVM.X64" nil)
+    ("*X64-CUR-FN-NAME*" "MODUS.MVM.X64" nil)
+    ("*X64-JIT-CONSTVEC-FULL-P*" "MODUS.MVM.X64" nil) ("*X64-JIT-MODE*" "MODUS.MVM.X64" nil)
+    ("*X64-JIT-SHARED-GC-TRAMP*" "MODUS.MVM.X64" nil)
+    ("*X64-LAST-SET-NARGS*" "MODUS.MVM.X64" nil)
+    ("*X64-LI-CONST-PATCHES*" "MODUS.MVM.X64" nil) ("*X64-LI-CONSTVEC-MAX*" "MODUS.MVM.X64" -1)))
+
+(defun %builder-state-symbol (name pkg)
+  "The symbol of a compiler variable: in PKG or, failing that, MODUS.MVM's (whose
+   packages it uses), so a name homed elsewhere in this image is still found."
+  (or (let ((p (find-package pkg))) (and p (find-symbol name p)))
+      (find-symbol name (find-package "MODUS.MVM"))))
+
+(defun %builder-enter-fresh-state ()
+  "Set the compiler's working state to SBCL's at its build call; the saved values."
+  (let ((saved nil))
+    (dolist (e *builder-fresh-state*)
+      (let ((s (%builder-state-symbol (first e) (second e))))
+        (when (and s (boundp s))
+          (setq saved (cons (cons s (symbol-value s)) saved))
+          (set s (third e)))))
+    saved))
+
+(defun %builder-leave-fresh-state (saved)
+  (dolist (p saved) (set (car p) (cdr p))))
+
 (defun %builder-boot-init ()
   "At boot (%JIT-BOOT-INIT): the AArch64 and RV32 translators' configuration
    and the target registry, which their build scripts set host-side."
@@ -119,7 +177,7 @@
           (s-cv-full *x64-jit-constvec-full-p*) (s-xerr *jit-xlate-err-info*)
           (s-hc-fixup *hc-fault-fixup*)
           (s-runtime-p *mvm-eval-runtime-p*) (s-halves *mvm-emit-halves*)
-          (s-static *static-build-p*))
+          (s-static *static-build-p*) (fresh nil))
       (unwind-protect
            (progn
              ;; compiler state: the host's empty tables (mvm-compile-all
@@ -150,9 +208,11 @@
              (setq *static-build-p* nil)
              ;; the image's configuration record is taken HERE, after the reset,
              ;; so it names the flags this compile uses (SBCL's are its defaults)
+             (setq fresh (%builder-enter-fresh-state))
              (when (and finalize (stringp src))
                (setf (getf args :source-text) (funcall finalize src target)))
              (apply #'build-image args))
+        (%builder-leave-fresh-state fresh)
         (setq *functions* s-functions *function-table* s-function-table
               *globals* s-globals *constants* s-constants
               *macro-table* s-macro-table *macro-name-table* s-macro-name-table

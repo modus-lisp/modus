@@ -3979,6 +3979,12 @@
       (set (car p) (cdr p)))
     old))
 
+(defun %jit-host-flags-keep (pairs)
+  "Record in PAIRS the values their symbols have now: what a host translation left
+   in the host's own state (a constant-vector high-water mark, say) is the host's
+   for the next one, not lost when the target's values are put back."
+  (dolist (p pairs) (setf (cdr p) (symbol-value (car p)))))
+
 (defun %host-compile-toplevel (form)
   "MVM-COMPILE-TOPLEVEL for code that runs HERE (EVAL, LOAD, a script's
    toplevel): with *JIT-HOST-FLAGS* in force, so a build script's settings for
@@ -3987,6 +3993,7 @@
   (if *jit-host-flags*
       (let ((saved (%jit-host-flags-swap *jit-host-flags*)))
         (unwind-protect (mvm-compile-toplevel form)
+          (%jit-host-flags-keep *jit-host-flags*)
           (%jit-host-flags-swap saved)))
       (mvm-compile-toplevel form)))
 
@@ -3994,6 +4001,7 @@
   (if *jit-host-flags*
       (let ((saved (%jit-host-flags-swap *jit-host-flags*)))
         (unwind-protect (%jit-translate-page-0 bc mvm-entry ft-list rt-table)
+          (%jit-host-flags-keep *jit-host-flags*)
           (%jit-host-flags-swap saved)))
       (%jit-translate-page-0 bc mvm-entry ft-list rt-table)))
 

@@ -187,6 +187,32 @@
   (cond ((eq target :linux-aarch64) (%init-aarch64-translator))
         ((eq target :linux-riscv32) (%init-riscv32-translator))))
 
+;;; Translator and runtime-JIT state %BUILDER-BUILD-IMAGE resets for the target that the
+;;; host's own JIT translations read: besides *BUILDER-FRESH-STATE*'s translator entries.
+(defparameter *builder-host-translator-names*
+  '(("*X64-JIT-MODE*" . "MODUS.MVM.X64") ("*X64-JIT-CONSTVEC-FULL-P*" . "MODUS.MVM.X64")
+    ("*JIT-XLATE-ERR-INFO*" . "MODUS.MVM") ("*JIT-LINKAGE-CELLS*" . "MODUS.MVM")
+    ("*PARK-SAFEPOINTS*" . "MODUS.MVM") ("*USE-JIT*" . "MODUS.MVM")
+    ("*HC-FAULT-FIXUP*" . "MODUS.MVM")))
+
+(defun %builder-host-translator-state (host-flags)
+  "HOST-FLAGS (*JIT-HOST-FLAGS*) plus the current value of every translator variable
+   a build resets: the fresh state's MODUS.MVM.X64 / MODUS.ASM entries and
+   *BUILDER-HOST-TRANSLATOR-NAMES*.  Fresh conses: %JIT-TRANSLATE-PAGE writes the
+   host's changes back into them."
+  (let ((pairs nil))
+    (flet ((add (name pkg)
+             (let ((s (%builder-state-symbol name pkg)))
+               (when (and s (boundp s)
+                          (not (assoc s host-flags :test #'eq))
+                          (not (assoc s pairs :test #'eq)))
+                 (setq pairs (cons (cons s (symbol-value s)) pairs))))))
+      (dolist (e *builder-fresh-state*)
+        (when (member (second e) '("MODUS.MVM.X64" "MODUS.ASM") :test #'string=)
+          (add (first e) (second e))))
+      (dolist (e *builder-host-translator-names*) (add (car e) (cdr e))))
+    (append (mapcar (lambda (p) (cons (car p) (cdr p))) host-flags) pairs)))
+
 (defun %builder-build-image (&rest args)
   "BUILD-IMAGE as the SBCL host runs it: compiler tables empty, this image's
    runtime-JIT settings at their DEFVAR defaults.  Everything is put back on
@@ -219,7 +245,15 @@
           (s-cv-full *x64-jit-constvec-full-p*) (s-xerr *jit-xlate-err-info*)
           (s-hc-fixup *hc-fault-fixup*)
           (s-runtime-p *mvm-eval-runtime-p*) (s-halves *mvm-emit-halves*)
-          (s-static *static-build-p*) (fresh nil))
+          (s-static *static-build-p*) (fresh nil)
+          (s-host-flags *jit-host-flags*))
+      ;; THE HOST'S TRANSLATOR STATE, as it stands now: what follows resets it for
+      ;; the target (*X64-JIT-MODE* NIL, the fresh state's translator entries), and
+      ;; a function the hot JIT translates mid-build -- a runtime-loaded translator
+      ;; is exactly that -- runs HERE.  Translated as image code instead of a JIT
+      ;; page, its collector entry and allocation bitmaps were not this image's,
+      ;; and a precise root (#x10000FB0) was left pointing at a dead copy.
+      (setq *jit-host-flags* (%builder-host-translator-state s-host-flags))
       (unwind-protect
            (progn
              ;; compiler state: the host's empty tables (mvm-compile-all
@@ -258,6 +292,7 @@
                (setf (getf args :source-text) (funcall finalize src target)))
              (apply #'build-image args))
         (setq *in-image-build* nil)
+        (setq *jit-host-flags* s-host-flags)
         (%builder-leave-fresh-state fresh)
         (setq *functions* s-functions *function-table* s-function-table
               *globals* s-globals *constants* s-constants

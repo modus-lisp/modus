@@ -11105,8 +11105,8 @@
             (%compile-lexical-exit (caddr form) (caddr entry)
                                    (or (cadddr entry) 0) (cadr entry) env))
            ;; Cross-unit: BLOCK lives in an enclosing function/lambda.
-           ((assoc (normalize-name bname) *nonlocal-blocks* :test #'=)
-            (let ((tag-val (cadr (assoc (normalize-name bname)
+           ((assoc (%block-name-hash bname) *nonlocal-blocks* :test #'=)
+            (let ((tag-val (cadr (assoc (%block-name-hash bname)
                                         *nonlocal-blocks* :test #'=))))
               ;; (%nlx-throw TAG-VAL value) — the BLOCK's CATCH frame
               ;; catches.  %nlx-throw (not THROW) so the handler-bind-safe
@@ -21555,6 +21555,16 @@
                 (progn (setq cur (car r)) (setq n (+ n 1)))
                 (return cur)))))))
 
+(defun %block-name-hash (name)
+  "The key a BLOCK named NAME is filed under: COMPILE-BLOCK's -- 0 for the NIL
+   block, else NORMALIZE-NAME.  (NORMALIZE-NAME NIL) is NOT 0, so comparing a
+   RETURN-FROM's NORMALIZE-NAME against a block's hash never matched the NIL
+   block: (block nil (funcall (lambda () (return-from nil :x))) :fell) installed
+   no catch frame, the RETURN-FROM lowered to a return from the lambda, and the
+   block fell through to :FELL.  TI's PROG is (BLOCK NIL (LET ...)) around their
+   RETURN, so every PROG that RETURNs from inside a lambda lost its exit."
+  (if name (normalize-name name) 0))
+
 (defun %return-from-escapes-block-p (body block-hash crossed-lambda shadowed)
   "Scan BODY (a list of forms) for a RETURN-FROM (or RETURN if BLOCK-HASH
    is 0, the NIL block) targeting BLOCK-HASH that lives INSIDE a lambda
@@ -21578,7 +21588,7 @@
                    ;; its body (RETURN-FROM there targets the inner block).
                    ((%form-op-is form 372279278 "BLOCK")
                     (let ((inner-sh (or sh
-                                        (= (normalize-name (cadr form))
+                                        (= (%block-name-hash (cadr form))
                                            block-hash))))
                       (let ((cur (cddr form)))
                         (loop while (consp cur) do
@@ -21646,7 +21656,7 @@
                    ;; RETURN-FROM <name> — check target + lambda boundary
                    ((%form-op-is form 164933334 "RETURN-FROM")
                     (when (and xl (not sh)
-                               (= (normalize-name (cadr form)) block-hash))
+                               (= (%block-name-hash (cadr form)) block-hash))
                       (setq found t))
                     (walk (caddr form) xl sh))
                    ;; RETURN (== return-from NIL) — only for the NIL block.
@@ -21760,7 +21770,7 @@
    through the THROW (we do NOT register a lexical *block-labels* entry):
    a lexical :br out of the middle of the catch's handler-case would skip
    its setjmp-frame teardown and corrupt the handler-case stack."
-  (let* ((name-hash (if name (normalize-name name) 0)))
+  (let* ((name-hash (%block-name-hash name)))
     (if (and (%return-from-escapes-block-p body name-hash nil nil)
              ;; ...but only when the catch frame can nest safely.  An
              ;; UNWIND-PROTECT or a cross-unit GO in the body shares the

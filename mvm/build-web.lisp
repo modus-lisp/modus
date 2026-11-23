@@ -543,7 +543,15 @@
     (unless (env= "MODUS_TYPE_ERROR_CODES" "0")
       (setf *type-error-codes* (make-hash-table :test 'equal)))
     (unless (env= "MODUS_STATIC_SYMBOL_SHORT_MISS" "0")
-      (setf *static-symbol-short-miss* t)))
+      (setf *static-symbol-short-miss* t))
+    ;; - *ARITH-RANGE-BY-SHIFT* (the small 68k image's, build-cli-common): the
+    ;;   30-bit range guard as SHL / SAR / CMP / BNE, not two immediates, two
+    ;;   compares and two branches.  Sound only where a shift is 32 bits wide,
+    ;;   which it is in web/mvm32.js, interpreted and translated alike; it is
+    ;;   a build-time setting, so the image's own (Lisp-interpreted) runtime
+    ;;   compiles keep the immediate form.  MODUS_WEB_RANGE_SHIFT=0 turns it off.
+    (when (and (= *web-word-size* 4) (not (env= "MODUS_WEB_RANGE_SHIFT" "0")))
+      (setf *arith-range-by-shift* t)))
   ;; The web image never calls BUILD-IMAGE, so build-checks' wrapper does not
   ;; see it: run the redefinition check around the compile directly.
   (setf *undeclared-redefinitions* nil)

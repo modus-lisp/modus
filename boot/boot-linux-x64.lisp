@@ -666,9 +666,17 @@
         (emit-bytes buf #x4C #x8B #x34 #x25) (emit-le32 buf #x10000F88) ; mov r14, [midpoint]
         (emit-bytes buf #x49 #x81 #xEE) (emit-le32 buf +linux-x64-gc-guard+) ; sub r14, guard
         (emit-bytes buf #x49 #x01 #xC6))                                ; add r14, rax
-      (progn
-        (emit-bytes buf #x49 #x89 #xC6)                                 ; mov r14, rax
-        (emit-x64-stub-add buf :r14 *linux-x64-r14-offset*)))
+      ;; THE SAME LENGTH AS THE BRANCH ABOVE (18 bytes): the native code offset
+      ;; is measured from this stub when the build script loads, BEFORE it sets
+      ;; *LINUX-X64-R14-OFFSET* to the midpoint, so a branch of another length
+      ;; moves every function entry (by 8 once: words ending #xB, not #x3, and
+      ;; the runtime JIT's tag-3 test took half the kernel for not native).
+      (let ((off *linux-x64-r14-offset*))
+        (unless (%x64-simm32-p off)
+          (error "MODUS_GC_R14 offset ~X does not fit an imm32" off))
+        (emit-bytes buf #x49 #xC7 #xC6) (emit-le32 buf off)          ; mov r14, off
+        (emit-bytes buf #x0F #x1F #x84 #x00 #x00 #x00 #x00 #x00)     ; 8-byte NOP
+        (emit-bytes buf #x49 #x01 #xC6)))                            ; add r14, rax
 
   ;; Initialize GC metadata at ABSOLUTE addresses 0x10000040..0x10000060
   ;; These are in the ELF BSS region (zero-initialized by the kernel loader).

@@ -341,6 +341,14 @@
 ;; allocation walked all the way to the end — too late for a Cheney
 ;; copy that needs the other half free.
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
+;; The native code offset was measured from the stub above; the stub must still
+;; be that long, or every function entry moves (and loses its tag-3 alignment).
+(unless (or cl-user::*cli-win64*
+            (not (boundp 'modus.mvm.x64::*x64-native-code-offset*))
+            (null modus.mvm.x64::*x64-native-code-offset*)
+            (= modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset)))
+  (error "x64 boot stub length changed after *X64-NATIVE-CODE-OFFSET* was measured (~D, now ~D)"
+         modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset)))
 ;; MCGC page-pinning test knob (stage 4).  OFF by default.  MODUS_MCGC_PINNING=1
 ;; enables the page-pool allocator + page collector for a pinning test build.
 (when (let ((v (sb-ext:posix-getenv "MODUS_MCGC_PINNING")))

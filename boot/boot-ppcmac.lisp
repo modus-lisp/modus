@@ -10,19 +10,28 @@
 ;;;; stub builds that picture with four BATs, which every 32-bit PowerPC from
 ;;;; the 601 on has, and then does what the hosted stub does after its mmaps:
 ;;;;
-;;;;   VA = PA #x00000000..#x0FFFFFFF  IBAT0 + DBAT0   image (#x10000..), stack,
+;;;;   VA = PA #x00000000..#x07FFFFFF  IBAT0 + DBAT0   image (#x10000..), stack,
 ;;;;                                                   handler-frame extension
 ;;;;   VA = PA #x10000000..#x1FFFFFFF  DBAT1           fixed block, heap, kind map
-;;;;   VA #xDEAC0000..#xDEADFFFF       DBAT2 -> PA #x0F800000  NIL's page
-;;;;   VA = PA #x80000000..#x8007FFFF  DBAT3, uncached mac-io (the ESCC console)
+;;;;   VA #xDEAC0000..#xDEADFFFF       DBAT2 -> PA #x07800000  NIL's page
+;;;;   VA #x08000000..#x09FFFFFF       DBAT3 -> PA #x80000000.., uncached: mac-io
+;;;;                                   (VA #x08000000: the ESCC, the VIA) and, on
+;;;;                                   QEMU mac99, the framebuffer (VA #x09000000)
+;;;;
+;;;; THE DEVICES ARE LOW because Lisp reaches them with MEM-REF, whose address
+;;;; travels as a 30-bit fixnum: nothing at or above 2^29 can be named.  (The
+;;;; translator's own console traps could use any address; drivers in Lisp --
+;;;; the CUDA/ADB keyboard and mouse, the screen -- cannot.)
 ;;;;
 ;;;; Memory (all below 512 MB, so -m 512 or more; QEMU mac99 runs with -m 1024):
-;;;;   #x00010000..  the image (37 MB) -- Open Firmware loads the file at its
-;;;;                 load-base (#x04000000 on OpenBIOS) and copies the segment
-;;;;   #x0C000000..#x0E000000  the stack, down from +PPCMAC-STACK-TOP+
-;;;;   #x0E000000..#x0E200000  the handler-frame extension (fixed, 64K frames)
-;;;;   #x0F800000..#x0F820000  NIL's 128 KB BAT block
-;;;;   #x0FE00000, #x0FF00000  the CLI's scratch pages
+;;;;   #x00010000..  the image (35 MB) -- Open Firmware loads the file at its
+;;;;                 load-base (#x04000000 on OpenBIOS) and copies the segment,
+;;;;                 so the file's buffer is dead once the stub runs
+;;;;   #x06000000..#x07000000  the stack, down from +PPCMAC-STACK-TOP+
+;;;;   #x07000000..#x07200000  the handler-frame extension (fixed, 64K frames)
+;;;;   #x07800000..#x07820000  NIL's 128 KB BAT block
+;;;;   #x07D00000..#x07D10000  the mutex arena (%BARE-SYNC-ARENA)
+;;;;   #x07E00000, #x07F00000  the CLI's scratch pages
 ;;;;   #x10000000..            the heap, +PPCMAC-HEAP-SIZE+, then its guard
 ;;;;   #x1FC00000..#x20000000  the kind map (heap/16)
 ;;;;
@@ -33,13 +42,15 @@
 (in-package :modus.mvm)
 
 (defconstant +ppcmac-load-addr+   #x10000    "Image byte 0 (the ELF header).")
-(defconstant +ppcmac-stack-top+   #x0E000000 "Grows down; the extension is above.")
+(defconstant +ppcmac-stack-top+   #x07000000 "Grows down; the extension is above.")
 (defconstant +ppcmac-heap-size+   #x4000000
   "64 MB: two 32 MB semispaces, and a kind map (size/16) that ends exactly at
    #x20000000, the top of DBAT1.")
-(defconstant +ppcmac-nil-pa+      #x0F800000 "PA behind VA #xDEAC0000 (128 KB).")
+(defconstant +ppcmac-nil-pa+      #x07800000 "PA behind VA #xDEAC0000 (128 KB).")
+(defconstant +ppcmac-device-va+   #x08000000
+  "VA of PA #x80000000 (mac-io, then QEMU's framebuffer at +#x1000000): 32 MB.")
 (defconstant +ppcmac-hstack-ext-frames+ #x10000
-  "Frames in the fixed extension: 64K x 32 bytes = 2 MB at #x0E000000.")
+  "Frames in the fixed extension: 64K x 32 bytes = 2 MB at #x07000000.")
 
 (defun ppcmac-mtspr (buf spr rs)
   (ppc-emit-word buf (logior (ash 31 26) (ash rs 21) (ash (logand spr 31) 16)
@@ -77,11 +88,12 @@
       (li +ppc-r0+ 0)
       (loop for spr from 528 to 543 do (ppcmac-mtspr buf spr +ppc-r0+))
       (ppc-emit-word buf #x4C00012C)                             ; isync
-      (dolist (bat `((528 529 #x00001FFF #x00000002)   ; IBAT0: 0..256 MB
-                     (536 537 #x00001FFF #x00000002)   ; DBAT0: 0..256 MB
+      (dolist (bat `((528 529 #x00000FFF #x00000002)   ; IBAT0: 0..128 MB
+                     (536 537 #x00000FFF #x00000002)   ; DBAT0: 0..128 MB
                      (538 539 #x10001FFF #x10000002)   ; DBAT1: 256..512 MB
                      (540 541 #xDEAC0003 ,(logior +ppcmac-nil-pa+ 2))  ; DBAT2: NIL
-                     (542 543 #x8000003F #x8000002A))) ; DBAT3: mac-io, I|G
+                     (542 543 ,(logior +ppcmac-device-va+ #x3FF)       ; DBAT3: 32 MB
+                              #x8000002A)))    ; -> PA #x80000000, I|G
         (destructuring-bind (u l uval lval) bat
           (li +ppc-r3+ lval) (ppcmac-mtspr buf l +ppc-r3+)
           (li +ppc-r3+ uval) (ppcmac-mtspr buf u +ppc-r3+)))
@@ -98,6 +110,7 @@
       (fill-range base #x28000 0)                                ; the fixed block, argv
       (fill-range +ppc-gc-kind-map+ (ash size -4) 0)             ; the kind map
       (fill-range #xDEAC0000 #x20000 +nil-value+)                ; NIL's page (and block)
+      (fill-range #x07D00000 #x10000 0)                          ; the mutex arena
       ;; the handler-frame extension: fixed (translate-ppc's Mac arm), capped
       (li +ppc-r3+ +ppc-hstack-ext-limit-addr+)
       (li +ppc-r4+ +ppcmac-hstack-ext-frames+)

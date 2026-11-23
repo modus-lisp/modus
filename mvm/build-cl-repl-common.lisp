@@ -486,8 +486,9 @@
     (mvm-text "lib/bare-log.lisp")
     ;; i386: SLEEP on the clock the image has (the PIT's ticks, translate-i386
     ;; *I386-PIT-CLOCK*) -- bare-sync's %SLEEP-MS is a busy loop sized for one
-    ;; board, which a 486 and a modern PC are not.
-    (if *cl-repl-i386-p*
+    ;; board, which a 486 and a modern PC are not.  The PowerPC Mac's clock is
+    ;; the timebase (translate-ppc's #x0310/#x0311), the same contract.
+    (if (or *cl-repl-i386-p* *cl-repl-ppcmac-p*)
         "
 (defun %sleep-ms (ms)
   (let ((end (+ (rdtsc) (ceiling (* (max ms 0) (cntfrq)) 1000))))
@@ -495,6 +496,52 @@
   nil)
 (defun %monotonic-ns ()
   (floor (* (rdtsc) 1000000000) (cntfrq)))
+"
+        "")
+    ;; The PowerPC Mac's mutex arena: 64 KB of low RAM below the scratch pages
+    ;; (boot/boot-ppcmac.lisp's map).  Without one, %SYNC-CELL's cells are
+    ;; address 0 -- every SB-THREAD lock glass makes would write the page of
+    ;; exception vectors.
+    (if *cl-repl-ppcmac-p*
+        "
+(declaim (overridable %bare-sync-arena))
+(defun %bare-sync-arena () (values #x07D00000 #x07D10000))
+
+;;; THE BOOT PAYLOAD (scripts/ppcmac-disk.lisp --payload): a second ELF segment
+;;; Open Firmware loads at #x07200000, between the handler-frame extension and
+;;; NIL's page.  \"MDPL\", a count, then per entry a name (u32 length, bytes)
+;;; and its data (u32 length, bytes, padded to 4).  A .lisp entry is evaluated
+;;; as LOAD would (%IT-EVAL-SOURCE), in order -- under the native tier its
+;;; DEFUNs become native code; any other entry is kept, as an octet vector, in
+;;; *PPCMAC-FILES* by name.  Run before the REPL; a failing entry is reported
+;;; and the rest go on.
+(defvar *ppcmac-files* nil)
+(defun %ppcmac-u32 (a) (+ (* 65536 (mem-ref a :u16)) (mem-ref (+ a 2) :u16)))
+(defun %ppcmac-octets (a n)
+  (let ((v (make-array n :element-type (quote (unsigned-byte 8)))))
+    (dotimes (i n v) (setf (aref v i) (mem-ref (+ a i) :u8)))))
+(defun ppcmac-file (name)
+  (cdr (assoc name *ppcmac-files* :test (function string=))))
+(defun %ppcmac-boot-payload ()
+  (let ((a #x07200000))
+    (when (and (= (mem-ref a :u16) #x4D44) (= (mem-ref (+ a 2) :u16) #x504C))
+      (let ((n (%ppcmac-u32 (+ a 4))) (p (+ a 8)))
+        (write-string-serial \"payload: \") (print-dec n) (write-string-serial \" entries\")
+        (write-char-serial 10)
+        (dotimes (i n)
+          (let* ((nl (%ppcmac-u32 p))
+                 (name (map (quote string) (function code-char) (%ppcmac-octets (+ p 4) nl)))
+                 (q (+ p 4 (* 4 (ceiling nl 4))))
+                 (dl (%ppcmac-u32 q))
+                 (data (%ppcmac-octets (+ q 4) dl)))
+            (setq p (+ q 4 (* 4 (ceiling dl 4))))
+            (write-string-serial \"  \") (write-string-serial name) (write-char-serial 10)
+            (if (and (> (length name) 5) (string= \".lisp\" name :start2 (- (length name) 5)))
+                (handler-case (%it-eval-source (%it-utf8-bytes-to-string data) name)
+                  (t (c) (write-string-serial \"  payload error: \")
+                         (handler-case (write-object c) (t (c2) c2 nil))
+                         (write-char-serial 10)))
+                (setq *ppcmac-files* (cons (cons name data) *ppcmac-files*)))))))))
 "
         "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
@@ -1443,6 +1490,15 @@
                   ("-4611686018427387903" . "-536870911"))))
     (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
       (unless at (error "32-bit: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
+      (setq *cli-arch-io-scratch-source*
+            (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
+                         (subseq *cli-arch-io-scratch-source* (+ at (length (car pair)))))))))
+
+;;; :PPCMAC: the two scratch pages below boot-ppcmac's 128 MB of low RAM.
+(when *cl-repl-ppcmac-p*
+  (dolist (pair '(("#x0FE00000" . "#x07E00000") ("#x0FF00000" . "#x07F00000")))
+    (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
+      (unless at (error "ppcmac: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
       (setq *cli-arch-io-scratch-source*
             (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
                          (subseq *cli-arch-io-scratch-source* (+ at (length (car pair)))))))))
@@ -3248,6 +3304,18 @@
   (halt))
 "))
 
+;;; :PPCMAC: the boot payload runs after boot, before the REPL.
+(when *cl-repl-ppcmac-p*
+  (let* ((old "  ;; --- the REPL (lib/serial-repl.lisp) ------------------------------------")
+         (at (search old *cli-arch-kernel-epilogue*)))
+    (unless at (error "ppcmac: the REPL moved in *CLI-ARCH-KERNEL-EPILOGUE*"))
+    (setq *cli-arch-kernel-epilogue*
+          (concatenate 'string (subseq *cli-arch-kernel-epilogue* 0 at)
+                       "  (handler-case (%ppcmac-boot-payload)
+    (t (c) (write-string-serial \"payload died\") (write-char-serial 10)))
+"
+                       (subseq *cli-arch-kernel-epilogue* at)))))
+
 ;;; :MAC68K: its boot files now (their layout is needed by the texts below):
 ;;; the image's first act is to set the runtime-data region's delta for the
 ;;; compiler it carries (boot-mac68k MAC68K-COINIT-TEXT), and its I/O scratch
@@ -4153,6 +4221,9 @@
   (cl-user::mvm-load "boot/boot-ppcmac.lisp")
   (funcall (intern "INSTALL-PPC32-TRANSLATOR" "MODUS.MVM"))
   (funcall (intern "PPC-SET-MAC-MODE" "MODUS.MVM") t)
+  ;; MODUS_PPC_JIT=1: the native tier's export table (build-cli-common)
+  (setf (symbol-value (intern "*PPC-NATIVE-TIER*" "MODUS.MVM"))
+        (equal (sb-ext:posix-getenv "MODUS_PPC_JIT") "1"))
   (format t "~&;; CONSOLE: ESCC channel A at #x~X (mac-io + #x13020)~%"
           (symbol-value (intern "*PPC-MAC-ESCC-A*" "MODUS.MVM"))))
 

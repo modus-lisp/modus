@@ -9698,6 +9698,34 @@
     (emit-mov-mem-reg buf 'r9 'rax 24)
     (emit-label buf out)))
 
+(defun emit-x64-fwd-target-check (buf addr scratch valid &key gen)
+  "Jump to VALID when ADDR (a forwarding word with its tag cleared) names a copy made THIS
+   collection: in to-space below the free pointer R13, or -- GEN -- in the old area below its
+   bump R12, when there is an old area.  Otherwise fall through: the word is not a forward.
+   A cons's car is a value slot and the interpreter keeps RAW machine words as values (its
+   operand stack is a Lisp list), so a car can end in #xF without being one; taking it for a
+   forward returned an address in neither semispace and never copied the cons (the 32-bit
+   ports' fix, ec45d3e5; test/gc-raw-car.lisp).  Clobbers SCRATCH."
+  (let ((not-young (make-label)))
+    (emit-load-gc-region buf scratch)
+    (emit-mov-reg-mem buf scratch scratch modus.mvm::+gc-off-to-start+)
+    (emit-cmp-reg-reg buf addr scratch)
+    (emit-jcc buf :b not-young)                       ; below to_start
+    (emit-cmp-reg-reg buf addr 'r13)
+    (emit-jcc buf :b valid)                           ; in [to_start, R13)
+    (emit-label buf not-young)
+    (when gen
+      (let ((no-old (make-label)))
+        (%gen-load-shr1 buf scratch +x64-gen-old-hi-addr+)
+        (emit-cmp-reg-imm buf scratch 0)
+        (emit-jcc buf :e no-old)                      ; no old area
+        (%gen-load-shr1 buf scratch +x64-gen-old-lo-addr+)
+        (emit-cmp-reg-reg buf addr scratch)
+        (emit-jcc buf :b no-old)
+        (emit-cmp-reg-reg buf addr 'r12)
+        (emit-jcc buf :b valid)                       ; in [old_lo, R12)
+        (emit-label buf no-old)))))
+
 (defun emit-x64-gen-copy-object (buf copy-label)
   "copy_object for a build with generational GC: the SIZE first, then the
    destination -- the old area's bump R12 when the source lies below the
@@ -9708,7 +9736,8 @@
   (let ((is-obj (make-label)) (sized (make-label)) (fwd (make-label))
         (bogus (make-label)) (done (make-label)) (young (make-label))
         (chosen (make-label)) (fail (make-label)) (copy-obj (make-label))
-        (u8 (make-label)) (f32 (make-label)) (gen-size (make-label)))
+        (u8 (make-label)) (f32 (make-label)) (gen-size (make-label))
+        (notfwd (make-label)) (fwd-ok (make-label)) (fwd-raw (make-label)))
     (emit-label buf copy-label)
     (emit-mov-reg-reg buf 'rdx 'rax)                  ; rdx = tagged source
     (emit-mov-reg-reg buf 'rsi 'rdx)
@@ -9717,7 +9746,8 @@
     (emit-mov-reg-reg buf 'r8 'rax)
     (emit-and-reg-imm buf 'r8 #x0F)
     (emit-cmp-reg-imm buf 'r8 #x0F)
-    (emit-jcc buf :e fwd)                             ; already forwarded
+    (emit-jcc buf :e fwd)                             ; already forwarded (checked at FWD)
+    (emit-label buf notfwd)
     (emit-mov-reg-reg buf 'r8 'rdx)
     (emit-and-reg-imm buf 'r8 #x0F)
     (emit-cmp-reg-imm buf 'r8 1)
@@ -9819,6 +9849,17 @@
     ;; ---- already forwarded: the new address, the original tag ----
     (emit-label buf fwd)
     (emit-and-reg-imm buf 'rax -16)
+    ;; a copy made this collection (to-space, the old area), or the phase-2 case below
+    ;; (from-space); anything else is a raw word in a car, and the cons is copied
+    (emit-x64-fwd-target-check buf 'rax 'r8 fwd-ok :gen t)
+    (emit-cmp-reg-reg buf 'rax 'rbx)
+    (emit-jcc buf :b fwd-raw)
+    (emit-cmp-reg-reg buf 'rax 'rcx)
+    (emit-jcc buf :b fwd-ok)
+    (emit-label buf fwd-raw)
+    (emit-mov-reg-mem buf 'rax 'rsi 0)                ; the word again: copy as usual
+    (emit-jmp buf notfwd)
+    (emit-label buf fwd-ok)
     ;; A forward INTO THIS COLLECTION'S FROM-SPACE is a major's phase-1
     ;; promotion seen from phase 2, whose from-space is the old area: a lock-
     ;; arena object phase 1 evacuated into the old area, named by a slot phase
@@ -10969,12 +11010,18 @@
       ;; RDX = tagged cons ptr. Raw addr = rdx & ~0xF (same as rdx-1 for aligned ptrs)
       (emit-mov-reg-reg buf 'rsi 'rdx)
       (emit-and-reg-imm buf 'rsi -16)            ; rsi = raw addr of cons
-      ;; Check if already forwarded: [rsi] has tag 0xF?
+      ;; Check if already forwarded: [rsi] has tag 0xF, AND names a copy made this
+      ;; collection -- a car can be a raw word ending in #xF (EMIT-X64-FWD-TARGET-CHECK)
       (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = car word
       (emit-mov-reg-reg buf 'r8 'rax)
       (emit-and-reg-imm buf 'r8 #x0F)
       (emit-cmp-reg-imm buf 'r8 #x0F)
-      (emit-jcc buf :e copy-fwd)
+      (let ((not-fwd (make-label)))
+        (emit-jcc buf :ne not-fwd)
+        (emit-mov-reg-reg buf 'r8 'rax)
+        (emit-and-reg-imm buf 'r8 -16)
+        (emit-x64-fwd-target-check buf 'r8 'r9 copy-fwd)
+        (emit-label buf not-fwd))
       ;; Not forwarded. Copy 16 bytes to free_ptr (R13)
       ;; Copy car
       (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = [rsi+0] = car

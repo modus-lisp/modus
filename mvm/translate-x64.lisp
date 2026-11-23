@@ -9643,6 +9643,75 @@
     (emit-mov-mem-reg buf 'r9 'rax 24)
     (emit-label buf out)))
 
+;;; A FORWARD is the first word of a from-space object overwritten with
+;;; (new-address | #xF).  The low nibble alone does not say so: a cons's car is
+;;; a value slot, and the interpreter keeps RAW machine words as values
+;;; (interp.lisp REG-SET; its operand stack is a Lisp list), so a raw odd word
+;;; can be a car.  Taken for a forward, it returned (word & ~15) | tag -- an
+;;; address in no space -- and left the cons uncopied, its memory reused
+;;; (test/gc-raw-car.lisp; the 32-bit collectors' fix, same rule).  So a forward
+;;; must also NAME A COPY MADE THIS COLLECTION: in [to_start, R13), or with
+;;; generational GC in the old area's promotions [old_hi at entry, R12) or (a
+;;; major's phase 2, which chases it) in from-space [RBX, RCX).
+(defun emit-x64-fwd-test (buf fwd-label)
+  "RAX = the first word of the from-space object.  Jump to FWD-LABEL iff it is
+   a forward (above); fall through otherwise.  Clobbers R8 and R9 only."
+  (let ((no (make-label)) (not-to (make-label)))
+    (emit-mov-reg-reg buf 'r8 'rax)
+    (emit-and-reg-imm buf 'r8 #x0F)
+    (emit-cmp-reg-imm buf 'r8 #x0F)
+    (emit-jcc buf :ne no)
+    (emit-mov-reg-reg buf 'r8 'rax)
+    (emit-and-reg-imm buf 'r8 -16)
+    (emit-load-gc-region buf 'r9)
+    (emit-mov-reg-mem buf 'r9 'r9 modus.mvm::+gc-off-to-start+)
+    (emit-cmp-reg-reg buf 'r8 'r9)
+    (emit-jcc buf :b not-to)
+    (emit-cmp-reg-reg buf 'r8 'r13)
+    (emit-jcc buf :b fwd-label)
+    (emit-label buf not-to)
+    (when (x64-gen-gc-p)
+      (let ((not-old (make-label)))
+        (emit-test-reg-reg buf 'r12 'r12)
+        (emit-jcc buf :e not-old)
+        (%gen-load-shr1 buf 'r9 +x64-gen-old-hi-addr+)
+        (emit-cmp-reg-reg buf 'r8 'r9)
+        (emit-jcc buf :b not-old)
+        (emit-cmp-reg-reg buf 'r8 'r12)
+        (emit-jcc buf :b fwd-label)
+        (emit-label buf not-old))
+      (emit-cmp-reg-reg buf 'r8 'rbx)
+      (emit-jcc buf :b no)
+      (emit-cmp-reg-reg buf 'r8 'rcx)
+      (emit-jcc buf :b fwd-label))
+    (emit-label buf no)))
+
+(defun emit-x64-page-fwd-test (buf fwd-label)
+  "EMIT-X64-FWD-TEST for the page-based pinning collector, whose to-space is
+   this collection's TO-RUN PAGES (descriptor 3), not one range: jump to
+   FWD-LABEL iff RAX ends in #xF and names a to-run page.  Clobbers R8, R9."
+  (let ((no (make-label)))
+    (emit-mov-reg-reg buf 'r8 'rax)
+    (emit-and-reg-imm buf 'r8 #x0F)
+    (emit-cmp-reg-imm buf 'r8 #x0F)
+    (emit-jcc buf :ne no)
+    (emit-mov-reg-reg buf 'r9 'rax)
+    (emit-and-reg-imm buf 'r9 -16)
+    (emit-mov-reg-abs buf 'r8 +mcgc-cfg-page-base-addr+)
+    (emit-cmp-reg-reg buf 'r9 'r8)
+    (emit-jcc buf :b no)
+    (emit-sub-reg-reg buf 'r9 'r8)
+    (emit-shr-reg-imm buf 'r9 +mcgc-page-shift+)
+    (emit-mov-reg-abs buf 'r8 +mcgc-cfg-page-count-addr+)
+    (emit-cmp-reg-reg buf 'r9 'r8)
+    (emit-jcc buf :ae no)
+    (emit-mov-reg-abs buf 'r8 +mcgc-cfg-descriptor-addr+)
+    (emit-bytes buf #x4F #x0F #xB6 #x04 #x08)          ; movzx r8, byte [r8+r9]
+    (emit-and-reg-imm buf 'r8 3)
+    (emit-cmp-reg-imm buf 'r8 3)
+    (emit-jcc buf :e fwd-label)
+    (emit-label buf no)))
+
 (defun emit-x64-gen-copy-object (buf copy-label)
   "copy_object for a build with generational GC: the SIZE first, then the
    destination -- the old area's bump R12 when the source lies below the
@@ -9659,10 +9728,7 @@
     (emit-mov-reg-reg buf 'rsi 'rdx)
     (emit-and-reg-imm buf 'rsi -16)                   ; rsi = raw source
     (emit-mov-reg-mem buf 'rax 'rsi 0)
-    (emit-mov-reg-reg buf 'r8 'rax)
-    (emit-and-reg-imm buf 'r8 #x0F)
-    (emit-cmp-reg-imm buf 'r8 #x0F)
-    (emit-jcc buf :e fwd)                             ; already forwarded
+    (emit-x64-fwd-test buf fwd)                       ; already forwarded
     (emit-mov-reg-reg buf 'r8 'rdx)
     (emit-and-reg-imm buf 'r8 #x0F)
     (emit-cmp-reg-imm buf 'r8 1)
@@ -10916,10 +10982,7 @@
       (emit-and-reg-imm buf 'rsi -16)            ; rsi = raw addr of cons
       ;; Check if already forwarded: [rsi] has tag 0xF?
       (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = car word
-      (emit-mov-reg-reg buf 'r8 'rax)
-      (emit-and-reg-imm buf 'r8 #x0F)
-      (emit-cmp-reg-imm buf 'r8 #x0F)
-      (emit-jcc buf :e copy-fwd)
+      (emit-x64-fwd-test buf copy-fwd)
       ;; Not forwarded. Copy 16 bytes to free_ptr (R13)
       ;; Copy car
       (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = [rsi+0] = car
@@ -10968,10 +11031,7 @@
       (emit-and-reg-imm buf 'rsi -16)            ; rsi = raw addr of object
       ;; Check if already forwarded
       (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = header word
-      (emit-mov-reg-reg buf 'r8 'rax)
-      (emit-and-reg-imm buf 'r8 #x0F)
-      (emit-cmp-reg-imm buf 'r8 #x0F)
-      (emit-jcc buf :e copy-fwd)
+      (emit-x64-fwd-test buf copy-fwd)
       ;; Not forwarded. Read element count from header.
       ;; Header = [subtag:8][unused:7][element-count:49]
       ;; Element count = header >> 8
@@ -11965,10 +12025,7 @@
       (emit-mov-reg-reg buf 'rsi 'rdx)
       (emit-and-reg-imm buf 'rsi -16)
       (emit-mov-reg-mem buf 'rax 'rsi 0)
-      (emit-mov-reg-reg buf 'r8 'rax)
-      (emit-and-reg-imm buf 'r8 #x0F)
-      (emit-cmp-reg-imm buf 'r8 #x0F)
-      (emit-jcc buf :e copy-fwd)
+      (emit-x64-page-fwd-test buf copy-fwd)
       ;; DEST overflow?  r13+16 > to_end -> refill (pop next to-run segment).
       ;; rsi(source)/rdx(orig tagged source) survive refill; OOM -> bogus.
       (emit-mov-reg-reg buf 'rax 'r13)
@@ -12007,10 +12064,7 @@
       (emit-mov-reg-reg buf 'rsi 'rdx)
       (emit-and-reg-imm buf 'rsi -16)
       (emit-mov-reg-mem buf 'rax 'rsi 0)
-      (emit-mov-reg-reg buf 'r8 'rax)
-      (emit-and-reg-imm buf 'r8 #x0F)
-      (emit-cmp-reg-imm buf 'r8 #x0F)
-      (emit-jcc buf :e copy-fwd)
+      (emit-x64-page-fwd-test buf copy-fwd)
       (emit-mov-reg-reg buf 'r8 'rax)
       (emit-shr-reg-imm buf 'r8 8)               ; r8 = element count
       ;; Byte-packed u8 vector (subtag #x11): size = align16(16 + N).  RAX

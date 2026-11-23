@@ -181,9 +181,17 @@
                                    (push (get-output-stream-string cur) acc)
                                    (write-char c cur)))
                       (nreverse acc)))
-                (error () sb-ext:*posix-argv*))))
-    (or (dolist (a args)
-          (let ((p (search "mvm/" a)))
+                (error ()
+                  ;; no /proc (a Windows host): a modus host's own record of
+                  ;; its command line, else what *POSIX-ARGV* kept
+                  (let ((v (or (find-symbol "*CLI-COMMAND-LINE*" "MODUS-INT")
+                               (find-symbol "*CLI-COMMAND-LINE*" "MODUS.RUNTIME"))))
+                    (if (and v (boundp v) (symbol-value v))
+                        (symbol-value v)
+                        sb-ext:*posix-argv*))))))
+    (or (dolist (a0 args)
+          (let* ((a (substitute #\/ #\\ a0))   ; mvm\build-....lisp on Windows
+                 (p (search "mvm/" a)))
             (when (and p (> (length a) 5) (string= ".lisp" a :start2 (- (length a) 5)))
               (return (subseq a p)))))
         "unknown")))

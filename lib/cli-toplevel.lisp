@@ -143,6 +143,12 @@
       (setq i (+ i 1)))))
 
 ;;; *POSIX-ARGV* — the SBCL-equivalent global, readable from user code.
+(defvar *cli-command-line* nil
+  "The whole command line, as %CLI-COLLECT-ARGV read it at startup: unlike
+   *POSIX-ARGV* it keeps the toplevel options (--script FILE).  The image
+   configuration record reads the build script from it where there is no
+   /proc/self/cmdline (Windows; lib/image-config.lisp %IMAGE-BUILD-SCRIPT).")
+
 (defvar *posix-argv* nil
   "List of the process's command-line arguments, element 0 = program name.
    Populated by CLI-TOPLEVEL at startup.  Mirrors SB-EXT:*POSIX-ARGV*.")
@@ -324,6 +330,7 @@
   (setq *%no-cons-array-wrappers* t)
   ;; Expose the full argv as *posix-argv* (element 0 = program name).
   (setq *posix-argv* (%cli-collect-argv))
+  (setq *cli-command-line* *posix-argv*)
   (let* ((all *posix-argv*)
          (args (cdr all))                 ; drop program name
          (actions nil)                    ; reversed list of (:eval/:load . x)

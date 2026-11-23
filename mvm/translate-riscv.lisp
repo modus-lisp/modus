@@ -4112,13 +4112,25 @@
         (rv-emit-load-word buf +rv-t5+ +rv-t4+ 0)          ; first word
         (rv-emit-andi buf +rv-t6+ +rv-t5+ 15)
         (rv-emit-addi buf +rv-t3+ +rv-x0+ 15)
-        (let ((not-fwd (fwd #'rv-emit-bne +rv-t6+ +rv-t3+)))
+        (let* ((not-fwd (fwd #'rv-emit-bne +rv-t6+ +rv-t3+))
+               ;; ...AND it names a copy made THIS collection: an object in
+               ;; [s3, s5) or a cons in [s6, s4).  A cons's car can be an odd
+               ;; RAW word (the interpreter's operand stack holds raw machine
+               ;; words as values); a nibble-only test took one for a forward
+               ;; and never copied the cons -- see translate-i386's
+               ;; I386-EMIT-GCNATIVE-FWD-TEST.
+               (below (progn (rv-emit-andi buf +rv-t6+ +rv-t5+ -16)
+                             (fwd #'rv-emit-bltu +rv-t6+ +rv-s3+)))
+               (isobj (fwd #'rv-emit-bltu +rv-t6+ +rv-s5+))
+               (gap (fwd #'rv-emit-bltu +rv-t6+ +rv-s6+))
+               (above (fwd #'rv-emit-bgeu +rv-t6+ +rv-s4+)))
+          (here isobj)
           ;; already forwarded: new pointer = (fwd & ~15) | tag
           (rv-emit-andi buf +rv-t5+ +rv-t5+ -16)
           (rv-emit-or buf +rv-t5+ +rv-t5+ +rv-t2+)
           (rv-emit-store-word buf +rv-t5+ +rv-a0+ 0)
           (rv-emit-jalr buf +rv-x0+ +rv-ra+ 0)
-          (here not-fwd))
+          (here not-fwd) (here below) (here gap) (here above))
         (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)
         (let ((is-cons (fwd #'rv-emit-beq +rv-t2+ +rv-t3+)))
           ;; -- object: header in t5 --

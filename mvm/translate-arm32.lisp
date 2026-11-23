@@ -3564,6 +3564,22 @@
           (arm32-and-imm buf +arm-r1+ +arm-r12+ 0 15)
           (arm32-cmp-imm buf +arm-r1+ 0 15)
           (arm32-b-cond buf +arm-cc-ne+ notfwd)
+          ;; ...AND it names a copy made THIS collection: an object in
+          ;; [r6, r8) or a cons in [r9, r7).  A cons's car can be an odd RAW
+          ;; word (the interpreter's operand stack holds raw machine words as
+          ;; values), and a nibble-only test took one for a forward and never
+          ;; copied the cons -- see translate-i386's I386-EMIT-GCNATIVE-FWD-TEST.
+          (let ((isfwd (lbl)))
+            (arm32-bic-imm buf +arm-r1+ +arm-r12+ 0 15)
+            (arm32-cmp buf +arm-r1+ +arm-r6+)
+            (arm32-b-cond buf +arm-cc-cc+ notfwd)                ; < to_start
+            (arm32-cmp buf +arm-r1+ +arm-r8+)
+            (arm32-b-cond buf +arm-cc-cc+ isfwd)                 ; < object free
+            (arm32-cmp buf +arm-r1+ +arm-r9+)
+            (arm32-b-cond buf +arm-cc-cc+ notfwd)                ; in the gap
+            (arm32-cmp buf +arm-r1+ +arm-r7+)
+            (arm32-b-cond buf +arm-cc-cs+ notfwd)                ; >= to_end
+            (here isfwd))
           ;; already forwarded: (fwd & ~15) | tag
           (arm32-bic-imm buf +arm-r12+ +arm-r12+ 0 15)
           (arm32-orr buf +arm-r12+ +arm-r12+ +arm-r2+)

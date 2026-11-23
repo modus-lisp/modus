@@ -1069,9 +1069,18 @@ the boot stub STAGED into the BSS at `0x10009000` rather than the live initial
 stack (4-byte slots, and the kernel stack at `0x40800390` is above the 2^30
 ceiling a tagged `mem-ref` address can express); and `*cstr-scratch*` /
 `*io-buf-addr*`, which must sit in the `0x10004000..0x10009000` BSS window
-because every syscall address travels as a tagged fixnum. There is **no in-image JIT** on i386 (`*JIT-ON*` is forced NIL) —
-`translate-i386.lisp` builds the image but has no runtime arm; `mvm-eval` falls
-back to `mvm-interpret`, which is correct, just slower.
+because every syscall address travels as a tagged fixnum. i386 has no x64-style
+JIT (`*JIT-ON*` is x64-only), but it has a **native tier**: `mvm/jit-i386-native.lisp`.
+The image carries `translate-i386.lisp`, and a runtime DEFUN is translated at its
+first call, `(compile 'f)` at once, and closure-building top-level forms natively.
+It is OFF by default: build with `MODUS_I386_JIT=1` to get it; without it
+`mvm-eval` interprets all runtime code. Whatever the tier refuses stays
+interpreted, with the reason in `*N386-REFUSED*`. Not yet default-safe: the i386
+ANSI sweep with it on, 2026-11-23, was 21653/21681. The 28 lost tests are 20
+`OPEN.*` (the `(unsigned-byte 1)`/`(unsigned-byte 2)` generator gives 0..3),
+`MISC.461`/`509`/`569` (integer arithmetic at the fixnum/bignum boundary),
+`DEFUN.5`-`7` (a DEFUN in a LET with special/optional defaults calls NIL), and
+`TRACE.9` and `DOCUMENTATION.NEW-METHOD.1` (native direct calls bypass TRACE).
 
 **THE i386 CL IMAGE USED TO DIE AT ITS FIRST COLLECTION — three defects, all
 fixed (2026-09-26).**  Any `--script` of ~1300 toplevel forms (each allocates

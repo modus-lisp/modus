@@ -1943,7 +1943,10 @@
                      (win64-platform-source)))
   ;; The JIT co-init's shim address (build-cli-common, *CLI-WIN64*).  Every copy of
   ;; the co-init in the source gets it; with the JIT on there must be at least one.
-  (let ((token "WIN64-SHIM-VA-PLACEHOLDER")
+  ;; The token is assembled, not written out: in a builder CLI this file is
+  ;; part of the image's own source (mvm/selfhost-tooling.lisp), and the loop
+  ;; below would replace a literal here with the address too.
+  (let ((token (concatenate 'string "WIN64-SHIM-VA-" "PLACEHOLDER"))
         (value (princ-to-string (modus.mvm::win64-shim-va)))
         (n 0))
     (loop

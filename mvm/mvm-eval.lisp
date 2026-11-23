@@ -3963,7 +3963,30 @@
           (setq *jit-retry-queue* keep))
       (setq *jit-retry-busy* nil))))
 
+(defvar *jit-host-flags* nil
+  "NIL, or ((SYMBOL . VALUE) ...): the translator settings this image's own
+   runtime JIT was configured with.  A builder CLI (mvm/builder.lisp) records
+   them at boot, because a build script it runs sets the same variables for the
+   image it is building -- a Linux image built on a Windows host would otherwise
+   make the host's JIT emit raw Linux syscalls and FS/GS window accesses.
+   %JIT-TRANSLATE-PAGE binds them around each translation.")
+
+(defun %jit-host-flags-swap (pairs)
+  "Set each (SYMBOL . VALUE) in PAIRS; the previous values, in the same shape."
+  (let ((old nil))
+    (dolist (p pairs)
+      (setq old (cons (cons (car p) (symbol-value (car p))) old))
+      (set (car p) (cdr p)))
+    old))
+
 (defun %jit-translate-page (bc mvm-entry ft-list rt-table)
+  (if *jit-host-flags*
+      (let ((saved (%jit-host-flags-swap *jit-host-flags*)))
+        (unwind-protect (%jit-translate-page-0 bc mvm-entry ft-list rt-table)
+          (%jit-host-flags-swap saved)))
+      (%jit-translate-page-0 bc mvm-entry ft-list rt-table)))
+
+(defun %jit-translate-page-0 (bc mvm-entry ft-list rt-table)
   "FLIP-SAFETY GUARD (Fix 1): translate + build a JIT exec page for BC, but
    turn ANY error signalled while translating/relocating (e.g. a translator
    gap such as `Unknown register: 0` in a flet/labels/CLOS-dispatch shape)

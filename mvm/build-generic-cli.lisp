@@ -242,7 +242,11 @@
 ;; was in RAX).  See reference_append_funcall_bug.md.
 (if cl-user::*cli-win64*
     (modus.mvm::win64-configure-build)   ; native offset, shim, Windows runtime source
-    (setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset)))  ; computed from the stub, see boot-linux-x64.lisp
+    (progn
+      (setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset))  ; computed from the stub, see boot-linux-x64.lisp
+      ;; set, not left to the default: a Windows-hosted builder's runtime JIT
+      ;; has its own shim address in this variable
+      (setf modus.mvm.x64::*x64-win-shim-va* nil)))
 
 ;; NATIVE THREADS, STEP 1: the hosted actor scheduler gets a REAL spinlock.
 ;; net/actors.lisp hands the lock's RELEASE to RESTORE-CONTEXT; with this set,
@@ -417,7 +421,8 @@
       (format t "  native code: ~D bytes -> ~A.native~%"
               (length (kernel-image-native-code image)) path))
     #-modus (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
-    #+modus (funcall (find-symbol "CHMOD" "SB-POSIX") path #o755)
+    ;; a Windows host has no mode bits (chmod is ENOSYS there); nothing to do
+    #+modus (ignore-errors (funcall (find-symbol "CHMOD" "SB-POSIX") path #o755))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
     (format t "Usage: ~A <script.lisp>~%" path)))

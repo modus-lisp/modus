@@ -110,6 +110,18 @@
     ("*X64-LAST-SET-NARGS*" "MODUS.MVM.X64" nil)
     ("*X64-LI-CONST-PATCHES*" "MODUS.MVM.X64" nil) ("*X64-LI-CONSTVEC-MAX*" "MODUS.MVM.X64" -1)))
 
+(defparameter *builder-host-jit-flag-names*
+  '(("*X64-WIN-TLS*" . "MODUS.MVM.X64") ("*X64-WIN-SHIM-VA*" . "MODUS.MVM.X64")
+    ("*X64-GEN-GC*" . "MODUS.MVM.X64") ("*X64-GC-ENABLED*" . "MODUS.MVM.X64")
+    ("*X64-GC-REGION-PERCPU*" . "MODUS.MVM.X64") ("*X64-LINUX-MODE*" . "MODUS.MVM.X64")
+    ("*X64-NATIVE-CODE-OFFSET*" . "MODUS.MVM.X64") ("*X64-SCHED-LOCK-ADDR*" . "MODUS.MVM.X64")
+    ("*X64-STW*" . "MODUS.MVM.X64") ("*X64-TLS-WINDOW*" . "MODUS.MVM.X64")
+    ("*X64-JIT-CONSTVEC-P*" . "MODUS.MVM.X64")
+    ("*MCGC-KIND-BITMAP-ENABLED*" . "MODUS.MVM.X64") ("*MCGC-KIND-CHECK-ENABLED*" . "MODUS.MVM.X64")
+    ("*MCGC-PINNING-ENABLED*" . "MODUS.MVM.X64") ("*WS5-FORCE-NO-KINDCHECK*" . "MODUS.MVM.X64"))
+  "Translator variables a build script sets for its TARGET that the host's runtime
+   JIT also reads; %BUILDER-BOOT-INIT records the host's values of them.")
+
 (defun %builder-state-symbol (name pkg)
   "The symbol of a compiler variable: in PKG or, failing that, MODUS.MVM's (whose
    packages it uses), so a name homed elsewhere in this image is still found."
@@ -135,6 +147,15 @@
   (handler-case (%init-aarch64-translator) (error () nil))
   (handler-case (%init-riscv32-translator) (error () nil))
   (handler-case (%init-selfhost-targets) (error () nil))
+  ;; The host JIT's own translator settings (%JIT-BOOT-INIT has just set them),
+  ;; kept apart from what a build script sets for its target (mvm-eval.lisp
+  ;; *JIT-HOST-FLAGS*).
+  (let ((pairs nil))
+    (dolist (e *builder-host-jit-flag-names*)
+      (let ((sym (%builder-state-symbol (car e) (cdr e))))
+        (when (and sym (boundp sym))
+          (setq pairs (cons (cons sym (symbol-value sym)) pairs)))))
+    (setq *jit-host-flags* pairs))
   t)
 
 (defun %builder-prepare-target (target)

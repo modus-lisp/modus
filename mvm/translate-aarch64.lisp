@@ -9912,9 +9912,12 @@
           (young   (incf *mvm-label-counter*))
           (pfail   (incf *mvm-label-counter*))
           (chosen  (incf *mvm-label-counter*))
-          (notcons (incf *mvm-label-counter*)))
+          (notcons (incf *mvm-label-counter*))
+          (notfwd  (incf *mvm-label-counter*))
+          (fwd-ok  (incf *mvm-label-counter*)))
       (a64-cmp-imm buf +a64-x14+ 15)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-fwd :bcond))
+      (a64-set-label buf notfwd)
       (a64-mov-reg buf +a64-x14+ +a64-x12+)              ; x14 = tag, kept to the end
       (a64-cmp-imm buf +a64-x12+ 1)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-cons :bcond))
@@ -10007,6 +10010,32 @@
       ;; ---- already forwarded: x13 = new|15 ----
       (a64-set-label buf co-fwd)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 4) (a64-lsl-imm buf +a64-x14+ +a64-x14+ 4) ; new addr
+      ;; ...a forward only when it names a copy made THIS collection: to-space below the
+      ;; free pointer [x22, x21), the old area's promotions [old_hi, x8), or (phase 2,
+      ;; below) from-space.  A cons's car can be an odd RAW word -- the interpreter keeps
+      ;; raw words as values -- and taking one for a forward never copied the cons
+      ;; (translate-x64 EMIT-X64-FWD-TARGET-CHECK; test/gc-raw-car.lisp).
+      (let ((notyoung (incf *mvm-label-counter*)) (notold (incf *mvm-label-counter*)))
+        (a64-cmp-reg buf +a64-x14+ +a64-x22+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i notyoung :bcond))
+        (a64-cmp-reg buf +a64-x14+ +a64-x21+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i fwd-ok :bcond))
+        (a64-set-label buf notyoung)
+        (a64-load-word buf +a64-x15+ +gc-old-hi-addr+)
+        (a64-asr-imm buf +a64-x15+ +a64-x15+ 1)          ; old_hi: where this collection promotes
+        (a64-cmp-reg buf +a64-x14+ +a64-x15+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i notold :bcond))
+        (a64-cmp-reg buf +a64-x14+ +a64-x8+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i fwd-ok :bcond))
+        (a64-set-label buf notold)
+        (when *a64-tls-window*                            ; the phase-2 case: from-space
+          (a64-cmp-reg buf +a64-x14+ +a64-x19+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i notfwd :bcond))
+          (a64-cmp-reg buf +a64-x14+ +a64-x20+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i fwd-ok :bcond)))
+        ;; a raw word: copy the cons as usual (x13 still holds the word)
+        (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i notfwd :b)))
+      (a64-set-label buf fwd-ok)
       (a64-add-reg buf +a64-x10+ +a64-x14+ +a64-x12+ 0 0) ; new | orig tag
       ;; A forward INTO THIS COLLECTION'S FROM-SPACE [x19, x20) is a major's
       ;; phase-1 promotion seen from phase 2 (from = the old area): chase it,

@@ -1267,7 +1267,9 @@ early copy baked the default allocation limit and the collector never ran.  **Wi
 callable** (`net/win32-winrt.lisp`; slots and IIDs generated from Windows' metadata by
 `scripts/gen-winrt-ids.py`, event handlers are native COM objects that ring events), and on it
 `net/win32-ble.lisp`, a Bluetooth LE mesh radio in `Bluetooth.swift`'s shape (`W32-BLE-START` /
-`-POLL` / `-SEND` / `-STOP`) for chirp.  natrium's entropy there is `%MODUS-HARDWARE-ENTROPY`
+`-POLL` / `-SEND` / `-STOP`) for chirp.  Any other Windows function is `W32-CALL` (`net/win32-api.lisp`: by name, UTF-16
+strings, out cells, structs, floats, COM, recording callbacks; `test/win64/win32-api.lisp`).
+natrium's entropy there is `%MODUS-HARDWARE-ENTROPY`
 (BCryptGenRandom, `net/win32-entropy.lisp`).
 
 ### Pi Zero 2 W (real hardware)

@@ -189,7 +189,8 @@
 ;; boot-win64's *WIN64-PLATFORM-FILES*.
 (defvar *cli-scan-extra-source* "")
 (when cl-user::*cli-win64*
-  (dolist (f '("net/win32-window.lisp" "net/win32-audio.lisp" "net/win32-winrt-ids.lisp"
+  (dolist (f '("net/win32-window.lisp" "net/win32-api.lisp" "net/win32-audio.lisp"
+               "net/win32-winrt-ids.lisp"
                "net/win32-winrt.lisp" "net/win32-ble.lisp"
                "net/win32-entropy.lisp" "net/win32-time.lisp"))
     (setq *cli-scan-extra-source*

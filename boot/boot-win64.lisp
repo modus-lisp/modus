@@ -1908,7 +1908,8 @@
     (dolist (l '(:wp-getwlp :wp-defwp :wp-validate :com-qi :com-addref :com-release :com-invoke))
       (format o "(defconstant +w32-~(~A~)-va+ ~D)~%" l (win64-label-va l)))))
 
-(defparameter *win64-platform-files* '("net/win32-window.lisp" "net/win32-audio.lisp"
+(defparameter *win64-platform-files* '("net/win32-window.lisp" "net/win32-api.lisp"
+                                        "net/win32-audio.lisp"
                                         "net/win32-winrt-ids.lisp" "net/win32-winrt.lisp"
                                         "net/win32-ble.lisp" "net/win32-entropy.lisp"
                                         "net/win32-time.lisp")

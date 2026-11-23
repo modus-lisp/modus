@@ -209,6 +209,12 @@
                   do (handler-case (return (funcall translator bytecode table))
                        (error (e)
                          (format t "  WARN: translator error #~D: ~A~%" attempt e)
+                         ;; in modus, a fault's condition carries the stack it happened
+                         ;; at: say where, since the translator is about to give up
+                         (let* ((p (find-package "MODUS-INT"))
+                                (f (and p (find-symbol "%PRINT-FAULT-BACKTRACE" p))))
+                           (when (and f (fboundp f))
+                             (ignore-errors (funcall f *standard-output* e))))
                          (when (>= attempt max-retries)
                            ;; Give up — return empty buffer
                            (format t "  WARN: giving up on translator, using partial result~%")

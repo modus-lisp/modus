@@ -1917,9 +1917,13 @@
    this list -- it reads them before this file is loaded.")
 
 (defun win64-platform-source ()
+  ;; MODUS-SOURCE through FIND-SYMBOL: this file is also BAKED into the builder
+  ;; CLI (mvm/selfhost-tooling.lisp), where a compiled reference to
+  ;; CL-USER::MODUS-SOURCE does not reach the function lib/load-mvm.lisp
+  ;; defines at run time (it answered NIL: FILE-ERROR on NIL).
   (apply (function concatenate) 'string
          (loop for f in *win64-platform-files*
-               collect (with-open-file (s (cl-user::modus-source f))
+               collect (with-open-file (s (funcall (find-symbol "MODUS-SOURCE" "COMMON-LISP-USER") f))
                          (let ((b (make-string (file-length s))))
                            (concatenate 'string (subseq b 0 (read-sequence b s))
                                         (string #\Newline)))))))

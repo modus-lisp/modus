@@ -12,6 +12,7 @@ Released binaries live in the dist repository, `modus-lisp/dist`, under `bin/REL
 | `modus-windows-x64.exe` | the same image as a Windows PE32+ console program (`mvm/build-win64-cli.lisp`) |
 | `modus-builder-linux-x64` | the CLI with the image-building tooling in it (`MODUS_BUILDER=1`): this one runs builds |
 | `modus-builder-windows-x64.exe` | the same, for Windows |
+| `modus.com` | both CLIs in one file (`scripts/make-ape.lisp`): an Actually Portable Executable that Windows runs as the PE, and a Unix shell runs as a script that copies the Linux image to `~/.cache/modus/` once and executes it |
 | `SHA256SUMS` | every file's SHA-256 |
 | `RELEASE.md` | the source commit, the build ID, and the commands that made each file |
 
@@ -38,7 +39,10 @@ MODUS_WIN64_OUT=modus.exe ./modus-builder-linux-x64 --dynamic-space-size 16384 \
 MODUS_BUILDER=1 MODUS_NARROW_STRINGS=1 MODUS_CLI_OUT=modus-builder \
   ./modus-builder-linux-x64 --dynamic-space-size 16384 --script mvm/build-generic-cli.lisp
 
-sha256sum modus modus.exe modus-builder    # compare with SHA256SUMS
+MODUS_APE_PE=modus.exe MODUS_APE_ELF=modus MODUS_APE_OUT=modus.com \
+  ./modus-builder-linux-x64 --script scripts/make-ape.lisp
+
+sha256sum modus modus.exe modus-builder modus.com   # compare with SHA256SUMS
 ```
 
 On Windows, run the same scripts with `modus-builder-windows-x64.exe` (`set NAME=value` in

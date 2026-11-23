@@ -48,7 +48,11 @@
   (unless (find-package "CRAM")
     (let ((src (modus:ape-segment "cram.lisp")))
       (unless src (error "this modus.com has no cram.lisp segment"))
-      (load (make-string-input-stream (octets-string src))))))
+      (load (make-string-input-stream (octets-string src)))
+      ;; native now: a DEFUN goes native on its NEXT call, so the one long
+      ;; ZLIB-DECOMPRESS of the sources would otherwise run interpreted
+      ;; (measured: 4 MB in 119 s cold, 0.54 s native)
+      (modus:jit-eager))))
 
 ;;; --- the sources ---------------------------------------------------------------
 

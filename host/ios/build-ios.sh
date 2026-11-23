@@ -30,7 +30,9 @@ case $KIND in
 esac
 TV=0; case $KIND in tv*) TV=1 ;; esac
 # the frameworks only the phone has: Speech's recognizer, Quick Look
-PHONE_FW="-framework Speech -framework QuickLook"; [ $TV = 1 ] && PHONE_FW=""
+PHONE_FW="-framework Speech -framework QuickLook"
+# and the TV's: AVKit, whose UIWindow.avDisplayManager (a category, so nothing pulls it in) sets the TV's mode
+[ $TV = 1 ] && PHONE_FW="-framework AVKit -framework CoreMedia"
 case $KIND in
   sim) PLATFORM=iPhoneSimulator ;; device) PLATFORM=iPhoneOS ;;
   tvsim) PLATFORM=AppleTVSimulator ;; tvdevice) PLATFORM=AppleTVOS ;;

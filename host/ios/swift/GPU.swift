@@ -28,12 +28,27 @@
 //   gpu_draw_indexed(pass, primitive, indices, count, first, wide)   COUNT indices from FIRST in the buffer
 //                                            INDICES: 16-bit, or 32-bit when WIDE is 1
 //
+// HIGH DYNAMIC RANGE, as WebGPU's canvas.configure({format: 'rgba16float', toneMapping: {mode: 'extended'}}):
+//   gpu_view_hdr(view, on)                   1: the view draws half floats in extended sRGB -- what a shader wrote
+//                                            before looks the same, and a value past 1.0 is brighter than white, up
+//                                            to the screen's headroom.  0 back to 8 bits.  On a TV it also asks
+//                                            for an HDR10 mode (AVDisplayManager), which the TV takes when its
+//                                            Match Content > Dynamic Range is on.  1 if the view is HDR now.
+//   gpu_headroom()                           how many times SDR white the screen can show now, in thousandths
+//                                            (1000: none -- an SDR screen); a TV that can show HDR says 4000,
+//                                            as tvOS's own figure is no use (below)
+// A pipeline follows its view: it is built for each pixel format it is used with (8-bit or float).
+//
 // Data is bytes in the image's memory, read in place: a single-float vector's payload is IEEE singles already.
 
 #if os(macOS)
 import AppKit          // the macOS window host builds this file too (host/macos/build-macos.sh gui)
 #else
 import UIKit
+#endif
+#if os(tvOS)
+import AVKit           // AVDisplayManager: the TV's mode
+import CoreMedia
 #endif
 import Metal
 import QuartzCore
@@ -132,6 +147,25 @@ private let sampler: MTLSamplerState? = {
 }()
 
 /// A frame in progress: its drawable, command buffer and encoder.
+/// A render pipeline as Lisp made it, and its state for each colour format it has been drawn into.
+private final class Pipeline {
+    let descriptor: MTLRenderPipelineDescriptor
+    var states: [MTLPixelFormat: MTLRenderPipelineState] = [:]
+    init(_ d: MTLRenderPipelineDescriptor) { descriptor = d }
+    func state(for format: MTLPixelFormat) -> MTLRenderPipelineState? {
+        if let s = states[format] { return s }
+        descriptor.colorAttachments[0].pixelFormat = format
+        do {
+            let s = try device!.makeRenderPipelineState(descriptor: descriptor)
+            states[format] = s
+            return s
+        } catch {
+            NSLog("modus gpu: the pipeline does not build: \(error)")
+            return nil
+        }
+    }
+}
+
 private final class Pass {
     let drawable: CAMetalDrawable
     let commands: MTLCommandBuffer
@@ -241,12 +275,63 @@ let gpuPipelineNew: Call = { shader, vp, vn, fp, fn, _ in
     colour.sourceAlphaBlendFactor = .one
     colour.destinationAlphaBlendFactor = .oneMinusSourceAlpha
     d.depthAttachmentPixelFormat = .depth32Float               // every view has one (gpu_pass_begin)
-    do {
-        return keep(try device.makeRenderPipelineState(descriptor: d))
-    } catch {
-        NSLog("modus gpu: the pipeline does not build: \(error)")
-        return 0
+    let pipeline = Pipeline(d)
+    guard pipeline.state(for: .bgra8Unorm) != nil else { return 0 }   // built now, so an error is said now
+    return keep(pipeline)
+}
+
+// THE TV'S MODE for HDR: a 4K HEVC HDR10 picture (PQ, BT.2020) at the screen's rate, as a video player asks.  The
+// TV switches only when the person's Match Content > Dynamic Range is on; otherwise it stays as it is set.
+#if os(tvOS)
+private func hdrCriteria() -> AVDisplayCriteria? {
+    let ext: [CFString: Any] = [
+        kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+        kCMFormatDescriptionExtension_TransferFunction: kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ,
+        kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+    ]
+    var format: CMVideoFormatDescription?
+    guard CMVideoFormatDescriptionCreate(allocator: nil, codecType: kCMVideoCodecType_HEVC, width: 3840,
+                                         height: 2160, extensions: ext as CFDictionary,
+                                         formatDescriptionOut: &format) == noErr, let format else { return nil }
+    return AVDisplayCriteria(refreshRate: Float(UIScreen.main.maximumFramesPerSecond), formatDescription: format)
+}
+#endif
+
+let gpuViewHDR: Call = { v, on, _, _, _, _ in
+    guard let view = gpuViews[v] else { return 0 }
+    let layer = view.metalLayer
+    layer.pixelFormat = on != 0 ? .rgba16Float : .bgra8Unorm
+    layer.colorspace = on != 0 ? CGColorSpace(name: CGColorSpace.extendedSRGB) : nil
+    // extended range, untone-mapped: preferredDynamicRange where there is one (the only way on a TV), else the
+    // older switch (a phone or Mac before 26)
+    if #available(macOS 26.0, iOS 26.0, tvOS 26.0, *) {
+        layer.preferredDynamicRange = on != 0 ? .high : .standard
+    } else {
+        #if !os(tvOS)
+        layer.wantsExtendedDynamicRangeContent = on != 0
+        #endif
     }
+    #if os(tvOS)
+    if let manager = view.window?.avDisplayManager {           // the view is in the window (adopt)
+        manager.preferredDisplayCriteria = on != 0 ? hdrCriteria() : nil
+    }
+    #endif
+    return on != 0 ? 1 : 0
+}
+
+let gpuHeadroom: Call = { _, _, _, _, _, _ in
+    #if os(macOS)
+    let headroom = NSScreen.main?.maximumExtendedDynamicRangeColorComponentValue ?? 1
+    #else
+    var headroom = UIScreen.main.currentEDRHeadroom
+    #if os(tvOS)
+    // A TV SAYS NEXT TO NOTHING: measured on an Apple TV 4K in an HDR10 mode, current 1.2 and potential 1.0, while
+    // 4x white showed plainly brighter than white.  So where the TV can show HDR at all, 4x: HDR10 puts SDR white
+    // near 200 nits, and a TV's highlights reach several times that.  (A TV left in SDR clips it to white.)
+    if AVPlayer.eligibleForHDRPlayback { headroom = max(headroom, 4) }
+    #endif
+    #endif
+    return UInt(max(1, headroom) * 1000)
 }
 
 let gpuBufferNew: Call = { p, n, _, _, _, _ in
@@ -296,8 +381,9 @@ let gpuPassBegin: Call = { v, rgb, _, _, _, _ in
 }
 
 let gpuSetPipeline: Call = { p, pipe, _, _, _, _ in
-    guard let pass = objects[p] as? Pass, let pipeline = objects[pipe] as? MTLRenderPipelineState else { return 0 }
-    pass.encoder.setRenderPipelineState(pipeline)
+    guard let pass = objects[p] as? Pass, let pipeline = objects[pipe] as? Pipeline,
+          let state = pipeline.state(for: pass.drawable.texture.pixelFormat) else { return 0 }
+    pass.encoder.setRenderPipelineState(state)
     return 1
 }
 
@@ -379,7 +465,7 @@ let gpuPassEnd: Call = { p, _, _, _, _, _ in
     guard let pass = objects.removeValue(forKey: p) as? Pass else { return 0 }
     pass.encoder.endEncoding()
     // A FRAME TO PRINT: copied out of the drawable before it is presented, and printed once the GPU has done
-    if printNext.remove(pass.view) != nil, let device {
+    if printNext.remove(pass.view) != nil, let device, pass.drawable.texture.pixelFormat == .bgra8Unorm {   // 8-bit only
         let t = pass.drawable.texture
         if let buffer = device.makeBuffer(length: t.width * t.height * 4, options: .storageModeShared),
            let blit = pass.commands.makeBlitCommandEncoder() {
@@ -414,6 +500,8 @@ func installGPU() {
     register("gpu_pass_end", gpuPassEnd)
     register("gpu_view_size", gpuViewSize)
     register("gpu_view_print", gpuViewPrint)
+    register("gpu_view_hdr", gpuViewHDR)
+    register("gpu_headroom", gpuHeadroom)
     register("gpu_set_depth", gpuSetDepth)
     register("gpu_set_cull", gpuSetCull)
     register("gpu_set_bytes", gpuSetBytes)

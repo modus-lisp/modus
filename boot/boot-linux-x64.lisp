@@ -102,18 +102,27 @@
     (list :data data :pages pages :bitmap-offset bmo :freelist-offset flo
           :kind-delta (- kdo bmo) :map (logand (+ kdo bms #xFFF) (lognot #xFFF)))))
 
-(defconstant +mcgc-page-count+ (getf (x64-heap-layout +linux-x64-gc-midpoint+) :pages))
+;; The DEFAULT layout, X64-HEAP-LAYOUT's arithmetic written out: a constant's
+;; initform must fold when the image's own compiler reads this file, where no
+;; function of it can be called (a SKIPPED form, and the two hosts diverge).
+(defconstant +mcgc-page-count+ (ash +linux-x64-heap-data-size+ -12))
 (defconstant +mcgc-meta-offset+ +linux-x64-heap-data-size+) ; metadata starts right after data
 (defconstant +mcgc-descriptor-offset+ +mcgc-meta-offset+)
-(defconstant +mcgc-bitmap-offset+ (getf (x64-heap-layout +linux-x64-gc-midpoint+) :bitmap-offset))
-(defconstant +mcgc-freelist-offset+ (getf (x64-heap-layout +linux-x64-gc-midpoint+) :freelist-offset))
+(defconstant +mcgc-bitmap-offset+
+  (logand (+ +linux-x64-heap-data-size+ +mcgc-page-count+ 63) (lognot 63)))
+(defconstant +mcgc-bitmap-size+ (ash +linux-x64-heap-data-size+ -7))
+(defconstant +mcgc-freelist-offset+
+  (logand (+ +mcgc-bitmap-offset+ +mcgc-bitmap-size+ 63) (lognot 63)))
+(defconstant +mcgc-kindbitmap-offset+
+  (logand (+ +mcgc-freelist-offset+ (* 4 +mcgc-page-count+) 63) (lognot 63)))
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; the default layout's: bare x64 stores this one (boot-x64.lisp), a hosted stub
   ;; the one it computes
   (setf modus.mvm.x64::*mcgc-kindbitmap-delta*
-        (getf (x64-heap-layout +linux-x64-gc-midpoint+) :kind-delta)))
+        (- +mcgc-kindbitmap-offset+ +mcgc-bitmap-offset+)))
 ;; Full mmap = data region + metadata region (the default layout's).
-(defconstant +linux-x64-heap-size+ (getf (x64-heap-layout +linux-x64-gc-midpoint+) :map))
+(defconstant +linux-x64-heap-size+
+  (logand (+ +mcgc-kindbitmap-offset+ +mcgc-bitmap-size+ #xFFF) (lognot #xFFF)))
 ;; --dynamic-space-size N: semispaces N/2, rounded down to 1 MB, within these.
 ;; The heap is mapped at +LINUX-X64-FIXED-HEAP-BASE+ (0x2000000000) and the JIT
 ;; arena at 0x3000000000, so the whole mapping stays under 64 GB.

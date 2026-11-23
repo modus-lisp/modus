@@ -129,6 +129,11 @@
    records the host's values, which %JIT-TRANSLATE-PAGE and
    %HOST-COMPILE-TOPLEVEL (mvm-eval.lisp) bind.")
 
+(defparameter *builder-host-jit-flag-defaults*
+  '(("*CONV-DELTA*" . 0))
+  "Host values for *BUILDER-HOST-JIT-FLAG-NAMES* entries that are unbound at
+   boot; an unbound one not listed here is not recorded.")
+
 (defun %builder-state-symbol (name pkg)
   "The symbol of a compiler variable: in PKG or, failing that, MODUS.MVM's (whose
    packages it uses), so a name homed elsewhere in this image is still found."
@@ -160,8 +165,14 @@
   (let ((pairs nil))
     (dolist (e *builder-host-jit-flag-names*)
       (let ((sym (%builder-state-symbol (car e) (cdr e))))
-        (when (and sym (boundp sym))
-          (setq pairs (cons (cons sym (symbol-value sym)) pairs)))))
+        ;; unbound at boot (a DEFPARAMETER of baked tooling whose initform
+        ;; never ran): the host's value is the default the compiler assumes,
+        ;; when there is one; otherwise it is left alone
+        (let ((dflt (assoc (car e) *builder-host-jit-flag-defaults* :test #'string=)))
+          (cond ((and sym (boundp sym))
+                 (setq pairs (cons (cons sym (symbol-value sym)) pairs)))
+                ((and sym dflt)
+                 (setq pairs (cons (cons sym (cdr dflt)) pairs)))))))
     (setq *jit-host-flags* pairs))
   t)
 

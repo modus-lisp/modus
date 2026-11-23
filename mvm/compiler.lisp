@@ -22843,6 +22843,17 @@
       (when (not (symbolp op)) (return-from tail-form-is-values-p nil))
       (let ((hash (normalize-name op)))
         (cond
+          ;; A symbol that SHADOWS a CL name is not that operator, whatever its
+          ;; hash: judge its expansion, as the catch-all below judges any macro.
+          ;; cortez's RETURN takes several values, (RETURN T BA), and the RETURN
+          ;; arm read its first argument as the whole value: T, single-valued,
+          ;; so the epilogue set the count to 1 and the caller got (T).  TI's
+          ;; SHEET-PREPARE-FOR-EXPOSE returns (RETURN T :CLEAN) out of a PROG.
+          ((%shadows-cl-p op)
+           (let ((r (%quiet-macroexpand-1 form)))
+             (if (and (cdr r) (not (equal (car r) form)))
+                 (tail-form-is-values-p (list (car r)))
+                 t)))
           ;; Direct values call
           ((= hash 18794783) t)  ; VALUES
           ;; VALUES-LIST also returns multiple values
@@ -23154,6 +23165,17 @@
    multiple values so the function epilogue doesn't clobber MV-COUNT."
   (cond
     ((atom forms) nil)
+    ;; A RETURN / RETURN-FROM that shadows CL's is a macro of its own (cortez's
+    ;; RETURN takes several values): look at what it expands to.
+    ((and (symbolp (car forms))
+          (let ((h (compute-name-hash (symbol-name (car forms)))))
+            (or (= h #.(compute-name-hash "RETURN"))
+                (= h #.(compute-name-hash "RETURN-FROM"))))
+          (%shadows-cl-p (car forms)))
+     (let ((r (%quiet-macroexpand-1 forms)))
+       (if (and (cdr r) (not (equal (car r) forms)))
+           (loop-body-has-mv-return-p (car r))
+           (loop-body-has-mv-return-p (cdr forms)))))
     ((and (consp forms) (symbolp (car forms))
           (let ((h (compute-name-hash (symbol-name (car forms)))))
             (or (= h #.(compute-name-hash "RETURN"))

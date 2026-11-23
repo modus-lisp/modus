@@ -17340,15 +17340,25 @@
          (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
          ;; An AOT SETQ of a global with a cell-cache slot stores through the
          ;; memoised cell (%GV-SET-C) instead of probing the table.
-         (let ((slot (and (not cell) (%gv-aot-slot hash var))))
-           (if slot
-               (progn
-                 (emit-li-tagged +vreg-v2+ slot)
-                 (when *mvm-emit-halves* (emit-ir :set-nargs 3))
-                 (emit-ir :call "%GV-SET-C" 3))
-               (progn
-                 (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
-                 (emit-ir :call "%GV-SET" 2))))
+         (let* ((slot (and (not cell) (%gv-aot-slot hash var)))
+                ;; A RUNTIME SETQ of a special with no cell yet (a DEFVAR
+                ;; without a value, or one defined later) stores through the
+                ;; per-site cache its reads already use (%GV-SET-SITE), not a
+                ;; table probe per store: %GV-SET -> %GV-CELL was 22% of a
+                ;; cl-bench BOYER run (UNIFY-SUBST) on the web image.
+                (site (and (not cell) (not slot) (%let-special-site var hash))))
+           (cond
+             (slot
+              (emit-li-tagged +vreg-v2+ slot)
+              (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+              (emit-ir :call "%GV-SET-C" 3))
+             (site
+              (emit-ir :li-const +vreg-v2+ (%e2-const-register site))
+              (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+              (emit-ir :call "%GV-SET-SITE" 3))
+             (t
+              (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
+              (emit-ir :call "%GV-SET" 2))))
          (unless (= dest +vreg-vr+)
            (emit-ir :mov dest +vreg-vr+))
          (when (> save-count 1)

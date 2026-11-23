@@ -1785,6 +1785,22 @@
             (%e2-symbol-value-cell hash sym c)
             (%e2-symbol-value-checked hash sym)))))
 
+(defun %gv-set-site (hash val site)
+  "%GV-SET for a runtime SETQ of a special that had no cell when it was
+   compiled: through SITE's memoised cell (%GV-SITE-CELL) once it exists,
+   instead of a table probe per store.  The thread rule is the read's
+   (%E2-SYMBOL-VALUE-SITE): unarmed or the armed main thread store in the
+   cell; any other thread goes through %GV-SET, which finds its own binding.
+   No cell yet: %GV-SET creates it, and the next store fills the site."
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)
+          (and (eql (mem-ref #x10000C30 :u32) 0)
+               (eql (mem-ref #x10000C34 :u32) 0)))
+      (let ((c (%gv-site-cell hash site)))
+        (if c
+            (progn (set-cdr c val) val)
+            (%gv-set hash val)))
+      (%gv-set hash val)))
+
 ;;; The armed arm of a read whose cell is known (baked, or a filled site): this
 ;;; thread's binding if it has one, else the cell, with no table probe.  Cells
 ;;; are never replaced, so a found cell is the live one.  Unbound goes to

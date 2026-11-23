@@ -179,11 +179,71 @@
 ;;; ============================================================
 
 (defstruct ppc-buffer
-  (words (make-array 32768))            ; fixed-size, position tracks fill
+  (words (make-array 32768))            ; grows (PPC-EMIT-WORD); position tracks fill
   (labels (make-hash-table :test 'eql))
   (fixups nil)      ; list of (word-index label-id type)
   (position 0)      ; byte position (always word-aligned)
-  (word-count 0))   ; word index (position / 4)
+  (word-count 0)    ; word index (position / 4)
+  (pools nil))      ; veneer pools: (first-word-idx nslots slot-hash next-free)
+
+;;; VENEER POOLS.  A PowerPC `b'/`bl' reaches +-32 MB, and a CL image is more
+;;; native code than that (34 MB, 2026-11-23), so a call from its end to a
+;;; runtime function at its start does not fit.  Every +PPC-POOL-SPACING+ bytes,
+;;; at a function boundary, the translator reserves a pool of veneer slots
+;;; (jumped over); PPC-FIXUP-LABELS sends an out-of-range branch to a slot in a
+;;; pool it can reach, and the slot jumps anywhere in 2^32, PC-relative:
+;;;   mflr r0 ; bl .+4 ; mflr r12 ; mtlr r0 ; addis r12,r12,@ha ; addi r12,r12,@l
+;;;   mtctr r12 ; bctr
+;;; LR comes back as it was (a `bl' to the slot keeps the caller's return
+;;; address); r0 and r12 are scratch at every branch.  One slot per (pool,
+;;; target): a far target called from many sites costs one slot per pool.
+(defconstant +ppc-pool-spacing+ (* 12 1024 1024))
+(defconstant +ppc-pool-slots+ 4096)
+(defconstant +ppc-veneer-words+ 8)
+
+(defun ppc-maybe-emit-pool (buf)
+  "At a function boundary: reserve a veneer pool if the last one (or the start)
+   is +PPC-POOL-SPACING+ bytes back."
+  (let ((last (if (ppc-buffer-pools buf) (* 4 (first (first (ppc-buffer-pools buf)))) 0)))
+    (when (>= (- (ppc-buffer-position buf) last) +ppc-pool-spacing+)
+      (let ((n (* +ppc-pool-slots+ +ppc-veneer-words+)))
+        ;; b over the pool
+        (ppc-emit-word buf (logior (ash 18 26) (* 4 (1+ n))))
+        (let ((first (ppc-buffer-word-count buf)))
+          (dotimes (i n) (ppc-emit-word buf #x7FE00008))      ; tw 31,0,0
+          (push (list first +ppc-pool-slots+ (make-hash-table :test 'eql) 0)
+                (ppc-buffer-pools buf)))))))
+
+(defun ppc-veneer-for (buf insn-pos label-id target)
+  "The byte position of a veneer slot, reachable by a branch at INSN-POS, that
+   jumps to TARGET (label LABEL-ID)."
+  (let ((words (ppc-buffer-words buf))
+        (reach (- (ash 1 25) (* 4 +ppc-pool-slots+ +ppc-veneer-words+))))
+    (dolist (pool (ppc-buffer-pools buf)
+                  (error "PPC: no veneer pool within reach of a branch at ~D" insn-pos))
+      (destructuring-bind (first nslots slots next) pool
+        (when (< (abs (- (* 4 first) insn-pos)) reach)
+          (let ((slot (gethash label-id slots)))
+            (unless slot
+              (when (>= next nslots)
+                (error "PPC: veneer pool at ~D is full (~D slots)" (* 4 first) nslots))
+              (setq slot next)
+              (setf (gethash label-id slots) slot
+                    (fourth pool) (1+ next))
+              (let* ((w (+ first (* slot +ppc-veneer-words+)))
+                     (base (* 4 (+ w 2)))                   ; the mflr r12: LR after bl .+4
+                     (r (- target base))
+                     (ha (logand (ash (+ r #x8000) -16) #xFFFF))
+                     (lo (logand r #xFFFF)))
+                (setf (aref words w)       #x7C0802A6       ; mflr r0
+                      (aref words (+ w 1)) #x48000005       ; bl .+4
+                      (aref words (+ w 2)) #x7D8802A6       ; mflr r12
+                      (aref words (+ w 3)) #x7C0803A6       ; mtlr r0
+                      (aref words (+ w 4)) (logior #x3D8C0000 ha)   ; addis r12,r12,ha
+                      (aref words (+ w 5)) (logior #x398C0000 lo)   ; addi r12,r12,lo
+                      (aref words (+ w 6)) #x7D8903A6       ; mtctr r12
+                      (aref words (+ w 7)) #x4E800420)))    ; bctr
+            (return (* 4 (+ first (* slot +ppc-veneer-words+))))))))))
 
 (defvar *ppc-li-const-patches* nil
   "List of (NATIVE-BYTE-OFFSET . POOL-INDEX) recorded by +OP-LI-CONST+: at that
@@ -194,6 +254,12 @@
 (defun ppc-emit-word (buf word)
   "Emit a 32-bit PPC instruction word."
   (let ((idx (ppc-buffer-word-count buf)))
+    ;; DOUBLE ON OVERFLOW, as arm32's buffer does.  It was a fixed 32768 words
+    ;; (128 KB of code): every ladder image fits, a CL image does not.
+    (when (>= idx (length (ppc-buffer-words buf)))
+      (let ((new (make-array (* 2 (length (ppc-buffer-words buf))))))
+        (replace new (ppc-buffer-words buf))
+        (setf (ppc-buffer-words buf) new)))
     (setf (aref (ppc-buffer-words buf) idx) (logand word #xFFFFFFFF))
     (setf (ppc-buffer-word-count buf) (+ idx 1))
     (incf (ppc-buffer-position buf) 4)))
@@ -245,6 +311,9 @@
             (:branch24
              ;; I-form: bits 6-29 hold offset/4, bit 30=AA, bit 31=LK
              ;; The offset is sign-extended 26-bit, shifted right 2
+             ;; Out of reach: through a veneer (PPC-VENEER-FOR).
+             (unless (<= (- (ash 1 25)) rel (1- (ash 1 25)))
+               (setq rel (- (ppc-veneer-for buf insn-pos label-id target) insn-pos)))
              (unless (<= (- (ash 1 25)) rel (1- (ash 1 25)))
                (error "PPC :branch24 rel ~D out of range ±2^25 at ~
                        word-idx ~D — would silently truncate"
@@ -255,6 +324,12 @@
                              (ash field 2)))))
             (:branch14
              ;; B-form: bits 16-29 hold offset/4, bit 30=AA, bit 31=LK
+             ;; Out of reach from an MVM instruction: noted, to be emitted long
+             ;; by the next translation (see PPC-EMIT-BC).
+             (let ((site (and *ppc-branch14-sites* (gethash word-idx *ppc-branch14-sites*))))
+               (when (and site (not (<= (- (ash 1 15)) rel (1- (ash 1 15)))))
+                 (pushnew site *ppc-branch14-overflow*)
+                 (setq rel 0)))
              (unless (<= (- (ash 1 15)) rel (1- (ash 1 15)))
                (error "PPC :branch14 rel ~D out of range ±2^15 at ~
                        word-idx ~D — would silently truncate"
@@ -554,11 +629,33 @@
   (when label-id
     (ppc-emit-fixup buf label-id :branch24)))
 
+;;; BRANCH RELAXATION.  A conditional branch reaches +-32 KB, and some functions
+;;; in a CL image are bigger than that.  TRANSLATE-MVM-TO-PPC translates, notes
+;;; the MVM instruction of every conditional branch that did not reach, and
+;;; translates again with those emitted long: the inverted condition over a `b'.
+(defvar *ppc-cur-mvm-pc* nil "The MVM pc being translated, or NIL (stubs).")
+(defvar *ppc-long-branch-pcs* nil
+  "MVM pcs whose conditional branches are emitted long (a hash table), or NIL.")
+(defvar *ppc-branch14-sites* nil
+  "Word index of a conditional branch -> the MVM pc that emitted it.")
+(defvar *ppc-branch14-overflow* nil
+  "MVM pcs whose conditional branches did not reach, this translation.")
+
 (defun ppc-emit-bc (buf bo bi &optional label-id)
   "BC bo, bi, target - conditional branch (B-form, opcode 16)"
-  (ppc-emit-word buf (ppc-b-form 16 bo bi 0))
-  (when label-id
-    (ppc-emit-fixup buf label-id :branch14)))
+  (if (and label-id *ppc-cur-mvm-pc* *ppc-long-branch-pcs*
+           (gethash *ppc-cur-mvm-pc* *ppc-long-branch-pcs*)
+           (member bo (list +ppc-bo-true+ +ppc-bo-false+)))
+      ;; long: bc !cond, .+8 ; b target
+      (progn
+        (ppc-emit-word buf (ppc-b-form 16 (if (= bo +ppc-bo-true+) +ppc-bo-false+ +ppc-bo-true+) bi 2))
+        (ppc-emit-b buf label-id))
+      (progn
+        (ppc-emit-word buf (ppc-b-form 16 bo bi 0))
+        (when label-id
+          (when (and *ppc-cur-mvm-pc* *ppc-branch14-sites*)
+            (setf (gethash (1- (ppc-buffer-word-count buf)) *ppc-branch14-sites*) *ppc-cur-mvm-pc*))
+          (ppc-emit-fixup buf label-id :branch14)))))
 
 (defun ppc-emit-beq (buf &optional label-id)
   "BEQ target"
@@ -758,6 +855,46 @@
 (defparameter *ppc-globals-base* #x00900000
   "Base of the PPC absolute-address convention slot block; set per target by
    install-ppc-translator / install-ppc32-translator.")
+
+(defparameter *ppc-mac-mode* nil
+  "T when building a BARE POWERPC MACINTOSH image (boot/boot-ppcmac.lisp):
+   loaded by Open Firmware from an HFS disk, no OS.  It keeps the HOSTED memory
+   map -- *PPC-LINUX-MODE* stays T, so the convention slots, the low block at
+   #x10000000, the kind map and the native collector are exactly the hosted
+   image's -- and swaps the Linux services for the Mac's: the console is the
+   ESCC's channel A (the modem port), the clock is the timebase, exit is a
+   spin, and the handler-frame extension is a fixed region rather than an
+   mmap.  ARM32's *ARM32-CL-BARE* and 68k's *68K-MAC-MODE* shape.
+   PPC-SET-MAC-MODE.")
+
+(defparameter *ppc-mac-escc-a* #x80013020
+  "Channel A's control register: mac-io (#x80000000 on QEMU's mac99 and on the
+   Uni-North Macs) + #x13020; its data register is 16 bytes up.  RR0 bit 0 is
+   a received character, bit 2 the transmit buffer empty.")
+(defparameter *ppc-mac-tb-shift* 16
+  "The clock is the timebase >> this: a 30-bit fixnum of it lasts 4 days at
+   QEMU mac99's 100 MHz.")
+(defparameter *ppc-mac-tb-hz* 100000000
+  "The timebase frequency: Open Firmware's /cpus/@0 timebase-frequency.")
+(defconstant +ppc-mac-hstack-ext-base+ #x0E000000
+  "The handler-frame extension on the Mac: a fixed 2 MB region, not an mmap
+   (boot/boot-ppcmac.lisp's map; the stub writes the frame limit).")
+
+(defun ppc-emit-mac-putc (buf rb)
+  "Write the byte in RB (not r0 or r12) to the ESCC's channel A, waiting for the
+   transmit buffer.  Clobbers r0, r12 and CR0."
+  (let ((wait (mvm-make-label)))
+    (ppc-emit-li buf +ppc-r12+ *ppc-mac-escc-a*)
+    (ppc-emit-label buf wait)
+    (ppc-emit-lbz buf +ppc-r0+ +ppc-r12+ 0)
+    (ppc-emit-andi-dot buf +ppc-r0+ +ppc-r0+ 4)
+    (ppc-emit-beq buf wait)
+    (ppc-emit-stb buf rb +ppc-r12+ 16)
+    (ppc-emit-eieio buf)))
+
+(defvar *ppc-unimpl-opcodes* nil
+  "Opcodes, and service traps as #x10000+code, that the PPC translator met and
+   has no arm for in the current mode.  A build prints this census.")
 
 (defparameter *ppc-linux-mode* nil
   "T when building a HOSTED Linux/PPC image rather than a bare-metal one.
@@ -1026,7 +1163,7 @@
     (ppc-emit-lfd buf fd +ppc-r1+ 0)
     (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)))
 
-(defun ppc-float-box (buf fs out)
+(defun ppc-float-box (buf fs out &optional (subtag #x60))
   "Box the double in FPR FS as a fresh four-chunk object; its TAGGED pointer
    lands in OUT (not r0).  STFD to a stack scratch, then LHZ each chunk back,
    tag it, store it.  Header (4<<8)|#x60, five words rounded to 16 bytes, so
@@ -1036,7 +1173,7 @@
     (ppc-emit-alloc-mark buf 1)          ; FIRST: clobbers r11/r12
     (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
     (ppc-emit-stfd buf fs +ppc-r1+ 0)
-    (ppc-emit-li buf +ppc-r0+ (logior #x60 (ash 4 8)))
+    (ppc-emit-li buf +ppc-r0+ (logior subtag (ash 4 8)))
     (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)          ; header at VA
     (loop for k from 0 to 3
           do (ppc-emit-lhz buf +ppc-r0+ +ppc-r1+ (* 2 k))
@@ -1282,8 +1419,12 @@
         (ppc-emit-li buf +ppc-r6+ #x62)
         (ppc-emit-li buf +ppc-r7+ -1)
         (ppc-emit-li buf +ppc-r8+ 0)
-        (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-mmap+)
-        (ppc-emit-sc buf)
+        (if *ppc-mac-mode*
+            ;; the Mac: the fixed region, and CR0.SO clear (crxor 3,3,3)
+            (progn (ppc-emit-li buf +ppc-r3+ +ppc-mac-hstack-ext-base+)
+                   (ppc-emit-word buf #x4C631982))
+            (progn (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-mmap+)
+                   (ppc-emit-sc buf)))
         ;; Nothing below touches CR0 until the BSO: MR is OR without Rc,
         ;; loads and ADDI leave CR alone.
         (ppc-emit-mr buf +ppc-r9+ +ppc-r3+)
@@ -1579,6 +1720,54 @@
               (ppc-emit-cmpi-word buf +ppc-scratch1+ 0)
               (ppc-emit-bgt buf top)
               (ppc-emit-label buf done)))
+           ((= code #x0302)
+            ;; MEMORY BARRIER: SYNC (i386's is a no-op, x86 being strongly ordered)
+            (ppc-emit-sync buf))
+           ;; --- THE BARE MAC (*PPC-MAC-MODE*): the hardware is the platform ---
+           ((and (= code #x0300) *ppc-mac-mode*)
+            ;; serial write: the untagged byte to the ESCC
+            (ppc-emit-srawi buf +ppc-r11+ +ppc-r3+ 1)
+            (ppc-emit-mac-putc buf +ppc-r11+))
+           ((and (= code #x0301) *ppc-mac-mode*)
+            ;; serial read: wait for a byte; TAGGED in V0, as hosted
+            (let ((wait (mvm-make-label)))
+              (ppc-emit-li buf +ppc-r12+ *ppc-mac-escc-a*)
+              (ppc-emit-label buf wait)
+              (ppc-emit-lbz buf +ppc-r0+ +ppc-r12+ 0)
+              (ppc-emit-andi-dot buf +ppc-r0+ +ppc-r0+ 1)
+              (ppc-emit-beq buf wait)
+              (ppc-emit-lbz buf +ppc-r3+ +ppc-r12+ 16)
+              (ppc-emit-add buf +ppc-r3+ +ppc-r3+ +ppc-r3+)))
+           ((and (= code #x0310) *ppc-mac-mode*)
+            ;; the clock: the timebase >> *PPC-MAC-TB-SHIFT*, as a 30-bit
+            ;; fixnum, TAGGED.  TBU / TBL / TBU again, for a carry between them.
+            (let ((again (mvm-make-label)) (sh *ppc-mac-tb-shift*))
+              (ppc-emit-label buf again)
+              (ppc-emit-word buf #x7D8D42E6)                 ; mftbu r12
+              (ppc-emit-word buf #x7C6C42E6)                 ; mftb  r3
+              (ppc-emit-word buf #x7D6D42E6)                 ; mftbu r11
+              (ppc-emit-cmpw buf +ppc-r11+ +ppc-r12+)
+              (ppc-emit-bne buf again)
+              (ppc-emit-rlwinm buf +ppc-r3+ +ppc-r3+ (- 32 sh) sh 31)      ; TBL >> sh
+              (ppc-emit-rlwinm buf +ppc-r12+ +ppc-r12+ (- 32 sh) 0 (1- sh)) ; TBU << 32-sh
+              (ppc-emit-or buf +ppc-r3+ +ppc-r3+ +ppc-r12+)
+              (ppc-emit-rlwinm buf +ppc-r3+ +ppc-r3+ 1 2 30)))   ; 30 bits, tagged
+           ((and (= code #x0311) *ppc-mac-mode*)
+            ;; its rate, TAGGED
+            (ppc-emit-li buf +ppc-r3+ (* 2 (ash *ppc-mac-tb-hz* (- *ppc-mac-tb-shift*)))))
+           ((and (member code '(#x0500 #x0304)) *ppc-mac-mode*)
+            ;; exit / halt: nothing to return to
+            (ppc-emit-word buf #x48000000))                  ; b .
+           ((and (= code #x0520) *ppc-mac-mode*)
+            ;; signal handlers: none on a bare Mac
+            nil)
+           ((and (member code '(#x0502 #x0503 #x050B)) *ppc-mac-mode*)
+            ;; a Linux system call on a bare Mac: -1 (TAGGED for #x0502/#x050B)
+            (ppc-emit-li buf +ppc-r3+ (if (= code #x0503) -1 -2)))
+           ((and *ppc-mac-mode* (>= code #x0300) (<= code #x0534))
+            ;; a Linux service trap with no Mac arm: a gap, recorded, TW if run
+            (pushnew (+ #x10000 code) *ppc-unimpl-opcodes*)
+            (ppc-emit-tw buf 31 0 0))
            ((and (= code #x0520) *ppc-linux-mode*)
             ;; INSTALL-SIGNAL-HANDLERS, hosted: PPC-EMIT-INSTALL-SIGNAL-HANDLERS.
             (ppc-emit-install-signal-handlers buf))
@@ -1617,6 +1806,80 @@
             (ppc-emit-shift-right-arith-imm buf +ppc-r3+ +ppc-r3+ 1)
             (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-exit+)
             (ppc-emit-sc buf))
+           ((and (member code '(#x0502 #x0503 #x050B)) *ppc-linux-mode*)
+            ;; GENERIC SYSCALLS.  #x0502: V0 = number, V1..V3 = arguments, all
+            ;; TAGGED, result TAGGED in V0.  #x0503: number TAGGED, arguments and
+            ;; result RAW.  #x050B: as #x0502 with V4..V6 as arguments 4..6.
+            ;; Number in r0, arguments r3..r8; `sc' clobbers r0 and r3..r12
+            ;; only, so V4..V8 (r14..r18) and VA/VL/VN survive.  An ERROR sets
+            ;; CR0.SO and returns the POSITIVE errno: it is negated here, so the
+            ;; shared Lisp side's "negative means errno" test holds on PowerPC.
+            (let ((ok (mvm-make-label))
+                  (raw (= code #x0503)))
+              (ppc-emit-shift-right-arith-imm buf +ppc-r0+ +ppc-r3+ 1)
+              (flet ((arg (dst src)
+                       (if raw
+                           (ppc-emit-mr buf dst src)
+                           (ppc-emit-shift-right-arith-imm buf dst src 1))))
+                (arg +ppc-r3+ +ppc-r4+)
+                (arg +ppc-r4+ +ppc-r5+)
+                (arg +ppc-r5+ +ppc-r6+)
+                (when (= code #x050B)
+                  (arg +ppc-r6+ +ppc-r14+)
+                  (arg +ppc-r7+ +ppc-r15+)
+                  (arg +ppc-r8+ +ppc-r16+)))
+              (ppc-emit-sc buf)
+              (ppc-emit-bc buf +ppc-bo-false+ +ppc-bi-so+ ok)
+              (ppc-emit-neg buf +ppc-r3+ +ppc-r3+)
+              (ppc-emit-label buf ok)
+              (unless raw
+                (ppc-emit-add buf +ppc-r3+ +ppc-r3+ +ppc-r3+))))
+           ((and (= code #x0310) *ppc-linux-mode*)
+            ;; THE CLOCK, hosted: milliseconds since the first read, TAGGED;
+            ;; rate 1000 Hz (#x0311).  clock_gettime(CLOCK_MONOTONIC) (246), a
+            ;; 32-bit timespec.  ARM32's and RV32's answer: a 30-bit fixnum
+            ;; holds 12.4 days of this.  The first read's seconds are kept
+            ;; TAGGED, +1 so 0 means unset, at #x10000FB8.  V1..V3 are saved.
+            (let ((have (mvm-make-label)))
+              (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -32)
+              (ppc-emit-stw buf +ppc-r4+ +ppc-r1+ 16)
+              (ppc-emit-stw buf +ppc-r5+ +ppc-r1+ 20)
+              (ppc-emit-stw buf +ppc-r6+ +ppc-r1+ 24)
+              (ppc-emit-li buf +ppc-r3+ 1)
+              (ppc-emit-addi buf +ppc-r4+ +ppc-r1+ 8)
+              (ppc-emit-li buf +ppc-r0+ 246)
+              (ppc-emit-sc buf)
+              (ppc-emit-lwz buf +ppc-r4+ +ppc-r1+ 8)           ; tv_sec
+              (ppc-emit-lwz buf +ppc-r5+ +ppc-r1+ 12)          ; tv_nsec
+              (ppc-emit-li buf +ppc-r12+ #x10000FB8)
+              (ppc-emit-lwz buf +ppc-r6+ +ppc-r12+ 0)
+              (ppc-emit-cmpi-word buf +ppc-r6+ 0)
+              (ppc-emit-bne buf have)
+              (ppc-emit-addi buf +ppc-r6+ +ppc-r4+ 1)
+              (ppc-emit-add buf +ppc-r6+ +ppc-r6+ +ppc-r6+)
+              (ppc-emit-stw buf +ppc-r6+ +ppc-r12+ 0)
+              (ppc-emit-label buf have)
+              (ppc-emit-srawi buf +ppc-r6+ +ppc-r6+ 1)
+              (ppc-emit-addi buf +ppc-r6+ +ppc-r6+ -1)          ; epoch seconds
+              (ppc-emit-subf buf +ppc-r4+ +ppc-r6+ +ppc-r4+)    ; elapsed seconds
+              (ppc-emit-li buf +ppc-r12+ 1000)
+              (ppc-emit-mullw buf +ppc-r4+ +ppc-r4+ +ppc-r12+)
+              (ppc-emit-li buf +ppc-r12+ 1000000)
+              (ppc-emit-divw buf +ppc-r5+ +ppc-r5+ +ppc-r12+)   ; ns -> ms
+              (ppc-emit-add buf +ppc-r3+ +ppc-r4+ +ppc-r5+)
+              (ppc-emit-add buf +ppc-r3+ +ppc-r3+ +ppc-r3+)
+              (ppc-emit-lwz buf +ppc-r4+ +ppc-r1+ 16)
+              (ppc-emit-lwz buf +ppc-r5+ +ppc-r1+ 20)
+              (ppc-emit-lwz buf +ppc-r6+ +ppc-r1+ 24)
+              (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 32)))
+           ((and (= code #x0311) *ppc-linux-mode*)
+            ;; CNTFRQ: #x0310's rate, TAGGED (1000 Hz).
+            (ppc-emit-li buf +ppc-r3+ 2000))
+           ((and (= code #x0304) *ppc-linux-mode*)
+            ;; HALT, hosted: exit(0).
+            (ppc-emit-li buf +ppc-r3+ 0)
+            (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-exit+)
+            (ppc-emit-sc buf))
            ((= code #x0300)
             ;; Serial write: V0 (r3) contains tagged fixnum char code
             (if *ppc-64-bit*
@@ -1638,7 +1901,9 @@
                   ;; Store byte to UART data register: stb r0, 0(r11)
                   (ppc-emit-stb buf +ppc-r0+ +ppc-r11+ 0))))
            (t
-            ;; Real CPU trap
+            ;; Real CPU trap.  A service trap with no arm for this mode is a
+            ;; gap: recorded for the build's census (as #x10000+code).
+            (when (>= code #x0300) (pushnew (+ #x10000 code) *ppc-unimpl-opcodes*))
             (ppc-emit-addi buf +ppc-r0+ 0 code)
             (ppc-emit-tw buf 31 +ppc-r0+ +ppc-r0+)))))
 
@@ -2432,6 +2697,139 @@
          (ppc-float-box buf 0 +ppc-scratch1+)
          (ppc-store-vreg buf vd +ppc-scratch1+)))))
 
+      ;; ---- the classic FPU's square root and single floats ----
+      ;; SPE (bare e500) has none of these yet: the census records them there.
+      (#.+op-fsqrt+
+       ;; (fsqrt Vd Vs): IEEE square root, boxed as a DOUBLE.  NOT the `fsqrt'
+       ;; instruction: it is optional in the architecture and the G3 (750) and
+       ;; G4 (74xx) do not have it -- only the 970 does.  FRSQRTE (an estimate
+       ;; to 1 part in 32, which they do have) and four Newton steps for 1/sqrt
+       ;; (5 -> 10 -> 20 -> 40 -> 80 bits), then s = x*y and one correction
+       ;; s + y*(x - s*s)/2.  x*y is formed before the second *y so a denormal x
+       ;; does not overflow y*y.  Zero, +inf and NaN are their own roots; a
+       ;; negative x (or -inf) gives NaN, as 0/0.  f0..f5 are scratch.
+       (if (ppc-spe-p)
+           (progn (pushnew opcode *ppc-unimpl-opcodes*) (ppc-emit-tw buf 31 0 0))
+           (let* ((vd (first operands))
+                  (ps (vreg-or-scratch (second operands) +ppc-scratch1+))
+                  (special (mvm-make-label)) (done (mvm-make-label)) (neg (mvm-make-label)))
+             (flet ((a-form (xo frt fra frb frc)
+                      (ppc-emit-word buf (logior (ash 63 26) (ash frt 21) (ash fra 16)
+                                                 (ash frb 11) (ash frc 6) (ash xo 1))))
+                    (fcmpu (fra frb)
+                      (ppc-emit-word buf (logior (ash 63 26) (ash fra 16) (ash frb 11)))))
+               (ppc-float-unbox buf ps 0)
+               ;; f2 = 0.5, f3 = 1.5, f5 = +inf, through the stack
+               (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -32)
+               (ppc-emit-li buf +ppc-r0+ 0)
+               (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 4)
+               (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 12)
+               (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 20)
+               (ppc-emit-addis buf +ppc-r0+ 0 #x3FE0)
+               (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 0)
+               (ppc-emit-addis buf +ppc-r0+ 0 #x3FF8)
+               (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 8)
+               (ppc-emit-addis buf +ppc-r0+ 0 #x7FF0)
+               (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 16)
+               (ppc-emit-lfd buf 2 +ppc-r1+ 0)
+               (ppc-emit-lfd buf 3 +ppc-r1+ 8)
+               (ppc-emit-lfd buf 5 +ppc-r1+ 16)
+               (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 32)
+               ;; 0 < x < +inf, else special
+               (a-form 20 4 2 2 0)                     ; f4 = 0.5 - 0.5 = 0
+               (fcmpu 0 4)                             ; x ? 0
+               (ppc-emit-ble buf special)              ; x <= 0
+               (ppc-emit-bc buf +ppc-bo-true+ +ppc-bi-so+ special)   ; unordered: NaN
+               (fcmpu 0 5)
+               (ppc-emit-beq buf special)              ; +inf
+               (a-form 26 1 0 0 0)                     ; f1 = frsqrte(x)
+               (dotimes (i 4)
+                 (a-form 25 4 0 0 1)                   ; f4 = x*y
+                 (a-form 25 4 4 0 1)                   ; f4 = x*y*y
+                 (a-form 25 4 4 0 2)                   ; f4 = x*y*y/2
+                 (a-form 20 4 3 4 0)                   ; f4 = 1.5 - f4
+                 (a-form 25 1 1 0 4))                  ; y = y*f4
+               (a-form 25 4 0 0 1)                     ; s = x*y
+               (a-form 25 5 4 0 4)                     ; f5 = s*s
+               (a-form 20 5 0 5 0)                     ; f5 = x - s*s
+               (a-form 25 5 5 0 1)                     ; f5 *= y
+               (a-form 25 5 5 0 2)                     ; f5 /= 2
+               (a-form 21 0 4 5 0)                     ; x = s + f5
+               (ppc-emit-b buf done)
+               (ppc-emit-label buf special)
+               (ppc-emit-blt buf neg)                  ; x < 0 (ordered)
+               (ppc-emit-b buf done)                   ; 0, +inf, NaN: x itself
+               (ppc-emit-label buf neg)
+               (a-form 20 4 0 0 0)                     ; f4 = x - x
+               (a-form 18 0 4 4 0)                     ; x = f4/f4: NaN
+               (ppc-emit-label buf done)
+               (ppc-float-box buf 0 +ppc-scratch1+)
+               (ppc-store-vreg buf vd +ppc-scratch1+)))))
+
+      (#.+op-fround32+
+       ;; (fround32 Vd Vs): FRSP, boxed as a SINGLE-FLOAT (#x64).
+       (if (ppc-spe-p)
+           (progn (pushnew opcode *ppc-unimpl-opcodes*) (ppc-emit-tw buf 31 0 0))
+           (let ((vd (first operands))
+                 (ps (vreg-or-scratch (second operands) +ppc-scratch1+)))
+             (ppc-float-unbox buf ps 0)
+             (ppc-emit-word buf (logior (ash 63 26) (ash 0 21) (ash 0 11) (ash 12 1)))  ; frsp f0,f0
+             (ppc-float-box buf 0 +ppc-scratch1+ #x64)
+             (ppc-store-vreg buf vd +ppc-scratch1+))))
+
+      ;; ---- Packed single-float vectors (subtag #x12), ppc32 ----
+      ;; Header (N << 8) | #x12, N big-endian 4-byte lanes after it: lane i at
+      ;; tagged - 9 + 4 + 4i.  The collector's words rule sizes it, 4N + 4.
+      (#.+op-alloc-f32+
+       (if (or (ppc-spe-p) *ppc-64-bit*)
+           (progn (pushnew opcode *ppc-unimpl-opcodes*) (ppc-emit-tw buf 31 0 0))
+           (progn
+             (ppc-emit-alloc-mark buf 1)   ; FIRST: clobbers r11/r12
+             (let* ((vd (first operands))
+                    (pc (vreg-or-scratch (second operands) +ppc-scratch1+))
+                    (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+               (ppc-emit-shift-right-arith-imm buf +ppc-scratch2+ pc 1)   ; N
+               (ppc-emit-slwi buf +ppc-r0+ +ppc-scratch2+ 8)
+               (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x12)
+               (ppc-emit-stw buf +ppc-r0+ +ppc-r19+ 0)
+               ;; bytes = align16(4N + 4), in r12
+               (ppc-emit-slwi buf +ppc-scratch2+ +ppc-scratch2+ 2)
+               (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ 19)
+               (ppc-emit-clear-low4 buf +ppc-scratch2+ +ppc-scratch2+)
+               (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
+               (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-scratch2+)
+               (ppc-emit-zero-tail buf pd 4)
+               (unless (ppc-vreg-phys vd)
+                 (ppc-store-vreg buf vd pd))))))
+
+      (#.+op-f32-load+
+       ;; (f32-load Vd Varr Vidx): LFS (which widens to double), boxed single.
+       (if (or (ppc-spe-p) *ppc-64-bit*)
+           (progn (pushnew opcode *ppc-unimpl-opcodes*) (ppc-emit-tw buf 31 0 0))
+           (let ((vd (first operands))
+                 (parr (vreg-or-scratch (second operands) +ppc-scratch1+))
+                 (pidx (vreg-or-scratch (third operands) +ppc-scratch2+)))
+             (ppc-emit-add buf +ppc-scratch2+ pidx pidx)            ; 4i
+             (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ parr)
+             (ppc-emit-word buf (logior (ash 48 26) (ash 0 21) (ash +ppc-scratch2+ 16)
+                                        (logand (- 4 +tag-object+) #xFFFF)))   ; lfs f0
+             (ppc-float-box buf 0 +ppc-scratch1+ #x64)
+             (ppc-store-vreg buf vd +ppc-scratch1+))))
+
+      (#.+op-f32-store+
+       ;; (f32-store Varr Vidx Vval): FRSP, then STFS into the lane.
+       (if (or (ppc-spe-p) *ppc-64-bit*)
+           (progn (pushnew opcode *ppc-unimpl-opcodes*) (ppc-emit-tw buf 31 0 0))
+           (progn
+             (ppc-float-unbox buf (vreg-or-scratch (third operands) +ppc-scratch1+) 0)
+             (ppc-emit-word buf (logior (ash 63 26) (ash 0 11) (ash 12 1)))   ; frsp f0,f0
+             (let ((parr (vreg-or-scratch (first operands) +ppc-scratch1+))
+                   (pidx (vreg-or-scratch (second operands) +ppc-scratch2+)))
+               (ppc-emit-add buf +ppc-scratch2+ pidx pidx)
+               (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ parr)
+               (ppc-emit-word buf (logior (ash 52 26) (ash 0 21) (ash +ppc-scratch2+ 16)
+                                          (logand (- 4 +tag-object+) #xFFFF)))))))   ; stfs f0
+
       (#.+op-itof+
        ;; Tagged fixnum -> fresh double.
        ;;   ppc64: untag, STD to scratch, LFD, FCFID (int64 -> double).
@@ -2952,7 +3350,8 @@
          (ppc-emit-store-abs buf +ppc-scratch1+ (ppc-mvcount-addr))))
 
       (otherwise
-       ;; Unknown opcode: emit a trap
+       ;; Unknown opcode: emit a trap, and record it for the build's census
+       (pushnew opcode *ppc-unimpl-opcodes*)
        (ppc-emit-tw buf 31 0 0)))))
 
 ;;; ============================================================
@@ -3071,7 +3470,16 @@
 
 (defun ppc-emit-die (buf message status)
   "write(2, MESSAGE) then exit(STATUS).  The text is stored on the stack a word
-   at a time, so it needs no data section.  Does not return."
+   at a time, so it needs no data section.  Does not return.  On the Mac: the
+   message to the console, then a spin."
+  (when *ppc-mac-mode*
+    (dolist (c (map 'list #'char-code message))
+      (when (= c 10) (ppc-emit-li buf +ppc-r11+ 13) (ppc-emit-mac-putc buf +ppc-r11+))
+      (ppc-emit-li buf +ppc-r11+ c)
+      (ppc-emit-mac-putc buf +ppc-r11+))
+    (ppc-emit-li buf +ppc-r3+ status)
+    (ppc-emit-word buf #x48000000)                     ; b .
+    (return-from ppc-emit-die nil))
   (let* ((bytes (map 'list #'char-code message))
          (padded (append bytes (make-list (mod (- (length bytes)) 4) :initial-element 0)))
          (room (logand (+ (length padded) 31) (lognot 15))))
@@ -3473,6 +3881,22 @@
 ;;; ============================================================
 
 (defun translate-mvm-to-ppc (bytecode function-table &key (64-bit t))
+  "%TRANSLATE-MVM-TO-PPC until every conditional branch reaches: each pass
+   emits long the branches the last one could not reach (PPC-EMIT-BC)."
+  (let ((long (make-hash-table :test 'eql)))
+    (loop for pass from 1
+          do (let ((*ppc-long-branch-pcs* long)
+                   (*ppc-branch14-sites* (make-hash-table :test 'eql))
+                   (*ppc-branch14-overflow* nil))
+               (multiple-value-bind (bytes fn-map)
+                   (%translate-mvm-to-ppc bytecode function-table :64-bit 64-bit)
+                 (unless *ppc-branch14-overflow*
+                   (return (values bytes fn-map)))
+                 (format t "~&;; ppc: pass ~D: ~D conditional branches out of reach, emitted long~%"
+                         pass (length *ppc-branch14-overflow*))
+                 (dolist (p *ppc-branch14-overflow*) (setf (gethash p long) t)))))))
+
+(defun %translate-mvm-to-ppc (bytecode function-table &key (64-bit t))
   "Translate MVM bytecode to PPC native code.
    When 64-BIT is T (default), emit PPC64 instructions.
    When NIL, emit PPC32 instructions.
@@ -3548,6 +3972,7 @@
                ;; did not align at all.  NOP padding is harmless: a function
                ;; never falls through (it ends in BLR or a branch).
                (when (gethash pc fn-entries)
+                 (ppc-maybe-emit-pool buf)
                  (loop while (/= 0 (mod (* 4 (ppc-buffer-word-count buf)) 16))
                        do (ppc-emit-nop buf)))
                ;; Emit label at current PC before translating
@@ -3559,7 +3984,8 @@
                       (operands (cadr decoded))
                       (new-pc (cddr decoded)))
                  ;; Compute branch target PCs relative to end of instruction
-                 (ppc-translate-insn buf opcode operands new-pc label-map function-table)
+                 (let ((*ppc-cur-mvm-pc* pc))
+                   (ppc-translate-insn buf opcode operands new-pc label-map function-table))
                  (setf pc new-pc))))
 
     (ppc-emit-hstack-stubs buf)
@@ -3612,6 +4038,12 @@
         (cond (on *ppc-hosted-globals-base*)
               (*ppc-64-bit* #x20900000)
               (t            #x00900000))))
+
+(defun ppc-set-mac-mode (on)
+  "Turn the bare-Macintosh mode on or off (*PPC-MAC-MODE*): the hosted memory
+   map and convention slots (hosted mode ON), with the Mac's service traps."
+  (ppc-set-linux-mode on)
+  (setf *ppc-mac-mode* (and on t)))
 
 (defun install-ppc-translator ()
   "Install the PPC64 translator into the target descriptor."

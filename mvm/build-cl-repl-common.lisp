@@ -106,9 +106,9 @@
 ;;; file; there is deliberately no default, so a new wrapper that forgets it
 ;;; fails loudly here instead of silently building a Pi image.
 (declaim (special *cl-repl-platform*))
-(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32 :mac68k))
+(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32 :mac68k :ppcmac))
   (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI, :VIRT, ~
-          :X64, :I386, :ARM32 or :MAC68K."
+          :X64, :I386, :ARM32, :MAC68K or :PPCMAC."
          *cl-repl-platform*))
 (defvar *cl-repl-rpi-p*  (eq *cl-repl-platform* :rpi))
 (defvar *cl-repl-virt-p* (eq *cl-repl-platform* :virt))
@@ -137,9 +137,16 @@
 ;; 68k layout kept in RAM, the translator in *68K-MAC-MODE* (bare traps over the
 ;; hosted layout, arm32's shape).  Console: the ROM's serial driver.  Soft float:
 ;; the 68LC040 has no FPU.
+;; :PPCMAC -- a bare PowerPC Macintosh (mvm/build-ppcmac-cl-repl.lisp): loaded
+;; by Open Firmware from its own HFS disk (scripts/ppcmac-disk.lisp), the hosted
+;; ppc32 layout kept under BATs (boot/boot-ppcmac.lisp), the translator in
+;; *PPC-MAC-MODE* (Mac traps over the hosted layout, arm32's shape).  Console:
+;; the ESCC's channel A.
+(defvar *cl-repl-ppcmac-p* (eq *cl-repl-platform* :ppcmac))
 (defvar *cl-repl-mac68k-p* (eq *cl-repl-platform* :mac68k))
 ;; The 32-bit images: 30-bit fixnums, 4-byte object headers.
-(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p* *cl-repl-mac68k-p*))
+(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p* *cl-repl-mac68k-p*
+                           *cl-repl-ppcmac-p*))
 (defvar *cl-repl-pc-p* (or *cl-repl-x64-p* *cl-repl-i386-p*)
   "T for the PC machines, 64- and 32-bit: no actor scheduler in the net image
    (the SSH server is ip.lisp's synchronous poll loop) and no USB NIC.")
@@ -249,6 +256,7 @@
 ;; layout co-init (*conv-relative*, *a64-x18-base*) into a 32-bit x86 image.
 (defvar *cli-arch* (cond (*cl-repl-x64-p* :x64) (*cl-repl-i386-p* :i386)
                          (*cl-repl-arm32-p* :arm32) (*cl-repl-mac68k-p* :68k)
+                         (*cl-repl-ppcmac-p* :ppc32)
                          (t :aarch64)))
 (defvar *cli-soft-float*
   (or *cl-repl-mac68k-p*
@@ -344,6 +352,8 @@
     (*cl-repl-arm32-p* nil)
     ;; :MAC68K — no 68k JIT.
     (*cl-repl-mac68k-p* nil)
+    ;; :PPCMAC — no PowerPC JIT.
+    (*cl-repl-ppcmac-p* nil)
     ;; :X64 bare metal: JIT OFF by default (translate-x64's exec pages come
     ;; from mmap(2) in linux mode; the bare-metal bump allocator the aarch64
     ;; arm has is not ported yet).  MODUS_X64_JIT=1 opts in for the port work.
@@ -1367,7 +1377,7 @@
                        (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
 
 (defvar *cli-arch-io-scratch-source*
-  (if (or *cl-repl-x64-p* *cl-repl-mac68k-p*)   ; no device tree to probe
+  (if (or *cl-repl-x64-p* *cl-repl-mac68k-p* *cl-repl-ppcmac-p*)   ; no device tree to probe
       (concatenate 'string "  (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)
   (setq *scratch-mmapped* nil)
@@ -4138,6 +4148,14 @@
             (symbol-value (sym "*POOL-NARROW-STRINGS*"))
             (symbol-value (sym "*NARROW-LITERALS-P*")))))
 
+(when cl-user::*cl-repl-ppcmac-p*
+  (cl-user::mvm-load "boot/boot-linux-ppc.lisp")
+  (cl-user::mvm-load "boot/boot-ppcmac.lisp")
+  (funcall (intern "INSTALL-PPC32-TRANSLATOR" "MODUS.MVM"))
+  (funcall (intern "PPC-SET-MAC-MODE" "MODUS.MVM") t)
+  (format t "~&;; CONSOLE: ESCC channel A at #x~X (mac-io + #x13020)~%"
+          (symbol-value (intern "*PPC-MAC-ESCC-A*" "MODUS.MVM"))))
+
 (when cl-user::*cl-repl-arm32-p*
   (cl-user::mvm-load "boot/boot-linux-arm32.lisp")
   (cl-user::mvm-load "boot/boot-arm32-cl.lisp")
@@ -4298,7 +4316,7 @@
 ;; "CONSOLE: COM1 via port I/O" and "CONSOLE: PL011 UART0 0x3F201000", which is
 ;; how it was caught — two consoles for one image is always a fall-through.
 (if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p* cl-user::*cl-repl-arm32-p*
-        cl-user::*cl-repl-mac68k-p*)
+        cl-user::*cl-repl-mac68k-p* cl-user::*cl-repl-ppcmac-p*)
     nil
  (if cl-user::*cl-repl-virt-p*
     (format t "~&;; CONSOLE: PL011 via the fixpoint boot descriptor, VA 20000000 ~
@@ -4680,6 +4698,7 @@
            (cond (cl-user::*cl-repl-virt-p* :fixpoint) (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                  (cl-user::*cl-repl-x64-p* :x86-64) (cl-user::*cl-repl-i386-p* :i386)
                  (cl-user::*cl-repl-arm32-p* :armv7-cl)
+                 (cl-user::*cl-repl-ppcmac-p* :ppcmac-cl)
                  (cl-user::*cl-repl-mac68k-p* :mac68k) (t :rpi))))
     (with-open-file (o p :direction :output :if-exists :supersede)
       (write-string cl-user::*full-source* o))
@@ -4690,6 +4709,7 @@
                                         (cl-user::*cl-repl-x64-p* :x86-64)
                                         (cl-user::*cl-repl-i386-p* :i386-cl)
                                         (cl-user::*cl-repl-arm32-p* :armv7-cl)
+                                        (cl-user::*cl-repl-ppcmac-p* :ppcmac-cl)
                                         (cl-user::*cl-repl-mac68k-p* :mac68k)
                                         (t :rpi))
                           :source-text cl-user::*full-source*)))
@@ -4699,6 +4719,7 @@
                         (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
                         (cl-user::*cl-repl-i386-p* "/tmp/modus-i386-cl-repl.bin")
                         (cl-user::*cl-repl-arm32-p* "/tmp/modus-arm32-cl-repl.bin")
+                        (cl-user::*cl-repl-ppcmac-p* "/tmp/modus-ppcmac.elf")
                         (cl-user::*cl-repl-mac68k-p* "/tmp/modus-mac68k-cl-repl.bin")
                         (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)
@@ -4794,6 +4815,24 @@
                (when (> (+ end #x200000) top)
                  (error "mac68k layout: the image ends at #x~X, within 2 MB of the stack top ~
                          #x~X." end top))))))
+      ;; ---- the PowerPC Mac (boot-ppcmac.lisp's map) --------------------
+      ;; The image runs at #x10000 and grows up; the stack grows DOWN from
+      ;; +PPCMAC-STACK-TOP+; Open Firmware loads the file at #x04000000.
+      (cl-user::*cl-repl-ppcmac-p*
+       (let ((gaps (symbol-value (intern "*PPC-UNIMPL-OPCODES*" "MODUS.MVM"))))
+         (if gaps
+             (format t "~&;; *** ppcmac TRANSLATOR GAPS (TW if run): ~{#x~X~^ ~} ***~%"
+                     (sort (copy-list gaps) #'<))
+             (format t "~&;; ppcmac: no unimplemented opcodes or traps.~%")))
+       (let* ((image-end (+ (symbol-value (intern "+PPCMAC-LOAD-ADDR+" "MODUS.MVM"))
+                            (length (kernel-image-image-bytes image))))
+              (stack-top (symbol-value (intern "+PPCMAC-STACK-TOP+" "MODUS.MVM"))))
+         (format t "~&;; ppcmac map: image #x10000 .. #x~X (~,1F MB), stack top #x~X, ~
+                   heap #x10000000..~%"
+                 image-end (/ image-end 1048576.0) stack-top)
+         (when (> image-end #x04000000)
+           (error "ppcmac layout: the image ends at #x~X, past OpenBIOS's load-base ~
+                   #x04000000, where Open Firmware reads the file." image-end))))
       ;; ---- ARMv7 QEMU virt (boot-arm32-cl.lisp's map) -----------------
       ;; The image runs at VA #x10000 and grows up; the stack grows DOWN from
       ;; +ARM32-CL-STACK-TOP+, and the L1 table sits above it.  Everything
@@ -4892,6 +4931,8 @@
             (cond
               (cl-user::*cl-repl-mac68k-p*
                 (format nil "sbcl --script scripts/mac68k-disk.lisp ~A DISK, then Basilisk II with it (serial port A is the console)" path))
+              (cl-user::*cl-repl-ppcmac-p*
+                (format nil "sbcl --script scripts/ppcmac-disk.lisp ~A DISK, then qemu-system-ppc -M mac99 -m 1024 -nographic -drive file=DISK,format=raw,media=disk (the console is serial port A)" path))
               (cl-user::*cl-repl-arm32-p*
                 (format nil "qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 -kernel ~A -display none -serial stdio -no-reboot" path))
               (cl-user::*cl-repl-x64-p*

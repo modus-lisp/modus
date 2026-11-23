@@ -1576,16 +1576,32 @@
                    (mvm-emit-byte final-buf (logand (ash insn -24) #xFF)))
                  (setq jmp-size (+ 8 pad))))
               ((member arch '(:ppc64 :ppc32))
-               ;; b target  (I-form, opcode 18, AA=0, LK=0): the 24-bit LI
-               ;; field is the word-aligned displacement from THIS
-               ;; instruction.  Big-endian, so the bytes go out high first.
-               (let* ((off (+ entry-native-offset 4))
-                      (insn (logior #x48000000 (logand off #x03FFFFFC))))
-                 (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
-                 (mvm-emit-byte final-buf (logand insn #xFF))
-                 (setq jmp-size 4)))
+               ;; A PC-RELATIVE jump that reaches +/-2 GB:
+               ;;   bl .+4 ; mflr r12 ; addis r12,r12,@ha ; addi r12,r12,@l
+               ;;   mtctr r12 ; bctr ; PAD
+               ;; It was a single `b', which reaches +/-32 MB -- RISC-V's 1 MB
+               ;; cliff above, one size up.  The CL image is 34 MB of native code
+               ;; with kernel-main near its end, and the `b' wrapped backward out
+               ;; of the image.  r12 and LR are free here: the stub has finished
+               ;; and translated code has not started.
+               ;; PAD (NOPs, skipped) puts native code on a 16-byte boundary, as
+               ;; on RISC-V: the translator aligns function entries to 16 relative
+               ;; to ITS buffer.  HDR is the ELF header the wrapper puts in front
+               ;; (one program header), which is mapped at the load address.
+               (let* ((hdr (case (getf boot-descriptor :elf-class) (32 84) (64 120) (t 0)))
+                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) 24) 16)) 16))
+                      (r (+ entry-native-offset 20 pad))   ; from the mflr r12
+                      (ha (logand (ash (+ r #x8000) -16) #xFFFF))
+                      (lo (logand r #xFFFF)))
+                 (dolist (insn (append (list #x48000005 #x7D8802A6
+                                             (logior #x3D8C0000 ha) (logior #x398C0000 lo)
+                                             #x7D8903A6 #x4E800420)
+                                       (make-list (floor pad 4) :initial-element #x60000000)))
+                   (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
+                   (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
+                   (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
+                   (mvm-emit-byte final-buf (logand insn #xFF)))
+                 (setq jmp-size (+ 24 pad))))
               ((eq arch :68k)
                ;; BRA.L (0x60FF + 32-bit displacement, 68020+/ColdFire).
                ;; The displacement is measured from the EXTENSION WORD at
@@ -2037,6 +2053,9 @@
     ;; wrapper dispatch, which is big-endian already.
     (:linux-ppc64 :ppc64)
     (:linux-ppc32 :ppc32)
+    ;; The bare PowerPC Mac CL image (boot/boot-ppcmac.lisp): the hosted
+    ;; ppc32 picture under BATs, the same translator in its Mac mode.
+    (:ppcmac-cl :ppc32)
     (:linux-68k :68k)
     (:mac68k :68k)
     ;; ARMv7, not the ARMv5 :arm32 descriptor: INSTALL-ARMV7-TRANSLATOR is what
@@ -2139,6 +2158,8 @@
     (:armv7-cl (funcall 'armv7-cl-boot-descriptor))
     ;; boot/boot-i386-cl.lisp, loaded by its build, as boot-arm32-cl.lisp is.
     (:i386-cl (funcall 'i386-cl-boot-descriptor))
+    ;; boot/boot-ppcmac.lisp, loaded by its build.
+    (:ppcmac-cl (funcall 'ppcmac-cl-boot-descriptor))
     (:rpi     (rpi-boot-descriptor))
     (:fixpoint (aarch64-fixpoint-boot-descriptor))
     (:uefi-x64 (uefi-x64-boot-descriptor))

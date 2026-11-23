@@ -418,7 +418,7 @@
           ;; a megabyte of dead code.  mvm-eval's JIT seam falls back cleanly, so
           ;; the image is CORRECT, just slower.  Removing this line is the whole
           ;; change when a RISC-V JIT arm lands.
-          ((member *cli-arch* '(:riscv64 :riscv32 :arm32 :68k)) nil)
+          ((member *cli-arch* '(:riscv64 :riscv32 :arm32 :68k :ppc32)) nil)
           ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
           (v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))  ; explicit
           ;; WS5 #206: DEFAULT is ON again.  It was turned OFF in 2d95d3e
@@ -912,9 +912,9 @@
     ;; i386 / riscv64: no in-image JIT translator — see the *JIT-ON* comment.
     ((%68k-native-tier-p) (%68k-native-tier-source))
     ((%i386-native-tier-p) (%i386-native-tier-source))
-    ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32 :68k)) "")
+    ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32 :68k :ppc32)) "")
     (t (error "build-cli-common: unknown *cli-arch* ~S ~
-               (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32 or :68k)"
+               (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32, :68k or :ppc32)"
               *cli-arch*))))
 
 ;;; ARCH SLOT — boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins
@@ -1460,7 +1460,7 @@
       "(defun %set-signal-disposition (signum disposition) signum disposition 0)
 (defun %ignore-sigpipe () 0)"))
   (let ((nr (ecase *cli-arch*
-              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32 :68k) 174))))
+              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32 :68k) 174) (:ppc32 173))))
     (concatenate 'string
       (if (member *cli-arch* '(:x64 :aarch64))
           (format nil "(defun %set-signal-disposition (signum disposition)
@@ -1832,7 +1832,7 @@
 (defun %machine-type-source ()
   (let ((m (ecase *cli-arch*
              (:x64 "x86_64") (:aarch64 "aarch64") (:i386 "i386")
-             (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l") (:68k "m68k"))))
+             (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l") (:68k "m68k") (:ppc32 "ppc"))))
     (format nil "~%(defun machine-type () ~S)~%(defun machine-version () ~S)~%" m m)))
 
 ;; MODUS_LISP_SPIN_AT spin points inside kernel-main (see %LISP-SPIN-FORM in
@@ -2844,7 +2844,7 @@
                                                      (mapcar (lambda (f) (merge-pathnames f *modus-base*))
                                                              (list "mvm/compiler.lisp" "mvm/cross.lisp"
                                                                    ;; this architecture's translator
-                                                                   (format nil "mvm/translate-~(~A~).lisp" *cli-arch*))))))))
+                                                                   (format nil "mvm/translate-~(~A~).lisp" (if (eq *cli-arch* :ppc32) :ppc *cli-arch*)))))))))
                       (maphash (lambda (k v) (declare (ignore v)) (push k r)) h)
                       r))))
       ;; a boot step lean boot skips is never a root, whoever names it
@@ -2885,7 +2885,7 @@
                    (remove-if-not #'probe-file
                                   (mapcar (lambda (f) (merge-pathnames f *modus-base*))
                                           (list "mvm/compiler.lisp" "mvm/cross.lisp"
-                                                (format nil "mvm/translate-~(~A~).lisp" *cli-arch*))))))
+                                                (format nil "mvm/translate-~(~A~).lisp" (if (eq *cli-arch* :ppc32) :ppc *cli-arch*)))))))
          (roots (let ((r (list "KERNEL-MAIN")) (h (make-hash-table :test #'equal)))
                   (do-external-symbols (s "COMMON-LISP") (push (symbol-name s) r))
                   ;; and the de-facto APIs portable code calls: the MOP

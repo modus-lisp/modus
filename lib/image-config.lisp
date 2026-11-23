@@ -172,23 +172,23 @@
   (let ((v (find-symbol "*IMAGE-BUILD-SCRIPT*" "COMMON-LISP-USER")))
     (when (and v (boundp v) (stringp (symbol-value v)))
       (return-from %image-build-script (symbol-value v))))
-  (let ((args (handler-case
-                  (with-open-file (f "/proc/self/cmdline")
-                    (let ((acc nil) (cur (make-string-output-stream)))
-                      (loop for c = (read-char f nil nil)
-                            while c
-                            do (if (char= c (code-char 0))
-                                   (push (get-output-stream-string cur) acc)
-                                   (write-char c cur)))
-                      (nreverse acc)))
-                (error ()
-                  ;; no /proc (a Windows host): a modus host's own record of
-                  ;; its command line, else what *POSIX-ARGV* kept
-                  (let ((v (or (find-symbol "*CLI-COMMAND-LINE*" "MODUS-INT")
-                               (find-symbol "*CLI-COMMAND-LINE*" "MODUS.RUNTIME"))))
-                    (if (and v (boundp v) (symbol-value v))
-                        (symbol-value v)
-                        sb-ext:*posix-argv*))))))
+  (let ((args
+          ;; a modus host's own record of its command line first: under Wine
+          ;; /proc/self/cmdline is readable and is WINE's
+          (let ((v (or (find-symbol "*CLI-COMMAND-LINE*" "MODUS-INT")
+                       (find-symbol "*CLI-COMMAND-LINE*" "MODUS.RUNTIME"))))
+            (if (and v (boundp v) (symbol-value v))
+                (symbol-value v)
+                (handler-case
+                    (with-open-file (f "/proc/self/cmdline")
+                      (let ((acc nil) (cur (make-string-output-stream)))
+                        (loop for c = (read-char f nil nil)
+                              while c
+                              do (if (char= c (code-char 0))
+                                     (push (get-output-stream-string cur) acc)
+                                     (write-char c cur)))
+                        (nreverse acc)))
+                  (error () sb-ext:*posix-argv*))))))
     (or (dolist (a0 args)
           (let* ((a (substitute #\/ #\\ a0))   ; mvm\build-....lisp on Windows
                  (p (search "mvm/" a)))

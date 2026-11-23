@@ -17,6 +17,7 @@
 # tvsim and tvdevice: the same app for an Apple TV (tvOS, its Simulator or a device): the desk on the TV,
 # driven by the remote; the phone's native controls, pickers and dictation are not there (#if os(tvOS)).
 # MODUS_IOS_ICON=PNG: the app's icon, 1024x1024, square (iOS rounds it); MODUS_IOS_ICON_DARK=PNG its dark one.
+# On a TV the same square icon becomes its layered icon and Top Shelf banner (tv-icon.swift).
 set -eu
 IMAGE=$1; OUT=$2; KIND=${3:-sim}; IDENT=${4:-}; PROFILE=${5:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -132,7 +133,17 @@ $( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
 PLIST
 # THE ICON: an asset catalog of one 1024-point image (and its dark one), compiled as Xcode compiles it --
 # Assets.car and the icon's keys, which go into the Info.plist
-if [ -n "${MODUS_IOS_ICON:-}" ] && [ $TV = 0 ]; then   # a TV's icon is a layered image stack: none yet
+if [ -n "${MODUS_IOS_ICON:-}" ] && [ $TV = 1 ]; then
+  # A TV'S ICON is a stack of layers the system tilts under the remote's thumb, in a brand-assets set with the Top
+  # Shelf's banners: tv-icon.swift makes them all from the same square icon (a TV has no dark mode for icons)
+  rm -rf "$OBJS/Assets.xcassets"
+  xcrun swift "$(dirname "$0")/tv-icon.swift" "$MODUS_IOS_ICON" "$OBJS/Assets.xcassets"
+  xcrun actool --compile "$OUT" --platform $SDKN --minimum-deployment-target 18.0 \
+    --target-device tv --app-icon "App Icon & Top Shelf Image" \
+    --output-partial-info-plist "$OBJS/icon.plist" "$OBJS/Assets.xcassets" > "$OBJS/actool.log"
+  /usr/libexec/PlistBuddy -c "Merge $OBJS/icon.plist" "$OUT/Info.plist" > /dev/null
+  rm -rf "$OBJS/Assets.xcassets"          # the sources, megabytes of banners: Assets.car has them
+elif [ -n "${MODUS_IOS_ICON:-}" ]; then
   SET=$OBJS/Assets.xcassets/AppIcon.appiconset
   mkdir -p "$SET"
   cp "$MODUS_IOS_ICON" "$SET/icon.png"

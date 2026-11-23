@@ -1303,6 +1303,7 @@ static void log_to_documents(void) {
 // A TV GIVES AN APP NO DOCUMENTS: its container's Documents cannot be written, and only Caches (which the system
 // may clear when space runs low) and tmp can.  So HOME is moved to Library/Caches, with a Documents folder of its
 // own, before anything reads it: the image's HOME/Documents and Files.swift's files_documents both land there.
+extern void modus_keep_restore(void);
 static void home_in_caches(void) {
     const char *home = getenv("HOME");
     if (!home) return;
@@ -1312,6 +1313,7 @@ static void home_in_caches(void) {
     mkdir(caches, 0755);
     mkdir(docs, 0755);
     setenv("HOME", caches, 1);
+    modus_keep_restore();                    // what the defaults kept of it, if Caches was emptied (modus-ui.m)
 }
 #endif
 

@@ -136,7 +136,7 @@
 ;; translate-68k.lisp decided *68K-JIT-SHAPES* from MODUS_68K_JIT when it loaded
 ;; (it serves the bare Mac too); the CLI's default is decided here.
 (when *cli-68k-jit*
-  (setf (symbol-value (find-symbol "*68K-JIT-SHAPES*" "MODUS.MVM"))
+  (setf (symbol-value (cl-user::host-symbol "*68K-JIT-SHAPES*" "MODUS.MVM"))
         (not (equal (sb-ext:posix-getenv "MODUS_68K_JIT_SHAPES") "0"))))
 
 ;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-test-aux.lisp

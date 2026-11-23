@@ -37,6 +37,16 @@
                             :name nil :type nil :defaults dir))))
   "The vessel checkout modus's bare-metal builds read their drivers from, or NIL.")
 
+(defun host-symbol (name package)
+  "The symbol NAME a build script sets in PACKAGE (a compiler or translator
+   variable).  FIND-SYMBOL, else INTERN: on a modus host (the builder CLI) a
+   kernel global the source never quotes has no symbol object -- compiled code
+   reaches its cell by name -- and FIND-SYMBOL is NIL, so a bare
+   (SETF (SYMBOL-VALUE (FIND-SYMBOL ...))) set NIL.  A modus host interns it
+   in MODUS-INT, where the kernel's globals are homed."
+  (or (find-symbol name package)
+      (intern name (or (find-package "MODUS-INT") package))))
+
 (defun modus-source (relative-path)
   "The file a build means by RELATIVE-PATH: modus's own if modus has it, else vessel's
    kernel/ copy.  Signals, naming both places, when neither has it -- a missing vessel
@@ -298,27 +308,27 @@
       (off (sb-ext:posix-getenv "MODUS_NO_GVCACHE"))
       (md  (sb-ext:posix-getenv "MODUS_GVCACHE_MODE")))
   (when (and on (plusp (length on)) (not (string= on "0")))
-    (setf (symbol-value (find-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) t)
+    (setf (symbol-value (host-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) t)
     (format t ";; MODUS_GVCACHE: AOT special reads use the cached cell~%"))
   (when (and off (plusp (length off)) (not (string= off "0")))
-    (setf (symbol-value (find-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) nil)
+    (setf (symbol-value (host-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) nil)
     (format t ";; MODUS_NO_GVCACHE: AOT special reads use the %GV-REF call~%"))
   (dolist (k '("MODUS_GVCACHE_LO" "MODUS_GVCACHE_HI"))
     (let ((v (sb-ext:posix-getenv k)))
       (when (and v (plusp (length v)))
-        (setf (symbol-value (find-symbol (if (search "_LO" k) "*GV-CACHE-LO*" "*GV-CACHE-HI*") :modus.mvm))
+        (setf (symbol-value (host-symbol (if (search "_LO" k) "*GV-CACHE-LO*" "*GV-CACHE-HI*") :modus.mvm))
               (parse-integer v))
         (format t ";; ~A=~A~%" k v))))
   (let ((o (sb-ext:posix-getenv "MODUS_GVCACHE_ONLY")))
     (when (and o (plusp (length o)))
-      (setf (symbol-value (find-symbol "*GV-CACHE-ONLY*" :modus.mvm))
+      (setf (symbol-value (host-symbol "*GV-CACHE-ONLY*" :modus.mvm))
             (let ((r nil) (start 0))
               (loop for i = (position #\, o :start start)
                     do (push (subseq o start i) r)
                        (if i (setq start (1+ i)) (return (nreverse r))))))
       (format t ";; MODUS_GVCACHE_ONLY=~A~%" o)))
   (when (and md (plusp (length md)))
-    (setf (symbol-value (find-symbol "*GV-CACHE-MODE*" :modus.mvm))
+    (setf (symbol-value (host-symbol "*GV-CACHE-MODE*" :modus.mvm))
           (intern (string-upcase md) :keyword))
     (format t ";; MODUS_GVCACHE_MODE=~A~%" md)))
 

@@ -138,7 +138,10 @@
   "The symbol of a compiler variable: in PKG or, failing that, MODUS.MVM's (whose
    packages it uses), so a name homed elsewhere in this image is still found."
   (or (let ((p (find-package pkg))) (and p (find-symbol name p)))
-      (find-symbol name (find-package "MODUS.MVM"))))
+      (find-symbol name (find-package "MODUS.MVM"))
+      ;; a kernel global no source quotes has no symbol yet: its cell is
+      ;; reached by name, so interning it in MODUS-INT names that cell
+      (intern name (find-package "MODUS-INT"))))
 
 (defun %builder-enter-fresh-state ()
   "Set the compiler's working state to SBCL's at its build call; the saved values."

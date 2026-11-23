@@ -212,7 +212,7 @@
   (check-layout-overlaps)
   (check-layout-pcrel)
   (flet ((put (name value)
-           (setf (symbol-value (find-symbol name :modus.mvm)) value)))
+           (setf (symbol-value (cl-user::host-symbol name :modus.mvm)) value)))
     (put "*CONV-RELATIVE*" t)
     (put "*CONV-DELTA*" *layout-conv-delta*)
     (put "*HOSTED-LAYOUT*" *layout-plist*)

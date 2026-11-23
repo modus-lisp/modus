@@ -71,12 +71,12 @@
   ;; MODUS_68K_TAGS3=1: 68k's 3-bit tags and 8-byte granule (target.lisp).
   (when (and (member arch '("68k" "mac68k") :test #'string=)
              (equal (sb-ext:posix-getenv "MODUS_68K_TAGS3") "1"))
-    (setf (symbol-value (find-symbol "*68K-TAGS3*" :modus.mvm)) t))
+    (setf (symbol-value (cl-user::host-symbol "*68K-TAGS3*" :modus.mvm)) t))
   ;; MODUS_MAC68K_LOAD_ADDR=#xNNNNNNNN: link a mac68k image there (the boot
   ;; disk's loader, which unpacks the real image at the usual address).
   (let ((la (sb-ext:posix-getenv "MODUS_MAC68K_LOAD_ADDR")))
     (when (and la (string= arch "mac68k"))
-      (setf (symbol-value (find-symbol "*MAC68K-LOAD-ADDR*" :modus.mvm))
+      (setf (symbol-value (cl-user::host-symbol "*MAC68K-LOAD-ADDR*" :modus.mvm))
             (let ((*read-base* 10)) (read-from-string la)))))
   (let* ((srcs (cddr sb-ext:*posix-argv*))
          (out (or (sb-ext:posix-getenv out-env) out-default))

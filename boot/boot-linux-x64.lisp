@@ -600,7 +600,7 @@
                   (#x48 #x89 #xC1) (#x4C #x29 #xC9)           ; rcx = rax - r9
                   (#x48 #x89 #x0C #x25 ,@(%x64-stub-le32 #x10000F98))  ; mov [kind delta], rcx
                   (#x4E #x8D #xA4 #x10 ,@(%x64-stub-le32 #xFFF))       ; lea r12, [rax+r10+0xFFF]
-                  (#x49 #x81 #xE4 ,@(%x64-stub-le32 #xFFFFF000))))))   ; and r12, -4096   = map size
+                  (#x49 #x81 #xE4 ,@(%x64-stub-le32 #xFFFFF000)))))   ; and r12, -4096   = map size
       (emit-bytes buf b))))
 
 ;;; A heap-geometry value that does not fit a sign-extended imm32 (a MODUS_X64_MIDPOINT

@@ -192,14 +192,18 @@
 ;;; at a function boundary, the translator reserves a pool of veneer slots
 ;;; (jumped over); PPC-FIXUP-LABELS sends an out-of-range branch to a slot in a
 ;;; pool it can reach, and the slot jumps anywhere in 2^32, PC-relative:
-;;;   mflr r0 ; bl .+4 ; mflr r12 ; mtlr r0 ; addis r12,r12,@ha ; addi r12,r12,@l
-;;;   mtctr r12 ; bctr
+;;;   stwu r1,-16(r1) ; stw r12,8(r1) ; mflr r0 ; bl .+4 ; mflr r12 ; mtlr r0
+;;;   addis r12,r12,@ha ; addi r12,r12,@l ; mtctr r12 ; lwz r12,8(r1)
+;;;   addi r1,r1,16 ; bctr
 ;;; LR comes back as it was (a `bl' to the slot keeps the caller's return
-;;; address); r0 and r12 are scratch at every branch.  One slot per (pool,
-;;; target): a far target called from many sites costs one slot per pool.
+;;; address), and so does R12: the handler-frame stubs take their arguments in
+;;; it (POP-EXT's destination is r12), and a veneer that used r12 as scratch made
+;;; POP-EXT copy a frame over its own code the first time a far caller popped
+;;; past the 46 in-memory frames.  Only r0 and CTR are clobbered.  One slot per
+;;; (pool, target): a far target called from many sites costs one slot per pool.
 (defconstant +ppc-pool-spacing+ (* 12 1024 1024))
 (defconstant +ppc-pool-slots+ 4096)
-(defconstant +ppc-veneer-words+ 8)
+(defconstant +ppc-veneer-words+ 12)
 
 (defun ppc-maybe-emit-pool (buf)
   "At a function boundary: reserve a veneer pool if the last one (or the start)
@@ -229,20 +233,24 @@
                 (error "PPC: veneer pool at ~D is full (~D slots)" (* 4 first) nslots))
               (setq slot next)
               (setf (gethash label-id slots) slot
-                    (fourth pool) (1+ next))
+                    (car (cdddr pool)) (1+ next))
               (let* ((w (+ first (* slot +ppc-veneer-words+)))
-                     (base (* 4 (+ w 2)))                   ; the mflr r12: LR after bl .+4
+                     (base (* 4 (+ w 4)))                   ; the mflr r12: LR after bl .+4
                      (r (- target base))
                      (ha (logand (ash (+ r #x8000) -16) #xFFFF))
                      (lo (logand r #xFFFF)))
-                (setf (aref words w)       #x7C0802A6       ; mflr r0
-                      (aref words (+ w 1)) #x48000005       ; bl .+4
-                      (aref words (+ w 2)) #x7D8802A6       ; mflr r12
-                      (aref words (+ w 3)) #x7C0803A6       ; mtlr r0
-                      (aref words (+ w 4)) (logior #x3D8C0000 ha)   ; addis r12,r12,ha
-                      (aref words (+ w 5)) (logior #x398C0000 lo)   ; addi r12,r12,lo
-                      (aref words (+ w 6)) #x7D8903A6       ; mtctr r12
-                      (aref words (+ w 7)) #x4E800420)))    ; bctr
+                (setf (aref words w)        #x9421FFF0      ; stwu r1,-16(r1)
+                      (aref words (+ w 1))  #x91810008      ; stw r12,8(r1)
+                      (aref words (+ w 2))  #x7C0802A6      ; mflr r0
+                      (aref words (+ w 3))  #x48000005      ; bl .+4
+                      (aref words (+ w 4))  #x7D8802A6      ; mflr r12
+                      (aref words (+ w 5))  #x7C0803A6      ; mtlr r0
+                      (aref words (+ w 6))  (logior #x3D8C0000 ha)  ; addis r12,r12,ha
+                      (aref words (+ w 7))  (logior #x398C0000 lo)  ; addi r12,r12,lo
+                      (aref words (+ w 8))  #x7D8903A6      ; mtctr r12
+                      (aref words (+ w 9))  #x81810008      ; lwz r12,8(r1)
+                      (aref words (+ w 10)) #x38210010      ; addi r1,r1,16
+                      (aref words (+ w 11)) #x4E800420)))   ; bctr
             (return (* 4 (+ first (* slot +ppc-veneer-words+))))))))))
 
 (defvar *ppc-li-const-patches* nil
@@ -293,7 +301,12 @@
                (word (aref words word-idx)))
           (unless target
             (error "PPC: undefined label ~D" label-id))
+          (when (consp fixup-type)
+            ;; (:DIFF32 . ANCHOR): the word is TARGET - ANCHOR (the export table)
+            (setf (aref words word-idx) (logand (- target (cdr fixup-type)) #xFFFFFFFF))
+            (setq fixup-type :done))
           (ecase fixup-type
+            (:done nil)
             ;; PC-RELATIVE ADDRESS HALVES for +op-fn-addr+.  The sequence is
             ;;   bl .+4 ; mflr rT ; addis rT,rT,@ha ; addi rT,rT,@l ; ori rT,rT,3
             ;; and LR holds the address of the MFLR, so both halves are measured
@@ -867,16 +880,17 @@
    mmap.  ARM32's *ARM32-CL-BARE* and 68k's *68K-MAC-MODE* shape.
    PPC-SET-MAC-MODE.")
 
-(defparameter *ppc-mac-escc-a* #x80013020
+(defparameter *ppc-mac-escc-a* #x08013020
   "Channel A's control register: mac-io (#x80000000 on QEMU's mac99 and on the
-   Uni-North Macs) + #x13020; its data register is 16 bytes up.  RR0 bit 0 is
+   Uni-North Macs, at VA #x08000000 under boot-ppcmac's DBAT3) + #x13020; its
+   data register is 16 bytes up.  RR0 bit 0 is
    a received character, bit 2 the transmit buffer empty.")
 (defparameter *ppc-mac-tb-shift* 16
   "The clock is the timebase >> this: a 30-bit fixnum of it lasts 4 days at
    QEMU mac99's 100 MHz.")
 (defparameter *ppc-mac-tb-hz* 100000000
   "The timebase frequency: Open Firmware's /cpus/@0 timebase-frequency.")
-(defconstant +ppc-mac-hstack-ext-base+ #x0E000000
+(defconstant +ppc-mac-hstack-ext-base+ #x07000000
   "The handler-frame extension on the Mac: a fixed 2 MB region, not an mmap
    (boot/boot-ppcmac.lisp's map; the stub writes the frame limit).")
 
@@ -891,6 +905,34 @@
     (ppc-emit-beq buf wait)
     (ppc-emit-stb buf rb +ppc-r12+ 16)
     (ppc-emit-eieio buf)))
+
+;;; THE NATIVE TIER (mvm/jit-ppc-native.lisp): a runtime DEFUN translated by this
+;;; file, baked into the image (MODUS_PPC_JIT=1).  The AOT side gives it:
+;;;   - an EXPORT TABLE of the routines that are not functions -- the collector
+;;;     and the handler-frame stubs -- emitted just before the code of the marker
+;;;     function %NPPC-EXPORT-TABLE (cross.lisp binds *PPC-EXPORT-MARKER-OFFSET*
+;;;     to its bytecode offset): "modusPXL", a count, then per routine its offset
+;;;     from the magic, or #x7FFFFFFF;
+;;;   - a ROOT WORD at +PPC-NATIVE-CONST-ROOT+ for the vector of constants
+;;;     runtime code loads, inside the low block the collector scans whole.
+(defparameter *ppc-native-tier* nil)
+(defvar *ppc-export-marker-offset* nil
+  "Bytecode offset of %NPPC-EXPORT-TABLE in the module being translated, or NIL.")
+(defconstant +ppc-native-const-root+ #x10000FBC
+  "The 32-bit ports' free upper half of the 64-bit JIT bump word (i386's too).")
+
+(defun ppc-native-export-labels ()
+  "The routines jit-ppc-native.lisp calls by address, in its order."
+  (list *ppc-gc-label* *ppc-hstack-push-slow-label* *ppc-hstack-pop-ext-label*))
+
+(defun ppc-emit-native-exports (buf)
+  (let ((magic (ppc-buffer-position buf)) (labels (ppc-native-export-labels)))
+    (ppc-emit-word buf #x6D6F6475)                ; "modu"
+    (ppc-emit-word buf #x7350584C)                ; "sPXL"
+    (ppc-emit-word buf (length labels))
+    (dolist (l labels)
+      (ppc-emit-word buf (if l 0 #x7FFFFFFF))
+      (when l (ppc-emit-fixup buf l (cons :diff32 magic))))))
 
 (defvar *ppc-unimpl-opcodes* nil
   "Opcodes, and service traps as #x10000+code, that the PPC translator met and
@@ -1720,6 +1762,32 @@
               (ppc-emit-cmpi-word buf +ppc-scratch1+ 0)
               (ppc-emit-bgt buf top)
               (ppc-emit-label buf done)))
+           ((= code #x0533)
+            ;; %JIT-ICACHE-FLUSH base len, both TAGGED: code was written as data.
+            ;; Per 32-byte line: DCBST (data out to memory), then SYNC, ICBI
+            ;; (the stale instruction line), SYNC, ISYNC -- the sequence the
+            ;; architecture gives for modified code.  Result 0.  r11/r12 only.
+            (let ((d (mvm-make-label)) (i (mvm-make-label)))
+              (ppc-emit-srawi buf +ppc-r11+ +ppc-r3+ 1)              ; base
+              (ppc-emit-srawi buf +ppc-r12+ +ppc-r4+ 1)
+              (ppc-emit-add buf +ppc-r12+ +ppc-r11+ +ppc-r12+)       ; end
+              (ppc-emit-rlwinm buf +ppc-r11+ +ppc-r11+ 0 0 26)       ; line-align
+              (ppc-emit-mr buf +ppc-r3+ +ppc-r11+)
+              (ppc-emit-label buf d)
+              (ppc-emit-word buf (logior #x7C00006C (ash +ppc-r11+ 11)))   ; dcbst 0,r11
+              (ppc-emit-addi buf +ppc-r11+ +ppc-r11+ 32)
+              (ppc-emit-cmpl-word buf +ppc-r11+ +ppc-r12+)
+              (ppc-emit-blt buf d)
+              (ppc-emit-sync buf)
+              (ppc-emit-mr buf +ppc-r11+ +ppc-r3+)
+              (ppc-emit-label buf i)
+              (ppc-emit-word buf (logior #x7C0007AC (ash +ppc-r11+ 11)))   ; icbi 0,r11
+              (ppc-emit-addi buf +ppc-r11+ +ppc-r11+ 32)
+              (ppc-emit-cmpl-word buf +ppc-r11+ +ppc-r12+)
+              (ppc-emit-blt buf i)
+              (ppc-emit-sync buf)
+              (ppc-emit-word buf #x4C00012C)                            ; isync
+              (ppc-emit-li buf +ppc-r3+ 0)))
            ((= code #x0302)
             ;; MEMORY BARRIER: SYNC (i386's is a no-op, x86 being strongly ordered)
             (ppc-emit-sync buf))
@@ -3973,6 +4041,8 @@
                ;; never falls through (it ends in BLR or a branch).
                (when (gethash pc fn-entries)
                  (ppc-maybe-emit-pool buf)
+                 (when (and *ppc-native-tier* (eql pc *ppc-export-marker-offset*))
+                   (ppc-emit-native-exports buf))
                  (loop while (/= 0 (mod (* 4 (ppc-buffer-word-count buf)) 16))
                        do (ppc-emit-nop buf)))
                ;; Emit label at current PC before translating
@@ -4014,6 +4084,54 @@
 ;;; ============================================================
 ;;; Installer
 ;;; ============================================================
+
+;;; HOST ONLY from here (the native tier bakes this file up to
+;;; PPC-DISASSEMBLE-NATIVE).
+
+(defun ppc-native-state-name-p (name)
+  "Per-translation state, not configuration: the native tier binds these."
+  (or (search "-LABEL*" name)
+      (member name '("*PPC-LI-CONST-PATCHES*" "*PPC-UNIMPL-OPCODES*" "*PPC-CUR-MVM-PC*"
+                     "*PPC-LONG-BRANCH-PCS*" "*PPC-BRANCH14-SITES*" "*PPC-BRANCH14-OVERFLOW*"
+                     "*PPC-EXPORT-MARKER-OFFSET*")
+              :test #'string=)))
+
+(defun ppc-native-dumpable-p (v)
+  (typecase v
+    ((or number character string symbol) t)
+    (cons (and (ppc-native-dumpable-p (car v)) (ppc-native-dumpable-p (cdr v))))
+    (simple-vector (every #'ppc-native-dumpable-p v))
+    (t nil)))
+
+(defun ppc-native-coinit-text ()
+  "Source text for jit-ppc-native.lisp's %NPPC-COINIT body: SETQs giving the
+   image's emitter the configuration this image was translated with (a DEFVAR's
+   initial value never runs in the image).  Every bound *PPC-...* special of
+   MODUS.MVM that is configuration and readable data.  Called by cross.lisp's
+   LATE-SOURCE-FILL, when the host's values are final."
+  (let ((forms nil) (skipped nil) (pkg (find-package :modus.mvm)))
+    (do-symbols (s pkg)
+      (let ((n (symbol-name s)))
+        (when (and (eq (symbol-package s) pkg) (boundp s)
+                   (> (length n) 6) (string= "*PPC-" n :end2 5)
+                   (char= (char n (1- (length n))) #\*)
+                   (not (constantp s))
+                   (not (ppc-native-state-name-p n)))
+          (if (ppc-native-dumpable-p (symbol-value s))
+              (push (cons n (let ((*package* (find-package :keyword)))
+                              (format nil "'~S" (symbol-value s))))
+                    forms)
+              (push n skipped)))))
+    (setq forms (sort forms #'string< :key #'car))
+    (format t "~&;; ppc native tier: ~D emitter settings carried into the image~@[; not data: ~{~A~^ ~}~]~%"
+            (length forms) (sort skipped #'string<))
+    (with-output-to-string (o)
+      (let ((*package* pkg) (*print-readably* nil) (*print-pretty* nil) (*print-base* 10)
+            (*print-radix* nil) (*print-circle* nil))
+        (format o "(progn")
+        (dolist (f forms)
+          (format o "~%    (setq ~A ~A)" (string-downcase (car f)) (cdr f)))
+        (format o "~%    t)")))))
 
 (defun ppc-disassemble-native (buf &key (start 0) (end nil))
   "Print a hex dump of PPC64 native code for debugging.

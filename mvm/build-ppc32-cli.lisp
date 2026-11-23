@@ -183,6 +183,9 @@
 
 (install-ppc32-translator)
 (ppc-set-linux-mode t)
+;; MODUS_PPC_JIT=1: the native tier (mvm/jit-ppc-native.lisp) -- the image
+;; carries the export table its runtime translator needs.
+(setf *ppc-native-tier* (equal (sb-ext:posix-getenv "MODUS_PPC_JIT") "1"))
 
 (let* ((out (or (sb-ext:posix-getenv "MODUS_CLI_OUT")
                 "/tmp/modus-ppc32-cli"))

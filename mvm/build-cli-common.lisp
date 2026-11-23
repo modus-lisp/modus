@@ -892,6 +892,28 @@
                  (modus.mvm::%source-file-trailer "mvm/translate-i386.lisp")
                  (string #\Newline))))
 
+;;; THE NATIVE PowerPC TIER (mvm/jit-ppc-native.lisp): the i386 tier's design on
+;;; ppc32.  MODUS_PPC_JIT=1 bakes translate-ppc.lisp (up to its host-only tail,
+;;; at PPC-NATIVE-STATE-NAME-P, DEFVAR initforms stripped) into the translator
+;;; slot, and jit-ppc-native.lisp into the late slot.  The emitter's settings
+;;; are filled in when BUILD-IMAGE compiles (PPC-NATIVE-COINIT-TEXT).  The build
+;;; sets *PPC-NATIVE-TIER* so the image carries the export table.
+(defun %ppc-native-tier-p ()
+  (and (eq *cli-arch* :ppc32) (equal (sb-ext:posix-getenv "MODUS_PPC_JIT") "1")))
+
+(defun %ppc-native-tier-source ()
+  (pushnew (cons "'(:nppc-coinit :pending)" 'modus.mvm::ppc-native-coinit-text)
+           modus.mvm::*late-source-fills* :test #'equal)
+  (let* ((src (mvm-text "mvm/translate-ppc.lisp"))
+         (marker "(defun ppc-native-state-name-p")
+         (pos (search marker src)))
+    (unless pos (error "ppc native tier: no PPC-NATIVE-STATE-NAME-P strip marker"))
+    (concatenate 'string
+                 (%strip-global-inits (subseq src 0 pos))
+                 modus.mvm::*build-package-reset-text*
+                 (modus.mvm::%source-file-trailer "mvm/translate-ppc.lisp")
+                 (string #\Newline))))
+
 ;;; The assembled translator slot, spliced into *all-runtime-source* and
 ;;; *full-source* as ONE unit.  Both arches: <encoder?> <translator> <co-init>,
 ;;; each followed by a newline — byte-identical on x64 to the three separate
@@ -912,6 +934,7 @@
     ;; i386 / riscv64: no in-image JIT translator — see the *JIT-ON* comment.
     ((%68k-native-tier-p) (%68k-native-tier-source))
     ((%i386-native-tier-p) (%i386-native-tier-source))
+    ((%ppc-native-tier-p) (%ppc-native-tier-source))
     ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32 :68k :ppc32)) "")
     (t (error "build-cli-common: unknown *cli-arch* ~S ~
                (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32, :68k or :ppc32)"
@@ -2856,7 +2879,9 @@
   (if (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
            (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
       (mvm-text "mvm/jit-68k.lisp")
-      (if (%i386-native-tier-p) (mvm-text "mvm/jit-i386-native.lisp") ""))
+      (cond ((%i386-native-tier-p) (mvm-text "mvm/jit-i386-native.lisp"))
+            ((%ppc-native-tier-p) (mvm-text "mvm/jit-ppc-native.lisp"))
+            (t "")))
   "Arch source placed after the CL runtime, the compiler and mvm-eval (see the
    slot in *FULL-SOURCE*).  A build may bind it first to add its own.")
 

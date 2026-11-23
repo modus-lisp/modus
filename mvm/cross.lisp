@@ -68,6 +68,10 @@
 ;;; Cross-Compilation Pipeline
 ;;; ============================================================
 
+(defvar *ppc-export-marker-offset* nil
+  "Set while translating for PowerPC: the bytecode offset of %NPPC-EXPORT-TABLE,
+   in front of which translate-ppc.lisp writes the native tier's export table.")
+
 (defvar *late-source-fills* nil
   "Alist (PLACEHOLDER . FUNCTION): before a compilation reads its source, each
    PLACEHOLDER string in it is replaced by FUNCTION's text, called THEN -- after
@@ -205,6 +209,13 @@
                                       :test #'string-equal)
                           (push (cons (string-upcase nm) (mvm-function-info-bytecode-offset fi))
                                 acc)))))))
+            ;; the PowerPC native tier's export table goes in front of this
+            ;; function (translate-ppc.lisp *PPC-EXPORT-MARKER-OFFSET*)
+            (setq modus.mvm::*ppc-export-marker-offset*
+                  (let ((fi (find "%NPPC-EXPORT-TABLE" fn-list
+                                  :key (lambda (fi) (string (mvm-function-info-name fi)))
+                                  :test #'string-equal)))
+                    (and fi (mvm-function-info-bytecode-offset fi))))
             (loop for attempt from 1
                   do (handler-case (return (funcall translator bytecode table))
                        (error (e)

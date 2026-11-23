@@ -137,13 +137,13 @@
 ;;; --- MVM-bytecode → AArch64 translator (modus.mvm) ---
 (defvar *translate-aa64-source* (mvm-text "mvm/translate-aarch64.lisp"))
 ;; Same code-buffer GC-corruption class as the x64/mvm-buffer shrinks above:
-;; a64-buffer's `code` slot defaults to 16M TAGGED slots (= 128 MB in-image,
-;; not 64 MB — these are boxed words, not a u8 vector) and A64-EMIT DOUBLES
+;; a64-buffer's `code` slot defaults to 16M (UNSIGNED-BYTE 32) slots (64 MB; as a
+;; generic vector it was 128 MB) and A64-EMIT DOUBLES
 ;; it on overflow, and each grow's replace-across-GC can move the buffer out
 ;; from under a stale local.  Rung 1 emits a trivial program (a few hundred
 ;; instructions), so 1M entries is a single up-front alloc that NEVER grows.
-(let ((needle "(code (make-array 16777216))")
-      (repl   "(code (make-array 1048576))"))
+(let ((needle "(code (make-array 16777216 :element-type '(unsigned-byte 32)))")
+      (repl   "(code (make-array 1048576 :element-type '(unsigned-byte 32)))"))
   (let ((p (search needle *translate-aa64-source*)))
     (unless p
       (error "#210: could not find a64-buffer 16M code-array default to shrink"))

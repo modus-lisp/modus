@@ -641,7 +641,10 @@
   ;; mvm.lisp ISA + interp + compiler + mvm-eval) blows past 64 MB —
   ;; a64-emit doubles the array on demand (same fix class as the
   ;; 96 MB x64 code-buffer overflow found landing WS3 on x64).
-  (code (make-array 16777216))
+  ;; (UNSIGNED-BYTE 32): 4 bytes an instruction.  A generic vector is 8 -- 128 MB
+  ;; here, 256 once doubled -- and a builder running this translator has one
+  ;; fixed 896 MB semispace to hold that and the whole compile.
+  (code (make-array 16777216 :element-type '(unsigned-byte 32)))
   (labels (make-hash-table :test 'eql))
   (fixups nil)
   (position 0))
@@ -660,7 +663,7 @@
       ;; from-space, so (replace new code) would copy abandoned memory and every
       ;; instruction emitted so far would be silently lost.  Re-read the slot
       ;; AFTER the allocation.  Harmless under SBCL (precise GC fixes locals up).
-      (let ((new (make-array (* 2 (length code)))))
+      (let ((new (make-array (* 2 (length code)) :element-type '(unsigned-byte 32))))
         (setq code (a64-buffer-code buf))
         (replace new code)
         (setf (a64-buffer-code buf) new)
@@ -958,7 +961,7 @@
    allocation the loop is allocation-free (fixnum logand/ash + aref), so one
    re-ordering closes the window.  Found while landing #210 rung 1."
   (let* ((n (a64-buffer-position buf))
-         (bytes (make-array (* n 4)))
+         (bytes (make-array (* n 4) :element-type '(unsigned-byte 8)))
          (code (a64-buffer-code buf)))
     (dotimes (i n bytes)
       (let ((w (aref code i))

@@ -771,8 +771,8 @@
       ;; Shrink the a64-buffer code array default (16M general slots ~ 128MB
       ;; tagged) to 64K — a64-emit grows it on demand, and a 128MB alloc per
       ;; make-a64-buffer would exhaust the image semispace on every JIT page.
-      (let ((needle "(code (make-array 16777216))")
-            (repl   "(code (make-array 65536))"))
+      (let ((needle "(code (make-array 16777216 :element-type '(unsigned-byte 32)))")
+            (repl   "(code (make-array 65536 :element-type '(unsigned-byte 32)))"))
         (let ((p (search needle src)))
           (unless p (error "CLI-JIT: could not find a64-buffer 16M code default to shrink"))
           (setq src (concatenate 'string (subseq src 0 p) repl

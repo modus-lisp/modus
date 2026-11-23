@@ -9,7 +9,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const { MVM, loadModule, MvmFault } = require('./mvm.js');
 const { NodeHost } = require('./host-node.js');
 
 const opts = { mvmw: path.join(__dirname, 'modus.mvmw'), trace: 0, debug: false, semi: 256 };
@@ -36,7 +35,11 @@ for (let i = 0; i < args.length; i++) {
   else argv.push(a);
 }
 
-const mod = loadModule(new Uint8Array(fs.readFileSync(opts.mvmw)));
+// The module header's word size (bytes 8..11) picks the machine: 8 = mvm.js
+// (x86-64 words as lo/hi pairs), 4 = mvm32.js (the i386-target module).
+const modBytes = new Uint8Array(fs.readFileSync(opts.mvmw));
+const { MVM, loadModule, MvmFault } = require(modBytes[8] === 4 ? './mvm32.js' : './mvm.js');
+const mod = loadModule(modBytes);
 const env = Object.entries(process.env).map(([k, v]) => `${k}=${v}`);
 const host = new NodeHost();
 const vm = new MVM(mod, host, { argv, env, trace: opts.trace, debug: opts.debug, maxSteps: opts.maxSteps, compile: opts.compile, compileThreshold: opts.compileThreshold, traceFrom: opts.traceFrom, traceCount: opts.traceCount, traceRegs: opts.traceRegs, profile: opts.profile, semispace: opts.semi << 20 });
@@ -79,6 +82,8 @@ if (process.env.DUMP_COMPILED) {
   host.log(`[dumped ${names.length} compiled fn names to ${process.env.DUMP_COMPILED}]`);
 }
 if (opts.profile) host.log(vm.profileReport(40));
+if (vm.callers) host.log('CALLERS\n' + [...vm.callers.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40).map(([k, c]) => String(c).padStart(10) + ' ' + k).join('\n'));
+if (process.env.MVM_SHAPES && vm.shapeReport) host.log(vm.shapeReport(parseInt(process.env.MVM_SHAPES, 10) > 1 ? parseInt(process.env.MVM_SHAPES, 10) : 40));
 if (vm.dcount.size) host.log('[dynamic delegated: ' + [...vm.dcount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([o, n]) => '0x' + o.toString(16) + ':' + n).join(' ') + ']');
 if (opts.trace && vm.compileStats.delegated.size) host.log('[delegated ops: ' + [...vm.compileStats.delegated.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([o, n]) => '0x' + o.toString(16) + ':' + n).join(' ') + ']');
 if (opts.trace) host.log(`[compiled ${vm.compileStats.fns} fns / ${vm.compileStats.insns} insns, ${vm.compileStats.failed} failed, ${vm.compileStats.ms | 0} ms]`);

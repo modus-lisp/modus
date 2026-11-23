@@ -11,7 +11,7 @@
 //               { type: 'query-result', id, op, bytes }
 
 importScripts('mvm.js', 'host-browser.js', 'warmset.js');
-const X = self.MVM_EXPORTS;
+let X = self.MVM_EXPORTS;
 
 self.onmessage = (ev) => {
   const msg = ev.data;
@@ -19,7 +19,11 @@ self.onmessage = (ev) => {
   const post = (m, t) => self.postMessage(m, t);
   try {
     const t0 = performance.now();
-    const mod = X.loadModule(new Uint8Array(msg.mvmw));
+    // The module header's word size picks the machine (as run-node.js): 4 = the
+    // i386-target module on mvm32.js, which replaces MVM_EXPORTS when loaded.
+    const bytes = new Uint8Array(msg.mvmw);
+    if (bytes[8] === 4) { importScripts('mvm32.js'); X = self.MVM_EXPORTS; }
+    const mod = X.loadModule(bytes);
     const host = new BrowserHost(msg.stdin, post, msg.http, msg.inbox, msg.query, msg.gui);
     for (const f of msg.files || []) host.addFile(f.path, new Uint8Array(f.bytes));
     const vm = new X.MVM(mod, host, { argv: msg.argv, env: msg.env, semispace: msg.semispace, trace: msg.trace | 0 });

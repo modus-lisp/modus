@@ -63,7 +63,7 @@ for (const [ops, n] of [[[0xEB,0xEC,0xF1,0xF9],3],[[0xED,0xEE,0xEF,0xF0,0xF2,0xF
 // interpreter -- slower, but it runs.  Before this list such a page relocated
 // and then stopped the VM with `unknown opcode'.
 const NO_EXEC = new Uint8Array(256);
-for (const o of [0x8C,0x8D,0xD9,0xDA,0xDB,0xDC,0xDD,0xDE,0xDF,0xE0,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA]) NO_EXEC[o] = 1;
+for (const o of [0xD9,0xDA,0xDB,0xDC,0xDD,0xDE,0xDF,0xE0,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA]) NO_EXEC[o] = 1;
 const ALLOC_START_OFF = 0x400;            // boot-linux-x64: +linux-x64-heap-alloc-start+
 const GUARD      = 0x01000000;            // 16 MB overshoot guard
 
@@ -1555,6 +1555,11 @@ class MVM {
   // resumes at the recorded block when a longjmp lands in its frame.
   compileFn(entry) {
     const m8 = this.m8;
+    // A late-binding thunk (build-web.lisp %WEB-LATE-THUNK) opens with two
+    // FENCEs and stays interpreted: the Lisp side rewrites it in place to a
+    // direct TAILCALL once its callee goes native, and a translated thunk
+    // would be cached by every caller's call site and never see that.
+    if (m8[entry] === 0x72 && m8[entry + 1] === 0x72) return null;
     const rd32 = (p) => (m8[p] | (m8[p + 1] << 8) | (m8[p + 2] << 16) | (m8[p + 3] << 24));
     // 1. explore the control-flow graph
     const starts = new Set([entry]);
@@ -1614,9 +1619,13 @@ class MVM {
       if (v <= 4) STORE5 += `m32[fb+(${OFF(v)})]=r${v}l;m32[fb+(${OFF(v) + 1})]=r${v}h;`;
       DECL += `let r${v}l=0,r${v}h=0;`;
     }
-    // V0-V3 and V5-V8 are caller-saved on the native machine, so after a
-    // call only V4 is meaningful; a fresh entry needs V0-V4 (args, rbx).
-    const ENTRY = `if(L===0){${[0, 1, 2, 3, 4].map((v) => `r${v}l=m32[fb+(${OFF(v)})];r${v}h=m32[fb+(${OFF(v) + 1})];`).join('')}}else{r4l=m32[fb+(${OFF(4)})];r4h=m32[fb+(${OFF(4) + 1})];}`;
+    // A call leaves this function (the driver re-enters it at the resume
+    // label), so its locals do not survive one: every V0-V8 is written to the
+    // frame before the call and V4-V8 are read back after it.  V0-V3 are dead
+    // across a call; V5-V8 are not when the image is built with
+    // *CALL-TEMPS-SURVIVE* (build-web.lisp), which drops the PUSH/POP that
+    // used to carry live temps across.  A fresh entry needs V0-V4 (args, rbx).
+    const ENTRY = `if(L===0){${[0, 1, 2, 3, 4].map((v) => `r${v}l=m32[fb+(${OFF(v)})];r${v}h=m32[fb+(${OFF(v) + 1})];`).join('')}}else{${[4, 5, 6, 7, 8].map((v) => `r${v}l=m32[fb+(${OFF(v)})];r${v}h=m32[fb+(${OFF(v) + 1})];`).join('')}}`;
     const WR = (v) => W(v, 'RL', 'RH');
     let curChunk = 0;
     const J = (t) => { const l = label.get(t); return labelChunk.get(l) === curChunk ? `{L=${l};continue;}` : `{${STORE}return ${-(2 + l)};}`; };
@@ -1739,9 +1748,9 @@ class MVM {
             const t = rd32(pc + 1) >>> 0;
             const c = `c${nsite++}`;
             sites.push(c);
-            out += `${P}${STORE5}vm.resumeL=${label.get(pc + len)};if(${c}===undefined)${c}=vm.compiledFor(${t});vm.nextF=${c};vm.push(${RET_SENTINEL},0);vm.enter(${t});return ${t * 2};`;
+            out += `${P}${STORE}vm.resumeL=${label.get(pc + len)};if(${c}===undefined)${c}=vm.compiledFor(${t});vm.nextF=${c};vm.push(${RET_SENTINEL},0);vm.enter(${t});return ${t * 2};`;
           } else {
-            out += `${P}${STORE5}{const t=vm.fnAddrToOffset(${lo(b1)},${hi(b1)});vm.resumeL=${label.get(pc + len)};vm.push(${RET_SENTINEL},0);vm.enter(t);return t*2;}`;
+            out += `${P}${STORE}{const t=vm.fnAddrToOffset(${lo(b1)},${hi(b1)});vm.resumeL=${label.get(pc + len)};vm.push(${RET_SENTINEL},0);vm.enter(t);return t*2;}`;
           }
           break;
         }

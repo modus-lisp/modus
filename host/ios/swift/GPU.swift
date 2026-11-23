@@ -175,7 +175,7 @@ func printImage(_ image: CGImage, title: String) {
     op.jobTitle = title
     if let window = rootView()?.window { op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil) }
     else { op.run() }
-    #else
+    #elseif os(iOS)   // a TV does not print
     let controller = UIPrintInteractionController.shared
     let info = UIPrintInfo(dictionary: nil)
     info.jobName = title

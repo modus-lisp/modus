@@ -24,10 +24,12 @@ private var views: [UInt: UIView] = [:]
 var nextHandle: UInt = 1
 // A scroll view's handle maps to the stack that holds its children (ui_add puts them there).
 private var scrollContent: [UInt: UIStackView] = [:]
+#if !os(tvOS)
 // A list's handle maps to its data source (a UITableView keeps its data source weakly).
 private var lists: [UInt: ModusList] = [:]
 // A text view's delegate is weak in UIKit, so the view's handle keeps it here.
 private var textViewDelegates: [UInt: ModusTextView] = [:]
+#endif
 private var events: [Term] = []
 
 func send(_ name: String, _ args: [Term]) {
@@ -67,6 +69,10 @@ struct Row {
     let section: String?
     let index: Int
 }
+
+// THE COMPONENTS are the phone's and iPad's: tvOS has few of these controls (no switch, slider, picker, document
+// picker, edit menu ...), so a TV build has only the event queue below and the desk.
+#if !os(tvOS)
 
 // A list of rows.  Lisp sends the rows as data (ui_list_set_data: a list of plists, each with :TITLE and
 // optionally :SUBTITLE); the table asks this object for its cells as it needs them, and a tap on a row is a
@@ -1864,6 +1870,8 @@ let resign: Call = { _, _, _, _, _, _ in
     return 0
 }
 
+#endif
+
 // events_next(buffer, capacity): the oldest event, encoded as a term into the buffer; its length in bytes, or 0
 // if there is none (or it does not fit, which an event never does at 1 KB).
 let eventsNext: Call = { buf, cap, _, _, _, _ in
@@ -1887,18 +1895,27 @@ func register(_ name: String, _ fn: Call) {
 public func modusSwiftInstall() {
     installGPU()                                   // GPU.swift: Metal, under WebGPU's shape
     installSpeech()                                // Speech.swift: the platform's voice and ear
+    #if !os(tvOS)
     installBluetooth()                             // Bluetooth.swift: LE links, for a mesh
+    #endif
     installFiles()                                 // Files.swift: Documents, and the document picker (iCloud Drive)
     installCamera()                                // Camera.swift: a preview, frames, photos and video
     installMicrophone()                            // Microphone.swift: its samples, for Lisp
     installNowPlaying()                            // NowPlaying.swift: Now Playing and the media keys
     installGamepad()                               // Gamepad.swift: game controllers
     installSpatial()                               // Spatial.swift: sound placed in three dimensions
+    #if !os(tvOS)
     installNotify()                                // Notify.swift: the system's notifications
+    #endif
+    #if !os(tvOS)
     installLocation()                              // Location.swift: where the device is
+    #endif
     installMotion()                                // Motion.swift: how the device itself is turned
     installLink()                                  // Link.swift: messages to and from the watch
+    #if !os(tvOS)
     installNative()                                // Native.swift: app-grade components (an app, not the desk)
+    #endif
+    #if !os(tvOS)   // a TV has none of the phone's controls: the desk draws its own (Native.swift likewise)
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
     register("ui_symbol_button_new", symbolButtonNew)
@@ -1993,5 +2010,6 @@ public func modusSwiftInstall() {
     register("ui_remove", removeView)
     register("ui_send_tap", sendTap)
     register("ui_resign", resign)
+    #endif
     register("ui_events_next", eventsNext)
 }

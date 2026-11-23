@@ -16,7 +16,7 @@
 //   events: MEDIA (h "play" | "pause" | "toggle" | "stop" | "next" | "previous"), SEEK (h milliseconds)
 
 import MediaPlayer
-#if os(iOS)
+#if os(iOS) || os(tvOS)
 import AVFoundation
 import UIKit
 #else
@@ -56,7 +56,7 @@ private func installCommands() {
         send("SEEK", [.int(Int(mediaHandle)), .int(Int(e.positionTime * 1000))])
         return .success
     }
-    #if os(iOS)
+    #if os(iOS) || os(tvOS)
     // the phone shows an app in Now Playing only while its audio session is playback, and not mixed with others
     try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
     try? AVAudioSession.sharedInstance().setActive(true)
@@ -98,7 +98,7 @@ let npTimes: Call = { dur, pos, playing, _, _, _ in
 
 let npArtwork: Call = { p, n, _, _, _, _ in
     let path = text(p, n)
-    #if os(iOS)
+    #if os(iOS) || os(tvOS)
     let image = path.isEmpty ? nil : UIImage(contentsOfFile: path)
     #else
     let image = path.isEmpty ? nil : NSImage(contentsOfFile: path)
@@ -116,7 +116,7 @@ let npArtworkData: Call = { p, n, _, _, _, _ in
     var ok = true
     if n > 0, let bytes = UnsafeRawPointer(bitPattern: p) {
         let data = Data(bytes: bytes, count: Int(n))
-        #if os(iOS)
+        #if os(iOS) || os(tvOS)
         let image = UIImage(data: data)
         #else
         let image = NSImage(data: data)

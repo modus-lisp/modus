@@ -20,7 +20,9 @@
 //   ear_level()                           the input level, in millionths of full scale
 
 import AVFoundation
+#if canImport(Speech) && !os(tvOS)
 import Speech
+#endif
 
 private let synthesizer = AVSpeechSynthesizer()
 
@@ -91,6 +93,7 @@ let speechFileDone: Call = { h, _, _, _, _, _ in UInt(bitPattern: fileStates[h] 
 
 // ---- the ear ------------------------------------------------------------------------------------------------
 
+#if !os(tvOS)   // a TV has no recognizer for an app (SFSpeechRecognizer): the voice alone
 private enum EarState: UInt { case idle = 0, asking, listening, denied, failed, file }
 
 private final class Ear {
@@ -215,6 +218,7 @@ private final class Ear {
 }
 
 private let ear = Ear()
+#endif
 
 private func copyOut(_ s: String, _ buf: UInt, _ cap: UInt) -> UInt {
     let bytes = Array(s.utf8)
@@ -224,6 +228,7 @@ private func copyOut(_ s: String, _ buf: UInt, _ cap: UInt) -> UInt {
     return UInt(bytes.count)
 }
 
+#if !os(tvOS)
 let earStart: Call = { _, _, _, _, _, _ in
     if ear.state != .listening && ear.state != .asking { ear.listen() }
     return 1
@@ -241,6 +246,7 @@ let earText: Call = { buf, cap, _, _, _, _ in
 }
 let earPartial: Call = { buf, cap, _, _, _, _ in copyOut(ear.partial, buf, cap) }
 let earLevel: Call = { _, _, _, _, _, _ in UInt(min(1.0, max(0.0, ear.level)) * 1_000_000) }
+#endif
 
 func installSpeech() {
     register("speech_say", speechSay)
@@ -248,6 +254,7 @@ func installSpeech() {
     register("speech_speaking", speechSpeaking)
     register("speech_to_file", speechToFile)
     register("speech_file_done", speechFileDone)
+    #if !os(tvOS)
     register("ear_start", earStart)
     register("ear_file", earFile)
     register("ear_stop", earStop)
@@ -256,4 +263,5 @@ func installSpeech() {
     register("ear_text", earText)
     register("ear_partial", earPartial)
     register("ear_level", earLevel)
+    #endif
 }

@@ -1,5 +1,5 @@
 #!/bin/sh
-# build-ios.sh IMAGE.elf OUT.app [sim|device] [SIGN-IDENTITY] [PROFILE.mobileprovision]
+# build-ios.sh IMAGE.elf OUT.app [sim|device|tvsim|tvdevice] [SIGN-IDENTITY] [PROFILE.mobileprovision]
 #
 # Wrap a Darwin-layout, JIT-off modus image in a minimal iOS app bundle
 # (docs/macos-hosting.md, M5).  The same shim as macOS (host/macos), built with
@@ -14,6 +14,8 @@
 # to name one, or list the arguments one per line in a bundled modus.args.
 # MODUS_CORE=FILE puts a snapshot's compiled code in the app (image-segments.sh).
 # MODUS_IOS_ROTATES=1: the app turns with the phone (portrait and both landscapes); otherwise iOS's default.
+# tvsim and tvdevice: the same app for an Apple TV (tvOS, its Simulator or a device): the desk on the TV,
+# driven by the remote; the phone's native controls, pickers and dictation are not there (#if os(tvOS)).
 # MODUS_IOS_ICON=PNG: the app's icon, 1024x1024, square (iOS rounds it); MODUS_IOS_ICON_DARK=PNG its dark one.
 set -eu
 IMAGE=$1; OUT=$2; KIND=${3:-sim}; IDENT=${4:-}; PROFILE=${5:-}
@@ -22,7 +24,16 @@ MAC=$HERE/../macos
 case $KIND in
   sim)    SDKN=iphonesimulator; TARGET=arm64-apple-ios18.0-simulator ;;
   device) SDKN=iphoneos;        TARGET=arm64-apple-ios18.0 ;;
-  *) echo "kind must be sim or device" >&2; exit 2 ;;
+  tvsim)    SDKN=appletvsimulator; TARGET=arm64-apple-tvos18.0-simulator ;;
+  tvdevice) SDKN=appletvos;        TARGET=arm64-apple-tvos18.0 ;;
+  *) echo "kind must be sim, device, tvsim or tvdevice" >&2; exit 2 ;;
+esac
+TV=0; case $KIND in tv*) TV=1 ;; esac
+# the frameworks only the phone has: Speech's recognizer, Quick Look
+PHONE_FW="-framework Speech -framework QuickLook"; [ $TV = 1 ] && PHONE_FW=""
+case $KIND in
+  sim) PLATFORM=iPhoneSimulator ;; device) PLATFORM=iPhoneOS ;;
+  tvsim) PLATFORM=AppleTVSimulator ;; tvdevice) PLATFORM=AppleTVOS ;;
 esac
 SDK=$(xcrun --sdk $SDKN --show-sdk-path)
 rm -rf "$OUT"; mkdir -p "$OUT"
@@ -61,7 +72,8 @@ done
 # signature (an ad-hoc signature that carries them is not launched): without an application identifier
 # and its keychain group, every keychain write is refused (errSecMissingEntitlement), so nothing the app
 # keeps there -- an SSH key, a password -- outlives the call that made it.
-if [ "$KIND" = sim ]; then
+case $KIND in *sim) SIMSIG=1 ;; *) SIMSIG=0 ;; esac
+if [ $SIMSIG = 1 ]; then
   SIMENT=$OBJS/sim.entitlements
   APPID=SIMULATOR.${MODUS_IOS_BUNDLE_ID:-org.modus-lisp.modus}
   cat > "$SIMENT" <<ENT
@@ -77,7 +89,7 @@ fi
 # shellcheck disable=SC2086  # LINKX is a flag list
 xcrun --sdk $SDKN swiftc -target $TARGET -sdk "$SDK" -o "$OUT/modus" "$OBJS"/*.o \
   -framework AudioToolbox -framework AVFoundation -framework UIKit -framework QuartzCore \
-  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal -framework Speech -framework QuickLook $LINKX
+  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal $PHONE_FW $LINKX
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -103,7 +115,7 @@ $( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
   <key>UILaunchScreen</key><dict/>
   <key>UIFileSharingEnabled</key><true/>
   <key>LSSupportsOpeningDocumentsInPlace</key><true/>
-  <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+  <key>UIDeviceFamily</key><array>$( [ $TV = 1 ] && echo '<integer>3</integer>' || echo '<integer>1</integer><integer>2</integer>' )</array>
   <key>UIApplicationSceneManifest</key><dict>
     <key>UIApplicationSupportsMultipleScenes</key><false/>
     <key>UISceneConfigurations</key><dict>
@@ -113,12 +125,12 @@ $( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
       </dict></array>
     </dict>
   </dict>
-  <key>CFBundleSupportedPlatforms</key><array><string>$( [ $KIND = sim ] && echo iPhoneSimulator || echo iPhoneOS )</string></array>
+  <key>CFBundleSupportedPlatforms</key><array><string>$PLATFORM</string></array>
 </dict></plist>
 PLIST
 # THE ICON: an asset catalog of one 1024-point image (and its dark one), compiled as Xcode compiles it --
 # Assets.car and the icon's keys, which go into the Info.plist
-if [ -n "${MODUS_IOS_ICON:-}" ]; then
+if [ -n "${MODUS_IOS_ICON:-}" ] && [ $TV = 0 ]; then   # a TV's icon is a layered image stack: none yet
   SET=$OBJS/Assets.xcassets/AppIcon.appiconset
   mkdir -p "$SET"
   cp "$MODUS_IOS_ICON" "$SET/icon.png"

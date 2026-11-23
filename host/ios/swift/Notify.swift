@@ -1,3 +1,4 @@
+#if !os(tvOS)   // a TV shows no app notifications but its badge
 // Notify.swift — the system's notifications, for Lisp: ask to send them, send one (now or in a while), and hear
 // when one is clicked.  The same on the Mac and the phone.  Lisp's side is vessel's notify.lisp.
 //
@@ -93,3 +94,4 @@ func installNotify() {
     register("notify_post", notifyPost)
     register("notify_badge", notifyBadge)
 }
+#endif

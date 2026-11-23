@@ -1,3 +1,4 @@
+#if !os(tvOS)   // app-grade components are the phone's and iPad's (tvOS has few of these controls)
 // Native.swift — app-grade native components: what a modus app needs to look like an ordinary iPhone app
 // rather than a window over glass's desk.  The navigation controller is the window's ROOT; screens are pushed
 // onto it and say when they are popped; tables are the system's inset-grouped ones in the system's colours,
@@ -22,7 +23,9 @@
 
 import CoreImage
 import ImageIO
+#if canImport(QuickLook)
 import QuickLook
+#endif
 import UIKit
 import UniformTypeIdentifiers
 
@@ -4074,3 +4077,4 @@ func installNative() {
     register("app_resolve", appResolve)
     register("app_documents", appDocuments)
 }
+#endif

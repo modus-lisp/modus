@@ -120,7 +120,7 @@ static void push_resize(long w, long h) {
     os_unfair_lock_unlock(&ev_lock);
 }
 
-static void push_keyboard(long px) {
+static __attribute__((unused)) void push_keyboard(long px) {
     os_unfair_lock_lock(&ev_lock);
     if (ev_tail - ev_head < NEV)
         events[ev_tail++ % NEV] = ((uint64_t)7 << 40) | (uint64_t)(px < 0 ? 0 : px);
@@ -144,8 +144,12 @@ static uint32_t keysym_for(uint32_t cp) {
 // THE KEYBOARD.  The view is a UIKeyInput, so it can be first responder: the on-screen keyboard
 // types into it, and so does a hardware one while the view holds focus.  Text is the image's to
 // interpret -- no autocorrection, no auto-capitals, the keys as typed.
+#if TARGET_OS_TV
+@interface ModusView : UIView <UIKeyInput>          // a TV has no clipboard and no edit menu
+#else
 @interface ModusView : UIView <UIKeyInput, UIEditMenuInteractionDelegate>
 @property(nonatomic, strong) UIEditMenuInteraction *editMenu;   // the paste menu (two-finger press)
+#endif
 @property(nonatomic) UITextAutocorrectionType autocorrectionType;
 @property(nonatomic) UITextAutocapitalizationType autocapitalizationType;
 @property(nonatomic) UITextSpellCheckingType spellCheckingType;
@@ -167,6 +171,7 @@ static uint32_t keysym_for(uint32_t cp) {
 }
 - (void)deleteBackward { push_key(0xff08); }
 
+#if !TARGET_OS_TV
 // PASTE.  The clipboard's text goes in as keys, as typing would: keysym_for makes a newline Return
 // and a tab Tab.  Cmd-V on a hardware keyboard, a Paste in the menu that a two-finger press
 // brings up (one finger stays the pointer), and the system's own paste: all come here.
@@ -208,11 +213,37 @@ static uint32_t keysym_for(uint32_t cp) {
                                         handler:^(__kindof UIAction *a) { [self paste:nil]; }];
     return [UIMenu menuWithChildren:@[ paste ]];
 }
+#endif
+#if TARGET_OS_TV
+// THE REMOTE.  A TV's input is presses, not touches: its arrows (the clickpad's edges) are the arrow keys, its
+// Select is Return, Back (Menu) is Escape and Play/Pause is Space -- what the desk does with a keyboard.  The view
+// is focusable so the presses come to it.  Back is the desk's from here on: Home (the TV button) leaves the app.
+- (BOOL)canBecomeFocused { return YES; }
+static uint32_t remote_keysym(UIPress *p) {
+    switch (p.type) {
+    case UIPressTypeLeftArrow:  return 0xff51;
+    case UIPressTypeUpArrow:    return 0xff52;
+    case UIPressTypeRightArrow: return 0xff53;
+    case UIPressTypeDownArrow:  return 0xff54;
+    case UIPressTypeSelect:     return 0xff0d;
+    case UIPressTypeMenu:       return 0xff1b;
+    case UIPressTypePlayPause:  return ' ';
+    default:                    return 0;
+    }
+}
+- (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)e {
+    for (UIPress *p in presses) if (!p.key && remote_keysym(p)) return;   // the remote's: taken at the press
+    [super pressesEnded:presses withEvent:e];
+}
+#endif
 // A hardware keyboard's arrows and Escape never reach insertText.
 - (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)e {
     BOOL rest = NO;
     for (UIPress *p in presses) {
         uint32_t ks = 0;
+#if TARGET_OS_TV
+        if (!p.key && (ks = remote_keysym(p))) { push_key(ks); continue; }
+#endif
         switch (p.key.keyCode) {
         case UIKeyboardHIDUsageKeyboardLeftArrow:  ks = 0xff51; break;
         case UIKeyboardHIDUsageKeyboardUpArrow:    ks = 0xff52; break;
@@ -227,6 +258,9 @@ static uint32_t keysym_for(uint32_t cp) {
 }
 - (void)touches:(NSSet<UITouch *> *)ts type:(long)type {
     for (UITouch *t in ts) {
+#if TARGET_OS_TV
+        if (t.type == UITouchTypeIndirect) continue;   // the remote's touch surface: its swipes are not taps on the screen
+#endif
         CGPoint p = [t locationInView:self];
         push_event(type, p);
         push_finger(t, type, p);
@@ -355,7 +389,9 @@ void modus_ui_start(void *scene) {
     // frame when the phone turned (measured: a landscape screen showing a 402-point-wide view).
     UIViewController *vc = [[ModusViewController alloc] init];
     ModusView *v = [[ModusView alloc] initWithFrame:b];
+#if !TARGET_OS_TV
     v.multipleTouchEnabled = YES;
+#endif
     v.backgroundColor = UIColor.blackColor;
     v.layer.magnificationFilter = kCAFilterNearest;
     if (fb_surface) v.layer.contents = (__bridge id)fb_surface;
@@ -366,6 +402,7 @@ void modus_ui_start(void *scene) {
     fb_view = v;
     show_part();
     note_safe_area(v);
+#if !TARGET_OS_TV   // a TV's keyboard is a screen of its own, and a TV does not turn
     // THE KEYBOARD'S FRAME, as it comes and goes (and when it changes size: emoji, a different
     // language): how much of the view it covers, in pixels, as a type-7 event.  The image lays
     // its windows out in what is left.
@@ -400,6 +437,7 @@ void modus_ui_start(void *scene) {
             });
         }
     }
+#endif
     // THE FRAME CLOCK: a display link signals FRAME_TICK once a refresh (60 or 120 Hz), and
     // WAIT-FRAME waits on it.  At most one tick is banked, so a slow frame does not let the
     // next ones run back to back.
@@ -492,8 +530,12 @@ int64_t modus_ui_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3
         NSString *s = [[NSString alloc] initWithBytes:(const void *)a0 length:(NSUInteger)a1
                                              encoding:NSUTF8StringEncoding];
         if (!s) return -22;
+#if TARGET_OS_TV
+        return -38;                                    // a TV has no pasteboard: ENOSYS
+#else
         dispatch_async(dispatch_get_main_queue(), ^{ [UIPasteboard generalPasteboard].string = s; });
         return 0;
+#endif
     }
     case 1006:
         dispatch_async(dispatch_get_main_queue(), ^{

@@ -1,3 +1,4 @@
+#if !os(tvOS)   // a TV has no location updates
 // Location.swift — where the device is, for Lisp: CoreLocation, the same on the Mac and the phone.  Lisp's side is
 // vessel's location.lisp.  POLLED, as the rest: ask, start, then read the latest fix when it suits.
 //
@@ -87,3 +88,4 @@ func installLocation() {
     register("location_stop", locationStop)
     register("location_get", locationGet)
 }
+#endif

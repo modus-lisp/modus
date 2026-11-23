@@ -180,12 +180,15 @@
   t)
 
 (defun %builder-prepare-target (target)
-  "Register the targets (their DEFPARAMETERs are host data) and give the
-   foreign translators the configuration their build scripts give them."
+  "Register the targets (their DEFPARAMETERs are host data)."
   (%init-selfhost-targets)
   (setq *builder-targets-ready* t)
-  (cond ((eq target :linux-aarch64) (%init-aarch64-translator))
-        ((eq target :linux-riscv32) (%init-riscv32-translator))))
+  ;; NOT the foreign translators' configuration: %BUILDER-BOOT-INIT gave them their
+  ;; defaults, and since then the build script has set what its target needs
+  ;; (the Darwin CLI: the native collector and the bitmap marks).  Calling
+  ;; %INIT-AARCH64-TRANSLATOR here put the defaults back over the script's
+  ;; settings -- the image came out 3 MB short of SBCL's, without its collector.
+  target)
 
 ;;; Translator and runtime-JIT state %BUILDER-BUILD-IMAGE resets for the target that the
 ;;; host's own JIT translations read: besides *BUILDER-FRESH-STATE*'s translator entries.

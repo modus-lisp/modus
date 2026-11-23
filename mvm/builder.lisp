@@ -209,9 +209,13 @@
              ;; the image's configuration record is taken HERE, after the reset,
              ;; so it names the flags this compile uses (SBCL's are its defaults)
              (setq fresh (%builder-enter-fresh-state))
+             ;; an EVAL mid-compile (a target macro's expander) leaves the
+             ;; compiler as it found it (mvm-eval.lisp MVM-EVAL-FORMS)
+             (setq *in-image-build* t)
              (when (and finalize (stringp src))
                (setf (getf args :source-text) (funcall finalize src target)))
              (apply #'build-image args))
+        (setq *in-image-build* nil)
         (%builder-leave-fresh-state fresh)
         (setq *functions* s-functions *function-table* s-function-table
               *globals* s-globals *constants* s-constants

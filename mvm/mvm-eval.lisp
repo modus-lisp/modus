@@ -4668,13 +4668,22 @@
       (setq *mexp-memo* s-memo) (setq *mexp-memo-gc* s-memogc)
       (setq *compile-target* s-ct))))
 
+(defvar *in-image-build* nil
+  "T while this image compiles an IMAGE (the builder CLI's %BUILDER-BUILD-IMAGE,
+   mvm/builder.lisp), whose build runs with *STATIC-BUILD-P* NIL as SBCL's does.
+   An EVAL reached mid-compile -- a target DEFMACRO's expander, a DEFCONSTANT
+   initform -- must then leave the compiler as it found it, as under a static
+   build: it SETQs *MVM-EVAL-RUNTIME-P* and *MVM-EMIT-HALVES* T, and the rest of
+   the build compiled in runtime mode (arity checks, :LI-HALVES; the builder's
+   own image differed from SBCL's by 1.8 MB).")
+
 (defun mvm-eval-forms (forms)
   ;; *%SOLE-EVAL-FORM* (compiler.lisp): the one form, for the compiler's
   ;; DEFMACRO; SETQ and put back, as evaluations nest
   (let ((saved (and (boundp '*%sole-eval-form*) *%sole-eval-form*)))
     (setq *%sole-eval-form* (and (consp forms) (null (cdr forms)) (car forms)))
     (unwind-protect
-         (if *static-build-p*
+         (if (or *static-build-p* (and (boundp '*in-image-build*) *in-image-build*))
              (%mvm-eval-forms-nested-in-static-build forms)
              (%mvm-eval-forms-1 forms))
       (setq *%sole-eval-form* saved))))

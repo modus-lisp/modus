@@ -47,6 +47,44 @@
   "Where the PE header goes.  It must end within SizeOfHeaders (0x400 here), and
    e_lfanew's bytes must hold no quote: #x80 #x02 #x00 #x00.")
 
+(defun ape-segments-from-env ()
+  "MODUS_APE_SEGMENTS: \"NAME=PATH NAME=PATH ...\", the extra segments, in order."
+  (let ((spec (ape-env "MODUS_APE_SEGMENTS" " ")) (acc nil) (start 0))
+    (loop
+      (let* ((sp (position #\Space spec :start start))
+             (word (subseq spec start sp)))
+        (when (plusp (length word))
+          (let ((eq (position #\= word)))
+            (unless eq (error "make-ape: MODUS_APE_SEGMENTS entry ~S is not NAME=PATH" word))
+            (push (cons (subseq word 0 eq) (ape-read (subseq word (1+ eq)))) acc)))
+        (if sp (setq start (1+ sp)) (return))))
+    (nreverse acc)))
+
+(defun ape-trailer (out segments &optional placed)
+  "OUT (an octet vector) with SEGMENTS ((NAME . OCTETS) ...) appended, 4 KB aligned, and
+   the directory and trailer lib/cli-toplevel.lisp reads (APE-SEGMENTS): the text of
+   ((NAME OFFSET LENGTH) ...), then \"MODUSAPE\", its offset and length (8 bytes each,
+   little-endian) and 8 zero bytes."
+  (let* ((at (length out)) (dir (reverse placed)) (parts nil))
+    (dolist (seg segments)
+      (setq at (* 4096 (ceiling at 4096)))
+      (push (list (car seg) at (length (cdr seg))) dir)
+      (push (cons at (cdr seg)) parts)
+      (incf at (length (cdr seg))))
+    (let* ((text (let ((*print-pretty* nil) (*print-base* 10))
+                   (prin1-to-string (reverse dir))))
+           (dir-at at)
+           (total (+ dir-at (length text) 32))
+           (new (make-array total :element-type '(unsigned-byte 8) :initial-element 0)))
+      (replace new out)
+      (dolist (p parts) (replace new (cdr p) :start1 (car p)))
+      (dotimes (i (length text)) (setf (aref new (+ dir-at i)) (char-code (char text i))))
+      (let ((tr (+ dir-at (length text))))
+        (dotimes (i 8) (setf (aref new (+ tr i)) (char-code (char "MODUSAPE" i))))
+        (dotimes (k 8) (setf (aref new (+ tr 8 k)) (ldb (byte 8 (* 8 k)) dir-at)))
+        (dotimes (k 8) (setf (aref new (+ tr 16 k)) (ldb (byte 8 (* 8 k)) (length text)))))
+      new)))
+
 (defun make-ape (pe elf)
   (let* ((lfanew (ape-u32 pe #x3C))
          (nsec (ape-u16 pe (+ lfanew 6)))
@@ -62,11 +100,11 @@
          (name (concatenate 'string "modus-" (ape-fnv64 elf)))
          (script (format nil "~C'~%~
 case $(uname -sm) in \"Linux x86_64\") ;; *) echo \"modus.com: no image for $(uname -sm) in this file\" >&2; exit 1;; esac~%~
-o=$0; case $o in */*) ;; *) o=$(command -v \"$o\");; esac~%~
+o=$0; case $o in */*) ;; *) o=$(command -v \"$o\");; esac; case $o in /*) ;; *) o=$PWD/$o;; esac~%~
 d=${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/modus; e=$d/~A~%~
 [ -x \"$e\" ] || { mkdir -p \"$d\" && dd if=\"$o\" bs=4096 skip=~D count=~D 2>/dev/null | head -c ~D > \"$e.$$\" ~
 && chmod 755 \"$e.$$\" && mv -f \"$e.$$\" \"$e\"; } || exit 1~%~
-exec \"$e\" \"$@\"~%exit 1~%"
+MODUS_APE=$o exec \"$e\" \"$@\"~%exit 1~%"
                          #\Newline name (/ elf-at 4096) elf-blocks (length elf)))
          (out (make-array (+ elf-at (* 4096 elf-blocks))
                           :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -93,14 +131,16 @@ exec \"$e\" \"$@\"~%exit 1~%"
       (setf (aref out (+ #x40 i)) (char-code (char script i))))
     (assert (<= size-of-headers first-raw))
     (replace out elf :start1 elf-at)
-    (values out name)))
+    (values out name elf-at)))
 
 (let ((pe (ape-read (ape-env "MODUS_APE_PE")))
       (elf (ape-read (ape-env "MODUS_APE_ELF")))
       (path (ape-env "MODUS_APE_OUT" "modus.com")))
-  (multiple-value-bind (out name) (make-ape pe elf)
-    (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
-                            :if-exists :supersede)
-      (write-sequence out s))
-    (format t "~&make-ape: ~A, ~D bytes (Linux image cached as ~~/.cache/modus/~A)~%"
-            path (length out) name)))
+  (multiple-value-bind (out0 name elf-at) (make-ape pe elf)
+    (let ((out (ape-trailer out0 (ape-segments-from-env)
+                            (list (list "linux-x64.elf" elf-at (length elf))))))
+      (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                              :if-exists :supersede)
+        (write-sequence out s))
+      (format t "~&make-ape: ~A, ~D bytes (Linux image cached as ~~/.cache/modus/~A)~%"
+              path (length out) name))))

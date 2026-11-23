@@ -3126,6 +3126,8 @@
                        ;; what this image is (lib/configuration.lisp), and the bare-metal
                        ;; message log (lib/bare-log.lisp)
                        "IMAGE-CONFIGURATION"
+                       ;; the modus.com this process came from (lib/cli-toplevel.lisp)
+                       "APE-FILE" "APE-SEGMENTS" "APE-SEGMENT"
                        "KMSG" "KMSG-EVENT" "KMSG-DUMP" "KMSG-RECORDS" "KMSG-STATUS"
                        "KMSG-ECHO-LEVEL" "KMSG-SHIP-TO" "KMSG-SHIP-STATUS")))
       (let ((sym (intern n int)))

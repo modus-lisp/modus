@@ -1736,7 +1736,9 @@
                    (string #\Newline)
                    ;; SAVE-AND-DIE on hosted x64: the arena bump word's address
                    ;; (lib/save-image-x64.lisp; the stub and the trap arm agree).
-                   (format nil "(defun %core-kindbitmap-delta () ~D)~%" modus.mvm.x64::*mcgc-kindbitmap-delta*)
+                   ;; The cons-kind bitmap's offset follows the heap chosen at
+                   ;; startup (--dynamic-space-size): the word the stub wrote.
+                   (format nil "(defun %core-kindbitmap-delta () (%gc-read64 (%conv-addr #x10000F98)))~%")
                    (mvm-text "lib/save-image-x64.lisp")
                    (string #\Newline)
                    ;; THE SSH-2 SERVER OVER A LINUX STREAM (docs/nitro-enclaves.md,

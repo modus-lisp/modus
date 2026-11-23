@@ -586,7 +586,12 @@
       (mcgc-store #x10000E20 (x64-mcgc-freelist-base))    ; freelist
       (mcgc-store #x10000E28 0)                           ; freelist_count
       (mcgc-store #x10000E30 0)                           ; alloc_page
-      (mcgc-store #x10000E38 (x64-mcgc-data-end)))        ; data_end
+      (mcgc-store #x10000E38 (x64-mcgc-data-end))         ; data_end
+      ;; the cons-kind bitmap's offset from the start bitmap, which translate-x64
+      ;; reads from this word (EMIT-X64-ADD-KIND-DELTA): the default layout's
+      (mcgc-store #x10000F98
+                  (let ((s (find-symbol "*MCGC-KINDBITMAP-DELTA*" "MODUS.MVM.X64")))
+                    (if (and s (boundp s)) (symbol-value s) #xFE4000))))
 
     ;; ZERO THE COLLECTOR'S METADATA: descriptors, the object-start bitmap, the
     ;; free list and the CONS-KIND bitmap (at bitmap_base + the translator's

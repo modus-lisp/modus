@@ -1093,6 +1093,15 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
   (:a64-handler-pop-va  #x10000F98 8 :constants ("MODUS-INT::+A64-HANDLER-POP-VA-SLOT+")
    :doc "VA of the POP helper."))
 
+(define-fixed-words (:images (:x64) :owner "boot/boot-linux-x64.lisp, boot/boot-x64.lisp, mvm/translate-x64.lisp")
+  (:x64-heap-midpoint #x10000F88 8
+   :doc "Bytes from the heap base to the second semispace: chosen at startup
+   (--dynamic-space-size) by the hosted stub, read by its heap tail.")
+  (:x64-heap-data-size #x10000F90 8
+   :doc "Bytes of the heap's data region (two semispaces and the guard).")
+  (:x64-kind-delta #x10000F98 8 :constants ("MODUS.MVM.X64::+MCGC-KIND-DELTA-ADDR+")
+   :doc "Cons-kind bitmap base minus object-start bitmap base (EMIT-X64-ADD-KIND-DELTA)."))
+
 (define-fixed-words (:images (:all) :owner "mvm/compiler.lisp")
   ;; :ALL, not :LOW-BLOCK: the compiler emits these two for EVERY target (the
   ;; inline global-cell read; COMPILE-QUOTE's static literals), including the

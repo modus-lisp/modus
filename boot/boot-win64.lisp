@@ -1271,6 +1271,15 @@
     (:bytes #xC7 #x04 #x25 ,@(w64-le32 #x10000200) 1 0 0 0)
     (:bytes #x48 #xC7 #xC3 1 0 0 0)                      ; mov rbx,1   (argc, for the tail)
     (:bytes #x45 #x31 #xED #x45 #x31 #xF6 #x45 #x31 #xFF) ; r13, r14, r15 = 0
+    ;; The heap's geometry, which the Linux stub chooses at startup
+    ;; (EMIT-LINUX-X64-CHOOSE-HEAP) and the tail reads: here the default layout,
+    ;; the one +LINUX-X64-HEAP-SIZE+ committed above.
+    ,@(let ((l (x64-heap-layout +linux-x64-gc-midpoint+)))
+        (loop for (slot v) in `((#x10000F88 ,+linux-x64-gc-midpoint+)
+                                (#x10000F90 ,(getf l :data))
+                                (#x10000F98 ,(getf l :kind-delta)))
+              collect `(:bytes #x48 #xB9 ,@(w64-le64 v)             ; mov rcx, v
+                               #x48 #x89 #x0C #x25 ,@(w64-le32 slot)))) ; mov [slot], rcx
     (:raw ,(win64-heap-tail-bytes))))
 
 (defun win64-stub-items ()

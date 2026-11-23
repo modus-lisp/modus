@@ -1700,6 +1700,19 @@
    WRONG tag (e.g. symbol_base|1) can no longer be copied as the wrong type
    — the bug that truncated a 40-byte symbol into a 16-byte cons.")
 
+
+(defconstant +mcgc-kind-delta-addr+ #x10000F98
+  "The cons-kind bitmap's offset from the object-start bitmap's base, as the boot
+   code laid them out: hosted x64 computes it from the heap it maps at startup
+   (--dynamic-space-size), bare x64 stores *MCGC-KINDBITMAP-DELTA*.")
+
+(defun emit-x64-add-kind-delta (buf reg)
+  "add REG, [+MCGC-KIND-DELTA-ADDR+] -- REG one of RCX RSI RDI R8."
+  (multiple-value-bind (rex modrm)
+      (ecase reg (rcx (values #x48 #x0C)) (rsi (values #x48 #x34))
+                 (rdi (values #x48 #x3C)) (r8 (values #x4C #x04)))
+    (emit-bytes buf rex #x03 modrm #x25)
+    (emit-u32 buf +mcgc-kind-delta-addr+)))
 (defun emit-mcgc-set-start-bit (buf addr-reg)
   "Set the MCGC object-start bitmap bit for the object whose RAW start
    address is in ADDR-REG (a tagged-pointer's untagged base — i.e. the
@@ -8162,8 +8175,7 @@
   (emit-shr-reg-imm buf 'rax 4)                 ; granule
   (emit-bytes buf #x48 #x8B #x0C #x25)          ; mov rcx, [bitmap_base]
   (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-  (emit-bytes buf #x48 #x81 #xC1)               ; add rcx, imm32 (kind delta)
-  (emit-u32 buf *mcgc-kindbitmap-delta*)
+  (emit-x64-add-kind-delta buf 'rcx)            ; add rcx, [kind delta]
   (emit-bytes buf #x48 #x0F #xAB #x01)          ; bts [rcx], rax
   (emit-pop buf 'rdx)
   (emit-pop buf 'rcx)
@@ -8196,8 +8208,7 @@
     (emit-shr-reg-imm buf 'rdx 4)                 ; granule
     (emit-bytes buf #x4C #x8B #x04 #x25)          ; mov r8, [bitmap_base]
     (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-    (emit-bytes buf #x49 #x81 #xC0)               ; add r8, imm32 (kind delta)
-    (emit-u32 buf *mcgc-kindbitmap-delta*)
+    (emit-x64-add-kind-delta buf 'r8)             ; add r8, [kind delta]
     (emit-bytes buf #x49 #x0F #xAB #x10)          ; bts [r8], rdx
     (emit-pop buf 'r8)
     (emit-pop buf 'rdx)
@@ -8226,8 +8237,7 @@
   (emit-shr-reg-imm buf 'rdx 4)                     ; granule
   (emit-bytes buf #x4C #x8B #x04 #x25)              ; mov r8, [bitmap_base]
   (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-  (emit-bytes buf #x49 #x81 #xC0)                   ; add r8, imm32 (kind delta)
-  (emit-u32 buf *mcgc-kindbitmap-delta*)
+  (emit-x64-add-kind-delta buf 'r8)                 ; add r8, [kind delta]
   (emit-bytes buf #x49 #x0F #xA3 #x10)              ; bt [r8], rdx  (CF = cons-kind bit)
   (emit-pop buf 'r8)
   (emit-pop buf 'rdx)
@@ -9292,7 +9302,7 @@
       (x64-stw-zero-bytes buf)
       (when (mcgc-kind-bitmap-on-p)
         (emit-mov-reg-reg buf 'rdi 'r10)
-        (emit-bytes buf #x48 #x81 #xC7) (emit-u32 buf *mcgc-kindbitmap-delta*)       ; add rdi, delta
+        (emit-x64-add-kind-delta buf 'rdi)                                          ; add rdi, delta
         (emit-mov-reg-reg buf 'rcx 'r11)
         (x64-stw-zero-bytes buf)))
     ;; the arena itself
@@ -9506,8 +9516,7 @@
         (emit-u32 buf +mcgc-cfg-bitmap-addr+)
         (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = object-start bit)
         (emit-jcc buf :nc scan-it)
-        (emit-bytes buf #x49 #x81 #xC0)                ; add r8, imm32 (cons-kind delta)
-        (emit-u32 buf *mcgc-kindbitmap-delta*)
+        (emit-x64-add-kind-delta buf 'r8)              ; add r8, [cons-kind delta]
         (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = cons-kind bit)
         (emit-jcc buf :c scan-it)                      ; a cons: scan its two words as before
         (emit-mov-reg-mem buf 'rsi 'r10 0)             ; rsi = header
@@ -9896,8 +9905,7 @@
   (emit-u32 buf +mcgc-cfg-page-base-addr+)
   (emit-shr-reg-imm buf 'rax 4)
   (emit-mov-reg-abs buf 'rsi +mcgc-cfg-bitmap-addr+)
-  (emit-bytes buf #x48 #x81 #xC6)                     ; add rsi, imm32
-  (emit-u32 buf *mcgc-kindbitmap-delta*)
+  (emit-x64-add-kind-delta buf 'rsi)                  ; add rsi, [kind delta]
   (emit-bytes buf #x48 #x0F #xA3 #x06)                ; bt [rsi], rax
   (emit-jcc buf :c cons-label))
 
@@ -10230,8 +10238,7 @@
       (emit-shr-reg-imm buf 'rax 7)
       (emit-mov-reg-abs buf 'rdi +mcgc-cfg-bitmap-addr+)
       (when kind
-        (emit-bytes buf #x48 #x81 #xC7)               ; add rdi, imm32
-        (emit-u32 buf *mcgc-kindbitmap-delta*))
+        (emit-x64-add-kind-delta buf 'rdi))           ; add rdi, [kind delta]
       (emit-add-reg-reg buf 'rdi 'rax)
       (emit-mov-reg-reg buf 'rcx 'rdx)
       (emit-bytes buf #x31 #xC0)                      ; xor eax, eax
@@ -10853,8 +10860,7 @@
       (emit-shr-reg-imm buf 'rax 7)                  ; byte offset into bitmap
       (emit-bytes buf #x48 #x8B #x3C #x25)           ; mov rdi, [bitmap_base]
       (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-      (emit-bytes buf #x48 #x81 #xC7)                ; add rdi, imm32 (kind delta)
-      (emit-u32 buf *mcgc-kindbitmap-delta*)
+      (emit-x64-add-kind-delta buf 'rdi)             ; add rdi, [kind delta]
       (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
       ;; RSI = this region's control block (loaded at the swap above)
       (emit-mov-reg-mem buf 'rcx 'rsi modus.mvm::+gc-off-space-size+)

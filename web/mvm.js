@@ -633,7 +633,9 @@ class MVM {
       if (self.isCons(raw)) size = 16;
       else {
         const subtag = hdr & 0xFF, count = (hdr >>> 8) + m32[hi + 1] * 16777216;
-        size = subtag === 0x11 ? align16(16 + count) : align16((count + 2) * 8);
+        // BYTES for a u8 vector and a narrow string (#x13), as translate-x64's
+        // collector; a narrow string sized in words was copied 8x over.
+        size = (subtag === 0x11 || subtag === 0x13) ? align16(16 + count) : align16((count + 2) * 8);
         if (size < 16 || raw + size > fromEnd) return v;
       }
       const dst = free;

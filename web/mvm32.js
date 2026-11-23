@@ -152,12 +152,19 @@ function loadModule(bytes) {
 }
 
 // Subtags whose payload holds no pointers: the typed to-space scan skips them.
-// u8 vector, f32 vector, SAP, string (char codes), double / single float.
+// translate-i386's collector's list (i386-emit-gcnative-typed-walk), plus the
+// wide string #x31, whose slots are character codes.
 const LEAF = new Uint8Array(256);
-for (const s of [0x11, 0x12, 0x16, 0x31, 0x60, 0x64]) LEAF[s] = 1;
+for (const s of [0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x31, 0x60, 0x64, 0x65, 0x66]) LEAF[s] = 1;
+// The count field is BYTES for a u8 vector (#x11) and a narrow string (#x13, a
+// u8 vector with its subtag rewritten), WORDS for everything else.  Sizing a
+// narrow string in words copied 4x its size and made the to-space walk step
+// over the objects after it unscanned: their pointers stayed in from-space
+// (a forwarding word, `#<?F239>', read back as a value), intermittently,
+// whenever a collection found a live narrow string.
 function objBytes(hdr) {
   const st = hdr & 0xFF, n = hdr >>> 8;
-  return st === 0x11 ? align16(4 + n) : align16(4 + 4 * n);
+  return (st === 0x11 || st === 0x13) ? align16(4 + n) : align16(4 + 4 * n);
 }
 
 class MVM {

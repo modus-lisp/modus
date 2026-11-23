@@ -15,6 +15,10 @@
    #:emit-s32
    #:code-buffer-bytes
    #:code-buffer-position
+   #:%seg-begin
+   #:+win-tls-save+
+   #:+win-tls-window+
+   #:+win-tls-percpu+
    ;; Labels
    #:make-label
    #:label-p

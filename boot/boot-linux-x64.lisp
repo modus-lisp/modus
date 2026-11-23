@@ -480,6 +480,17 @@
     (emit-le32 buf +linux-x64-jit-bump-slot+)
     (emit-bytes buf #x48 #x89 #xE8))               ; mov rax, rbp  (heap base back)
 
+  (emit-linux-x64-heap-tail buf))
+
+  ;; Fall through to JMP kernel-main
+
+(defun emit-linux-x64-heap-tail (buf)
+  "The part of the Linux x64 entry that follows the heap mapping, with RAX =
+   the heap base: argc/argv into the low block, the GC metadata, the MCGC
+   config words and the MVM registers (R12, R14, R15, RBP).  Shared with the
+   Windows stub (boot-win64.lisp), which maps the heap with VirtualAlloc but
+   otherwise enters the same state.  Position independent: absolute addresses
+   and rel8 jumps inside it only."
   ;; Store argc/argv to globals area at heap base (mmap result in RAX)
   ;; argc at [rax+0], argv[0] at [rax+0x10], argv[1] at [rax+0x18], argv[2] at [rax+0x20]
   (emit-bytes buf #x48 #x89 #x18)                ; mov [rax], rbx     (argc)
@@ -583,8 +594,6 @@
   (emit-le64 buf #xDEAD0001)
   ;; Frame pointer
   (emit-bytes buf #x48 #x89 #xE5))               ; mov rbp, rsp
-
-  ;; Fall through to JMP kernel-main
 
 ;;; ============================================================
 ;;; Helper: emit raw bytes

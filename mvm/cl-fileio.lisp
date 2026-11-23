@@ -516,9 +516,10 @@
 
 ;;; Resolve a pathname (string or object) to an absolute path string.
 (defun %strip-logical-host (path)
-  "Strip logical host prefix like CLTEST: from path."
+  "Strip logical host prefix like CLTEST: from path.  A Windows drive is not one."
   (let ((len (length path))
         (i 0))
+    (when (%drive-namestring-p path) (return-from %strip-logical-host path))
     (loop
       (when (>= i len) (return path))
       ;; CHAR, not %PRIM-AREF: a fill-pointer or adjustable string is a header
@@ -561,7 +562,8 @@
     ;; If path is relative (doesn't start with /), prepend defaults.
     ;; *default-pathname-defaults* may be a string or pathname obj; coerce
     ;; via namestring before treating as a directory prefix.
-    (if (and (> (length path) 0) (= (char-code (char path 0)) 47))  ; 47 = #\/
+    (if (and (> (length path) 0)
+             (or (= (char-code (char path 0)) 47) (%drive-namestring-p path)))  ; 47 = #\/
         path
         (let* ((dpd *default-pathname-defaults*)
                (base (cond
@@ -1763,6 +1765,17 @@
 ;; gauntlet regresses (226→~100 at uiop/launch-program define-package),
 ;; that is the downstream gap, not this fix.  The ANSI binary wants the
 ;; correct parse (truename / user-homedir-pathname / pathname-name tests).
+;; WINDOWS DRIVES.  "C:/a/b" names directory (:absolute "C:" "a") there: an
+;; absolute namestring whose first component is the drive.  Elsewhere it is an
+;; ordinary relative path (a directory named "C:"), so only the Windows image
+;; (boot/boot-win64.lisp) answers yes.  Used by the parser, the logical-host
+;; strip and the directory renderer below.
+(declaim (overridable %drive-namestring-p))
+(defun %drive-namestring-p (s)
+  "True when S starts with a drive letter and a colon, then a slash or nothing."
+  (declare (ignore s))
+  nil)
+
 (defun %split-directory-string (s)
   "Split a directory string like \"/a/b/\" or \"a/b/\" into
    (:absolute \"a\" \"b\") or (:relative \"a\" \"b\").  Empty → nil."
@@ -1770,7 +1783,7 @@
     (cond
       ((= len 0) nil)
       (t
-       (let ((absolute (= (char-code (aref s 0)) 47))
+       (let ((absolute (or (= (char-code (aref s 0)) 47) (%drive-namestring-p s)))
              (parts nil)
              (start (if (= (char-code (aref s 0)) 47) 1 0))
              (k 0))
@@ -1910,7 +1923,8 @@
      (let ((rel (car dir))
            (parts (cdr dir))
            (result ""))
-       (when (eq rel :absolute)
+       (when (and (eq rel :absolute)
+                  (not (and (stringp (car parts)) (%drive-namestring-p (car parts)))))
          (setq result "/"))
        (dolist (p parts)
          (cond
@@ -2527,6 +2541,7 @@
   (cond
     ((and (stringp host) (string= host "CLTESTROOT")) nil)
     (t (error "load-logical-pathname-translations: unknown host"))))
+(declaim (overridable user-homedir-pathname))   ; Windows: %USERPROFILE% (boot-win64)
 (defun user-homedir-pathname (&rest args)
   "Return the user's home directory pathname.  Accepts an optional host
    designator argument.  Per CLHS: must return a pathname (or NIL)."
@@ -2579,7 +2594,8 @@
 
 (defun %absolute-path-string (path)
   "PATH (a namestring) made absolute against the current directory."
-  (if (and (> (length path) 0) (= (char-code (char path 0)) 47))
+  (if (and (> (length path) 0)
+           (or (= (char-code (char path 0)) 47) (%drive-namestring-p path)))
       path
       (let ((cwd (%sys-getcwd)))
         (if (null cwd)
@@ -2627,7 +2643,12 @@
 (defun %resolve-symlinks (abs)
   "ABS, an absolute path string, with every symbolic link in it followed -- what
    realpath(3) answers.  At most 40 links, as Linux allows; past that ABS is returned."
-  (let ((todo (%split-path-components abs)) (out "") (links 0))
+  (let* ((parts (%split-path-components abs))
+         ;; A Windows drive path starts from its drive, not from "/".
+         (drive (and (%drive-namestring-p abs) (car parts)))
+         (todo (if drive (cdr parts) parts))
+         (out (or drive ""))
+         (links 0))
     (loop
       (when (null todo)
         (return (if (string= out "") "/" out)))

@@ -55,7 +55,9 @@
    table -- what nm prints -- sorted by address; NIL if it cannot be read.  Every function
    the image was built with is there, not just the ones *SYMBOL-FUNCTION-TABLE* publishes."
   (handler-case
-      (with-open-file (s "/proc/self/exe" :element-type '(unsigned-byte 8))
+      ;; Linux's: a Windows image has no /proc (and its executable is a PE, not an ELF)
+      (with-open-file (s (or (probe-file "/proc/self/exe") (return-from %bt-elf-table nil))
+                         :element-type '(unsigned-byte 8))
         (let* ((eh (%bt-read s 0 64))
                (shoff (%bt-u eh #x28 8)) (shentsize (%bt-u eh #x3A 2)) (shnum (%bt-u eh #x3C 2))
                (sh (%bt-read s shoff (* shnum shentsize)))

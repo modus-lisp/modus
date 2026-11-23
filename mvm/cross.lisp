@@ -783,6 +783,8 @@
     ((null boot-descriptor) 0)
     ;; Linux x64 ELF64: ELF header (64) + 1 program header (56) = 120
     ((eq (getf boot-descriptor :elf-format) :linux-x64) 120)
+    ;; Windows PE32+: the PE headers and padding (boot/boot-win64.lisp).
+    ((eq (getf boot-descriptor :elf-format) :win64) #x1000)
     ;; Linux AArch64 ELF64: same 64+56 layout as x64.
     ((eq (getf boot-descriptor :elf-format) :linux-aarch64) 120)
     ;; Linux i386 ELF32: ELF header (52) + 1 program header (32) = 84.
@@ -1898,6 +1900,8 @@
                   (cond
                     ((getf boot-descriptor :uefi)
                      (wrap-in-pe32plus raw-bytes))
+                    ((eq (getf boot-descriptor :elf-format) :win64)
+                     (wrap-in-pe64-win raw-bytes))
                     ((eq (getf boot-descriptor :elf-format) :linux-x64)
                      (wrap-in-elf64-le raw-bytes
                                        (or (getf boot-descriptor :load-addr) #x400000)
@@ -2029,6 +2033,7 @@
     (:uefi-x64 :x86-64)
     (:uefi-x64-cl :x86-64)
     (:linux-x64 :x86-64)
+    (:win64 :x86-64)
     (:linux-aarch64 :aarch64)
     (:linux-riscv :riscv64)
     (:linux-riscv32 :riscv32)
@@ -2144,6 +2149,7 @@
     (:uefi-x64 (uefi-x64-boot-descriptor))
     (:uefi-x64-cl (uefi-x64-cl-boot-descriptor))
     (:linux-x64 (linux-x64-boot-descriptor))
+    (:win64 (win64-boot-descriptor))
     (:linux-aarch64 (linux-aarch64-boot-descriptor))
     (:linux-riscv (linux-riscv-boot-descriptor))
     (:linux-riscv32 (linux-riscv32-boot-descriptor))

@@ -104,6 +104,11 @@
 ;;; block (%init-x64-translator + x64-asm.lisp) on an AARCH64 image, dead only
 ;;; because its *jit-on* was nil — see #266.
 (defvar *cli-bare-metal* nil)
+;; T for the Windows hosted image (mvm/build-win64-cli.lisp), which builds with
+;; the per-thread FS window, the per-CPU GS block and stop-the-world OFF (on
+;; Windows GS is the TEB, and FS is not ours to set).  The runtime JIT must emit
+;; the same shape, so its co-init (%INIT-X64-TRANSLATOR) turns them off too.
+(defvar *cli-win64* nil)
 (defvar *cli-bare-metal-tarball* nil)
 (defvar *cli-bare-metal-net-source* "")
 ;;; SAVE-AND-DIE on bare metal: what a restored process runs INSTEAD of boot
@@ -734,6 +739,16 @@
   (setq *x64-sched-lock-addr* nil)
   (setq *x64-stw* nil)
   (setq *park-safepoints* nil)
+"
+       "")
+   (if *cli-win64*
+       ;; WIN64-SHIM-VA-PLACEHOLDER is replaced by build-win64-cli with the
+       ;; shim's address (it needs boot-win64, which loads after this file).
+       ;; Set here, not at top level: init-all-globals resets a top-level setq.
+       ;; The window, per-CPU storage and stop-the-world are on, as on Linux;
+       ;; *X64-WIN-TLS* turns their FS/GS prefixes into TEB TLS-slot accesses.
+       "  (setq modus.mvm.x64::*x64-win-shim-va* WIN64-SHIM-VA-PLACEHOLDER)
+  (setq modus.mvm.x64::*x64-win-tls* t)
 "
        "")
    "  t)
@@ -3006,6 +3021,13 @@
           (with-open-file (o f :direction :output :if-exists :supersede)
             (dolist (n removed) (write-line n o))))))))
 
+;;; Text a build adds to *ALL-RUNTIME-SOURCE* for its NAMES only (that variable is
+;;; scanned, never compiled), because the build appends the code itself to
+;;; *FULL-SOURCE* later -- the Windows image's net/win32-window.lisp, whose functions
+;;; must be callable by name (glass's native presenter finds them with FIND-SYMBOL).
+;;; "" everywhere else, so every other build's scanner input is unchanged.
+(defvar *cli-scan-extra-source* "")
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
                        *configuration-source* (string #\Newline)
@@ -3058,6 +3080,7 @@
                        ;; SYM-NAME-AUTO — is byte-identical.
                        *cli-bare-metal-net-source*
                        (%extra-source-text)
+                       *cli-scan-extra-source*
                        *driver-source*))
 
 ;;; NOTE: *genera-source* is deliberately NOT part of *all-runtime-source*.

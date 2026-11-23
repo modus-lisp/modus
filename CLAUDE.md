@@ -1263,6 +1263,28 @@ Bootable USB for real hardware (ThinkPad T420 etc.):
 sudo dd if=/tmp/modus-usb.img of=/dev/sdX bs=1M status=progress  # write to USB
 ```
 
+### Hosted Windows x86-64 (`modus.exe`) — docs/win64.md
+```bash
+sbcl --dynamic-space-size 4096 --script mvm/build-win64-cli.lisp   # -> modus.exe (PE32+)
+WINE_RUN=wine64 test/win64/run-wine.sh modus.exe                    # under Wine
+test/win64/run-vm.sh win2022.qcow2 modus.exe                        # real Windows (KVM)
+```
+The same image as `./modus`, built by `build-generic-cli.lisp` with `*CLI-WIN64*` (every
+difference is guarded by it; with it off the Linux image is byte-identical).  Linux syscalls go
+through a shim in the boot stub (`boot/boot-win64.lisp`) to kernel32.  REPL, collector and JIT
+work, and so do files, IPv4 sockets, native threads, fault recovery and cores; the glass desk runs.
+`test/win64/run-vm.sh` runs the same checks in a real Windows Server 2022 guest (KVM).  **The window
+and per-CPU bases are TEB TLS slots, not FS/GS** (a user FS base is lost at a context switch on real
+Windows; Wine keeps it): with `*X64-WIN-TLS*`, every FS/GS-prefixed access the translator emits is
+captured and rewritten by `EMIT-BYTE` (`MODUS.ASM:%SEG-BEGIN`).  A hand-counted byte distance across
+such an access must be measured (`X64-TLS-INSN-LENGTH`).  **The boot stub is assembled at emit time**: an
+early copy baked the default allocation limit and the collector never ran.  **WinRT is
+callable** (`net/win32-winrt.lisp`; slots and IIDs generated from Windows' metadata by
+`scripts/gen-winrt-ids.py`, event handlers are native COM objects that ring events), and on it
+`net/win32-ble.lisp`, a Bluetooth LE mesh radio in `Bluetooth.swift`'s shape (`W32-BLE-START` /
+`-POLL` / `-SEND` / `-STOP`) for chirp.  natrium's entropy there is `%MODUS-HARDWARE-ENTROPY`
+(BCryptGenRandom, `net/win32-entropy.lisp`).
+
 ### Pi Zero 2 W (real hardware)
 The Zero runs the same board image as above (USB host + a USB NIC, HDMI
 console).  The USB-**gadget** SSH image (`net/dwc2-device.lisp`, CDC-ECM over

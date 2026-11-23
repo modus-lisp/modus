@@ -46,6 +46,7 @@
   (load (merge-pathnames "../lib/load-mvm.lisp" (directory-namestring (truename *load-truename*)))))
 
 (defvar *cli-arch* :x64)
+(defvar *cli-win64* nil)   ; T from mvm/build-win64-cli.lisp
 
 ;; ABI FACT, and it was WRONG here until the image grew threads: on x86-64
 ;; syscall 60 is `exit', which ends ONLY THE CALLING THREAD; `exit_group', the
@@ -191,6 +192,21 @@
         (concatenate 'string *cli-arch-override-source*
                      (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline))))
 
+;; Windows: the platform files are appended to the image by WIN64-CONFIGURE-BUILD (they
+;; need boot-win64's constants); their names go to the scanners here.  The same list as
+;; boot-win64's *WIN64-PLATFORM-FILES*.
+(defvar *cli-scan-extra-source* "")
+(when cl-user::*cli-win64*
+  (dolist (f '("net/win32-window.lisp" "net/win32-audio.lisp" "net/win32-winrt-ids.lisp"
+               "net/win32-winrt.lisp" "net/win32-ble.lisp"
+               "net/win32-entropy.lisp" "net/win32-time.lisp"))
+    (setq *cli-scan-extra-source*
+          (concatenate 'string *cli-scan-extra-source*
+                       (with-open-file (s (merge-pathnames (concatenate 'string "../" f)
+                                                           (directory-namestring (truename *load-truename*))))
+                         (let ((b (make-string (file-length s))))
+                           (subseq b 0 (read-sequence b s))))
+                       (string #\Newline)))))
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 
@@ -199,6 +215,9 @@
 ;;; ============================================================
 
 (mvm-load "boot/boot-linux-x64.lisp")   ; a modus host adopts its constants (MVM-LOAD)
+;; WINDOWS (mvm/build-win64-cli.lisp sets *CLI-WIN64*): the same image as a
+;; PE32+ EXE.  Each difference below is guarded by the flag; see boot/boot-win64.lisp.
+(when cl-user::*cli-win64* (mvm-load "boot/boot-win64.lisp"))
 
 (in-package :modus.mvm)
 
@@ -221,7 +240,9 @@
 ;; misaligned call returns immediately, leaving the caller's RAX
 ;; intact (silently looks like the fn returned T or whatever else
 ;; was in RAX).  See reference_append_funcall_bug.md.
-(setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset))  ; computed from the stub, see boot-linux-x64.lisp
+(if cl-user::*cli-win64*
+    (modus.mvm::win64-configure-build)   ; native offset, shim, Windows runtime source
+    (setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset)))  ; computed from the stub, see boot-linux-x64.lisp
 
 ;; NATIVE THREADS, STEP 1: the hosted actor scheduler gets a REAL spinlock.
 ;; net/actors.lisp hands the lock's RELEASE to RESTORE-CONTEXT; with this set,
@@ -258,8 +279,12 @@
 ;; a fresh Linux process has FS base 0, so every one of these accesses names
 ;; the same word at the same address it always did.  A worker thread installs
 ;; its own FS base as its first act.
+;; Windows: on too, with the FS (and GS) prefixes turned into TEB TLS-slot
+;; accesses (*X64-WIN-TLS*, mvm/translate-x64.lisp): FS is not the runtime's
+;; there, and GS is the TEB.
 (setf modus.mvm::*tls-window* t)
 (setf modus.mvm.x64::*x64-tls-window* t)
+(setf modus.mvm.x64::*x64-win-tls* cl-user::*cli-win64*)
 ;; STOP-THE-WORLD FOR REGION 0 (translate-x64): the trampoline's handshake,
 ;; the back-edge poll and the safe-region traps; and layout key :STW, which
 ;; turns on the runtime half (net/hosted-sync.lisp %GC-STW-ARM, the safe
@@ -369,9 +394,11 @@
 (format t "~%Compiling generic image (~D chars)...~%"
         (length cl-user::*full-source*))
 
-(let ((image (cl-user::host-build-image :target :linux-x64
+(let ((image (cl-user::host-build-image :target (if cl-user::*cli-win64* :win64 :linux-x64)
                                          :source-text cl-user::*full-source*)))
-  (let ((path (or (sb-ext:posix-getenv "MODUS_CLI_OUT") "modus")))
+  (let ((path (if cl-user::*cli-win64*
+                  (or (sb-ext:posix-getenv "MODUS_WIN64_OUT") "modus.exe")
+                  (or (sb-ext:posix-getenv "MODUS_CLI_OUT") "modus"))))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)

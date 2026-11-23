@@ -3979,6 +3979,17 @@
       (set (car p) (cdr p)))
     old))
 
+(defun %host-compile-toplevel (form)
+  "MVM-COMPILE-TOPLEVEL for code that runs HERE (EVAL, LOAD, a script's
+   toplevel): with *JIT-HOST-FLAGS* in force, so a build script's settings for
+   its target (the Darwin layout's *CONV-DELTA*, say) do not reach the host's
+   own compiles."
+  (if *jit-host-flags*
+      (let ((saved (%jit-host-flags-swap *jit-host-flags*)))
+        (unwind-protect (mvm-compile-toplevel form)
+          (%jit-host-flags-swap saved)))
+      (mvm-compile-toplevel form)))
+
 (defun %jit-translate-page (bc mvm-entry ft-list rt-table)
   (if *jit-host-flags*
       (let ((saved (%jit-host-flags-swap *jit-host-flags*)))
@@ -4564,7 +4575,7 @@
            (defs (if last-defun-p forms (reverse (cdr rforms))))
            (toplevel (append defs (list (list (quote defun) (quote %mvm-eval-thunk) nil expr)))))
       (dolist (f toplevel)
-        (let ((result (mvm-compile-toplevel f)))
+        (let ((result (%host-compile-toplevel f)))
           (cond
             ((null result) nil)
             ((and (consp result) (eq (car result) :multi-result))
@@ -5368,7 +5379,7 @@
       ;; materialised as a closure instead of escaping as a raw offset.
       (setq *e2-module-defuns* persist-names)
       (dolist (f toplevel)
-        (let ((result (mvm-compile-toplevel f)))
+        (let ((result (%host-compile-toplevel f)))
           (cond
             ((null result) nil)
             ((and (consp result) (eq (car result) :multi-result))

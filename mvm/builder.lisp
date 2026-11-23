@@ -118,9 +118,16 @@
     ("*X64-STW*" . "MODUS.MVM.X64") ("*X64-TLS-WINDOW*" . "MODUS.MVM.X64")
     ("*X64-JIT-CONSTVEC-P*" . "MODUS.MVM.X64")
     ("*MCGC-KIND-BITMAP-ENABLED*" . "MODUS.MVM.X64") ("*MCGC-KIND-CHECK-ENABLED*" . "MODUS.MVM.X64")
-    ("*MCGC-PINNING-ENABLED*" . "MODUS.MVM.X64") ("*WS5-FORCE-NO-KINDCHECK*" . "MODUS.MVM.X64"))
-  "Translator variables a build script sets for its TARGET that the host's runtime
-   JIT also reads; %BUILDER-BOOT-INIT records the host's values of them.")
+    ("*MCGC-PINNING-ENABLED*" . "MODUS.MVM.X64") ("*WS5-FORCE-NO-KINDCHECK*" . "MODUS.MVM.X64")
+    ;; the compiler's layout settings (mvm/hosted-layout-env.lisp APPLY-LAYOUT-HOST
+    ;; sets them for an AArch64 target): read while compiling code to run here
+    ("*CONV-RELATIVE*" . "MODUS.MVM") ("*CONV-DELTA*" . "MODUS.MVM")
+    ("*HOSTED-LAYOUT*" . "MODUS.MVM") ("*PCREL-LAYOUT*" . "MODUS.MVM")
+    ("*TLS-WINDOW*" . "MODUS.MVM"))
+  "Translator and compiler variables a build script sets for its TARGET that the
+   host's own compiles (runtime JIT, EVAL/LOAD) also read; %BUILDER-BOOT-INIT
+   records the host's values, which %JIT-TRANSLATE-PAGE and
+   %HOST-COMPILE-TOPLEVEL (mvm-eval.lisp) bind.")
 
 (defun %builder-state-symbol (name pkg)
   "The symbol of a compiler variable: in PKG or, failing that, MODUS.MVM's (whose

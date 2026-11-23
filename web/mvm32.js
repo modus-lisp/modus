@@ -54,6 +54,7 @@ for (const [ops, n] of [[[0x74,0x7C,0x7D,0x7E],3],[[0x6A,0x6B,0x6C,0x6D,0x6E,0x6
 const BACK_BRANCH = new Uint8Array(256);
 for (const o of [0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0xC7]) BACK_BRANCH[o] = 1;
 const OSR_THRESHOLD = 500;
+const NO_OSR = typeof process !== 'undefined' && process.env && !!process.env.MVM_NO_OSR;
 const NO_EXEC = new Uint8Array(256);
 for (const o of [0xD9,0xDA,0xDB,0xDC,0xDD,0xDE,0xDF,0xE0,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xAA,0xAB,0xAC]) NO_EXEC[o] = 1;
 const ALLOC_START_OFF = 0x400;
@@ -848,7 +849,16 @@ class MVM {
       case 83: return h.mkdir(this.cstr(a1), a2);
       case 87: return h.unlink(this.cstr(a1));
       case 201: return (Date.now() / 1000) | 0;
-      case 228: { const ms = Date.now(); this.st64(a2, (ms / 1000) | 0, 0); this.st64(a2 + 8, ((ms % 1000) * 1e6) | 0, 0); return 0; }
+      case 228: {
+        // CLOCK_PROCESS_CPUTIME_ID (2) / CLOCK_THREAD_CPUTIME_ID (3): the
+        // process's CPU time where the host has it (node; run it with
+        // --single-threaded for a VM-only figure), else the wall clock.
+        if ((a1 === 2 || a1 === 3) && typeof process !== 'undefined' && process.cpuUsage) {
+          const u = process.cpuUsage(), us = u.user + u.system;
+          this.st64(a2, Math.floor(us / 1e6), 0); this.st64(a2 + 8, (us % 1e6) * 1000, 0); return 0;
+        }
+        const ms = Date.now(); this.st64(a2, (ms / 1000) | 0, 0); this.st64(a2 + 8, ((ms % 1000) * 1e6) | 0, 0); return 0;
+      }
       case 217: {
         const r = h.getdents(a1);
         if (typeof r === 'number') return r;
@@ -877,11 +887,11 @@ class MVM {
 
   // -- the interpreter --------------------------------------------------------------
   run() {
-    const baseEsp = this.esp;
+    const baseEsp = this.esp, jd0 = this.jd;
     for (;;) {
       try { this.loop(); return; }
       catch (e) {
-        if (e instanceof LongJmp && e.esp <= baseEsp) continue;
+        if (e instanceof LongJmp && e.esp <= baseEsp) { this.jd = jd0; continue; }
         throw e;
       }
     }
@@ -903,7 +913,7 @@ class MVM {
       // function loads when entered at a block label.  Without it a long loop
       // inside ONE call (every benchmark's driver, any script loop) never left
       // the interpreter: a function is translated only after 20 CALLS.
-      if (npc < pc && BACK_BRANCH[op] && this.compileOn) pc = this.osrAt(npc);
+      if (npc < pc && BACK_BRANCH[op] && this.compileOn && !NO_OSR) pc = this.osrAt(npc);
       else pc = npc;
       if (pc === RET_SENTINEL) return;
     }
@@ -1280,18 +1290,22 @@ class MVM {
     if (f) this.drive(f);
     else this.run();
   }
-  drive(f, L0 = 0) {
+  // R0: F has already run once and returned R0 (the direct-call fast path
+  // hands over a call or tail-call request it cannot finish itself).
+  drive(f, L0 = 0, r0 = undefined) {
     const cf = this.contF, cl = this.contL, ce = this.contE;
     const base = this.contDepth;
     let d = base;
     let L = L0, ebp = this.ebp;
-    this.jd++;
+    const jd0 = ++this.jd;
     try {
       for (;;) {
         let r;
-        try { r = f(this, L); }
+        if (r0 !== undefined) { r = r0; r0 = undefined; }
+        else try { r = f(this, L); }
         catch (e) {
           if (!(e instanceof LongJmp)) throw e;
+          this.jd = jd0;          // fast-path direct calls it unwound did not count down
           let found = false;
           if (ebp === this.ebp && f.RES && f.RES[e.ip] !== undefined) { L = f.RES[e.ip]; found = true; }
           while (!found && d > base) {
@@ -1319,6 +1333,7 @@ class MVM {
           try { this.run(); }
           catch (e) {
             if (!(e instanceof LongJmp)) throw e;
+            this.jd = jd0;
             let found = false;
             while (!found && d > base) {
               d--;
@@ -1419,9 +1434,14 @@ class MVM {
       }
     }
     insns.sort((a, b) => a[0] - b[0]);
+    const insnIdx = new Map(); for (let i = 0; i < insns.length; i++) insnIdx.set(insns[i][0], i);
     const label = new Map(); let nl = 0;
     for (const [pc] of insns) if (starts.has(pc)) label.set(pc, nl++);
-    const CHUNK = DBG.MVM_CHUNK ? parseInt(DBG.MVM_CHUNK, 10) : 150;
+    // Instructions per JS function: a jump between chunks returns to the
+    // dispatcher and reloads every register, and past ~800 V8 stops optimizing
+    // the function.  Measured (CPU, BOYER / FRPOLY): 150 -> 450 is 15-25%
+    // faster, 300..600 a plateau, 800 and up much slower.
+    const CHUNK = DBG.MVM_CHUNK ? parseInt(DBG.MVM_CHUNK, 10) : 450;
     const labelChunk = new Map(); let nch = 0, acc = 0;
     for (const [pc] of insns) {
       if (label.has(pc)) { if (acc >= CHUNK) { nch++; acc = 0; } labelChunk.set(label.get(pc), nch); }
@@ -1439,10 +1459,26 @@ class MVM {
       if (v <= 4) STORE5 += `m32[fb+(${IX[v]})]=r${v};`;
       DECL += `let r${v}=0;`;
     }
+    // FRAME SLOTS IN JS LOCALS: each constant-index slot this function names
+    // (OBJ-REF / OBJ-SET on VFP) is read from a local s<k>; a write goes to
+    // the local AND the frame (write-through), so memory is always current --
+    // the collector's stack scan, a dynamic-index AREF on VFP and a re-entry
+    // read it there -- and nothing has to be stored before a call.  The
+    // locals are reloaded wherever the registers are (entry, after a
+    // collection, a trap or a delegated instruction).  Off: MVM_NO_SLOT_LOCALS.
+    const slotSet = new Set();
+    if (!DBG.MVM_NO_SLOT_LOCALS)
+      for (const [pc, op] of insns) {
+        if (op === 0x61 && m8[pc + 2] === 21) slotSet.add(m8[pc + 3]);
+        else if (op === 0x62 && m8[pc + 1] === 21) slotSet.add(m8[pc + 2]);
+      }
+    let SLOAD = '';
+    for (const k of slotSet) { SLOAD += `s${k}=m32[fb+(${slotOff(k) >> 2})];`; DECL += `let s${k}=0;`; }
+    LOAD += SLOAD;
     // A call leaves this function; V4-V8 come back from the frame on resume
     // (*CALL-TEMPS-SURVIVE*: see mvm.js).
-    const LOAD48 = [4, 5, 6, 7, 8].map((v) => `r${v}=m32[fb+(${IX[v]})];`).join('');
-    const ENTRY = `if(L===0){${[0, 1, 2, 3, 4].map((v) => `r${v}=m32[fb+(${IX[v]})];`).join('')}}else{${[4, 5, 6, 7, 8].map((v) => `r${v}=m32[fb+(${IX[v]})];`).join('')}}`;
+    const LOAD48 = [4, 5, 6, 7, 8].map((v) => `r${v}=m32[fb+(${IX[v]})];`).join('') + SLOAD;
+    const ENTRY = `if(L===0){${[0, 1, 2, 3, 4].map((v) => `r${v}=m32[fb+(${IX[v]})];`).join('')}}else{${[4, 5, 6, 7, 8].map((v) => `r${v}=m32[fb+(${IX[v]})];`).join('')}}${SLOAD}`;
     let curChunk = 0;
     const J = (t) => { const l = label.get(t); return labelChunk.get(l) === curChunk ? `{L=${l};continue;}` : `{${STORE}return ${-(2 + l)};}`; };
     const chk = (a, what) => `if(${a}<${VBASE}||${a}>=HE)vm.memFault(${JSON.stringify(what)});`;
@@ -1514,6 +1550,18 @@ class MVM {
         case 0x48: out += `if(${R(b1)}!==${NIL})${J(pc + len + rd32(pc + 2))}`; break;
         case 0x50: case 0x51: {
           const d = op === 0x50 ? -1 : 3;
+          // Straight after the compiler's own cons guard -- OBJ-TAG t x;
+          // CMP-IMM t 2; BNE slow; with no other way in -- X is a cons, so
+          // its tag and bounds need no second check (68k's cfde9c0f).
+          const i = insnIdx.get(pc);
+          const g1 = insns[i - 1], g2 = insns[i - 2], g3 = insns[i - 3];
+          if (i >= 3 && !label.has(pc) && g1[1] === 0x42 && g1[0] + 5 === pc
+              && g2[1] === 0x33 && g2[0] + 6 === g1[0] && rd32(g2[0] + 2) === 2
+              && g3[1] === 0x63 && g3[0] + 3 === g2[0] && m8[g3[0] + 1] === m8[g2[0] + 1]
+              && m8[g3[0] + 2] === b2 && m8[g3[0] + 1] !== b2) {
+            out += W(b1, `m32[(${R(b2)}-${VBASE - d})>>2]`);
+            break;
+          }
           out += `${P}{const x=${R(b2)},a=x+(${d});if((x&7)!==1||a<${VBASE}||a>=HE)vm.memFault('car/cdr of non-cons');${W(b1, `m32[(a-${VBASE})>>2]`)}}`;
           break;
         }
@@ -1527,12 +1575,12 @@ class MVM {
         case 0x56: out += `{const x=${R(b2)};${W(b1, `(x!==${NIL}&&(x&15)===1)?${NIL}:${TV}`)}}`; break;
         case 0x60: out += `${P}${W(b1, `vm.allocObj(${b2 | (b3 << 8)},${b4},true)`)}`; break;
         case 0x61: {
-          if (b2 === 21) out += W(b1, `m32[fb+(${slotOff(b3) >> 2})]`);
+          if (b2 === 21) out += W(b1, slotSet.has(b3) ? `s${b3}` : `m32[fb+(${slotOff(b3) >> 2})]`);
           else out += `${P}{const a=${R(b2)}+${4 * b3 - 5};${chk('a', 'obj-ref')}${W(b1, `m32[(a-${VBASE})>>2]`)}}`;
           break;
         }
         case 0x62: {
-          if (b1 === 21) out += `m32[fb+(${slotOff(b2) >> 2})]=${R(b3)};`;
+          if (b1 === 21) out += slotSet.has(b2) ? `m32[fb+(${slotOff(b2) >> 2})]=s${b2}=${R(b3)};` : `m32[fb+(${slotOff(b2) >> 2})]=${R(b3)};`;
           else out += `${P}{const a=${R(b1)}+${4 * b2 - 5};${chk('a', 'obj-set')}m32[(a-${VBASE})>>2]=${R(b3)};}`;
           break;
         }
@@ -1593,9 +1641,9 @@ class MVM {
             // call returns to the driver as before.  The site re-asks for an
             // untranslated callee: caching the first answer kept a callee that
             // crossed the threshold later interpreted from this site for good.
-            out += `${P}${STORE}if(!${c})${c}=vm.compiledFor(${t});if(${c}&&vm.jd<${JD_MAX}){vm.push(${RET_SENTINEL});vm.enter(${t});const g0=vm.gcCount;vm.drive(${c});if(vm.gcCount!==g0){${LOAD48}}}else{vm.resumeL=${label.get(pc + len)};vm.nextF=${c};vm.push(${RET_SENTINEL});vm.enter(${t});return ${t * 2};}`;
+            out += `${P}${STORE}if(!${c})${c}=vm.compiledFor(${t});if(${c}&&vm.jd<${JD_MAX}){vm.push(${RET_SENTINEL});vm.enter(${t});const g0=vm.gcCount;if(${c}.RES)vm.drive(${c});else{vm.jd++;const q=${c}(vm,0);vm.jd--;if(q!==-1)vm.drive(${c},0,q);}if(vm.gcCount!==g0){${LOAD48}}}else{vm.resumeL=${label.get(pc + len)};vm.nextF=${c};vm.push(${RET_SENTINEL});vm.enter(${t});return ${t * 2};}`;
           } else {
-            out += `${P}${STORE}{const t=vm.fnAddrToOffset(${R(b1)}),g=vm.compiledFor(t);if(g&&vm.jd<${JD_MAX}){vm.push(${RET_SENTINEL});vm.enter(t);const g0=vm.gcCount;vm.drive(g);if(vm.gcCount!==g0){${LOAD48}}}else{vm.resumeL=${label.get(pc + len)};vm.nextF=g;vm.push(${RET_SENTINEL});vm.enter(t);return t*2;}}`;
+            out += `${P}${STORE}{const t=vm.fnAddrToOffset(${R(b1)}),g=vm.compiledFor(t);if(g&&vm.jd<${JD_MAX}){vm.push(${RET_SENTINEL});vm.enter(t);const g0=vm.gcCount;if(g.RES)vm.drive(g);else{vm.jd++;const q=g(vm,0);vm.jd--;if(q!==-1)vm.drive(g,0,q);}if(vm.gcCount!==g0){${LOAD48}}}else{vm.resumeL=${label.get(pc + len)};vm.nextF=g;vm.push(${RET_SENTINEL});vm.enter(t);return t*2;}}`;
           }
           break;
         }
@@ -1632,7 +1680,7 @@ class MVM {
       if (op === 0x82 || op === 0x83 || op === 0x40) out += `vm.fault('fell off a block');\n`;
     }
     outs[curChunk] = out;
-    const ENTRYX = `if(L===0){${[0, 1, 2, 3, 4].map((v) => `r${v}=m32[fb+(${IX[v]})];`).join('')}}else{${LOAD}}`;
+    const ENTRYX = `if(L===0){${[0, 1, 2, 3, 4].map((v) => `r${v}=m32[fb+(${IX[v]})];`).join('')}${SLOAD}}else{${LOAD}}`;
     // An OSR entry (a loop head, mid-function) loads every register: they are
     // all live there, not just the arguments.
     const mk = (o, i) => `function(vm,L){const m32=vm.m32,m8=vm.m8;let fb=(vm.ebp-${VBASE})>>2;const HE=vm.heapEnd;let cmp=0,ovf=false;${DECL}${osr ? LOAD : i === 0 && nch === 1 ? ENTRY : ENTRYX}for(;;)switch(L){\n${o}default: vm.fault('bad block label '+L);\n}}`;

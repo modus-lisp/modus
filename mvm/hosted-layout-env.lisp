@@ -170,11 +170,14 @@
                         (+ #x10000000 *layout-conv-delta*)
                         (layout-slid-text "%slide"))
                 (format nil "  (setq *conv-delta* ~D)
-  (setq *hosted-layout* (quote ~S))
+  (setq *hosted-layout* (quote ~A))
   (setq *aarch64-darwin-syscall-slot* ~A)
 "
                         *layout-conv-delta*
-                        *layout-plist*
+                        ;; printed flat: ~S follows *PRINT-PRETTY*, which SBCL's
+                        ;; script toplevel has on and modus's off, and this text
+                        ;; is image source (the same bytes from every host)
+                        (let ((*print-pretty* nil)) (prin1-to-string *layout-plist*))
                         (let ((slot (layout-darwin-syscall-slot)))
                           (if slot (format nil "~D" slot) "nil"))))
             (layout-coinit-rest-text))))

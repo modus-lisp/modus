@@ -635,6 +635,9 @@
   t)
 ")
 
+;;; --- Windows x86-64: boot/boot-win64.lisp (PE32+ writer, :WIN64 descriptor) ---
+(defvar *boot-win64-desc-source* (mvm-text "boot/boot-win64.lisp"))
+
 (defvar *selfhost-cross-tooling-source*
   (concatenate 'string
     ;; #210 rung 1: the aarch64 translator + its co-init go here, BEFORE
@@ -657,4 +660,7 @@
     *boot-linux-i386-desc-source*   (string #\Newline)
     *boot-linux-rv32-desc-source*   (string #\Newline)
     *boot-x64-bare-sources*         (string #\Newline)
+    ;; Windows: the PE32+ writer and the :WIN64 boot descriptor
+    ;; (mvm/build-win64-cli.lisp), so a builder can build modus.exe
+    *boot-win64-desc-source*        (string #\Newline)
     *selfhost-target-coinit-source* (string #\Newline)))

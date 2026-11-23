@@ -71,6 +71,10 @@
     (error "coroutines-start: call it on the main thread."))
   (unless (zerop (%gc-read64 #x100050D0))
     (error "coroutines-start: the actor runtime holds the parked-computation table."))
+  ;; argv and envp, while region 0's stack base is still the process stack's:
+  ;; every transfer re-points that base at the stack it enters.
+  (when (boundp '*cli-argv-base*)
+    (setq *cli-argv-base* (%cli-argv-base)))
   (when (zerop (%ha-carve)) (error "coroutines-start: the band could not be carved."))
   (%ha-percpu-init-cpu (%ha-percpu-base) 0)
   (%ha-set-percpu-mode 1)

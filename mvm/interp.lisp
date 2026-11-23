@@ -421,6 +421,24 @@
                   (%mvm-resolve-runtime-fn name)))))
       (%mvm-resolve-runtime-fn name)))
 
+(defun %interp-undefined-call (entry name)
+  "The function to call for the runtime call ENTRY, whose callee NAME is undefined: signal
+   UNDEFINED-FUNCTION with SBCL's restarts, as compiled code's bridge does
+   (%JIT-BRIDGE-UNDEFINED).  CONTINUE looks the name up again -- a handler that has just
+   defined it resumes the call in place, and one that has not is asked again; USE-VALUE calls
+   the function it is given.  The interpreter used to signal with no restarts, so a handler
+   that could supply the function -- cortez's resolver, pulling a definition on demand -- had
+   nothing to resume, and EVAL'd code alone failed where compiled code went on."
+  (loop
+    (restart-case (error (quote undefined-function) :name (%runtime-fn-name-symbol name))
+      (continue ()
+        :report "Retry calling the function."
+        (let ((f (%mvm-rt-cell-fn-1 (cdr entry) name)))
+          (when f (return f))))
+      (use-value (f)
+        :report "Call a function given in its place."
+        (return (if (functionp f) f (fdefinition f)))))))
+
 (defun %mvm-rt-cell-store-p-1 (cell name)
   "%MVM-RT-CELL-STORE-P with the stub's cache cell in hand."
   (if (consp cell)
@@ -1794,7 +1812,8 @@
                  ;; store %val->word of the result in VR, continue after the CALL.
                  (let* ((entry (%mvm-rt-entry runtime-table bc pc))
                         (name (car entry))
-                        (fn (%mvm-rt-cell-fn-1 (cdr entry) name))
+                        (fn (or (%mvm-rt-cell-fn-1 (cdr entry) name)
+                                (%interp-undefined-call entry name)))
                         (nargs (mvm-nargs state)))
                    (if fn
                        (let ((args

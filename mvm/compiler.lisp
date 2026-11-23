@@ -28675,20 +28675,31 @@
              (hsym (%mvm-gensym "MRH"))
              (be (eql (ct-target-big-endian) 1))
              (hi-off (if be 0 2))
-             (lo-off (if be 2 0)))
+             (lo-off (if be 2 0))
+             (ca (%conv-addr-form addr-form))
+             ;; A COMPILE-TIME ADDRESS GETS LITERAL HALF ADDRESSES.  Through
+             ;; the variable, `(+ asym 2)' ran at run time, and every low-block
+             ;; word is >= #x10000000 = 2^28 -- outside EMIT-ARITH-PAIR's
+             ;; 30-bit operand guard -- so each read of a fixed word took
+             ;; GENERIC-ADD's slow path.  That was every %GV-SET's thread gate
+             ;; (#x10000DB8): 13% of BOYER's instructions on the 32-bit web image.
+             ;; (Unrebased only: a literal goes through MEM-REF's region rule
+             ;; again, and a rebased one must not be rebased twice.)
+             (k (and (eq ca addr-form) (%conv-const-int ca)))
+             (half (lambda (off) (cond (k (+ k off)) ((zerop off) asym) (t (list '+ asym off))))))
         (return-from compile-mem-ref
           (compile-form
             ;; The halves address a VARIABLE, which the region rule cannot
             ;; prove: rebase the written address here, once, or a moved
             ;; region's :u32 reads the virtual word (measured: the 68k Mac
             ;; faulted on #x10000DB8 in %GV-SET-C).
-            (list 'let (list (list asym (%conv-addr-form addr-form)))
-                  (list 'let (list (list hsym (list 'mem-ref (if (zerop hi-off) asym (list '+ asym hi-off)) :u16)))
+            (list 'let (list (list asym (if k 0 ca)))
+                  (list 'let (list (list hsym (list 'mem-ref (funcall half hi-off) :u16)))
                         (list 'if (list '< hsym (ash 1 (- (ct-fixnum-bits) 17)))
                               (list '+ (list 'ash hsym 16)
-                                       (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16))
+                                       (list 'mem-ref (funcall half lo-off) :u16))
                               (list '+ (list 'bignum-ash hsym 16)
-                                       (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16)))))
+                                       (list 'mem-ref (funcall half lo-off) :u16)))))
             env dest)))))
   (compile-form (%conv-addr-form addr-form) env dest)
   ;; Untag address: logical shift right by 1
@@ -28732,14 +28743,20 @@
            (let* ((asym (%mvm-gensym "MEMA")) (vsym (%mvm-gensym "MEMV"))
                   (be (eql (ct-target-big-endian) 1))
                   (hi-off (if be 0 2))
-                  (lo-off (if be 2 0)))
+                  (lo-off (if be 2 0))
+                  (ca (%conv-addr-form addr-form))
+                  ;; literal half addresses for a compile-time address, as
+                  ;; compile-mem-ref's split (a run-time `(+ asym 2)' on a
+                  ;; low-block word goes to GENERIC-ADD on a 30-bit tower)
+                  (k (and (eq ca addr-form) (%conv-const-int ca)))
+                  (half (lambda (off) (cond (k (+ k off)) ((zerop off) asym) (t (list '+ asym off))))))
              (return-from compile-setf
                (compile-form
                  ;; rebased once, as compile-mem-ref's split does
-                 (list 'let (list (list asym (%conv-addr-form addr-form)) (list vsym value-form))
-                       (list 'setf (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16)
+                 (list 'let (list (list asym (if k 0 ca)) (list vsym value-form))
+                       (list 'setf (list 'mem-ref (funcall half lo-off) :u16)
                              (list 'logand vsym 65535))
-                       (list 'setf (list 'mem-ref (if (zerop hi-off) asym (list '+ asym hi-off)) :u16)
+                       (list 'setf (list 'mem-ref (funcall half hi-off) :u16)
                              (list 'logand (list 'bignum-ash vsym -16) 65535))
                        vsym)
                  env dest))))

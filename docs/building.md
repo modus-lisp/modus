@@ -12,7 +12,7 @@ Released binaries live in the dist repository, `modus-lisp/dist`, under `bin/REL
 | `modus-windows-x64.exe` | the same image as a Windows PE32+ console program (`mvm/build-win64-cli.lisp`) |
 | `modus-builder-linux-x64` | the CLI with the image-building tooling in it (`MODUS_BUILDER=1`): this one runs builds |
 | `modus-builder-windows-x64.exe` | the same, for Windows |
-| `modus.com` | both CLIs in one file (`scripts/make-ape.lisp`): an Actually Portable Executable that Windows runs as the PE, and a Unix shell runs as a script that copies the Linux image to `~/.cache/modus/` once and executes it |
+| `modus.com` | both CLIs in one file (`scripts/make-ape.lisp`): an Actually Portable Executable that Windows runs as the PE, and a Unix shell runs as a script that copies the Linux image to `~/.cache/modus/` once and executes it.  It is *derived* from the two files above, not compiled: the copy it runs on Unix has `modus-linux-x64`'s SHA-256, and make-ape gives the same bytes on every host |
 | `SHA256SUMS` | every file's SHA-256 |
 | `RELEASE.md` | the source commit, the build ID, and the commands that made each file |
 

@@ -11,7 +11,9 @@
 ;;;; file as a script when the kernel answers ENOEXEC -- the start of a quoted string
 ;;;; that swallows the rest of the DOS header (e_lfanew included).  The quote closes in
 ;;;; the DOS stub, and a few lines of sh copy the ELF to ~/.cache/modus/ once (named
-;;;; after its contents, so a new release never runs a stale copy) and exec it.  The PE
+;;;; after its contents, so a new release never runs a stale copy) and exec it.  The
+;;;; copy is the ELF's exact bytes, so its SHA-256 is the release's modus-linux-x64:
+;;;; what runs on Unix is the cross-checked image, not something derived from it.  The PE
 ;;;; header moves from 0x80 to 0x280 to make room; nothing else in the PE changes.
 ;;;;
 ;;;; Not the single-image APE Cosmopolitan builds: the two images differ (syscalls go
@@ -62,10 +64,10 @@
 case $(uname -sm) in \"Linux x86_64\") ;; *) echo \"modus.com: no image for $(uname -sm) in this file\" >&2; exit 1;; esac~%~
 o=$0; case $o in */*) ;; *) o=$(command -v \"$o\");; esac~%~
 d=${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/modus; e=$d/~A~%~
-[ -x \"$e\" ] || { mkdir -p \"$d\" && dd if=\"$o\" of=\"$e.$$\" bs=4096 skip=~D count=~D 2>/dev/null ~
+[ -x \"$e\" ] || { mkdir -p \"$d\" && dd if=\"$o\" bs=4096 skip=~D count=~D 2>/dev/null | head -c ~D > \"$e.$$\" ~
 && chmod 755 \"$e.$$\" && mv -f \"$e.$$\" \"$e\"; } || exit 1~%~
 exec \"$e\" \"$@\"~%exit 1~%"
-                         #\Newline name (/ elf-at 4096) elf-blocks))
+                         #\Newline name (/ elf-at 4096) elf-blocks (length elf)))
          (out (make-array (+ elf-at (* 4096 elf-blocks))
                           :element-type '(unsigned-byte 8) :initial-element 0)))
     (unless (and (= (aref pe 0) 77) (= (aref pe 1) 90) (= (ape-u32 pe lfanew) #x4550))

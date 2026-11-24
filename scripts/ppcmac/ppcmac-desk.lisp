@@ -63,7 +63,7 @@
     (when r (setf glass::*font-regular* (scribe:open-font r)))
     (when b (setf glass::*font-bold* (scribe:open-font b)))
     ;; the listener's monospace face (glass/term reads it from glass's fonts/)
-    (let ((m (%payload-file "JetBrainsMono-Regular.ttf")))
+    (let ((m (%payload-file "IosevkaTerm-Regular.ttf")))
       (when m (setf glass-term::*term-fonts* (list (scribe:open-font m)))))
     (and r b t)))
 

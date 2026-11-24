@@ -98,7 +98,7 @@
       (format o "~A~C~A~%" f #\Tab (repo-path f)))
     (dolist (font '("LiberationSans-Regular.ttf" "LiberationSans-Bold.ttf"))
       (format o "~A~C~A~%" font #\Tab (repo-path (concatenate 'string "scribe/fonts/" font))))
-    (format o "~A~C~A~%" "JetBrainsMono-Regular.ttf" #\Tab (repo-path "glass/fonts/JetBrainsMono-Regular.ttf"))
+    (format o "~A~C~A~%" "IosevkaTerm-Regular.ttf" #\Tab (repo-path "glass/fonts/IosevkaTerm-Regular.ttf"))
     (dolist (f '("ppcmac-input.lisp" "ppcmac-usb.lisp" "ppcmac-desk.lisp"))
       (format o "~A~C~A~%" f #\Tab (namestring (merge-pathnames (concatenate 'string "ppcmac/" f) *scripts*)))))
   (format t "ppcmac-glass-payload: ~A: ~D entries~%" out (+ (length *files*) 6)))

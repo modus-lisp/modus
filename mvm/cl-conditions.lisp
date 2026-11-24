@@ -3106,6 +3106,8 @@
                        "ACTORS-SELF" "ACTORS-YIELD" "ACTORS-START" "ACTORS-STOP"
                        "COROUTINES-START" "COROUTINE-CREATE" "COROUTINE-TRANSFER"
                        "COROUTINE-CURRENT" "COROUTINE-DONE-P"
+                       "COROUTINE-STACK-BYTES" "SET-COROUTINE-STACK-BYTES"
+                       "DEFINE-HASH-TABLE-TEST"
                        "SPAWN-LINK" "LINK"
                        "SOCKET-CONNECT" "SOCKET-LISTEN" "SOCKET-LISTEN-ON"
                        "SOCKET-LISTEN-PORT" "SOCKET-ACCEPT" "SOCKET-SEND"

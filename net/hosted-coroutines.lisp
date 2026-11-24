@@ -49,6 +49,22 @@
 (defun %co-max () 64)
 (defvar *co-stack-bytes* #x2000000) ; 32 MB, committed only as touched
 
+(defun coroutine-stack-bytes () *co-stack-bytes*)
+
+(defun set-coroutine-stack-bytes (bytes)
+  "Make every coroutine's stack BYTES long (a multiple of 4096, at least 1 MB).
+   Only before COROUTINES-START: a slot's stack is mapped the first time the slot
+   is made and kept, and its window's stack limit is computed from this, so a
+   change after any slot exists would give two sizes and a wrong limit for the
+   old ones.  The mapping is committed only as it is touched, so a large size
+   costs address space, not memory.  The default is 32 MB; SBCL code that ran
+   on a thread under --control-stack-size wants that size here.  Returns BYTES."
+  (unless (and (integerp bytes) (>= bytes #x100000) (zerop (mod bytes 4096)))
+    (error "set-coroutine-stack-bytes: ~S is not a multiple of 4096 of at least 1 MB." bytes))
+  (when (coroutines-started-p)
+    (error "set-coroutine-stack-bytes: coroutines are already started; set it before COROUTINES-START."))
+  (setq *co-stack-bytes* bytes))
+
 (defun %co-get (off) (%gc-read64 (+ *co-ctl* off)))
 (defun %co-set (off v) (%gc-write64 (+ *co-ctl* off) v))
 (defun %co-save-area (id) (+ *co-ctl* (+ #x100 (* id 64))))

@@ -4299,25 +4299,32 @@
     ((characterp object)
      (char-code object))
     ((stringp object)
-     ;; FNV-1a 32-bit on string chars, return as fixnum
-     (let ((hash 2166136261)
-           (i 0)
-           (len (length object)))
-       ;; A plain #x31 string reads its slots directly (same codes AREF would
-       ;; lift to characters and %ENSURE-CHAR-CODE lower again).
-       (if (and (%prim-stringp object) (not (%mda-p object)) (not (%prim-base-string-p object))
-                (not (%prim-string32-p object)))
-           (loop
-             (when (>= i len) (return))
-             (setq hash (logxor hash (%ensure-char-code (%word-aref object i))))
-             (setq hash (logand (* hash 16777619) #xFFFFFFFF))
-             (setq i (+ i 1)))
-           (loop
-             (when (>= i len) (return))
-             (setq hash (logxor hash (%ensure-char-code (aref object i))))
-             (setq hash (logand (* hash 16777619) #xFFFFFFFF))
-             (setq i (+ i 1))))
-       hash))
+     ;; %STRING-HASH, as an EQUAL table hashes: 32 bits, by character code (a string that is not a plain one --
+     ;; adjustable, fill-pointered, displaced -- through a simple copy).  Where a fixnum is narrower than 32 bits
+     ;; that is bignum arithmetic: FNV-1a as before.
+     (if (> +fixnum-bits+ 32)
+         (if (and (%prim-stringp object) (not (%mda-p object)))
+             (%string-hash object)
+             (%string-hash (copy-seq object)))
+         ;; FNV-1a 32-bit on string chars, return as fixnum
+         (let ((hash 2166136261)
+               (i 0)
+               (len (length object)))
+           ;; A plain #x31 string reads its slots directly (same codes AREF would
+           ;; lift to characters and %ENSURE-CHAR-CODE lower again).
+           (if (and (%prim-stringp object) (not (%mda-p object)) (not (%prim-base-string-p object))
+                    (not (%prim-string32-p object)))
+               (loop
+                 (when (>= i len) (return))
+                 (setq hash (logxor hash (%ensure-char-code (%word-aref object i))))
+                 (setq hash (logand (* hash 16777619) #xFFFFFFFF))
+                 (setq i (+ i 1)))
+               (loop
+                 (when (>= i len) (return))
+                 (setq hash (logxor hash (%ensure-char-code (aref object i))))
+                 (setq hash (logand (* hash 16777619) #xFFFFFFFF))
+                 (setq i (+ i 1))))
+           hash)))
     ((symbolp object)
      ;; Use name hash if available
      ;; By NAME for every symbol.  Native symbols and keywords (#x50/#x53

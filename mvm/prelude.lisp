@@ -2230,36 +2230,68 @@
         (car (cdr (cdr (cdr (cdr (cdr c))))))
         nil)))
 
-(declaim (optimize (safety 0)))     ; the index is below the length
-(defun %fnv-string-hash (key)
-  "FNV-1a of plain string KEY's characters, 32 bits (%HT-HASH's 64-bit EQUAL-table string hash).  Its own
-   function, at SPEED 3 so its locals live in registers (%PROMOTE-LOCALS-P), H declared to its 32 bits so the
-   multiply needs no overflow check -- the low 32 bits of the product are the same either way.  It was 130 ns
-   for a 59-character name (SBCL's SXHASH: 35).  Every read is a character CODE (a wide string's words are its
-   codes, fixnums), so (UNSIGNED-BYTE 32) bounds it and the XOR and product with it."
+;;; THE STRING HASH (EQUAL tables, SXHASH): four FNV-1a lanes over the characters in turn -- character I goes to
+;;; lane I mod 4 -- then the lanes and the length folded into one and avalanched.  One FNV-1a chain is a multiply
+;;; waiting on the multiply before it, six cycles a character however it is compiled: 115 ns for a 59-character
+;;; name, where SBCL's SXHASH takes 35.  Four chains run side by side and the loop's own cost is paid once per
+;;; four characters.  Only character CODES enter, so equal strings hash equally in every representation (narrow
+;;; #x13, wide #x31, 32-bit #x15), as an EQUAL table needs; every value is 32 bits, every product below 2^58.
+;;; FNV's low bits hear only the low bits of what went in, and the bucket index IS the low bits: the final XOR of
+;;; the high half down is what makes them depend on all of it.
+
+(declaim (optimize (safety 0)))     ; every index is below the length
+(defun %string-hash (key)
+  "The 32-bit hash of plain string KEY's characters (see above)."
   (declare (optimize (speed 3)))
-  (let ((h 2166136261) (len (array-length key)) (i 0))
-    (declare (type (unsigned-byte 32) h) (type fixnum len i))
-    ;; A plain string here: wide (#x31, a word per character) or narrow
-    ;; (#x13, a byte) -- chosen ONCE, not per character as %PRIM-AREF
-    ;; would.  Both read the CODE, so equal contents hash equally across
-    ;; the two representations, as an EQUAL table needs.
+  (let* ((len (array-length key)) (end (- len (logand len 3))) (i 0)
+         (a 2166136261) (b 3735928559) (c 1103515245) (d 2654435769))
+    (declare (type (integer 0 1152921504606846975) len end i)
+             (type (unsigned-byte 32) a b c d))
     (if (%prim-base-string-p key)
-        (loop
-          (when (>= i len) (return nil))
-          (setq h (logand (* (logxor h (the (unsigned-byte 32) (%u8-ref key i))) 16777619) #xFFFFFFFF))
-          (setq i (+ i 1)))
-      (if (%prim-string32-p key)
-        ;; ...or a 32-bit string (#x15): a u32 code per character
-        (loop
-          (when (>= i len) (return nil))
-          (setq h (logand (* (logxor h (the (unsigned-byte 32) (%c32-ref key i))) 16777619) #xFFFFFFFF))
-          (setq i (+ i 1)))
-        (loop
-          (when (>= i len) (return nil))
-          (setq h (logand (* (logxor h (the (unsigned-byte 32) (%word-aref key i))) 16777619) #xFFFFFFFF))
-          (setq i (+ i 1)))))
-    h))
+        (progn
+          (loop
+            (when (>= i end) (return nil))
+            (setq a (logand (* (logxor a (the (unsigned-byte 32) (%u8-ref key i))) 16777619) #xFFFFFFFF))
+            (setq b (logand (* (logxor b (the (unsigned-byte 32) (%u8-ref key (+ i 1)))) 16777619) #xFFFFFFFF))
+            (setq c (logand (* (logxor c (the (unsigned-byte 32) (%u8-ref key (+ i 2)))) 16777619) #xFFFFFFFF))
+            (setq d (logand (* (logxor d (the (unsigned-byte 32) (%u8-ref key (+ i 3)))) 16777619) #xFFFFFFFF))
+            (setq i (+ i 4)))
+          (loop
+            (when (>= i len) (return nil))
+            (setq a (logand (* (logxor a (the (unsigned-byte 32) (%u8-ref key i))) 16777619) #xFFFFFFFF))
+            (setq i (+ i 1))))
+        (if (%prim-string32-p key)
+            (progn
+              (loop
+                (when (>= i end) (return nil))
+                (setq a (logand (* (logxor a (the (unsigned-byte 32) (%c32-ref key i))) 16777619) #xFFFFFFFF))
+                (setq b (logand (* (logxor b (the (unsigned-byte 32) (%c32-ref key (+ i 1)))) 16777619) #xFFFFFFFF))
+                (setq c (logand (* (logxor c (the (unsigned-byte 32) (%c32-ref key (+ i 2)))) 16777619) #xFFFFFFFF))
+                (setq d (logand (* (logxor d (the (unsigned-byte 32) (%c32-ref key (+ i 3)))) 16777619) #xFFFFFFFF))
+                (setq i (+ i 4)))
+              (loop
+                (when (>= i len) (return nil))
+                (setq a (logand (* (logxor a (the (unsigned-byte 32) (%c32-ref key i))) 16777619) #xFFFFFFFF))
+                (setq i (+ i 1))))
+            (progn
+              (loop
+                (when (>= i end) (return nil))
+                (setq a (logand (* (logxor a (the (unsigned-byte 32) (%word-aref key i))) 16777619) #xFFFFFFFF))
+                (setq b (logand (* (logxor b (the (unsigned-byte 32) (%word-aref key (+ i 1)))) 16777619) #xFFFFFFFF))
+                (setq c (logand (* (logxor c (the (unsigned-byte 32) (%word-aref key (+ i 2)))) 16777619) #xFFFFFFFF))
+                (setq d (logand (* (logxor d (the (unsigned-byte 32) (%word-aref key (+ i 3)))) 16777619) #xFFFFFFFF))
+                (setq i (+ i 4)))
+              (loop
+                (when (>= i len) (return nil))
+                (setq a (logand (* (logxor a (the (unsigned-byte 32) (%word-aref key i))) 16777619) #xFFFFFFFF))
+                (setq i (+ i 1))))))
+    (setq a (logand (* (logxor a b) 16777619) #xFFFFFFFF))
+    (setq a (logand (* (logxor a c) 16777619) #xFFFFFFFF))
+    (setq a (logand (* (logxor a d) 16777619) #xFFFFFFFF))
+    (setq a (logand (* (logxor a (logand len #xFFFFFFFF)) 16777619) #xFFFFFFFF))
+    (setq a (logxor a (ash a -16)))
+    (setq a (logand (* a 16777619) #xFFFFFFFF))
+    (logxor a (ash a -15))))
 (declaim (optimize (safety 1)))
 
 (defun %ht-hash (key strcmp? mask)
@@ -2310,7 +2342,7 @@
          ;; exhausted the heap.  Every intermediate here is below 2^28.  The
          ;; 64-bit path is FNV-1a exactly as before.
          (if (> +fixnum-bits+ 32)
-             (logand (%fnv-string-hash key) mask)
+             (logand (%string-hash key) mask)
              (let ((h 1162397) (len (array-length key)) (i 0))   ; #x11BC9D
                (loop
                  (when (>= i len) (return nil))

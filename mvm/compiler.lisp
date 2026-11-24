@@ -24291,25 +24291,10 @@
         (declare (special *arith-trust*))
         (emit-arith-pair fast-op generic-name dest (binding-reg rb) src1))
       (return-from %compile-arith-arg-step-e2 nil)))
-  (if (let ((leaf (%leaf-operand-p arg env)))
-        ;; A leaf, or a pure typed expression, compiled into a fresh temp
-        ;; cannot disturb DEST — with one x64 caveat: the translator's
-        ;; scratch register is rax, which is also VR, and a SPILL temp
-        ;; (V9+) or an :aref is written through it.  So when DEST is VR the
-        ;; shortcut is taken only for a leaf landing in a physical temp
-        ;; (V4..V8); otherwise DEST is a callee-saved / spilled vreg and the
-        ;; scratch traffic is harmless.
-        ;; A HEAP CONSTANT IS NOT SUCH A LEAF: in runtime-compiled code a
-        ;; bignum literal or a quoted object loads from the constant vector
-        ;; THROUGH rax, so with DEST = VR it overwrote the left operand --
-        ;; (logxor a #xe100000000000000) returned the constant, and every
-        ;; AES-GCM tag seal computed was wrong.  Only a variable or a small
-        ;; integer immediate is safe with DEST = VR.
-        (and (or leaf (%pure-simple-expr-p arg env))
-             (or (/= dest +vreg-vr+)
-                 (and leaf (< *temp-reg-counter* 5)
-                      (or (symbolp arg)
-                          (and (integerp arg) (<= (integer-length arg) 60)))))))
+  ;; A leaf, or a pure typed expression, compiled into a fresh temp cannot disturb DEST -- with x64's caveat
+  ;; for DEST = VR (its translator's scratch register; a heap constant loads through it too: (logxor a
+  ;; #xe100000000000000) returned the constant, and every AES-GCM tag seal was wrong).  %ARG-PRESERVES-DEST-P.
+  (if (%arg-preserves-dest-p arg env dest)
       ;; Leaf / pure right operand: no push/mov/pop round trip is needed.
       (let ((temp (alloc-temp-reg)))
         (compile-form arg env temp)
@@ -25895,9 +25880,10 @@
                    (setq src1 nil))
                  (let ((temp (alloc-temp-reg))
                        (*arith-push-depth* (1+ *arith-push-depth*)))
-                   (emit-ir :push dest)
-                   (compile-form arg env temp)
-                   (emit-ir :pop dest)
+                   (let ((keep (and (%image-aarch64-p) (%arg-preserves-dest-p arg env dest))))
+                     (unless keep (emit-ir :push dest))
+                     (compile-form arg env temp)
+                     (unless keep (emit-ir :pop dest)))
                    (let ((*arith-trust* trust))
                      (declare (special *arith-trust*))
                      (emit-arith-pair :add-checked "GENERIC-ADD" dest temp))
@@ -25970,9 +25956,10 @@
                          (setq src1 nil))
                        (let ((temp (alloc-temp-reg))
                              (*arith-push-depth* (1+ *arith-push-depth*)))
-                         (emit-ir :push dest)
-                         (compile-form arg env temp)
-                         (emit-ir :pop dest)
+                         (let ((keep (and (%image-aarch64-p) (%arg-preserves-dest-p arg env dest))))
+                           (unless keep (emit-ir :push dest))
+                           (compile-form arg env temp)
+                           (unless keep (emit-ir :pop dest)))
                          (let ((*arith-trust* trust))
                            (declare (special *arith-trust*))
                            (emit-arith-pair :sub-checked "GENERIC-SUBTRACT" dest temp))
@@ -26018,9 +26005,10 @@
                          (%compile-arith-arg-step-e2 arg env dest :mul-checked "GENERIC-MULTIPLY" trust))
                        (let ((temp (alloc-temp-reg))
                              (*arith-push-depth* (1+ *arith-push-depth*)))
-                         (emit-ir :push dest)
-                         (compile-form arg env temp)
-                         (emit-ir :pop dest)
+                         (let ((keep (and (%image-aarch64-p) (%arg-preserves-dest-p arg env dest))))
+                           (unless keep (emit-ir :push dest))
+                           (compile-form arg env temp)
+                           (unless keep (emit-ir :pop dest)))
                          (let ((*arith-trust* trust))
                            (declare (special *arith-trust*))
                            (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp))
@@ -28089,9 +28077,10 @@
                        (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND" trust))
                      (let ((temp (alloc-temp-reg))
                            (*arith-push-depth* (1+ *arith-push-depth*)))
-                       (emit-ir :push dest)
-                       (compile-form arg env temp)
-                       (emit-ir :pop dest)
+                       (let ((keep (and (%image-aarch64-p) (%arg-preserves-dest-p arg env dest))))
+                         (unless keep (emit-ir :push dest))
+                         (compile-form arg env temp)
+                         (unless keep (emit-ir :pop dest)))
                        ;; Fixnum^fixnum -> raw :and (fast); bignum operand -> GENERIC-LOGAND
                        ;; (the now-fast two's-complement engine).  Raw :and on a bignum
                        ;; pointer returned garbage.
@@ -28124,9 +28113,10 @@
                        (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR" trust))
                      (let ((temp (alloc-temp-reg))
                            (*arith-push-depth* (1+ *arith-push-depth*)))
-                       (emit-ir :push dest)
-                       (compile-form arg env temp)
-                       (emit-ir :pop dest)
+                       (let ((keep (and (%image-aarch64-p) (%arg-preserves-dest-p arg env dest))))
+                         (unless keep (emit-ir :push dest))
+                         (compile-form arg env temp)
+                         (unless keep (emit-ir :pop dest)))
                        (let ((*arith-trust* trust))
                          (declare (special *arith-trust*))
                          (emit-arith-pair :or "GENERIC-LOGIOR" dest temp))
@@ -28155,9 +28145,10 @@
                        (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR" trust))
                      (let ((temp (alloc-temp-reg))
                            (*arith-push-depth* (1+ *arith-push-depth*)))
-                       (emit-ir :push dest)
-                       (compile-form arg env temp)
-                       (emit-ir :pop dest)
+                       (let ((keep (and (%image-aarch64-p) (%arg-preserves-dest-p arg env dest))))
+                         (unless keep (emit-ir :push dest))
+                         (compile-form arg env temp)
+                         (unless keep (emit-ir :pop dest)))
                        (let ((*arith-trust* trust))
                          (declare (special *arith-trust*))
                          (emit-arith-pair :xor "GENERIC-LOGXOR" dest temp))
@@ -30741,6 +30732,54 @@
          (let ((b (env-lookup env form)))
            (and b (member (binding-location b) (list :stack :reg)))))
         (t nil)))
+
+;;; WHEN A BINARY OP'S LEFT OPERAND NEEDS NO SAVING.  It sits in DEST while the right operand compiles; the
+;;; emitters PUSH it and POP it back unless compiling the right operand cannot touch DEST.  For DEST = VR that
+;;; was ruled out entirely, for x86-64's sake (its translator's scratch register is rax = VR).  Elsewhere VR is
+;;; only written by a CALL's return, so an operand that cannot call -- a variable, a small integer, a raw or
+;;; declared array read with such an index -- leaves it alone.  Each lane of a hash loop,
+;;; (setq h (logand (* (logxor h (aref s i)) P) M)), was a PUSH and a POP around its load.
+
+(defun %vr-scratch-free-p ()
+  "VR is not the translator's scratch register: aarch64, at run time or in an image."
+  (if *mvm-eval-runtime-p*
+      (and (boundp (quote *jit-target-arch*)) (eq (symbol-value (quote *jit-target-arch*)) :aarch64))
+      (%image-aarch64-p)))
+
+(defun %image-aarch64-p ()
+  "An image compile for aarch64."
+  (and (not *mvm-eval-runtime-p*) *compile-target* (eq (compile-target-name *compile-target*) :aarch64)))
+
+(defun %call-free-operand-p (form env)
+  "FORM compiles to loads that execute no CALL (an index error's trap does not return): a leaf, a raw or
+   declared array read with a call-free index, or THE of one at SAFETY 0."
+  (cond ((%leaf-operand-p form env) t)
+        ((not (consp form)) nil)
+        ((not (symbolp (car form))) nil)
+        (t (let ((op (symbol-name (car form))) (args (cdr form)))
+             (and (consp args) (consp (cdr args)) (null (cddr args))
+                  (cond
+                    ((string= op "THE")
+                     (and (eql *compile-safety* 0) (%call-free-operand-p (cadr args) env)))
+                    ((or (string= op "%WORD-AREF") (string= op "%U8-REF") (string= op "%C32-REF"))
+                     (and (%leaf-operand-p (car args) env) (%call-free-operand-p (cadr args) env)))
+                    ((string= op "AREF")
+                     (and (symbolp (car args))
+                          (or (%declared-generic-array-var-p (car args) env)
+                              (%declared-u8-array-var-p (car args) env))
+                          (%call-free-operand-p (cadr args) env)))
+                    (t nil)))))))
+
+(defun %arg-preserves-dest-p (arg env dest)
+  "Compiling ARG into a fresh temp leaves DEST as it was: the binary-op emitters' test for skipping the PUSH /
+   POP of the left operand (see above, and %COMPILE-ARITH-ARG-STEP-E2)."
+  (let ((leaf (%leaf-operand-p arg env)))
+    (or (and (or leaf (%pure-simple-expr-p arg env))
+             (or (/= dest +vreg-vr+)
+                 (and leaf (< *temp-reg-counter* 5)
+                      (or (symbolp arg)
+                          (and (integerp arg) (<= (integer-length arg) 60))))))
+        (and (= dest +vreg-vr+) (%vr-scratch-free-p) (%call-free-operand-p arg env)))))
 
 (defun %pure-simple-expr-p (form env)
   "FORM compiles to straight-line typed code: a leaf, a typed aref of a

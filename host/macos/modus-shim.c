@@ -1078,10 +1078,22 @@ static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
 // into the image where they point at it, so a symbol map can name them.
 #include <sys/ucontext.h>
 static uint64_t g_code_lo, g_code_hi;
+// FAULT REPORTS WITHOUT STDIO.  A recoverable fault's handler does not return: the image's stub branches into
+// its armed handler-case frame.  A report made with fprintf there left stdio's state behind (the stream's lock
+// and its buffer, taken in a signal handler that never came back), and MODUS_SHIM_FAULTS=1 -- the switch for
+// finding faults -- made every boot fail, at its first recovered fault (the Darwin kernel pads' write, which
+// is how read-only code is found).  Formatted into a stack buffer and written with write(2), which is
+// async-signal-safe.
+__attribute__((format(printf, 1, 2)))
+static void sig_printf(const char *fmt, ...) {
+    char b[512];
+    va_list ap; va_start(ap, fmt); int n = vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    if (n > 0) { ssize_t w = write(2, b, (size_t)(n < (int)sizeof b ? n : (int)sizeof b - 1)); (void)w; }
+}
 static void pr_reg(const char *n, uint64_t v) {
     if (v >= g_code_lo && v < g_code_hi)
-        fprintf(stderr, " %s=%#llx(+%#llx)", n, (unsigned long long)v, (unsigned long long)(v - g_code_lo));
-    else fprintf(stderr, " %s=%#llx", n, (unsigned long long)v);
+        sig_printf(" %s=%#llx(+%#llx)", n, (unsigned long long)v, (unsigned long long)(v - g_code_lo));
+    else sig_printf(" %s=%#llx", n, (unsigned long long)v);
 }
 static void report_fault(int sig, siginfo_t *si, void *uc_);
 
@@ -1176,6 +1188,26 @@ static void lx_fault_frames(int lsig, siginfo_t *si, ucontext_t *uc,
     luc->mc.pstate = ts->__cpsr;
 }
 
+// INTO THE IMAGE'S FAULT STUB WITH THE INTERRUPTED CODE'S REGISTERS.  The stub never returns: it branches into
+// the armed handler-case frame.  Called as a C function from ON_FAULT, it ran with ON_FAULT's own values in the
+// callee-saved x19-x28 -- the epilogue that would have restored the interrupted code's never ran -- and those are
+// the image's dedicated registers (x26 is NIL).  How many ON_FAULT clobbered was the compiler's choice: few on
+// the quiet path, more when MODUS_SHIM_FAULTS made it report, and then the code that resumed read NIL as
+// 0xDEAD0000 and every boot failed at its first recovered fault.  So x19-x28 are reloaded from the interrupted
+// context (X1928) and the stub is entered by a plain branch, the arguments in x0-x2.
+__attribute__((noreturn))
+static void enter_image_handler(uint64_t handler, uint64_t sig, void *lsi, void *luc, const uint64_t *x1928) {
+    __asm__ volatile(
+        "mov x16, %0\n\t" "mov x0, %1\n\t" "mov x1, %2\n\t" "mov x2, %3\n\t" "mov x17, %4\n\t"
+        "ldp x19, x20, [x17, #0]\n\t" "ldp x21, x22, [x17, #16]\n\t" "ldp x23, x24, [x17, #32]\n\t"
+        "ldp x25, x26, [x17, #48]\n\t" "ldp x27, x28, [x17, #64]\n\t"
+        "br x16\n\t"
+        :: "r"(handler), "r"(sig), "r"(lsi), "r"(luc), "r"(x1928)
+        : "x0", "x1", "x2", "x16", "x17", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+          "memory");
+    __builtin_unreachable();
+}
+
 static void on_fault(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     uint64_t pc = __darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
@@ -1203,28 +1235,28 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
     if (show < 0) show = getenv("MODUS_SHIM_FAULTS") != NULL;
     if (show) {
         __typeof__(uc->uc_mcontext->__ss) *ts = &uc->uc_mcontext->__ss;
-        fprintf(stderr, "modus-shim: [%lld] signal %d", (long long)my_tid(), sig);
+        sig_printf("modus-shim: [%lld] signal %d", (long long)my_tid(), sig);
         pr_reg("pc", pc);
-        fprintf(stderr, " addr=%p", si->si_addr);
+        sig_printf(" addr=%p", si->si_addr);
         pr_reg("lr", __darwin_arm_thread_state64_get_lr(*ts));
         pr_reg("sp", __darwin_arm_thread_state64_get_sp(*ts));
-        fprintf(stderr, "\n");
+        sig_printf("\n");
         // A jump to nowhere: show where it came from — every register, and
         // the code before the return address, for an offline disassembly.
         if (sig == SIGTRAP) {
-            fprintf(stderr, "modus-shim: code at pc %#llx:", (unsigned long long)pc);
+            sig_printf("modus-shim: code at pc %#llx:", (unsigned long long)pc);
             const uint32_t *w = (const uint32_t *)(uintptr_t)((pc & ~3ULL) - 0x200);
-            for (int i = 0; i < 0x90; i++) fprintf(stderr, "%s%08x", i % 8 ? " " : "\n  ", w[i]);
-            fprintf(stderr, "\n");
+            for (int i = 0; i < 0x90; i++) sig_printf("%s%08x", i % 8 ? " " : "\n  ", w[i]);
+            sig_printf("\n");
         }
         if (pc < 0x10000) {
-            for (int i = 0; i < 29; i++) { char n[8]; snprintf(n, sizeof n, "x%d", i); pr_reg(n, ts->__x[i]); if (i % 4 == 3) fprintf(stderr, "\n"); }
+            for (int i = 0; i < 29; i++) { char n[8]; snprintf(n, sizeof n, "x%d", i); pr_reg(n, ts->__x[i]); if (i % 4 == 3) sig_printf("\n"); }
             pr_reg("fp", __darwin_arm_thread_state64_get_fp(*ts));
             uint64_t lr = __darwin_arm_thread_state64_get_lr(*ts);
-            fprintf(stderr, "\nmodus-shim: code before lr %#llx:", (unsigned long long)lr);
+            sig_printf("\nmodus-shim: code before lr %#llx:", (unsigned long long)lr);
             const uint32_t *w = (const uint32_t *)(uintptr_t)((lr & ~3ULL) - 0x100);
-            for (int i = 0; i < 0x48; i++) fprintf(stderr, "%s%08x", i % 8 ? " " : "\n  ", w[i]);
-            fprintf(stderr, "\n");
+            for (int i = 0; i < 0x48; i++) sig_printf("%s%08x", i % 8 ? " " : "\n  ", w[i]);
+            sig_printf("\n");
         }
     }
     if (slot >= 0 && image_fault_handler[slot].handler > 1) {
@@ -1236,8 +1268,10 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
         // On this stack: the handler never returns, and the stub has read them by then.
         struct lx_siginfo lsi; struct lx_ucontext luc;
         lx_fault_frames(fault_slot_lx_sig[slot], si, uc, &lsi, &luc);
-        ((void (*)(int, void *, void *))(uintptr_t)image_fault_handler[slot].handler)
-            (fault_slot_lx_sig[slot], &lsi, &luc);
+        uint64_t x1928[10];
+        for (int i = 0; i < 10; i++) x1928[i] = uc->uc_mcontext->__ss.__x[19 + i];
+        enter_image_handler((uint64_t)image_fault_handler[slot].handler, (uint64_t)fault_slot_lx_sig[slot],
+                            &lsi, &luc, x1928);
     }
     report_fault(sig, si, uc_);
 }
@@ -1245,14 +1279,14 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
 static void report_fault(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     __typeof__(uc->uc_mcontext->__ss) *ts = &uc->uc_mcontext->__ss;
-    fprintf(stderr, "\nmodus-shim: signal %d at", sig);
+    sig_printf("\nmodus-shim: signal %d at", sig);
     pr_reg("pc", __darwin_arm_thread_state64_get_pc(*ts));
-    fprintf(stderr, " fault-addr=%p\n ", si->si_addr);
-    for (int i = 0; i < 29; i++) { char n[8]; snprintf(n, sizeof n, "x%d", i); pr_reg(n, ts->__x[i]); if (i % 4 == 3) fprintf(stderr, "\n "); }
+    sig_printf(" fault-addr=%p\n ", si->si_addr);
+    for (int i = 0; i < 29; i++) { char n[8]; snprintf(n, sizeof n, "x%d", i); pr_reg(n, ts->__x[i]); if (i % 4 == 3) sig_printf("\n "); }
     pr_reg("fp", __darwin_arm_thread_state64_get_fp(*ts));
     pr_reg("lr", __darwin_arm_thread_state64_get_lr(*ts));
     pr_reg("sp", __darwin_arm_thread_state64_get_sp(*ts));
-    fprintf(stderr, "\n");
+    sig_printf("\n");
     _exit(128 + sig);
 }
 static void install_fault_report(void) {

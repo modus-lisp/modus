@@ -1410,3 +1410,107 @@ address space is the constraint").
 On the Simulator and an iPhone 15 Pro, the app restores and draws warp's
 media player through glass.  On the Mac, with the same snapshot, a VP8 film
 decodes at about 28 frames per second.
+
+## The macOS CLI built without Apple's toolchain (2026-11-24)
+
+`mvm/build-macos-cli.lisp` makes what `host/macos/build-macos.sh IMAGE OUT cli` makes, on
+Linux, from source, with no clang, ld or codesign: the same Darwin-layout image in
+`__TEXT,__modus` of an arm64 executable that dyld loads, signed ad hoc.  SBCL and a modus
+builder produce the same bytes.
+
+```
+MODUS_MACOS_IMAGE=modus-darwin.elf MODUS_MACOS_OUT=modus \
+  sbcl --dynamic-space-size 4096 --script mvm/build-macos-cli.lisp     # or BUILDER --script
+python3 -I host/macos/check-macho.py modus --modus --elf modus-darwin.elf
+host/macos/mac-test.sh ./modus [./modus-ld]                            # on a Mac
+```
+
+**NOT YET RUN ON A MAC.**  Everything below is checked on Linux; `host/macos/mac-test.sh`
+is the first-run script, step by step, with what each step rules out.
+
+### Why not the MVM compiler, and not assembly by hand
+
+The host's job is C-ABI work: dyld enters it as `main`, the kernel as a signal handler,
+libpthread as a thread start routine, the image through its syscall slot; it calls libSystem
+with AAPCS64 arguments (variadic ones on the stack, Apple's rule) and moves raw 64-bit words
+between Linux and Darwin structures.  MVM code is tagged values whose every non-fixnum path
+calls a runtime helper, with no C-call primitive on aarch64 and nothing callable from C.
+So `mvm/macho-cc.lisp` is a ~600-line compiler for an untagged, C-shaped Lisp whose output
+*is* AAPCS64: values in x0, temporaries pushed 16 bytes at a time, locals below x29, and it
+never touches x18 (Apple's) or x19-x28 -- which is how the syscall stub keeps the image's
+callee-saved registers without saving them.  It uses none of the translator's emission
+flags, so a builder needs nothing pinned (`*BUILDER-HOST-JIT-FLAG-NAMES*`).
+`host/macos/shim.lisp` is modus-shim.c and syscall-stub.S in that language, call for call.
+
+### The executable
+
+| | |
+|---|---|
+| header | `MH_EXECUTE`, `NOUNDEFS\|DYLDLINK\|TWOLEVEL\|PIE` |
+| `__PAGEZERO` | 4 GB, no access (xnu `mach_loader.c`: 64-bit arm64 must have it) |
+| `__TEXT` r-x | header + load commands, `__text` (host code), `__cstring`, `__modus` (the ELF, 16 KB aligned) |
+| `__DATA_CONST` rw-, `SG_READ_ONLY` | `__got`: one slot per libSystem import |
+| `__DATA` rw- | `__data`: the host's variables |
+| `__LINKEDIT` r-- | bind opcodes, symbols, indirect symbols, strings, code signature |
+| load commands | `LC_DYLD_INFO_ONLY`, `LC_SYMTAB`, `LC_DYSYMTAB`, `LC_LOAD_DYLINKER` /usr/lib/dyld, `LC_UUID`, `LC_BUILD_VERSION` (macOS 14.4), `LC_MAIN`, `LC_LOAD_DYLIB` libSystem.B.dylib, `LC_CODE_SIGNATURE` |
+
+**Calls reach libSystem through the GOT**: `ADRP x16, slot; LDR x16, [x16, :lo12:slot];
+BLR x16`.  dyld binds each slot from the bind opcodes (dylib ordinal 1, `BIND_TYPE_POINTER`,
+segment 2).  No rebases: the host code forms every internal address PC-relatively.
+
+**The signature** is what Apple's ld writes for an arm64 link (ld64 `LinkEdit.hpp`,
+`CodeSignatureAtom`): one CodeDirectory, version 0x20400, `CS_ADHOC|CS_LINKER_SIGNED`,
+SHA-256 over 4 KB pages of everything before it, identifier = the output's leaf name,
+execSeg = `__TEXT`, `CS_EXECSEG_MAIN_BINARY`, padded to 8.  Go's `cmd/internal/codesign`
+writes the same, and its hashes recompute identically with the checker below.  SHA-256 is
+natrium's (`MODUS_NATRIUM`, else the nearest `natrium/` checkout).
+
+**Against Apple's ld** (what build-macos.sh's link would hold, from ld64's source):
+- fixups: ld defaults to chained fixups (`LC_DYLD_CHAINED_FIXUPS` + exports trie) for
+  deployment targets that support them (`Options.cpp`, `supportsChainedFixups`); this is
+  ld's `-no_fixup_chains` form, which Go's linker writes for every darwin/arm64 binary;
+- no `__stubs`/`__unwind_info`, `LC_FUNCTION_STARTS`, `LC_DATA_IN_CODE`,
+  `LC_SOURCE_VERSION` (optional, for tools and crash-report symbolication);
+- `LC_BUILD_VERSION` names no tool and SDK 14.4 (ld: its own version and the SDK's);
+- one dylib, where the C build links AudioToolbox, Security and Foundation too;
+- build-macos.sh then re-signs with `codesign --force --sign -`, which replaces ld's
+  linker-signed signature with codesign's (requirements blob, no `CS_LINKER_SIGNED`).
+
+### Checked on Linux
+
+- `VERIFY-MACHO` (in the build): re-reads the bytes and checks header, every load
+  command, segment/section placement and permissions, the embedded image, the
+  CodeDirectory fields and every page hash.  The build fails on a mismatch.
+- `host/macos/check-macho.py` (independent, Python): dyld's and xnu's rules as their sources
+  state them (`mach_o/UnsafeHeader.cpp`, `Image.cpp`, `MachOAnalyzer.cpp`,
+  `bsd/kern/mach_loader.c`), bind opcodes interpreted slot by slot against the indirect
+  symbol table, all page hashes recomputed with hashlib, and every ADRP/branch in the host
+  code landing in a mapped section.  It passes on a Go-built darwin/arm64 binary too.
+- `test/run-macho-shim-test.sh`: the host code under qemu-aarch64 with libSystem test
+  doubles, 234 checks of the compiler and the translation code, including the stub's
+  every-register-but-x0 promise and the clone resume context.
+- `test/run-macho-e2e.sh IMAGE`: the host code running the **real image** under qemu with
+  libSystem played by Linux (`test/macho-e2e-doubles.lisp`); qemu's `-B` lets page 0 be the
+  main thread's TSD, where the image reads its delta (TPIDRRO_EL0 is 0 in Linux user
+  space).  `--eval`, files, directories, clocks, the collector, a fault caught through the
+  signal path into the image's handler, the JIT, a loopback socket.  Not threads.
+
+### Dropped from modus-shim.c, and why
+
+The window (1001-1008), speaker (1010-1013, used only by vessel's desk app, which needs the
+window) and keychain (1030-1032, vessel's iOS terminal): the CLI image never calls them;
+they answer -ENOSYS like any unknown call, and app.lisp already treats a non-zero 1010 as
+"no speaker".  The iOS/tvOS/watchOS arms, the in-place layout (`MODUS_IN_PLACE`,
+`image-segments.sh`), `MODUS_SLIDE` and the preloaded `__MODUSC` core (build-macos.sh
+options this builder does not make), `modus.args` / `@NAME` arguments (app bundles), and the
+diagnostic extras `MODUS_SHIM_PROFILE`, `MODUS_SHIM_RESIDENT`, `MODUS_SHIM_FAULTS`.
+`MODUS_SHIM_STRACE` and the fault report are kept.
+
+### Found on the way (image bugs, both hosts)
+
+- **Hosted AArch64 `accept` was a futex.**  `net/hosted-sockets-a64.lisp` passed AArch64's
+  accept number (202) to `%gc-safe-block-3`, whose remap translates *x86-64* numbers, and
+  x86-64's 202 is futex: every `sb-bsd-sockets:socket-accept` issued `futex(fd, WAIT, 0)`
+  (EFAULT on Linux; on macOS a wait on a page-zero address).  It now passes x86-64's 43.
+- **`(sb-ext:exit :code 42)` exits 84** from the AArch64 images (Linux too): the code
+  reaches exit_group still tagged.  Open.

@@ -22444,12 +22444,25 @@
                  (symbolp name)
                  (null unique-name)
                  (or (%e2-name-names-gf-p name)
+                     ;; NOT DEFINED when this form is compiled, and not a function
+                     ;; of this module either: read the cell when the form RUNS.
+                     ;; The baked :LI-FUNC of an undefined name loaded NIL, so
+                     ;; (eval '(function undefined)) answered NIL where SBCL, and
+                     ;; this image's own FDEFINITION, signal UNDEFINED-FUNCTION.
+                     ;; TI's (DEFF INTERNAL-READ #'READ) ran before their READ was
+                     ;; pulled, stored NIL, and their Lisp Listener died calling it
+                     ;; ("The function NIL is undefined") on every turn of its loop;
+                     ;; signalled, cortez's resolver pulls READ and runs it again.
+                     (and (not (fboundp name))
+                          (not (%e2-fn-in-module-p resolved-name)))
                      ;; A closure stored with (SETF FDEFINITION): read the
                      ;; cell so #'NAME is EQ to it (see %E2-NAME-SET-FUNCTION-P).
                      (and (fboundp (quote %e2-name-set-function-p))
                           (%e2-name-set-function-p fn-name)
                           (not (%e2-fn-in-module-p resolved-name)))))
-            (compile-form (list 'symbol-function (list 'quote name)) env dest)
+            (compile-form (list (if (fboundp name) 'symbol-function 'fdefinition)
+                                (list 'quote name))
+                          env dest)
             (if (and *mvm-eval-runtime-p*
                      (symbolp name)
                      (%e2-fn-in-module-p resolved-name))

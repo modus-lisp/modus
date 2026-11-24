@@ -10410,7 +10410,7 @@
    ;; %PRIM-STRINGP %PRIM-U8-VECTOR-P %RAW-CONSP %SHARED-LITERAL %SLOT-REF %SPAWN-THREAD
    ;; %STRUCT-SLOT-REF %STRUCT-SLOT-SET %U8-REF %U8-REF-UNCHECKED %U8-SET
    ;; %U8-SET-UNCHECKED %UCAR %UCDR %VAL->WORD %WORD->VAL %WORD-AREF %WORD-ASET CHAR
-   ;; CNTFRQ SAFETY-CHECK SCHAR WITH-SIMPLE-RESTART %EXP-D
+   ;; CNTFRQ SAFETY-CHECK SCHAR WITH-SIMPLE-RESTART %EXP-D %TARGET-FPD-P
     128401437 164901478 125009599 279156048 288867729 462383973 343008121 79476218
     103993613 58414919 121414968 156403790 108856844 9852007 388138896 75164491
     504669726 209633815 344711121 338108280 324903310 33180769 375151373 62768255
@@ -10421,7 +10421,7 @@
     367627940 469097205 84095010 323209429 14355506 434674778 231353088 17781339
     462768251 388046666 260184480 362441329 437115943 483756498 497160708 121290012
     292480825 189301986 429343799 367065803 155426392 228425908 483931868
-    314680310)
+    314680310 483640953)
   "The hashes of the names COMPILE-COMPOUND's dispatch tests for that
    *HASH-DISPATCH-NAMES* (made from its bare literals) does not have: the ones
    its clauses spell #.(COMPUTE-NAME-HASH \"NAME\").  The two together are
@@ -12157,6 +12157,12 @@
        (compile-slot-ref (cadr form) (caddr form) env dest))
       ;; (%UCAR X) / (%UCDR X): CAR / CDR with no NIL or cons test, for runtime
       ;; code that has already proved X a cons (a cache cell it built).
+      ;; (%TARGET-FPD-P): T where the code being compiled runs with the fpd-* ops
+      ;; (native double compares and arithmetic), NIL elsewhere -- a constant, so
+      ;; runtime code can take a native double path that would recurse where the
+      ;; same form compiles to the generic helper it implements (%FLOAT-LT-P).
+      ((= op-name #.(compute-name-hash "%TARGET-FPD-P"))
+       (if (or (%runtime-fpd-p) (ct-has-fpd-p)) (compile-t dest) (compile-nil dest)))
       ((= op-name #.(compute-name-hash "%UCAR"))
        (compile-form (cadr form) env dest)
        (emit-ir :car dest dest))

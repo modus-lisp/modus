@@ -152,10 +152,18 @@
    (-0 - +0 is a zero, inf - 1 is inf), so it is kept, and only a NaN
    difference -- an infinity against itself, or a NaN operand -- takes the
    bit comparison.  Bits always cost 1.8x on a compare-heavy loop."
-  (let ((d (%float-sub a b)))
-    (if (not (%float-nan-p d))
-        (and (float-negative-p d) (not (%float-zero-p d)))
-        (%float-lt-bits-p a b))))
+  ;; NATIVE where the target compares doubles in FP registers (fcmp: a NaN is
+  ;; unordered, +0 = -0, a boxed single's payload is its double): one compare,
+  ;; no box.  The subtraction allocated a float per compare -- 44 ns, and ZEROP
+  ;; of a float, two of them through %FLOAT-EQ-P, 150 (cl-bench FRPOLY/FLOAT).
+  (if (%target-fpd-p)
+      (let ((x a) (y b))
+        (declare (type double-float x y))
+        (< x y))
+      (let ((d (%float-sub a b)))
+        (if (not (%float-nan-p d))
+            (and (float-negative-p d) (not (%float-zero-p d)))
+            (%float-lt-bits-p a b)))))
 
 (defun %float-lt-bits-p (a b)
   "%FLOAT-LT-P by IEEE bits alone: see there."
@@ -174,8 +182,13 @@
 
 (defun %float-eq-p (a b)
   "Float A = float B under IEEE: never for a NaN, +0 = -0."
-  (and (not (%float-nan-p a)) (not (%float-nan-p b))
-       (not (%float-lt-p a b)) (not (%float-lt-p b a))))
+  (if (%target-fpd-p)
+      ;; native, as %FLOAT-LT-P: ordered both ways (false for a NaN)
+      (let ((x a) (y b))
+        (declare (type double-float x y))
+        (and (<= x y) (>= x y)))
+      (and (not (%float-nan-p a)) (not (%float-nan-p b))
+           (not (%float-lt-p a b)) (not (%float-lt-p b a)))))
 
 (defun %float-vs-real-lt-p (a b)
   "A < B where exactly one of A and B is a NON-FINITE float and the other is a
@@ -3543,6 +3556,16 @@
   "Return T if numeric value A < numeric value B.
    Handles integers, boxed floats (subtag #x60 IEEE or #x32 rational
    form), and tagged ratios (subtag #x33)."
+  ;; native floats first, as NUMERIC-EQUAL-P
+  (when (%target-fpd-p)
+    (if (%ieee-float-p a)
+        (cond ((%ieee-float-p b) (return-from numeric-value-less-p (%float-lt-p a b)))
+              ((and (fixnump b) (< b 9007199254740992) (> b -9007199254740992))
+               (return-from numeric-value-less-p
+                 (let ((x a) (k b)) (declare (type double-float x) (type fixnum k)) (< x (float k 1d0))))))
+        (when (and (fixnump a) (< a 9007199254740992) (> a -9007199254740992) (%ieee-float-p b))
+          (return-from numeric-value-less-p
+            (let ((k a) (y b)) (declare (type fixnum k) (type double-float y)) (< (float k 1d0) y))))))
   ;; BOTH IEEE floats first: the common case pays nothing for the checks below.
   (when (and (%float4-p a) (%float4-p b))
     (return-from numeric-value-less-p (%float-bits-lt a b)))
@@ -3660,6 +3683,18 @@
   ;; fixnum-compare path never pays the type-walk.  The guard used to
   ;; require BOTH sides non-fixnum, so a complex against a fixnum -- e.g.
   ;; ZEROP, which is (= x 0) -- skipped this arm: (zerop #C(0.0 0.0)) was NIL.
+  ;; NATIVE FLOATS FIRST (see %FLOAT-LT-P): a float against a float, or against
+  ;; a fixnum below 2^53 (exactly a double), is one FP compare -- before the
+  ;; chain of type tests below, ~5 ns each.  ZEROP of a float is (= x 0).
+  (when (%target-fpd-p)
+    (if (%ieee-float-p a)
+        (cond ((%ieee-float-p b) (return-from numeric-equal-p (%float-eq-p a b)))
+              ((and (fixnump b) (< b 9007199254740992) (> b -9007199254740992))
+               (return-from numeric-equal-p
+                 (let ((x a) (k b)) (declare (type double-float x) (type fixnum k)) (= x (float k 1d0))))))
+        (when (and (fixnump a) (< a 9007199254740992) (> a -9007199254740992) (%ieee-float-p b))
+          (return-from numeric-equal-p
+            (let ((k a) (y b)) (declare (type fixnum k) (type double-float y)) (= (float k 1d0) y))))))
   (when (and (%float4-p a) (%float4-p b))
     (return-from numeric-equal-p (%float-bits-eq a b)))
   (when (or (and (not (fixnump a)) (%complex-p a))

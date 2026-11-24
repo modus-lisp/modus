@@ -87,7 +87,10 @@ FASLs failed silently.
 The image base is fixed (no relocations): the runtime's absolute addresses are
 compiled in, as they are for the ELF.
 
-**Startup.**  The prologue maps the heap, the JIT arena and the stack, then
+**Startup.**  The prologue sizes the heap from `--dynamic-space-size` in the command line
+(the Linux stub's parser and layout, `X64-CHOOSE-HEAP-ITEMS`; Windows commits it all up
+front, so a large size needs that much commit charge), maps it, the JIT arena and the
+stack, then
 builds what a Linux process starts with above its stack base -- `argc`, `argv`,
 NULL, `envp`, NULL -- because `lib/cli-toplevel.lisp` reads argv and envp from
 there.  `argv[0]` is the whole command line (`GetCommandLineA`), which a Windows

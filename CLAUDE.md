@@ -1438,8 +1438,12 @@ semispaces of N/2, rounded down to 1 MB, kept within 32 MB .. 24 GB each (the he
 `X64-HEAP-LAYOUT`'s arithmetic, storing three words the heap tail reads: `0x10000F88`
 midpoint, `0x10000F90` data size, `0x10000F98` the cons-kind bitmap's offset from the
 start bitmap.  **Nothing compiled depends on the heap size**: the translator adds the kind
-offset from `0x10000F98` (`EMIT-X64-ADD-KIND-DELTA`); bare x64 and the Windows stub store
-their fixed values there.  A saved core restores only under the size it was saved with.
+offset from `0x10000F98` (`EMIT-X64-ADD-KIND-DELTA`); bare x64 stores its fixed values there.
+**`modus.exe` takes the flag too** (2026-11-25): the Windows stub finds it in
+`GetCommandLineA`'s string and runs the same parser and layout
+(`X64-CHOOSE-HEAP-ITEMS`, shared with the Linux chooser, whose bytes are unchanged);
+before, it committed a fixed 896 MB pair and the Windows builder ran out building the
+Darwin image.  A saved core restores only under the size it was saved with.
 - **The stub's length is measured before a build script finishes setting it up**
   (`*X64-NATIVE-CODE-OFFSET*`, build-generic-cli): a stub whose length depends on a
   later setting moves every function entry.  A branch 8 bytes longer made every function

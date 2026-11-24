@@ -54,7 +54,7 @@
          (r (modus-int::%gc-region-0)) (k (modus-int::%gc-meta-scale))
          (f (modus-int::%gc-meta-read r k)) (tt (modus-int::%gc-meta-read (+ r 8) k))
          (sz (modus-int::%gc-meta-read (+ r 16) k))
-         (cbm (modus-int::%census-cons-bitmap)) (page (modus-int::%gc-meta-read #x10000E00 k))
+         (cbm (modus-int::%census-cons-bitmap)) (page (modus-int::%gc-meta-read (modus-int::%conv-addr #x10000E00) k))
          (a (modus-int::%gc-old-lo)) (end (modus-int::%gc-old-hi)) (out nil) (n 0))
     (flet ((slot (x obj kind)
              (when (and (< n 5)
@@ -84,7 +84,7 @@
    evacuating collection, so a slot pointing at one must stay on a dirty card."
   (let* ((w (modus-int::%gc-card-words)) (cards (modus-int::%gc-read64 w)) (area (modus-int::%gc-read64 (+ w 8)))
          (lo (modus-int::%rt-arena-base)) (hi (modus-int::%rt-arena-end))
-         (cbm (modus-int::%census-cons-bitmap)) (page (modus-int::%gc-meta-read #x10000E00 (modus-int::%gc-meta-scale)))
+         (cbm (modus-int::%census-cons-bitmap)) (page (modus-int::%gc-meta-read (modus-int::%conv-addr #x10000E00) (modus-int::%gc-meta-scale)))
          (a (modus-int::%gc-old-lo)) (end (modus-int::%gc-old-hi)) (n 0) (clean 0))
     (flet ((slot (x)
              (let ((v (mem-ref x :u64)))

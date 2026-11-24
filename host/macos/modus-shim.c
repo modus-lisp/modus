@@ -1188,26 +1188,6 @@ static void lx_fault_frames(int lsig, siginfo_t *si, ucontext_t *uc,
     luc->mc.pstate = ts->__cpsr;
 }
 
-// INTO THE IMAGE'S FAULT STUB WITH THE INTERRUPTED CODE'S REGISTERS.  The stub never returns: it branches into
-// the armed handler-case frame.  Called as a C function from ON_FAULT, it ran with ON_FAULT's own values in the
-// callee-saved x19-x28 -- the epilogue that would have restored the interrupted code's never ran -- and those are
-// the image's dedicated registers (x26 is NIL).  How many ON_FAULT clobbered was the compiler's choice: few on
-// the quiet path, more when MODUS_SHIM_FAULTS made it report, and then the code that resumed read NIL as
-// 0xDEAD0000 and every boot failed at its first recovered fault.  So x19-x28 are reloaded from the interrupted
-// context (X1928) and the stub is entered by a plain branch, the arguments in x0-x2.
-__attribute__((noreturn))
-static void enter_image_handler(uint64_t handler, uint64_t sig, void *lsi, void *luc, const uint64_t *x1928) {
-    __asm__ volatile(
-        "mov x16, %0\n\t" "mov x0, %1\n\t" "mov x1, %2\n\t" "mov x2, %3\n\t" "mov x17, %4\n\t"
-        "ldp x19, x20, [x17, #0]\n\t" "ldp x21, x22, [x17, #16]\n\t" "ldp x23, x24, [x17, #32]\n\t"
-        "ldp x25, x26, [x17, #48]\n\t" "ldp x27, x28, [x17, #64]\n\t"
-        "br x16\n\t"
-        :: "r"(handler), "r"(sig), "r"(lsi), "r"(luc), "r"(x1928)
-        : "x0", "x1", "x2", "x16", "x17", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
-          "memory");
-    __builtin_unreachable();
-}
-
 static void on_fault(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     uint64_t pc = __darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
@@ -1266,12 +1246,35 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
         // arguments, and Darwin's were passed through: si_addr read as si_uid and
         // the SP as zero, so every recoverable fault looked like a stack overflow).
         // On this stack: the handler never returns, and the stub has read them by then.
+        // INTO THE STUB BY RETURNING, NOT BY CALLING.  The stub never returns: it branches into the armed
+        // handler-case frame.  Called from here as a C function it ran (a) with this handler's own values in
+        // the callee-saved x19-x28, the image's dedicated registers (x26 is NIL: the resumed code read NIL as
+        // 0xDEAD0000, and MODUS_SHIM_FAULTS's reporting made every boot fail), and (b) without the handler ever
+        // returning, so the kernel still had the thread on its alternate signal stack: the NEXT signal was
+        // delivered on the thread's own stack, and a stack overflow -- no room there -- killed the process
+        // with SIGILL (every boot recovers one fault first, the kernel pads' write).  So the interrupted
+        // context is redirected to the stub, x0-x2 its arguments, and the handler returns: sigreturn ends
+        // the alternate-stack episode and restores every other register as it was.  The stub's two blocks
+        // must outlive this frame: they go at the BOTTOM of this thread's alternate stack, which the
+        // handler's frame (at the top) never reaches and which the stub has read before anything else
+        // could be delivered there.
+        stack_t cur; memset(&cur, 0, sizeof cur);
+        if (sigaltstack(NULL, &cur) == 0 && cur.ss_sp && cur.ss_size >= 8192) {
+            struct lx_siginfo *lsi = (struct lx_siginfo *)cur.ss_sp;
+            struct lx_ucontext *luc = (struct lx_ucontext *)((uint8_t *)cur.ss_sp + 256);
+            lx_fault_frames(fault_slot_lx_sig[slot], si, uc, lsi, luc);
+            __typeof__(uc->uc_mcontext->__ss) *ts = &uc->uc_mcontext->__ss;
+            ts->__x[0] = (uint64_t)fault_slot_lx_sig[slot];
+            ts->__x[1] = (uint64_t)(uintptr_t)lsi;
+            ts->__x[2] = (uint64_t)(uintptr_t)luc;
+            __darwin_arm_thread_state64_set_pc_fptr(*ts, (void *)(uintptr_t)image_fault_handler[slot].handler);
+            return;
+        }
+        // no alternate stack to keep them on: the old way, which at least runs the stub
         struct lx_siginfo lsi; struct lx_ucontext luc;
         lx_fault_frames(fault_slot_lx_sig[slot], si, uc, &lsi, &luc);
-        uint64_t x1928[10];
-        for (int i = 0; i < 10; i++) x1928[i] = uc->uc_mcontext->__ss.__x[19 + i];
-        enter_image_handler((uint64_t)image_fault_handler[slot].handler, (uint64_t)fault_slot_lx_sig[slot],
-                            &lsi, &luc, x1928);
+        ((void (*)(int, void *, void *))(uintptr_t)image_fault_handler[slot].handler)
+            (fault_slot_lx_sig[slot], &lsi, &luc);
     }
     report_fault(sig, si, uc_);
 }

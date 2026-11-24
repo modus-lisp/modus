@@ -282,16 +282,19 @@
 
 ;;; OVERFLOW, through the per-window test limit (+HSTACK-EXT-LIMIT-ADDR+,
 ;;; window +0x5608, a raw count of extension frames -- the same word on
-;;; AArch64, +A64-HSTACK-EXT-LIMIT-ADDR+).
+;;; AArch64, +A64-HSTACK-EXT-LIMIT-ADDR+).  Through %CONV-ADDR: a slid image
+;;; (the macOS runner's MODUS_SLIDE) has its region elsewhere, and the bare
+;;; literal was a write to unmapped memory there -- the file's last section
+;;; faulted.
 (defun hstack-geometry ()
   "(WINDOW-FRAMES LIMIT-ADDRESS WIDTH) for this machine: the handler frames
    kept in memory before the extension, and the test-only lower limit on
    extension frames (a raw count; 0 = none).  NIL: no test limit known here."
   (let ((mt (machine-type)))
     (cond ((string= mt "x86_64")
-           (list 512 (+ (modus-int::%tls-self-base) #x10005608) :u64))
+           (list 512 (+ (modus-int::%tls-self-base) (modus-int::%conv-addr #x10005608)) :u64))
           ((string= mt "aarch64")
-           (list 170 (+ (modus-int::%tls-self-base) #x10005608) :u64))
+           (list 170 (+ (modus-int::%tls-self-base) (modus-int::%conv-addr #x10005608)) :u64))
           ;; translate-i386: 127 frames in the BSS tail, then the
           ;; extension; its test limit is a u32 at #x1001FF04
           ((string= mt "i386") (list 127 #x1001FF04 :u32))

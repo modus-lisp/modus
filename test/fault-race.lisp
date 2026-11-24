@@ -55,7 +55,7 @@
 
 (defun set-ext-limit (n)
   "THIS thread's test-only limit on handler-frame extension frames."
-  (modus-int::%gc-write64 (+ (modus-int::%tls-self-base) #x10005608) n))
+  (modus-int::%gc-write64 (+ (modus-int::%tls-self-base) (modus-int::%conv-addr #x10005608)) n))
 
 (defun unbounded (n) (1+ (unbounded (1+ n))))
 

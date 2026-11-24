@@ -2381,12 +2381,20 @@
       ;; supplied (or was supplied as nil), signal program-error.
       (when (and bad-key (not allow-other-keys))
         (%signal-program-error))
-      ;; Handle start/end
-      (let ((actual-str (if (or (> start 0) end)
-                            (%substring str start (if end end (length str)))
-                            str)))
+      ;; Handle start/end.  :START alone -- reading a string form by form --
+      ;; starts the stream AT start in the original string (no copy; the
+      ;; position it reports is then already absolute).  Copying the rest of
+      ;; the string at every call made such a loop quadratic: a fifth of
+      ;; cl-bench COMPILER's instructions on the web image.
+      (let* ((in-place (and (null end) (integerp start) (> start 0)
+                            (stringp str) (<= start (length str))))
+             (offset (if in-place 0 start))
+             (actual-str (if (and (not in-place) (or (> start 0) end))
+                             (%substring str start (if end end (length str)))
+                             str)))
         ;; Create string input stream
         (let ((s (make-string-input-stream actual-str)))
+          (when in-place (rplaca (cdr (%stream-data s)) start))
           ;; Read from stream — fresh #N= label table per top-level call.
           ;; Discard the terminating whitespace unless :preserve-whitespace
           ;; was requested (CLHS 23.2 read-from-string).  The token loop
@@ -2425,7 +2433,7 @@
               ;; so pos already points past it (CLHS `"abc   "` → 4).
               (when (and pending (characterp pending))
                 (setq pos (- pos 1)))
-              (values result (+ start pos)))))))))
+              (values result (+ offset pos)))))))))
 
 ;;; --- Make-symbol (uninterned) ---
 

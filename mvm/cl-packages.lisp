@@ -2681,9 +2681,34 @@
     (setq *symbol-plists* (make-hash-table :test 'eq)))
   *symbol-plists*)
 
+;; A direct-mapped cache in front of the plist table: slot (name-hash mod 256)
+;; holds one (SYMBOL . PLIST) cons, so a reader sees a whole pair or none.
+;; GET through GETHASH was ~39% of cl-bench BOYER on the web image.  The name
+;; hash (slot 0) does not move with the symbol, so a symbol's slot is fixed;
+;; every writer of the table (SET-GET, REMPROP, SET-SYMBOL-PLIST) clears the
+;; cache, and REMPROP's in-place splice is seen through the cached head anyway.
+(defvar *plist-cache* nil)
+
+(defun %plist-cache-clear ()
+  (let ((c *plist-cache*))
+    (when c (dotimes (i 256) (setf (svref c i) 0)))))
+
+(defun %symbol-plist-raw (symbol)
+  (let ((h (and (%cl-sym-p symbol) (%word-aref symbol 0))))
+    (if (fixnump h)
+        (let* ((c (or *plist-cache* (setq *plist-cache* (make-array 256 :initial-element 0))))
+               (i (logand h 255))
+               (e (svref c i)))
+          (if (and (consp e) (eq (car e) symbol))
+              (cdr e)
+              (let ((p (gethash symbol (%get-plist-ht))))
+                (setf (svref c i) (cons symbol p))
+                p)))
+        (gethash symbol (%get-plist-ht)))))
+
 (defun get (symbol indicator &optional default)
   "Get property INDICATOR from SYMBOL's property list."
-  (let ((plist (gethash symbol (%get-plist-ht))))
+  (let ((plist (%symbol-plist-raw symbol)))
     (if (null plist)
         default
         (let ((cur plist))
@@ -2740,6 +2765,7 @@
         (value (car (last default-and-value))))
     (let ((plist (gethash symbol ht)))
       (puthash symbol ht (%plist-set (if (null plist) nil plist) indicator value)))
+    (%plist-cache-clear)
     value))
 
 (defun remprop (symbol indicator)
@@ -2752,6 +2778,7 @@
       ((null plist) nil)
       ((eq (car plist) indicator)
        (puthash symbol ht (cddr plist))
+       (%plist-cache-clear)
        t)
       (t
        (let ((prev (cdr plist)) (cur (cddr plist)))
@@ -2792,6 +2819,7 @@
   ;; (setf (symbol-plist s) l) stored nothing and signalled on GET
   ;; (upstream GET.4, REMPROP.2-4, PSETF.30, ROTATEF.30).
   (puthash symbol (%get-plist-ht) plist)
+  (%plist-cache-clear)
   plist)
 
 (defun set (symbol value)

@@ -140,18 +140,49 @@
       t)))
 
 (defun desk-turn ()
+  "One turn: input, the window manager, the screen.  T when nothing happened
+   (no event, nothing painted): an idle turn."
   (mac-input-poll)
-  (let ((moved nil))
+  (incf *desk-turns*)
+  (let ((moved nil) (events nil))
     (loop for e = (mac-next-event) while e
-          do (case (first e)
+          do (setq events t)
+             (case (first e)
                (:pointer (glass.wm:wm-pointer *wm* (second e) (third e) (fourth e)) (setq moved t))
                (:key (glass.wm:wm-key *wm* (second e) (third e)))))
     (glass.wm:wm-tick *wm*)
     (let ((painted (desk-present)))
       (when (or painted moved (null *under-at*))
         (pointer-hide)
-        (pointer-show *mac-mouse-x* *mac-mouse-y*))))
-  (incf *desk-turns*))
+        (pointer-show *mac-mouse-x* *mac-mouse-y*))
+      (not (or events painted)))))
+
+;;; --- translation while idle ------------------------------------------------
+;;; The native tier translates a function at its FIRST CALL (jit-ppc-native
+;;; %NPPC-FIRST-CALL-STUB), so the first menu, the first window, the first key
+;;; in the listener each paid for translating what it ran: 1.3 s for a first
+;;; root menu under QEMU, 5 ms once translated.  Idle turns translate what
+;;; nothing has called yet, a module at a time, through COMPILE's own step
+;;; (%JIT-EAGER-ALL with a name).  Between turns, from DESK's loop: from inside
+;;; a turn, translation broke the image (the REPL after it failed every form).
+(defvar *jit-todo* :unset "DEFUN names whose modules are still to translate.")
+(defvar *idle-jit-ms* 20 "Translation one idle turn may spend, in milliseconds.")
+
+(defun %jit-pending-names ()
+  (let ((todo nil))
+    (maphash (lambda (k v) (unless (modus-int::%nppc-done-p (first v)) (push k todo)))
+             modus-int::*jit-module-registry*)
+    todo))
+
+(defun desk-idle-jit ()
+  "Translate pending modules for up to *IDLE-JIT-MS*.  T while any remain."
+  (when (eq *jit-todo* :unset)
+    (setq *jit-todo* (or (ignore-errors (%jit-pending-names)) nil)))
+  (let ((end (+ (get-internal-real-time)
+                (* *idle-jit-ms* (floor internal-time-units-per-second 1000)))))
+    (loop while (and *jit-todo* (< (get-internal-real-time) end))
+          do (ignore-errors (modus-int::%jit-eager-all (pop *jit-todo*)))))
+  (and *jit-todo* t))
 
 (defun serial-byte-waiting-p ()
   "A byte has arrived on the ESCC's channel A (RR0 bit 0): someone at a serial
@@ -167,7 +198,8 @@
     (desk-make))
   (if turns
       (dotimes (i turns) (desk-turn))
-      (loop (desk-turn) (when (serial-byte-waiting-p) (return)))))
+      (loop (when (desk-turn) (desk-idle-jit))
+            (when (serial-byte-waiting-p) (return)))))
 
 ;; At boot: the desk.  With a serial console (the firmware's was one: boot info
 ;; +48) it turns once, so the screen shows it, and the REPL follows -- (DESK) runs

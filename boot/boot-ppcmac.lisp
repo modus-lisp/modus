@@ -36,8 +36,10 @@
 ;;;;   #x07C00000..#x07D00000  USB's DMA: OHCI's HCCA, descriptors, buffers
 ;;;;   #x07D00000..#x07D10000  the mutex arena (%BARE-SYNC-ARENA)
 ;;;;   #x07E00000, #x07F00000  the CLI's scratch pages
-;;;;   #x10000000..            the heap, +PPCMAC-HEAP-SIZE+, then its guard
-;;;;   #x1FC00000..#x20000000  the kind map (heap/16)
+;;;;   #x10000000..            the heap: +PPCMAC-HEAP-SIZE-G4E+ (128 MB) on a G4e,
+;;;;                           +PPCMAC-HEAP-SIZE+ (64 MB) on a G3 / 7400
+;;;;   #x1FC00000..            the kind map (heap/16: to #x20000000, or #x20400000
+;;;;                           on a G4e, its top 4 MB through DBAT6)
 ;;;;
 ;;;; Interrupts stay off (MSR[EE] = 0) and Open Firmware's vectors stay in place:
 ;;;; a fault lands in OF.  Translated with PPC-SET-MAC-MODE (Mac traps, hosted
@@ -56,7 +58,13 @@
 (defconstant +ppcmac-stack-top+   #x07000000 "Grows down; the extension is above.")
 (defconstant +ppcmac-heap-size+   #x4000000
   "64 MB: two 32 MB semispaces, and a kind map (size/16) that ends exactly at
-   #x20000000, the top of DBAT1.")
+   #x20000000, the top of DBAT1.  The heap of a CPU with four BATs (G3, 7400).")
+(defconstant +ppcmac-heap-size-g4e+ #x8000000
+  "128 MB on a G4e (7447/745x: every aluminium PowerBook): the desk's live set
+   is ~25 MB, and at 32 MB a semispace a start-up spike or a burst of the native
+   tier's translation ran out.  Its kind map is 8 MB, to #x20400000: DBAT6 maps
+   the 4 MB past #x20000000 (only the collector's native code reaches them),
+   to PA #x04400000 -- below the payload, beside the small-RAM kind map.")
 (defconstant +ppcmac-nil-pa+      #x07800000 "PA behind VA #xDEAC0000 (128 KB).")
 (defconstant +ppcmac-fb-va+       #x09000000
   "VA of a framebuffer that is not beside mac-io: DBAT4's 16 MB (a G4e).")
@@ -469,8 +477,22 @@
    #x1FC00000 to PA #x04000000, below the stack and above the native tier's
    code area.  A PowerBook G4 ships with 256 or 512 MB.  On a 7400/7410 with
    less than 512 MB there are no BATs for it: the identity map stands."
-  (let ((big (mvm-make-label)) (done (mvm-make-label)))
+  (let ((big (mvm-make-label)) (done (mvm-make-label)) (not-g4e (mvm-make-label)))
     (flet ((li (r v) (ppc-emit-li buf r v)))
+      ;; a G4e's 128 MB heap: its kind map's top 4 MB through DBAT6
+      ;; (+PPCMAC-HEAP-SIZE-G4E+)
+      (ppc-emit-rlwinm buf +ppc-r3+ +ppc-r16+ 16 16 31)
+      (ppc-emit-addi buf +ppc-r3+ +ppc-r3+ (logand (- #x8000) #xFFFF))
+      (li +ppc-r4+ 5)
+      (ppc-emit-cmpl-word buf +ppc-r3+ +ppc-r4+)
+      (ppc-emit-bge buf not-g4e)
+      (ppcmac-emit-mfspr buf +ppc-r3+ 1008)                       ; HID0: HIGH_BAT_EN
+      (ppc-emit-oris buf +ppc-r3+ +ppc-r3+ #x0080)
+      (ppcmac-mtspr buf 1008 +ppc-r3+)
+      (ppc-emit-word buf #x4C00012C)
+      (li +ppc-r3+ #x04400002) (ppcmac-mtspr buf 573 +ppc-r3+)    ; DBAT6L: PA #x04400000
+      (li +ppc-r3+ #x2000007F) (ppcmac-mtspr buf 572 +ppc-r3+)    ; DBAT6U: #x20000000, 4 MB
+      (ppc-emit-label buf not-g4e)
       (ppc-emit-cmpwi buf +ppc-r27+ 0)
       (ppc-emit-beq buf big)
       (li +ppc-r3+ #x20000000)
@@ -500,12 +522,8 @@
   (let* ((*ppc-64-bit* nil)
          (buf (make-ppc-buffer))
          (base +linux-ppc-heap-addr+)
-         (size +ppcmac-heap-size+)
-         (mid (ash size -1))
-         (alloc-start +linux-ppc-heap-alloc-start+)
-         (space (- mid alloc-start))
-         (margin (min +linux-ppc-gc-margin-max+ (logand (ash space -2) (lognot 15)))))
-    (flet ((li (r v) (ppc-emit-li buf r v))
+         (alloc-start +linux-ppc-heap-alloc-start+))
+    (labels ((li (r v) (ppc-emit-li buf r v))
            (fill-range (start bytes value)
              ;; r3 = cursor, r4 = value, CTR = words
              (let ((top (mvm-make-label)))
@@ -516,7 +534,26 @@
                (ppc-emit-label buf top)
                (ppc-emit-stw buf +ppc-r4+ +ppc-r3+ 0)
                (ppc-emit-addi buf +ppc-r3+ +ppc-r3+ 4)
-               (ppc-emit-bc buf 16 0 top))))                      ; bdnz
+               (ppc-emit-bc buf 16 0 top)))                       ; bdnz
+           (heap (size)
+             ;; a heap of SIZE at BASE: its kind map zeroed, VA / VL / VN, and
+             ;; the Cheney block at #x10000040 (r1 is the stack by now)
+             (let* ((mid (ash size -1))
+                    (space (- mid alloc-start))
+                    (margin (min +linux-ppc-gc-margin-max+ (logand (ash space -2) (lognot 15)))))
+               (fill-range +ppc-gc-kind-map+ (ash size -4) 0)
+               (ppc-emit-li buf +ppc-r19+ (+ base alloc-start))
+               (ppc-emit-li buf +ppc-r20+ (- (+ base mid) margin))
+               (ppc-emit-li buf +ppc-r21+ +nil-value+)
+               (ppc-emit-li buf +ppc-r11+ (+ base #x40))
+               (ppc-emit-stw buf +ppc-r19+ +ppc-r11+ #x00)          ; from_start
+               (ppc-emit-li buf +ppc-r12+ (+ base mid))
+               (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ #x08)          ; to_start
+               (ppc-emit-li buf +ppc-r12+ space)
+               (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ #x10)          ; space_size
+               (ppc-emit-stw buf +ppc-r1+ +ppc-r11+ #x18)           ; stack_base
+               (ppc-emit-li buf +ppc-r12+ 0)
+               (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ #x20))))       ; gc_count
       ;; ---- 0. ask Open Firmware, while it is still there (PPCMAC-EMIT-OF-QUERY):
       ;; r20 fb PA, r21 width, r22 height, r23 linebytes, r24 depth, r25 mac-io PA,
       ;; r26 the VIA's kind, r27 RAM; on an 8-bit screen, a colour cube in its CLUT
@@ -582,27 +619,25 @@
       (li +ppc-r0+ 0)
       (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 0)                     ; back chain 0
       (fill-range base #x28000 0)                                ; the fixed block, argv
-      (fill-range +ppc-gc-kind-map+ (ash size -4) 0)             ; the kind map
       (fill-range #xDEAC0000 #x20000 +nil-value+)                ; NIL's page (and block)
       (fill-range #x07D00000 #x10000 0)                          ; the mutex arena
       ;; the handler-frame extension: fixed (translate-ppc's Mac arm), capped
       (li +ppc-r3+ +ppc-hstack-ext-limit-addr+)
       (li +ppc-r4+ +ppcmac-hstack-ext-frames+)
       (ppc-emit-stw buf +ppc-r4+ +ppc-r3+ 0)
-      ;; MVM registers: VA = r19, VL = r20, VN = r21
-      (li +ppc-r19+ (+ base alloc-start))
-      (li +ppc-r20+ (- (+ base mid) margin))
-      (li +ppc-r21+ +nil-value+)
-      ;; the Cheney block at #x10000040
-      (li +ppc-r11+ (+ base #x40))
-      (ppc-emit-stw buf +ppc-r19+ +ppc-r11+ #x00)                ; from_start
-      (li +ppc-r12+ (+ base mid))
-      (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ #x08)                ; to_start
-      (li +ppc-r12+ space)
-      (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ #x10)                ; space_size
-      (ppc-emit-stw buf +ppc-r1+ +ppc-r11+ #x18)                 ; stack_base
-      (li +ppc-r12+ 0)
-      (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ #x20)                ; gc_count
+      ;; the heap: 128 MB on a G4e (PVR in r16; DBAT6 maps its kind map's top
+      ;; 4 MB, PPCMAC-EMIT-HEAP-BATS), 64 MB on a CPU with four BATs
+      (let ((small (mvm-make-label)) (done (mvm-make-label)))
+        (ppc-emit-rlwinm buf +ppc-r3+ +ppc-r16+ 16 16 31)
+        (ppc-emit-addi buf +ppc-r3+ +ppc-r3+ (logand (- #x8000) #xFFFF))
+        (li +ppc-r4+ 5)
+        (ppc-emit-cmpl-word buf +ppc-r3+ +ppc-r4+)
+        (ppc-emit-bge buf small)
+        (heap +ppcmac-heap-size-g4e+)
+        (ppc-emit-b buf done)
+        (ppc-emit-label buf small)
+        (heap +ppcmac-heap-size+)
+        (ppc-emit-label buf done))
       ;; VFP needs a frame before the first prologue runs
       (ppc-emit-mr buf +ppc-r31+ +ppc-r1+)
       ;; a first byte on the console, before any Lisp: the stub ran

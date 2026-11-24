@@ -29,11 +29,11 @@ def main():
                           '-serial', f'unix:{ser},server=on,wait=on',
                           '-monitor', f'unix:{mon},server=on,wait=off'],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(300):                 # 30 s: a loaded host starts QEMU slowly
+    for _ in range(1200):                # 120 s: a loaded host starts QEMU slowly
         if os.path.exists(ser): break
         time.sleep(0.1)
     s = socket.socket(socket.AF_UNIX); s.connect(ser); s.settimeout(0.5)
-    for _ in range(300):
+    for _ in range(1200):
         if os.path.exists(mon): break
         time.sleep(0.1)
     m = socket.socket(socket.AF_UNIX); m.connect(mon); m.settimeout(0.5)

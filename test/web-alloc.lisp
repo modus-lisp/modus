@@ -1,0 +1,6 @@
+(defun mk (n) (list (make-string n :initial-element #\x) (make-array n :initial-element 7) (make-array n :element-type '(unsigned-byte 8) :initial-element 3)))
+(dotimes (i 300) (mk (mod i 40)))
+(let ((acc 0)) (dotimes (i 2000) (let ((l (mk (mod i 70)))) (incf acc (+ (length (first l)) (reduce #'+ (second l)) (reduce #'+ (third l)))))) (print (list :acc acc)))
+(print (list :empty (mk 0)))
+(print (list :big (length (first (mk 100000))) (aref (second (mk 100000)) 99999) (aref (third (mk 100000)) 99999)))
+(print (list :str (concatenate 'string "ab" (make-string 3 :initial-element #\z) "λ")))

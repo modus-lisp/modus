@@ -1585,6 +1585,115 @@
 (declaim (overridable %ht-cold-miss))
 (defun %ht-cold-miss (key ht) key ht nil)
 
+;;; THE HASH TABLES' SMALL HELPERS, INLINE.  Every GETHASH / PUTHASH / REMHASH went through a dozen of these as
+;;; calls -- the holder's slots, the address index's cell, region and epoch, the dict index's width, mask and
+;;; slots -- three to eight nanoseconds each: an EQ table's GETHASH was 92 ns and a PUTHASH of a new key 237,
+;;; where SBCL takes 11 and 7.  Declared INLINE (honoured by the image build, *AOT-INLINE*) and defined here,
+;;; ahead of their callers, which is what an inline expansion needs.
+(declaim (inline %ht-vec-set %ht-h-set-vec %ht-tag %ht-nohash %ht-h-vec %ht-h-count %ht-h-strcmp %ht-h-set-count %ht-bucket-holder %ht-addr-cell %ht-addr-ok-p %ht-addr-epoch %ht-addr-hash %ht-eq-object-key-p %htd-w %htd-slots %htd-slot %htd-set-slot %htd-mask))
+
+(defun %ht-vec-set (vec i val)
+  "Var-index ASET forced to dest=frame-slot (CLAUDE.md var-index ASET bug)."
+  (let ((dummy (aset vec i val))) dummy))
+
+(defun %ht-h-set-vec   (h v) (set-car h v))
+
+(defun %ht-tag () 442386510)   ; #x1A571A8E
+
+(defun %ht-nohash ()
+  "Fixnum sentinel for `key/table is not structurally hashable'.
+   Was the keyword :NOHASH — but a keyword literal compiles to a runtime
+   %INTERN-KEYWORD call per evaluation, which (a) is a gethash on the
+   keyword table on the gethash hot path itself, and (b) faults in
+   builds that never call INIT-KEYWORD-TABLE (build-mvm) once legacy
+   0-arg tables carry a bucket-holder.  A fixnum compares by EQ in one
+   instruction and needs no table."
+  -424242001)
+
+(defun %ht-h-vec    (h) (car h))
+
+(defun %ht-h-count  (h) (car (cdr h)))
+
+(defun %ht-h-strcmp (h) (cdr (cdr h)))
+
+(defun %ht-h-set-count (h n) (set-car (cdr h) n))
+
+(defun %ht-bucket-holder (ht)
+  "Return the (vec-or-flag count . strcmp?) bucket-holder cons for HT, or NIL
+   for something that is not a tagged table.  HOT PATH: this runs on every
+   GETHASH/PUTHASH.  Both MAKE-HASH-TABLE paths build the proper 5-list meta
+   (test rsize rthresh size holder), so after the tag check the holder is a
+   fixed cdr-walk with no per-link CONSP probes (the probing version alone was
+   12% of the in-image profile of a library load)."
+  (let ((c (cdr ht)))
+    (if (and (consp c) (eq (car c) (%ht-tag)))
+        (car (cdr (cdr (cdr (cdr (cdr c))))))
+        nil)))
+
+(defun %ht-addr-cell (ht)
+  "The (EPOCH) cell of a MAKE-HASH-TABLE-ARGS table, or NIL for any other."
+  (let ((r (cdr (cdr (cdr (cdr (cdr (cdr (cdr ht)))))))))
+    (if (consp r) (car r) nil)))
+
+(defun %ht-addr-ok-p ()
+  "True on the thread whose active region is region 0 (see ADDRESS INDEX): (EQL (%GC-REGION) region 0's block),
+   read here -- %GC-REGION-CELL's word, %GC-REGION's two halves, 0 for region 0 -- without the two calls, which
+   were a tenth of a PUTHASH / REMHASH loop."
+  (let* ((cell (if (= (mem-ref #x10000FF8 :u32) 0)
+                   (%conv-addr #x10000F08)
+                   (+ (%conv-addr #x10000F08) (* (percpu-ref 16) 8))))
+         (lo (mem-ref cell :u32))
+         (hi (mem-ref (+ cell 4) :u32)))
+    (or (and (= hi 0) (= lo 0))
+        (= (+ (* (* hi 65536) 65536) lo) (%conv-addr #x10000040)))))
+
+(defun %ht-addr-epoch ()
+  "Region 0's collection count mixed with its from-space base: changes at every
+   collection, and when a restored core put the heap somewhere else."
+  (let ((rcb (%conv-addr #x10000040)))
+    (logxor (mem-ref (+ rcb #x20) :u32) (mem-ref rcb :u32))))
+
+(defun %ht-addr-hash (key mask)
+  (let ((k (ash (%val->word key) -4)))       ; objects are 16-byte aligned
+    (logand (logxor k (logxor (ash k -8) (ash k -16))) mask)))
+
+(defun %ht-eq-object-key-p (key strcmp?)
+  "KEY is one an EQ or EQL table (STRCMP? NIL) holds by its address: what %HT-HASH answers :NOHASH for there and
+   %HT-ADDR-KEY-P takes -- not a fixnum, character, NIL, T, symbol or number."
+  (and (null strcmp?) (not (fixnump key)) key (not (eq key t)) (not (characterp key))
+       (not (symbolp key)) (not (numberp key))))
+
+(defun %htd-w (entries)
+  "Bytes per index slot for ENTRIES' capacity."
+  (if (< (%prim-array-length entries) 131070) 2 4))
+
+(defun %htd-slots (idx w)
+  (if (eq w 2) (ash (%prim-array-length idx) -1) (ash (%prim-array-length idx) -2)))
+
+(defun %htd-slot (idx i w)
+  (if (eq w 2)
+      (let ((b (+ i i)))
+        (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8)))
+      (let ((b (* i 4)))
+        (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8)
+           (ash (%u8-ref idx (+ b 2)) 16) (ash (%u8-ref idx (+ b 3)) 24)))))
+
+(defun %htd-set-slot (idx i w v)
+  (if (eq w 2)
+      (let ((b (+ i i)))
+        (%u8-set idx (+ b 1) (logand (ash v -8) 255))
+        (%u8-set idx b (logand v 255)))
+      (let ((b (* i 4)))
+        (%u8-set idx (+ b 3) (logand (ash v -24) 255))
+        (%u8-set idx (+ b 2) (logand (ash v -16) 255))
+        (%u8-set idx (+ b 1) (logand (ash v -8) 255))
+        (%u8-set idx b (logand v 255))))
+  v)
+
+(defun %htd-mask (dict)
+  (let ((idx (car dict)))
+    (- (%htd-slots idx (%htd-w (cdr dict))) 1)))
+
 (defun gethash (key ht &optional default)
   "Look up KEY in hash table HT.  Returns (values value present-p);
    if not present, value is DEFAULT (nil if not supplied) and
@@ -1631,7 +1740,8 @@
                         (setq dict-val (%word-aref e (+ 3 (+ n n))))
                         (return nil))))
                   (setq i (logand (+ i 1) mask))))
-              (let ((n (%htd-find ht vec key (cdr (cdr holder)))))
+              (let ((n (let ((q (%htd-eq-object-find ht vec key (cdr (cdr holder)))))
+                         (if (eq q t) (%htd-find ht vec key (cdr (cdr holder))) q))))
                 (when (fixnump n)
                   (if (eq n -424242001)
                       (setq use-linear t)       ; a key the alist holds (above)
@@ -1715,6 +1825,16 @@
 ;;; the table was a small alist is the alist's own cons, entered in the side
 ;;; too, so it stays current when the table becomes a dict.
 (defvar *%ht-pair-sides* nil "((TABLE . SIDE) ...): the tables that have handed out pairs.")
+
+(declaim (inline %ht-has-pair-side-p))
+(defun %ht-has-pair-side-p (ht)
+  "HT has handed out pairs (is on *%HT-PAIR-SIDES*).  PUTHASH and REMHASH ask on every call once any table has:
+   ASSOC with its :TEST parsed its keywords each time."
+  (let ((c *%ht-pair-sides*))
+    (loop
+      (when (null c) (return nil))
+      (when (eq (car (car c)) ht) (return t))
+      (setq c (cdr c)))))
 
 (defun %ht-pair-side (ht create)
   (let ((c *%ht-pair-sides*))
@@ -1854,7 +1974,9 @@
    the authoritative CAR alist and (pinned) the O(1) bucket index, + the
    holder's entry count."
   ;; a pair handed out for KEY (%GETHASH-PAIR, *%HT-PAIR-SIDES*) sees VALUE
-  (when *%ht-pair-sides* (%ht-pair-set ht key value))
+  ;; only a table that has handed out pairs has a side: look for HT in the list here, not in two calls
+  (when (and *%ht-pair-sides* (%ht-has-pair-side-p ht))
+    (%ht-pair-set ht key value))
   (let* ((holder (%ht-bucket-holder ht))
          (vec (and holder (%ht-active-vec-h ht holder))))
     (when (consp vec)
@@ -1874,8 +1996,8 @@
              (%ht-vec-set (cdr vec) (+ 3 (+ n n)) value)
              (return-from puthash value))
           (t (return-from puthash
-               (%htd-add ht holder key value strcmp?
-                         (and (eq (%ht-hash key strcmp? 255) (%ht-nohash)) t))))))))
+               ;; an object key: %HTD-FIND found its miss by address, which only such a key reaches
+               (%htd-add ht holder key value strcmp? (%ht-eq-object-key-p key strcmp?))))))))
   (let* ((holder (let ((c (cdr ht)))          ; %ht-bucket-holder, inlined
                    (if (and (consp c) (eq (car c) (%ht-tag)))
                        (car (cdr (cdr (cdr (cdr (cdr c))))))
@@ -1966,7 +2088,8 @@
   ;; cl-bench's HTABLE-SET+REMOVE removed the oldest of 16k string keys, 16k
   ;; STRING= calls deep, 3800x SBCL.
   ;; a pair handed out for KEY (%GETHASH-PAIR) is cleared and forgotten
-  (when *%ht-pair-sides* (%ht-pair-forget ht key))
+  (when (and *%ht-pair-sides* (%ht-has-pair-side-p ht))
+    (%ht-pair-forget ht key))
   (let* ((holder (%ht-bucket-holder ht))
          (vec (and holder (%ht-active-vec-h ht holder))))
     (when (consp vec)
@@ -1974,7 +2097,7 @@
       (let* ((strcmp? (%ht-h-strcmp holder)) (n (%htd-find ht vec key strcmp?)))
         (if (and n (not (eq n (%ht-nohash))))
             (let ((e (cdr vec)))
-              (when (eq (%ht-hash key strcmp? 255) (%ht-nohash))
+              (when (%ht-eq-object-key-p key strcmp?)       ; held by address: one fewer object key
                 (%ht-vec-set e 1 (- (%word-aref e 1) 1)))
               (%ht-vec-set e (+ 2 (+ n n)) e)
               (%ht-vec-set e (+ 3 (+ n n)) nil)
@@ -2109,7 +2232,6 @@
 ;;; path (cl-eval.lisp's make-hash-table-args, exposed at runtime as the
 ;;; CL `MAKE-HASH-TABLE`), they pull the real values from the cdr.
 
-(defun %ht-tag () 442386510)   ; #x1A571A8E
 
 (defun %ht-meta (ht)
   "Return the (test rsize rthresh size) tail-cons, or NIL for legacy."
@@ -2192,15 +2314,6 @@
 ;;; stay on the pure-alist path: the bucket-holder is only present on
 ;;; explicit-:TEST tables, and only activated past the threshold.
 
-(defun %ht-nohash ()
-  "Fixnum sentinel for `key/table is not structurally hashable'.
-   Was the keyword :NOHASH — but a keyword literal compiles to a runtime
-   %INTERN-KEYWORD call per evaluation, which (a) is a gethash on the
-   keyword table on the gethash hot path itself, and (b) faults in
-   builds that never call INIT-KEYWORD-TABLE (build-mvm) once legacy
-   0-arg tables carry a bucket-holder.  A fixnum compares by EQ in one
-   instruction and needs no table."
-  -424242001)
 
 (defun %ht-bucket-threshold () 32)
 
@@ -2212,23 +2325,7 @@
 ;;; Storing the precomputed STRCMP? boolean (not the test symbol) lets the hot
 ;;; path avoid a per-op (eq test 'equal) symbol compare and a HASH-TABLE-TEST
 ;;; meta walk — that overhead is what erased the bucket win.
-(defun %ht-h-vec    (h) (car h))
-(defun %ht-h-count  (h) (car (cdr h)))
-(defun %ht-h-strcmp (h) (cdr (cdr h)))
-(defun %ht-h-set-vec   (h v) (set-car h v))
-(defun %ht-h-set-count (h n) (set-car (cdr h) n))
 
-(defun %ht-bucket-holder (ht)
-  "Return the (vec-or-flag count . strcmp?) bucket-holder cons for HT, or NIL
-   for something that is not a tagged table.  HOT PATH: this runs on every
-   GETHASH/PUTHASH.  Both MAKE-HASH-TABLE paths build the proper 5-list meta
-   (test rsize rthresh size holder), so after the tag check the holder is a
-   fixed cdr-walk with no per-link CONSP probes (the probing version alone was
-   12% of the in-image profile of a library load)."
-  (let ((c (cdr ht)))
-    (if (and (consp c) (eq (car c) (%ht-tag)))
-        (car (cdr (cdr (cdr (cdr (cdr c))))))
-        nil)))
 
 ;;; THE STRING HASH (EQUAL tables, SXHASH): four FNV-1a lanes over the characters in turn -- character I goes to
 ;;; lane I mod 4 -- then the lanes and the length folded into one and avalanched.  One FNV-1a chain is a multiply
@@ -2518,9 +2615,6 @@
       (let ((v (%ht-hash e t #x3FFFFF)))
         (if (eq v (%ht-nohash)) 11 v))))
 
-(defun %ht-vec-set (vec i val)
-  "Var-index ASET forced to dest=frame-slot (CLAUDE.md var-index ASET bug)."
-  (let ((dummy (aset vec i val))) dummy))
 
 (defun %ht-max-buckets ()
   "The most buckets an index grows to.  65536 held chains to ~2 entries up to
@@ -2588,20 +2682,8 @@
    forward reference."
   (eql +target-big-endian+ 1))
 
-(defun %ht-addr-cell (ht)
-  "The (EPOCH) cell of a MAKE-HASH-TABLE-ARGS table, or NIL for any other."
-  (let ((r (cdr (cdr (cdr (cdr (cdr (cdr (cdr ht)))))))))
-    (if (consp r) (car r) nil)))
 
-(defun %ht-addr-ok-p ()
-  "True on the thread whose active region is region 0 (see ADDRESS INDEX)."
-  (eql (%gc-region) (%conv-addr #x10000040)))
 
-(defun %ht-addr-epoch ()
-  "Region 0's collection count mixed with its from-space base: changes at every
-   collection, and when a restored core put the heap somewhere else."
-  (let ((rcb (%conv-addr #x10000040)))
-    (logxor (mem-ref (+ rcb #x20) :u32) (mem-ref rcb :u32))))
 
 (defun %ht-addr-key-p (key)
   "True for a key an EQ/EQL table compares by identity but %HT-HASH cannot
@@ -2609,9 +2691,6 @@
    %HT-HASH answered :NOHASH, so it is not a fixnum, character, symbol, NIL or T)."
   (not (numberp key)))
 
-(defun %ht-addr-hash (key mask)
-  (let ((k (ash (%val->word key) -4)))       ; objects are 16-byte aligned
-    (logand (logxor k (logxor (ash k -8) (ash k -16))) mask)))
 
 (defun %ht-key-hash (key strcmp? mask addr?)
   "%HT-HASH, and when ADDR? (the caller vouched that the address index is
@@ -2860,32 +2939,9 @@
           (member ht *%ht-pinned-pairs* :test (function eq)))
       t nil))
 
-(defun %htd-w (entries)
-  "Bytes per index slot for ENTRIES' capacity."
-  (if (< (%prim-array-length entries) 131070) 2 4))
 
-(defun %htd-slots (idx w)
-  (if (eq w 2) (ash (%prim-array-length idx) -1) (ash (%prim-array-length idx) -2)))
 
-(defun %htd-slot (idx i w)
-  (if (eq w 2)
-      (let ((b (+ i i)))
-        (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8)))
-      (let ((b (* i 4)))
-        (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8)
-           (ash (%u8-ref idx (+ b 2)) 16) (ash (%u8-ref idx (+ b 3)) 24)))))
 
-(defun %htd-set-slot (idx i w v)
-  (if (eq w 2)
-      (let ((b (+ i i)))
-        (%u8-set idx (+ b 1) (logand (ash v -8) 255))
-        (%u8-set idx b (logand v 255)))
-      (let ((b (* i 4)))
-        (%u8-set idx (+ b 3) (logand (ash v -24) 255))
-        (%u8-set idx (+ b 2) (logand (ash v -16) 255))
-        (%u8-set idx (+ b 1) (logand (ash v -8) 255))
-        (%u8-set idx b (logand v 255))))
-  v)
 
 (defun %htd-make (cap)
   "An empty dict with room for CAP entries."
@@ -2957,9 +3013,6 @@
                 (return n))))))
       (setq i (logand (+ i 1) mask)))))
 
-(defun %htd-mask (dict)
-  (let ((idx (car dict)))
-    (- (%htd-slots idx (%htd-w (cdr dict))) 1)))
 
 (defun %htd-scan (dict key)
   "Entry number of object KEY in DICT by an EQ scan of its entries, or NIL."
@@ -2971,6 +3024,18 @@
 
 (defun %htd-place-at (dict n h)
   "Enter entry N in DICT's index, probing from slot H."
+  ;; A 2-byte index (every dict under 65535 entries) inline: through %HTD-W / %HTD-MASK / %HTD-SLOT /
+  ;; %HTD-SET-SLOT it was five calls and more a placement, and every PUTHASH of a new key places one.
+  (when (< (%prim-array-length (cdr dict)) 131070)
+    (let* ((idx (car dict)) (mask (- (ash (%prim-array-length idx) -1) 1)) (i h) (v (+ n 1)))
+      (declare (type (integer 0 1152921504606846975) mask i v))
+      (loop
+        (let ((b (+ i i)))
+          (when (and (eq (%u8-ref idx b) 0) (eq (%u8-ref idx (+ b 1)) 0))
+            (%u8-set idx (+ b 1) (logand (ash v -8) 255))
+            (%u8-set idx b (logand v 255))
+            (return-from %htd-place-at nil)))
+        (setq i (logand (+ i 1) mask)))))
   (let* ((idx (car dict)) (w (%htd-w (cdr dict))) (mask (%htd-mask dict)) (i h))
     (loop
       (when (eq (%htd-slot idx i w) 0)
@@ -3026,9 +3091,49 @@
          (%ht-h-set-vec (%ht-bucket-holder ht) new)
          new)))))
 
+
+(defun %htd-eq-object-find (ht dict key strcmp?)
+  "%HTD-FIND for the commonest key of an EQ or EQL table -- an object compared by identity (a vector, a cons, a
+   structure, a string) -- in ONE call: entry number, NIL when it is absent, or T when this cannot say (another
+   kind of key, another test, an address index not current on this thread) and %HTD-FIND must.  %HTD-FIND asked
+   %HT-HASH first (a dozen type tests to answer :NOHASH), then %HTD-OBJ-KEY-P, %HT-ADDR-OK-P, the epoch, the
+   address hash: ten calls, 92 ns a GETHASH (SBCL: 11).  A collection during the probe (its loop has a
+   safepoint) moves the key: a miss then is re-asked of %HTD-FIND.  SPEED 3, the probe's numbers declared: an
+   index slot is two bytes, an entry number below the capacity, so no shift or compare needs its generic path."
+  (declare (optimize (speed 3) (safety 0)))
+  (if (and (%ht-eq-object-key-p key strcmp?) (< (%prim-array-length (cdr dict)) 131070))
+      (let ((cell (%ht-addr-cell ht)))
+        (if (and cell (%ht-addr-ok-p))
+            (let ((epoch (%ht-addr-epoch)))
+              (if (eql (car cell) epoch)
+                  (let* ((idx (car dict)) (e (cdr dict))
+                         (mask (- (ash (%prim-array-length idx) -1) 1))
+                         (cap (ash (- (%prim-array-length e) 2) -1))
+                         (k (ash (%val->word key) -4))
+                         (i (logand (logxor k (logxor (ash k -8) (ash k -16))) mask))
+                         (found nil))
+                    (declare (type (integer 0 1152921504606846975) mask cap i k))
+                    (loop
+                      (let* ((b (+ i i))
+                             (sl (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8))))
+                        (when (eq sl 0) (return nil))
+                        (let ((n (- sl 1)))
+                          (when (and (< n cap) (eq (%word-aref e (+ 2 (+ n n))) key))
+                            (setq found n)
+                            (return nil))))
+                      (setq i (logand (+ i 1) mask)))
+                    (cond (found found)
+                          ((eql (%ht-addr-epoch) epoch) nil)
+                          (t t)))
+                  t))
+            t))
+      t))
+
 (defun %htd-find (ht dict key strcmp?)
   "Entry number of KEY in DICT, NIL if absent, or %HT-NOHASH for a key the dict
    cannot hold (the caller turns the table back into an alist)."
+  (let ((q (%htd-eq-object-find ht dict key strcmp?)))     ; an object key, in one call
+    (unless (eq q t) (return-from %htd-find q)))
   (let ((h (if (and (fixnump key) (not (and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp))))
                (let ((k (if (< key 0) (- key) key)))
                  (logand (logxor k (logxor (ash k -8) (ash k -16))) (%htd-mask dict)))
@@ -3064,9 +3169,51 @@
     (%ht-h-set-vec holder new)
     new))
 
+(defun %htd-reuse-dead (ht holder key value strcmp? obj?)
+  "Put absent KEY -> VALUE into the first REMOVED entry on KEY's probe path, if one comes before an empty slot:
+   T when it did.  REMHASH leaves an entry dead (its key slot the entries vector) and its index slot in place, so
+   a table that loses and gains keys only appended -- filled, rebuilt into a new dict, allocated -- and every
+   collection that caused made every EQ table's address index stale.  SBCL reuses the slot; so does this: the
+   dead entry's index slot is on KEY's path, so KEY is found there, and any other key's probe compares it and
+   goes on as before.  The value goes in before the key (as an append's), so a reader sees the dead marker or
+   the whole entry.  An object key only by an address index current on this thread; a 2-byte index only."
+  (declare (optimize (speed 3) (safety 0)))
+  (let* ((dict (%ht-h-vec holder)) (idx (car dict)) (e (cdr dict)))
+    ;; only when the dict holds a removed entry (more used than live): else the append's own hash would be
+    ;; the second one a new string key paid
+    (when (and (< (%prim-array-length e) 131070) (> (%word-aref e 0) (%ht-h-count holder)))
+      (let* ((mask (- (ash (%prim-array-length idx) -1) 1))
+             (cap (ash (- (%prim-array-length e) 2) -1))
+             (h (if obj?
+                    (and (%ht-addr-ok-p) (eql (car (%ht-addr-cell ht)) (%ht-addr-epoch))
+                         (%ht-addr-hash key mask))
+                    (if (and (fixnump key) (not (and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp))))
+                        (let ((k (if (< key 0) (- key) key)))
+                          (logand (logxor k (logxor (ash k -8) (ash k -16))) mask))
+                        (let ((hh (%ht-hash key strcmp? mask)))
+                          (and (not (eq hh (%ht-nohash))) hh))))))
+        (when h
+          (let ((i h))
+            (declare (type (integer 0 1152921504606846975) i mask cap))
+            (loop
+              (let* ((b (+ i i))
+                     (sl (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8))))
+                (when (eq sl 0) (return nil))
+                (let ((n (- sl 1)))
+                  (when (and (< n cap) (eq (%word-aref e (+ 2 (+ n n))) e))
+                    (%ht-vec-set e (+ 3 (+ n n)) value)
+                    (when obj? (%ht-vec-set e 1 (+ (%word-aref e 1) 1)))
+                    (%publish-fence)
+                    (%ht-vec-set e (+ 2 (+ n n)) key)
+                    (%ht-h-set-count holder (+ (%ht-h-count holder) 1))
+                    (return t))))
+              (setq i (logand (+ i 1) mask)))))))))
+
 (defun %htd-add (ht holder key value strcmp? obj?)
   "Append KEY -> VALUE (absent; OBJ? when an object key) to HOLDER's dict,
    growing it when full."
+  (when (%htd-reuse-dead ht holder key value strcmp? obj?)
+    (return-from %htd-add value))
   (let* ((dict (%ht-h-vec holder)) (entries (cdr dict))
          (used (%word-aref entries 0))
          (cap (ash (- (%prim-array-length entries) 2) -1)))

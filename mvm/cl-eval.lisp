@@ -3301,7 +3301,17 @@
                (setq rest (cdr rest)))))))
 
 ;;; Type predicates
-(defun numberp (x) (or (integerp x) (floatp-impl x) (ratiop x) (%complex-p x)))
+(defun numberp (x)
+  "Integer (inline), ratio (inline), then one subtag read for the floats (#x60, #x64..#x66, as FLOATP-IMPL) and
+   a complex (#x32 with its marker, %COMPLEX-P).  It was the four predicates in turn, each re-testing the
+   immediates and re-reading the subtag: 7 ns for a vector, and an EQ table asks it of every object key."
+  (cond ((integerp x) t)
+        ((ratiop x) t)
+        ((or (consp x) (null x) (characterp x)) nil)
+        (t (let ((st (obj-subtag x)))
+             (or (= st 96) (and (>= st 100) (<= st 102))
+                 ;; #x32 is every general vector too: a complex is one of 3+ slots, %COMPLEX-MARKER first
+                 (and (= st #x32) (>= (%prim-array-length x) 3) (eq (aref x 0) '%complex-marker)))))))
 (defun realp (x)
   "T iff X is a real number (integer, float, or rational).  Explicitly
    rejects complex numbers — modus's %complex-p check first since

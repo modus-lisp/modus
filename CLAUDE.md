@@ -1075,8 +1075,10 @@ The image carries `translate-i386.lisp`, and a runtime DEFUN is translated at it
 first call, `(compile 'f)` at once, and closure-building top-level forms natively.
 It is OFF by default: build with `MODUS_I386_JIT=1` to get it; without it
 `mvm-eval` interprets all runtime code. Whatever the tier refuses stays
-interpreted, with the reason in `*N386-REFUSED*`. Not yet default-safe: the i386
-ANSI sweep with it on, 2026-11-23, was 21653/21681. The 28 lost tests are 20
+interpreted, with the reason in `*N386-REFUSED*`. The i386 ANSI sweep with it on:
+2026-11-23, 21653/21681; **2026-11-24, 21681/21681** (dos386 38d896fa, main merged:
+the variable-count ASH guard and the 32-bit collector fix cleared all 28 below).
+On 2026-11-23 the 28 lost were 20
 `OPEN.*` (the `(unsigned-byte 1)`/`(unsigned-byte 2)` generator gives 0..3),
 `MISC.461`/`509`/`569` (integer arithmetic at the fixnum/bignum boundary),
 `DEFUN.5`-`7` (a DEFUN in a LET with special/optional defaults calls NIL), and

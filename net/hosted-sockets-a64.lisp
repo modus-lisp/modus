@@ -81,7 +81,12 @@
 (defun %sbs-open (family type) (%gc-safe-block-3 198 family type 0))           ; socket
 (defun %sbs-close (fd) (%gc-safe-block-3 57 fd 0 0))                           ; close
 (defun %sbs-listen (fd backlog) (%gc-safe-block-3 201 fd backlog 0))           ; listen
-(defun %sbs-accept (fd) (%gc-safe-block-3 202 fd 0 0))                         ; accept
+;;; accept is the one call here spelled in x86-64's numbering (43): the syscall traps remap
+;;; x86-64 numbers (translate-aarch64 *AARCH64-LINUX-SYSCALL-REMAP*), and x86-64's 202 is
+;;; futex, so passing AArch64's 202 issued futex(fd, FUTEX_WAIT, 0) -- EFAULT on Linux, a
+;;; wait on a page-zero address on macOS -- and no hosted AArch64 accept ever ran.  The
+;;; others pass because no x86-64 entry has their numbers; 43 remaps to AArch64's 202.
+(defun %sbs-accept (fd) (%gc-safe-block-3 43 fd 0 0))                          ; accept
 (defun %sbs-shutdown (fd how) (%gc-safe-block-3 210 fd how 0))                 ; shutdown
 
 (defun %sbs-bind-in (fd ip port)

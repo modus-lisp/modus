@@ -22,12 +22,18 @@
 // only a backward jump sets L and re-enters the dispatch.
 
 let C = null;
-const W_OPS = process.env.MVM_WASM_COUNT ? new Float64Array(256) : null;
-const W_TR = process.env.MVM_WASM_COUNT ? new Map() : null, W_DC = process.env.MVM_WASM_COUNT ? new Map() : null;
-if (W_TR) process.on('exit', () => {
-  process.stderr.write('[wasm traps ' + [...W_TR].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([c, n]) => '0x' + c.toString(16) + ':' + n).join(' ') + ']\n');
-  process.stderr.write('[wasm dcall\n  ' + [...W_DC].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([c, n]) => n + ' ' + c).join('\n  ') + ']\n'); });
-if (W_OPS) process.on('exit', () => { const r = []; for (let i = 0; i < 256; i++) if (W_OPS[i]) r.push([W_OPS[i], i]); r.sort((a, b) => b[0] - a[0]); process.stderr.write('[wasm exec ops ' + r.slice(0, 15).map(([n, i]) => '0x' + i.toString(16) + ':' + n).join(' ') + ']\n'); });
+// Environment and log: node's process.env / stderr, or in a browser worker the
+// MVM_ENV object and MVM_LOG function worker.js sets on its global (no node
+// globals are touched there).
+const ENV = typeof process !== 'undefined' && process.env ? process.env : (globalThis.MVM_ENV || {});
+const LOG = typeof process !== 'undefined' && process.stderr ? (s) => process.stderr.write(s) : (s) => (globalThis.MVM_LOG || console.log)(s);
+const ON_EXIT = typeof process !== 'undefined' && process.on ? (f) => process.on('exit', f) : () => {};
+const W_OPS = ENV.MVM_WASM_COUNT ? new Float64Array(256) : null;
+const W_TR = ENV.MVM_WASM_COUNT ? new Map() : null, W_DC = ENV.MVM_WASM_COUNT ? new Map() : null;
+if (W_TR) ON_EXIT(() => {
+  LOG('[wasm traps ' + [...W_TR].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([c, n]) => '0x' + c.toString(16) + ':' + n).join(' ') + ']\n');
+  LOG('[wasm dcall\n  ' + [...W_DC].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([c, n]) => n + ' ' + c).join('\n  ') + ']\n'); });
+if (W_OPS) ON_EXIT(() => { const r = []; for (let i = 0; i < 256; i++) if (W_OPS[i]) r.push([W_OPS[i], i]); r.sort((a, b) => b[0] - a[0]); LOG('[wasm exec ops ' + r.slice(0, 15).map(([n, i]) => '0x' + i.toString(16) + ':' + n).join(' ') + ']\n'); });
 function init(c) { C = c; }
 
 // ---- binary encoding --------------------------------------------------------
@@ -62,21 +68,21 @@ const IMPORTS = [
   ['dbgenter', [I32, I32, I32], []],  // 15 debug: a setjmp function entered (id, frame, L)
 ];
 const FNTYPE = 0;   // (i32 L) -> i32, always type 0
-const NOFAST = !!process.env.MVM_WASM_NOFAST;
-const NOTAIL = !!process.env.MVM_WASM_NOTAIL, NOSJ = !!process.env.MVM_WASM_NOSJ;
-const MAXINSN = (process.env.MVM_WASM_MAXINSN && parseInt(process.env.MVM_WASM_MAXINSN, 10)) || 100000;
+const NOFAST = !!ENV.MVM_WASM_NOFAST;
+const NOTAIL = !!ENV.MVM_WASM_NOTAIL, NOSJ = !!ENV.MVM_WASM_NOSJ;
+const MAXINSN = (ENV.MVM_WASM_MAXINSN && parseInt(ENV.MVM_WASM_MAXINSN, 10)) || 100000;
 // Labels per chunk: a function with more becomes an entry dispatcher plus
 // one Wasm function per CHL labels (the JS translator's CHUNK, for the same
 // reasons: TurboFan's frame and compile time grow with a function's size).
-const CHL = (process.env.MVM_WASM_CHUNK && parseInt(process.env.MVM_WASM_CHUNK, 10)) || 256;
-const NOINL = new Set((process.env.MVM_WASM_NOINL || '').split(',').filter(Boolean).map((x) => parseInt(x, 16)));
+const CHL = (ENV.MVM_WASM_CHUNK && parseInt(ENV.MVM_WASM_CHUNK, 10)) || 256;
+const NOINL = new Set((ENV.MVM_WASM_NOINL || '').split(',').filter(Boolean).map((x) => parseInt(x, 16)));
 const F_EXEC = 0, F_GC = 1, F_CHECKED = 2, F_FAULT = 3, F_TAIL = 4, F_TRAP = 5, F_CONS = 6,
       F_CALLREQ = 7, F_DCALL = 8, F_DCALLIND = 9, F_FINISH = 10, F_SLOTFOR = 11, F_FBYTES = 12, F_SYNCIN = 13, F_LJLABEL = 14, F_DBGENTER = 15;
 // dep: Wasm-to-Wasm call depth (native stack), not mirrored in the VM.
 // cmp / ovf: the compare and overflow flags across a jump between chunks.
 const GLOBALS = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc', 'dep', 'cmp', 'ovf'];
 const G_VR = 0, G_VA = 1, G_VL = 2, G_ESP = 3, G_EBP = 4, G_PC = 5, G_DEP = 6, G_CMP = 7, G_OVF = 8;
-const WDEPTH = (process.env.MVM_WASM_DEPTH && parseInt(process.env.MVM_WASM_DEPTH, 10)) || 600;
+const WDEPTH = (ENV.MVM_WASM_DEPTH && parseInt(ENV.MVM_WASM_DEPTH, 10)) || 600;
 const SYNCED = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc'];
 
 // ---- per-VM state: the shared globals and the import object --------------------
@@ -128,13 +134,13 @@ function state(vm) {
     },
     fbytes(t) { return C.frameBytes(vm.m8, t); },
     syncin() { syncIn(); },
-    dbgenter(id, fb, L) { process.stderr.write(`[sj-enter ${vm.where(resMaps[id].keys().next().value)} frame=${((fb + C.VBASE) >>> 0).toString(16)} L=${L}]\n`); },
+    dbgenter(id, fb, L) { LOG(`[sj-enter ${vm.where(resMaps[id].keys().next().value)} frame=${((fb + C.VBASE) >>> 0).toString(16)} L=${L}]\n`); },
     ljlabel(id, ip, fb) {
       const l = vm.ebp - C.VBASE === fb ? resMaps[id].get(ip) : undefined;
-      if (process.env.MVM_WASM_DEBUG && l === undefined) { const owner = resMaps.findIndex((m) => m.has(ip)); const c = [...vm.compiled].find(([t, f]) => f && f.RES && f.RES[ip] !== undefined); process.stderr.write(`[lj-miss owner-wasm-module=${owner} js-owner=${c ? vm.where(c[0]) + (c[1].wexp ? ' (wasm)' : ' (js)') : 'none (interpreted?)'}]\n`); }
-      if (process.env.MVM_WASM_DEBUG && l !== undefined) vm.dumpFrame('wasm');
-      if (process.env.MVM_WASM_DEBUG && l !== undefined) { let q = ip, out = []; for (let k = 0; k < 14; k++) { const op = vm.m8[q], n = C.INSN_LEN[op]; out.push(Array.from(vm.m8.slice(q, q + n)).map((x) => x.toString(16).padStart(2, '0')).join('')); q += n || 1; } process.stderr.write('[lj code ' + out.join(' ') + ']\n'); }
-      if (process.env.MVM_WASM_DEBUG) process.stderr.write(`[lj ip=${vm.where(ip)} vm.ebp=${(vm.ebp >>> 0).toString(16)} frame=${((fb + C.VBASE) >>> 0).toString(16)} -> ${l}]\n`);
+      if (ENV.MVM_WASM_DEBUG && l === undefined) { const owner = resMaps.findIndex((m) => m.has(ip)); const c = [...vm.compiled].find(([t, f]) => f && f.RES && f.RES[ip] !== undefined); LOG(`[lj-miss owner-wasm-module=${owner} js-owner=${c ? vm.where(c[0]) + (c[1].wexp ? ' (wasm)' : ' (js)') : 'none (interpreted?)'}]\n`); }
+      if (ENV.MVM_WASM_DEBUG && l !== undefined) vm.dumpFrame('wasm');
+      if (ENV.MVM_WASM_DEBUG && l !== undefined) { let q = ip, out = []; for (let k = 0; k < 14; k++) { const op = vm.m8[q], n = C.INSN_LEN[op]; out.push(Array.from(vm.m8.slice(q, q + n)).map((x) => x.toString(16).padStart(2, '0')).join('')); q += n || 1; } LOG('[lj code ' + out.join(' ') + ']\n'); }
+      if (ENV.MVM_WASM_DEBUG) LOG(`[lj ip=${vm.where(ip)} vm.ebp=${(vm.ebp >>> 0).toString(16)} frame=${((fb + C.VBASE) >>> 0).toString(16)} -> ${l}]\n`);
       return l === undefined ? -1 : l;
     },
     finish(t, q) {
@@ -154,11 +160,11 @@ function state(vm) {
   const imports = { e: { m: vm.wmem, t: table, lj: C.LJ_TAG } };
   for (const n of GLOBALS) imports.e['g_' + n] = g[n];
   const counts = {};
-  if (process.env.MVM_WASM_COUNT) {
+  if (ENV.MVM_WASM_COUNT) {
     for (const [n] of IMPORTS) { counts[n] = 0; const h = f[n]; imports.e[n] = function (a, b, c) { counts[n]++; return h(a, b, c); }; }
-    process.on('exit', () => process.stderr.write("[wasm imports " + JSON.stringify(counts) + " entries " + vm._w.entries + " stats " + JSON.stringify(vm._w.stats) + "]\n"));
+    ON_EXIT(() => LOG("[wasm imports " + JSON.stringify(counts) + " entries " + vm._w.entries + " stats " + JSON.stringify(vm._w.stats) + "]\n"));
   } else for (const [n] of IMPORTS) imports.e[n] = f[n];
-  if (process.env.MVM_WASM_DEBUG) process.on('exit', () => { if (vm._w.dump) process.stderr.write('[RANGE ' + vm._w.dump + ']\n'); });
+  if (ENV.MVM_WASM_DEBUG) ON_EXIT(() => { if (vm._w.dump) LOG('[RANGE ' + vm._w.dump + ']\n'); });
   vm._w = { g, imports, syncIn, syncOut, table, slotOf, resMaps, stats: { fns: 0, failed: 0, bytes: 0, ms: 0 } };
   return vm._w;
 }
@@ -186,7 +192,7 @@ function compile(vm, entry, osr) {
     while (!seen.has(pc)) {
       seen.add(pc);
       const op = m8[pc], len = INSN_LEN[op];
-      if (len === 0) { W.stats.failed++; if (process.env.MVM_WASM_DEBUG) process.stderr.write(`[wasm refuse ${vm.where(entry)}: opcode 0x${op.toString(16)} len 0]\n`); return null; }
+      if (len === 0) { W.stats.failed++; if (ENV.MVM_WASM_DEBUG) LOG(`[wasm refuse ${vm.where(entry)}: opcode 0x${op.toString(16)} len 0]\n`); return null; }
       insns.push([pc, op, len]);
       if ((op >= 0x41 && op <= 0x46) || op === 0xC7) {
         const t = pc + len + rd32(pc + 1); starts.add(t); work.push(t); starts.add(pc + len);
@@ -195,7 +201,7 @@ function compile(vm, entry, osr) {
       else if (op === 0x82 || op === 0x83) break;
       else if (op === 0x80 || op === 0x81) starts.add(pc + len);
       else if (op === 0x02 && (m8[pc + 1] | (m8[pc + 2] << 8)) === 0x0510) { hasSetjmp = true; starts.add(pc + len); sjResume.push(pc + len); }
-      else if (op === 0x90 || op === 0x91 || op === 0xA2 || op === 0x01) { W.stats.failed++; if (process.env.MVM_WASM_DEBUG) process.stderr.write(`[wasm refuse ${vm.where(entry)}: opcode 0x${op.toString(16)}]\n`); return null; }
+      else if (op === 0x90 || op === 0x91 || op === 0xA2 || op === 0x01) { W.stats.failed++; if (ENV.MVM_WASM_DEBUG) LOG(`[wasm refuse ${vm.where(entry)}: opcode 0x${op.toString(16)}]\n`); return null; }
       pc += len;
     }
   }
@@ -372,7 +378,7 @@ function compile(vm, entry, osr) {
   // A function with setjmp landings: loop $re { try { <dispatch> } catch $lj }.
   // The catch takes a longjmp to THIS frame (ebp) at one of its landings: VM
   // state back from JS, the Wasm depth back to this frame's, re-enter there.
-  if (hasSetjmp && process.env.MVM_WASM_DEBUG) { i32c(resId); lget(LFB); lget(LP); call(F_DBGENTER); }
+  if (hasSetjmp && ENV.MVM_WASM_DEBUG) { i32c(resId); lget(LFB); lget(LP); call(F_DBGENTER); }
   if (hasSetjmp) { gget(G_DEP); lset(LDEP); o.push(0x03, 0x40, 0x06, 0x40); }
   skeleton();
   }
@@ -706,7 +712,7 @@ function compile(vm, entry, osr) {
     const K = bodies.length, F0 = IMPORTS.length + 1;
     o = [];
     gget(G_EBP); i32c(-VBASE); op1(0x6A); lset(LFB);
-    if (hasSetjmp && process.env.MVM_WASM_DEBUG) { i32c(resId); lget(LFB); lget(LP); call(F_DBGENTER); }
+    if (hasSetjmp && ENV.MVM_WASM_DEBUG) { i32c(resId); lget(LFB); lget(LP); call(F_DBGENTER); }
     if (hasSetjmp) { gget(G_DEP); lset(LDEP); o.push(0x03, 0x40, 0x06, 0x40); }
     o.push(0x03, 0x40);                     // loop $d
     o.push(0x02, I32);                      // block $chk (result i32)
@@ -762,11 +768,11 @@ function compile(vm, entry, osr) {
   let inst;
   const tA = performance.now();
   try { const mm = new WebAssembly.Module(new Uint8Array(mod)); const tB = performance.now(); W.stats.modMs = (W.stats.modMs || 0) + (tB - tA); inst = new WebAssembly.Instance(mm, W.imports); W.stats.instMs = (W.stats.instMs || 0) + (performance.now() - tB); W.stats.emitMs = (W.stats.emitMs || 0) + (tA - t0); }
-  catch (e) { W.stats.failed++; if (process.env.MVM_WASM_DEBUG && W.stats.failed < 6) process.stderr.write(`[wasm compile ${vm.where(entry)}: ${e.message}]\n`); return null; }
+  catch (e) { W.stats.failed++; if (ENV.MVM_WASM_DEBUG && W.stats.failed < 6) LOG(`[wasm compile ${vm.where(entry)}: ${e.message}]\n`); return null; }
   if (hasSetjmp) W.stats.sj = (W.stats.sj || 0) + 1;
   const run = inst.exports.f;
   const fn = function (vm, L) {
-    if (process.env.MVM_WASM_DEBUG) {
+    if (ENV.MVM_WASM_DEBUG) {
       W.depth = (W.depth || 0) + 1; (W.hist = W.hist || []).push(vm.where(entry) + ' L' + L + ' jd' + vm.jd);
       try { return fn2(vm, L); }
       catch (e) { if (e instanceof RangeError && !W.logged) { W.logged = 1; W.dump = 'wrapper depth ' + W.depth + ' jd ' + vm.jd + ' dep ' + W.g.dep.value + '\n' + W.hist.slice(-12).join('\n'); } throw e; }

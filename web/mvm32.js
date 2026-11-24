@@ -54,7 +54,10 @@ for (const [ops, n] of [[[0x74,0x7C,0x7D,0x7E],3],[[0x6A,0x6B,0x6C,0x6D,0x6E,0x6
 const BACK_BRANCH = new Uint8Array(256);
 for (const o of [0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0xC7]) BACK_BRANCH[o] = 1;
 const OSR_THRESHOLD = 500;
-const NO_OSR = typeof process !== 'undefined' && process.env && !!process.env.MVM_NO_OSR;
+// Environment: node's process.env, or in a browser worker the MVM_ENV object
+// worker.js sets on its global (the URL's ?wasm= / MVM_* parameters).
+const ENV = typeof process !== 'undefined' && process.env ? process.env : ((typeof self !== 'undefined' && self.MVM_ENV) || {});
+const NO_OSR = !!ENV.MVM_NO_OSR;
 const NO_EXEC = new Uint8Array(256);
 for (const o of [0xD9,0xDA,0xDB,0xDC,0xDD,0xDE,0xDF,0xE0,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xAA,0xAB,0xAC]) NO_EXEC[o] = 1;
 const ALLOC_START_OFF = 0x400;
@@ -96,11 +99,11 @@ const IX = new Int32Array(16); for (let v = 0; v < 16; v++) IX[v] = ROFF[v] >> 2
 const IX0 = IX[0], IX1 = IX[1], IX2 = IX[2], IX3 = IX[3], IX4 = IX[4];
 
 const RET_SENTINEL = -1;
-const SHAPES = typeof process !== 'undefined' && process.env && !!process.env.MVM_SHAPES;
+const SHAPES = !!ENV.MVM_SHAPES;
 // Nested drive()s a direct call may stack on the JS stack before a call falls
 // back to returning to its driver (deep Lisp recursion must not overflow it).
-const JD_MAX = (typeof process !== 'undefined' && process.env && process.env.MVM_JD_MAX) ? parseInt(process.env.MVM_JD_MAX, 10) : 400;
-const DBG = (typeof process !== 'undefined' && process.env) ? process.env : {};
+const JD_MAX = ENV.MVM_JD_MAX ? parseInt(ENV.MVM_JD_MAX, 10) : 400;
+const DBG = ENV;
 const FN_UNRESOLVED = 0xFFFFFFF0;
 
 class LongJmp { constructor(esp, ip) { this.esp = esp; this.ip = ip; } }
@@ -1827,10 +1830,15 @@ class MVM {
 }
 
 const MVM_EXPORTS = { MVM, loadModule, MvmFault, MvmExit, NIL, TV, VBASE };
-// MVM_WASM=1: translate to WebAssembly (web/wasm32.js) instead of JS.
+// MVM_WASM=1: translate to WebAssembly (web/wasm32.js) instead of JS.  Under
+// node it is require()d; a browser worker loads it first and leaves its
+// exports in self.MVM_WASM32 (worker.js, which also decides MVM_WASM there).
 let WASM = null;
-if (typeof process !== 'undefined' && process.env && process.env.MVM_WASM && typeof require !== 'undefined') {
-  WASM = require('./wasm32.js');
+if (ENV.MVM_WASM) {
+  if (typeof process !== 'undefined' && typeof require !== 'undefined') WASM = require('./wasm32.js');
+  else if (typeof self !== 'undefined' && self.MVM_WASM32) WASM = self.MVM_WASM32;
+}
+if (WASM) {
   WASM.init({ VBASE, NIL, TV, IX, slotOff, FRAME_SIZE, INSN_LEN, JIT_PHYS, A_WEB_CONSTS, POOL_ADDR,
               A_MVCOUNT, A_CENV, A_NARGS, RET_SENTINEL, FN_UNRESOLVED, frameEnterParams, ldbMask,
               JD_MAX, LongJmp, BACK_BRANCH, frameBytes, STACK_ADDR, LJ_TAG });

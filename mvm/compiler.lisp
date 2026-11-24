@@ -13518,7 +13518,10 @@
     (t
      (let ((temp (alloc-temp-reg)))
        (compile-form a env dest)
-       (if (%leaf-operand-p b env)
+       ;; a right operand that cannot touch DEST needs no save (%ARG-PRESERVES-DEST-P): a string
+       ;; compare's (eq (%word-aref a i) (%word-aref b i)) pushed and popped every character
+       (if (or (%leaf-operand-p b env)
+               (and (or *mvm-eval-runtime-p* (%image-aarch64-p)) (%arg-preserves-dest-p b env dest)))
            (compile-form b env temp)
            (progn (emit-ir :push dest) (compile-form b env temp) (emit-ir :pop dest)))
        (emit-ir :cmp dest temp)
@@ -27523,9 +27526,11 @@
               (true-label (make-compiler-label))
               (end-label (make-compiler-label)))
           (compile-form a env dest)
-          (emit-ir :push dest)
-          (compile-form b env temp)
-          (emit-ir :pop dest)
+          (let ((keep (or (%leaf-operand-p b env)
+                          (and (or *mvm-eval-runtime-p* (%image-aarch64-p)) (%arg-preserves-dest-p b env dest)))))
+            (unless keep (emit-ir :push dest))
+            (compile-form b env temp)
+            (unless keep (emit-ir :pop dest)))
           (emit-ir :cmp dest temp)
           (emit-ir :beq true-label)
           ;; Not equal: NIL

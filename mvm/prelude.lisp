@@ -816,15 +816,25 @@
   "Two plain #x31 strings with the same characters: lengths, then the code
    words.  (STRING= parses keywords and string designators first.)"
   (declare (optimize (speed 3)))      ; locals in registers (%PROMOTE-LOCALS-P)
-  (let ((n (array-length a)))
-    (declare (type fixnum n))
+  (let* ((n (array-length a)) (i n) (stop (logand n 3)))
+    (declare (type (unsigned-byte 56) n i stop))
+    ;; FROM THE END, four characters an iteration.  Keys that differ mostly differ late -- names numbered at the
+    ;; end, paths under one directory -- and an EQUAL table compares a probed key of the same length in full
+    ;; before it finds that out: mill's tensor names share their first 46 characters.  A match costs the same.
     (and (= n (array-length b))
-         (let ((i 0))
-           (declare (type fixnum i))
+         (progn
            (loop
-             (when (>= i n) (return t))
-             (unless (eq (%word-aref a i) (%word-aref b i)) (return nil))
-             (setq i (+ i 1)))))))
+             (when (<= i stop) (return nil))
+             (setq i (- i 4))
+             (unless (and (eq (%word-aref a (+ i 3)) (%word-aref b (+ i 3)))
+                          (eq (%word-aref a (+ i 2)) (%word-aref b (+ i 2)))
+                          (eq (%word-aref a (+ i 1)) (%word-aref b (+ i 1)))
+                          (eq (%word-aref a i) (%word-aref b i)))
+               (return-from %simple-string= nil)))
+           (loop
+             (when (eq i 0) (return t))
+             (setq i (- i 1))
+             (unless (eq (%word-aref a i) (%word-aref b i)) (return nil)))))))
 (declaim (optimize (safety 1)))
 
 (declaim (optimize (safety 0)))     ; the index is below both lengths
@@ -834,15 +844,25 @@
    keyword parse, then a dispatched %PRIM-AREF per character on both sides: 137 ns for two 59-character names,
    where SBCL takes 3, and every EQUAL table keyed by such names (mill's tensor table) paid it per probe."
   (declare (optimize (speed 3)))      ; locals in registers (%PROMOTE-LOCALS-P)
-  (let ((n (array-length a)))
-    (declare (type fixnum n))
+  (let* ((n (array-length a)) (i n) (stop (logand n 3)))
+    (declare (type (unsigned-byte 56) n i stop))
+    ;; FROM THE END, four characters an iteration.  Keys that differ mostly differ late -- names numbered at the
+    ;; end, paths under one directory -- and an EQUAL table compares a probed key of the same length in full
+    ;; before it finds that out: mill's tensor names share their first 46 characters.  A match costs the same.
     (and (= n (array-length b))
-         (let ((i 0))
-           (declare (type fixnum i))
+         (progn
            (loop
-             (when (>= i n) (return t))
-             (unless (eq (%u8-ref a i) (%u8-ref b i)) (return nil))
-             (setq i (+ i 1)))))))
+             (when (<= i stop) (return nil))
+             (setq i (- i 4))
+             (unless (and (eq (%u8-ref a (+ i 3)) (%u8-ref b (+ i 3)))
+                          (eq (%u8-ref a (+ i 2)) (%u8-ref b (+ i 2)))
+                          (eq (%u8-ref a (+ i 1)) (%u8-ref b (+ i 1)))
+                          (eq (%u8-ref a i) (%u8-ref b i)))
+               (return-from %base-string= nil)))
+           (loop
+             (when (eq i 0) (return t))
+             (setq i (- i 1))
+             (unless (eq (%u8-ref a i) (%u8-ref b i)) (return nil)))))))
 (declaim (optimize (safety 1)))
 
 (defun %plain-base-string-p (x)
@@ -2342,7 +2362,7 @@
   (declare (optimize (speed 3)))
   (let* ((len (array-length key)) (end (- len (logand len 3))) (i 0)
          (a 2166136261) (b 3735928559) (c 1103515245) (d 2654435769))
-    (declare (type (integer 0 1152921504606846975) len end i)
+    (declare (type (unsigned-byte 56) len end i)
              (type (unsigned-byte 32) a b c d))
     (if (%prim-base-string-p key)
         (progn
@@ -3028,7 +3048,7 @@
   ;; %HTD-SET-SLOT it was five calls and more a placement, and every PUTHASH of a new key places one.
   (when (< (%prim-array-length (cdr dict)) 131070)
     (let* ((idx (car dict)) (mask (- (ash (%prim-array-length idx) -1) 1)) (i h) (v (+ n 1)))
-      (declare (type (integer 0 1152921504606846975) mask i v))
+      (declare (type (unsigned-byte 56) mask i v))
       (loop
         (let ((b (+ i i)))
           (when (and (eq (%u8-ref idx b) 0) (eq (%u8-ref idx (+ b 1)) 0))
@@ -3112,7 +3132,7 @@
                          (k (ash (%val->word key) -4))
                          (i (logand (logxor k (logxor (ash k -8) (ash k -16))) mask))
                          (found nil))
-                    (declare (type (integer 0 1152921504606846975) mask cap i k))
+                    (declare (type (unsigned-byte 56) mask cap i k))
                     (loop
                       (let* ((b (+ i i))
                              (sl (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8))))
@@ -3194,7 +3214,7 @@
                           (and (not (eq hh (%ht-nohash))) hh))))))
         (when h
           (let ((i h))
-            (declare (type (integer 0 1152921504606846975) i mask cap))
+            (declare (type (unsigned-byte 56) i mask cap))
             (loop
               (let* ((b (+ i i))
                      (sl (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8))))

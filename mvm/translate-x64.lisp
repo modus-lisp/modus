@@ -1766,6 +1766,10 @@
   (entry-table nil)
   ;; GC helper label (one per translated unit)
   (gc-label nil)
+  ;; HEAP EXHAUSTED for a SIZED gc-check (:gc-check-n / :gc-check-r): one fatal
+  ;; routine per unit, called when the allocation still does not fit after the
+  ;; collection.  NIL (no re-test) where there is no hosted syscall to say so.
+  (exhausted-label nil)
   ;; Handler-stack helper labels (one per translated unit). The push helper
   ;; saves the current [#x10000180/+8/+16] state to a memory stack so nested
   ;; handler-cases don't clobber their parent's setjmp frame; the pop helper
@@ -6009,11 +6013,20 @@
                 (page-lbl (and (mcgc-pinning-on-p) (mcgc-page-gc-label)))
                 (gc-lbl (or page-lbl (translate-state-gc-label state))))
            (when gc-lbl
-             (let ((skip-label (make-label)))
+             (let ((skip-label (make-label))
+                   (ex (translate-state-exhausted-label state)))
                (emit-lea buf +scratch-reg+ 'r12 nbytes)
                (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
                (emit-jcc buf :l skip-label)
                (emit-call buf gc-lbl)
+               ;; AND AGAIN AFTER THE COLLECTION: an object that still does not fit
+               ;; would run past the limit into memory the next collection copies
+               ;; over -- silent corruption.  Say so and stop.
+               (when ex
+                 (emit-lea buf +scratch-reg+ 'r12 nbytes)
+                 (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
+                 (emit-jcc buf :l skip-label)
+                 (emit-call buf ex))
                (emit-label buf skip-label)))))
 
         ((op= +op-gc-check-r+)
@@ -6054,19 +6067,29 @@
                 (page-lbl (and (mcgc-pinning-on-p) (mcgc-page-gc-label)))
                 (gc-lbl (or page-lbl (translate-state-gc-label state))))
            (when gc-lbl
-             (let ((skip-label (make-label)))
-               (when keep (emit-push buf +scratch-reg+))
-               (if pc
-                   (emit-mov-reg-reg buf +scratch-reg+ pc)
-                   (emit-load-vreg buf vcount +scratch-reg+))
-               (if (= kind 0)
-                   (emit-shl-reg-imm buf +scratch-reg+ 3)   ; untagged slots
-                   (emit-sar-reg-imm buf +scratch-reg+ 1))  ; tagged bytes
-               (emit-add-reg-imm buf +scratch-reg+ 32)
-               (emit-add-reg-reg buf +scratch-reg+ 'r12)
-               (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
-               (emit-jcc buf :l skip-label)
-               (emit-call buf gc-lbl)
+             (let ((skip-label (make-label))
+                   (ex (translate-state-exhausted-label state)))
+               (flet ((end-of-alloc ()
+                        ;; RAX = where R12 will be after the allocation
+                        (cond (keep (emit-mov-reg-mem buf +scratch-reg+ 'rsp 0)) ; the pushed count
+                              (pc (emit-mov-reg-reg buf +scratch-reg+ pc))
+                              (t (emit-load-vreg buf vcount +scratch-reg+)))
+                        (if (= kind 0)
+                            (emit-shl-reg-imm buf +scratch-reg+ 3)   ; untagged slots
+                            (emit-sar-reg-imm buf +scratch-reg+ 1))  ; tagged bytes
+                        (emit-add-reg-imm buf +scratch-reg+ 32)
+                        (emit-add-reg-reg buf +scratch-reg+ 'r12)))
+                 (when keep (emit-push buf +scratch-reg+))
+                 (end-of-alloc)
+                 (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
+                 (emit-jcc buf :l skip-label)
+                 (emit-call buf gc-lbl)
+                 ;; and again after the collection (the :gc-check-n arm above)
+                 (when ex
+                   (end-of-alloc)
+                   (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
+                   (emit-jcc buf :l skip-label)
+                   (emit-call buf ex)))
                (emit-label buf skip-label)
                (when keep (emit-pop buf +scratch-reg+))))))
 
@@ -12420,6 +12443,8 @@
          (fn-entry-labels (when call-pad (make-array n-functions)))
          ;; GC trampoline label (pre-allocated so all translate-states can use it)
          (gc-trampoline-label (when *x64-gc-enabled* (make-label)))
+         ;; the sized checks' heap-exhausted routine (hosted only: it writes to stderr)
+         (exhausted-label (when (and *x64-gc-enabled* *x64-linux-mode*) (make-label)))
          ;; MCGC stage-4 page-collector trampoline label (only when pinning on).
          ;; Stashed in *mcgc-page-gc-label* so gc-check / ensure-room sites can
          ;; reach it during instruction translation below.
@@ -12498,6 +12523,7 @@
                               :function-table fn-offset-to-label
                               :entry-table fn-offset-to-entry
                               :gc-label gc-trampoline-label
+                              :exhausted-label exhausted-label
                               :handler-push-label handler-push-lbl
                               :handler-pop-label handler-pop-lbl
                               :yield-longjmp-label yield-longjmp-lbl
@@ -12632,6 +12658,11 @@
          (setq *x64-last-gc-tramp-label* gc-trampoline-label)
          (unless *x64-jit-mode*
            (format *error-output* "~&  GC trampoline emitted, %GC-COLLECT wired~%"))))
+      ;; HEAP EXHAUSTED: the sized checks' routine (translate-state-exhausted-label).
+      (when exhausted-label
+        (emit-label buf exhausted-label)
+        (emit-fatal-message buf (format nil "~%Modus: heap exhausted -- an allocation does not fit after a full collection (raise --dynamic-space-size)~%")
+                            137))
       ;; Emit the shared cons-kind-bit setter (CALLed from cons alloc sites).
       (when cons-bit-label
         (emit-mcgc-cons-bit-subroutine buf cons-bit-label))

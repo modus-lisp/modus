@@ -1426,7 +1426,33 @@ these at collection time.
 
 ## Garbage Collector
 
-Cheney semi-space copying collector. Two ~469MB semispaces within the mmap'd heap.
+Cheney semi-space copying collector, two semispaces within the mmap'd heap.
+
+### Hosted x64 sizes its heap AT STARTUP: `--dynamic-space-size` (2026-11-24)
+
+`./modus --dynamic-space-size 8GB` (MB by default, or KB / MB / GB, as SBCL takes it):
+semispaces of N/2, rounded down to 1 MB, kept within 32 MB .. 24 GB each (the heap at
+`0x2000000000`, the JIT arena at `0x3000000000`).  No flag: the build's
+`MODUS_X64_MIDPOINT` default, 896 MB semispaces.  `EMIT-LINUX-X64-CHOOSE-HEAP`
+(boot-linux-x64.lisp) parses argv before the heap is mapped and lays the heap out with
+`X64-HEAP-LAYOUT`'s arithmetic, storing three words the heap tail reads: `0x10000F88`
+midpoint, `0x10000F90` data size, `0x10000F98` the cons-kind bitmap's offset from the
+start bitmap.  **Nothing compiled depends on the heap size**: the translator adds the kind
+offset from `0x10000F98` (`EMIT-X64-ADD-KIND-DELTA`); bare x64 and the Windows stub store
+their fixed values there.  A saved core restores only under the size it was saved with.
+- **The stub's length is measured before a build script finishes setting it up**
+  (`*X64-NATIVE-CODE-OFFSET*`, build-generic-cli): a stub whose length depends on a
+  later setting moves every function entry.  A branch 8 bytes longer made every function
+  word end `#xB`, the runtime JIT's tag-3 test took half the kernel for not native, and
+  `(make-hash-table :test #'equal)` in a DEFUN made an EQL table -- with ANSI still at
+  21681/21681.  build-generic-cli now fails if the stub's length changed.
+- **A sized check (`:gc-check-n` / `:gc-check-r`) re-tests after collecting** and calls the
+  unit's exhausted routine (`translate-state-exhausted-label`) when the allocation still
+  does not fit: "heap exhausted -- an allocation does not fit", exit 137.  It used to go
+  ahead, run past the limit into memory the next collection copies over, and corrupt the
+  heap silently (the builder building the Darwin CLI in 896 MB).  Hosted only.
+- Small heaps: threads fault with 256 MB semispaces (hosted-stw, hosted-many-regions),
+  as they did before this, when such a heap took a build-time MODUS_X64_MIDPOINT.
 
 - **GC check**: `CMP R12, R14; JB skip; CALL gc_trampoline` after every allocation
 - **Roots**: stack scan (RSP to stack_base) + globals alist + symbol table

@@ -186,6 +186,20 @@
 
 ;; No BULK-MOVE / BULK-FILL: web/mvm.js models the x64 machine but does not
 ;; implement those two opcodes, so REPLACE and FILL keep their Lisp loops here.
+;; NARROW STRINGS on the 32-bit module (the 68k image's MODUS_NARROW_STRINGS):
+;; a byte per character (#x13) instead of a word, which web/mvm32.js's
+;; collector sizes as bytes; no #x15 strings (their accessors assume 64-bit
+;; words, compiler.lisp *STRING32-P*).  Pooled literals follow below
+;; (*POOL-NARROW-STRINGS*).  MODUS_WEB_NARROW=0 keeps word strings.
+(defvar cl-user::*web-narrow*
+  (and (not (equal (sb-ext:posix-getenv "MODUS_WEB_WORD") "8"))     ; *WEB-WORD-SIZE*'s rule
+       (let ((v (sb-ext:posix-getenv "MODUS_WEB_NARROW"))) (not (and v (string= v "0"))))))
+(when cl-user::*web-narrow*
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source*
+                     (string #\Newline) "(defun %narrow-strings-p () t)"
+                     (string #\Newline) "(defun %string32-strings-p () nil)" (string #\Newline))))
+
 ;; Bound before build-cli-common's DEFVAR, which then leaves it alone.
 (defvar *cli-native-bulk-source* "")
 
@@ -551,7 +565,8 @@
     ;;   a build-time setting, so the image's own (Lisp-interpreted) runtime
     ;;   compiles keep the immediate form.  MODUS_WEB_RANGE_SHIFT=0 turns it off.
     (when (and (= *web-word-size* 4) (not (env= "MODUS_WEB_RANGE_SHIFT" "0")))
-      (setf *arith-range-by-shift* t)))
+      (setf *arith-range-by-shift* t))
+    (when cl-user::*web-narrow* (setf *pool-narrow-strings* t)))
   ;; The web image never calls BUILD-IMAGE, so build-checks' wrapper does not
   ;; see it: run the redefinition check around the compile directly.
   (setf *undeclared-redefinitions* nil)

@@ -197,7 +197,10 @@ class MVM {
     // buffer, so translated Wasm code can mark an allocation inline.
     const bmpBytes = (((this.heapEnd - this.heapBase) >> 4) >> 3) + 16;
     this.bmpOff = (this.heapEnd - VBASE + 15) & ~15;
-    const size = this.bmpOff + 2 * bmpBytes;
+    // and the sixteen float registers, so translated Wasm reads and writes
+    // them where the VM's own float ops do
+    this.frOff = (this.bmpOff + 2 * bmpBytes + 15) & ~15;
+    const size = this.frOff + 128;
     // A WebAssembly.Memory when the engine has one, so translated Wasm code
     // (wasm32.js, MVM_WASM=1) and this VM share the same bytes.
     if (typeof WebAssembly !== 'undefined') {
@@ -211,7 +214,7 @@ class MVM {
     this.f64 = new Float64Array(1);
     this.f64u16 = new Uint16Array(this.f64.buffer);
     this.f64u32 = new Uint32Array(this.f64.buffer);
-    this.fr = new Float64Array(16);
+    this.fr = new Float64Array(this.buf, this.frOff, 16);
     const granules = (this.heapEnd - this.heapBase) >> 4;
     if (DBG.MVM_OLD_BMP) { this.startBmp = new Uint8Array((granules >> 3) + 1); this.consBmp = new Uint8Array((granules >> 3) + 1); } else {
     this.startBmp = new Uint8Array(this.buf, this.bmpOff, (granules >> 3) + 1);

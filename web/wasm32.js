@@ -47,7 +47,7 @@ function sleb(o, v) {
 function str(o, s) { uleb(o, s.length); for (let i = 0; i < s.length; i++) o.push(s.charCodeAt(i)); }
 function section(o, id, body) { o.push(id); uleb(o, body.length); for (const b of body) o.push(b); }
 
-const I32 = 0x7f, I64 = 0x7e;
+const I32 = 0x7f, I64 = 0x7e, F64 = 0x7c;
 // imports, in index order: [name, params, results]
 const IMPORTS = [
   ['exec', [I32], [I32]],            // 0 delegate pc -> vm.cmp
@@ -83,7 +83,8 @@ const F_EXEC = 0, F_GC = 1, F_CHECKED = 2, F_FAULT = 3, F_TAIL = 4, F_TRAP = 5, 
 const FB_BIAS = 4096;          // see LOAD
 const DIRTYOFF = !!ENV.MVM_WASM_NODIRTY;
 const NOINLSJ = !!ENV.MVM_WASM_NOINLSJ;
-const NOGCSKIP = !!ENV.MVM_WASM_NOGCSKIP;   // bisect: reload V4-V15 after every call      // bisect: setjmp / handler-pop through JS   // bisect: spill every register every time
+const NOGCSKIP = !!ENV.MVM_WASM_NOGCSKIP;
+const NOFLOAT = !!ENV.MVM_WASM_NOFLOAT;     // bisect: float ops through JS   // bisect: reload V4-V15 after every call      // bisect: setjmp / handler-pop through JS   // bisect: spill every register every time
 // gcn: the VM's collection count, which vm.gc() bumps itself (see fastCall).
 const GLOBALS = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc', 'dep', 'cmp', 'ovf', 'gcn'];
 const G_VR = 0, G_VA = 1, G_VL = 2, G_ESP = 3, G_EBP = 4, G_PC = 5, G_DEP = 6, G_CMP = 7, G_OVF = 8, G_GCN = 9;
@@ -228,7 +229,8 @@ function compile(vm, entry, osr) {
   const tCfg = performance.now(); W.stats.cfgMs = (W.stats.cfgMs || 0) + (tCfg - t0);
   // 2. code
   const LP = 0, LR = (v) => 1 + v, LCMP = 17, LOVF = 18, LFB = 19, LT1 = 20, LT2 = 21, LT3 = 22, LDEP = 23, LGC = 24;
-  const NLOCALS = 24;           // beyond the param
+  const NLOCALS = 24;           // i32s beyond the param; then one i64 and two f64s
+  const LI64 = 25, LF1 = 26, LF2 = 27;
   let o = [];                   // current function body bytes
   let nglob = GLOBALS.length;   // module-defined globals (call-site caches) follow the imported ones
   let cur = -1;                 // label of the code being emitted
@@ -410,6 +412,101 @@ function compile(vm, entry, osr) {
     END();
     i32c(NIL); gset(G_VR);
   };
+  // ---- floats (vm.floatVal / vm.allocFloat / vm.fr, inline) ----
+  // A boxed float: header (4<<8)|subtag, then four slots holding the double's
+  // 16-bit pieces, most significant first, each shifted left one (fixnums).
+  const FRA = (k) => vm.frOff + 8 * k;                       // phys address of fr[k]
+  const frLd = (k) => { i32c(FRA(k)); o.push(0x2B, 0x03, 0x00); };
+  const frSt = (k) => { lset(LF1); i32c(FRA(k)); lget(LF1); o.push(0x39, 0x03, 0x00); };   // f64 on the stack -> fr[k]
+  const fround = () => { op1(0xB6); op1(0xBB); };          // f32.demote_f64, f64.promote_f32
+  const badFloat = (r) => {                                 // i32: 1 when R is no boxed float in the heap
+    get(r); lset(LT1);
+    lget(LT1); i32c(15); op1(0x71); i32c(9); op1(0x47);
+    lget(LT1); i32c(vm.heapBase); op1(0x48); op1(0x72);
+    lget(LT1); i32c(vm.heapEnd); op1(0x4E); op1(0x72);
+  };
+  const noRoom = () => { gget(G_VA); i32c(32); op1(0x6A); i32c(vm.heapEnd); op1(0x4A); };   // va + 32 > heapEnd
+  const unbox = (r) => {                                    // f64 of a validated boxed float
+    for (let k = 1; k <= 4; k++) {
+      get(r); adr(4 * k - 9); ld32(); i32c(1); op1(0x76); i32c(0xFFFF); op1(0x71); op1(0xAD);
+      if (k < 4) { o.push(0x42); sleb(o, 64 - 16 * k); op1(0x86); }
+      if (k > 1) op1(0x84);                                 // i64.or
+    }
+    op1(0xBF);                                              // f64.reinterpret_i64
+  };
+  const box = (subtag, d) => {                              // f64 on the stack -> a new boxed float in V<d>
+    lset(LF1); lget(LF1); op1(0xBD); lset(LI64);            // i64.reinterpret_f64
+    gget(G_VA); ltee(LT3); i32c(32); op1(0x6A); gset(G_VA);
+    lget(LT3); adr(); i32c((4 << 8) | subtag); st32();
+    for (let k = 0; k < 4; k++) {
+      lget(LT3); adr(4 + 4 * k);
+      lget(LI64); o.push(0x42); sleb(o, 48 - 16 * k); op1(0x88); op1(0xA7);   // i64.shr_u, i32.wrap
+      i32c(0xFFFF); op1(0x71); i32c(1); op1(0x74); st32();
+    }
+    for (let k = 5; k <= 7; k++) { lget(LT3); adr(4 * k); i32c(0); st32(); }
+    markBits(false);
+    lget(LT3); i32c(9); op1(0x72); set(d);
+  };
+  const laneAddr = (arr, idx) => {                          // LT2 = phys lane address; i32 bad on the stack
+    get(arr); lset(LT1);
+    lget(LT1); i32c(-5); op1(0x6A); get(idx); i32c(1); op1(0x75); i32c(2); op1(0x74); op1(0x6A); lset(LT2);
+    lget(LT1); i32c(15); op1(0x71); i32c(9); op1(0x47);
+    lget(LT2); i32c(vm.heapBase); op1(0x48); op1(0x72);
+    lget(LT2); i32c(vm.heapEnd); op1(0x4E); op1(0x72);
+    lget(LT2); i32c(-VBASE); op1(0x6A); lset(LT2);
+  };
+  const f64c = (v) => { const b = new Uint8Array(new Float64Array([v]).buffer); o.push(0x44); for (const x of b) o.push(x); };
+  const floatOp = (pc, op, b1, b2, b3) => {
+    const ARITH = { 0: 0xA0, 1: 0xA1, 2: 0xA2, 3: 0xA3 };
+    if (op >= 0xBE && op <= 0xC1) {
+      badFloat(b2); badFloat(b3); op1(0x72); noRoom(); op1(0x72);
+      IF(); delegate(pc); ELSE(); unbox(b2); unbox(b3); op1(ARITH[op - 0xBE]); box(0x60, b1); END();
+    } else if (op === 0xF4 || op === 0xD0) {
+      badFloat(b2); noRoom(); op1(0x72);
+      IF(); delegate(pc); ELSE(); unbox(b2); if (op === 0xF4) op1(0x9F); else fround(); box(op === 0xF4 ? 0x60 : 0x64, b1); END();
+    } else if (op === 0xC2) {
+      noRoom();
+      IF(); delegate(pc); ELSE(); get(b2); i32c(1); op1(0x75); op1(0xB7); box(0x60, b1); END();
+    } else if (op === 0xC4) {
+      badFloat(b1); badFloat(b2); op1(0x72);
+      IF(); delegate(pc); ELSE();
+        unbox(b1); lset(LF2); unbox(b2); lset(LF1);
+        lget(LF2); lget(LF1); op1(0x64); lget(LF2); lget(LF1); op1(0x63); op1(0x6B); lset(LCMP);   // (x>y)-(x<y)
+      END();
+    } else if (op === 0xEB || op === 0xD1) {
+      badFloat(b2);
+      IF(); delegate(pc); ELSE(); unbox(b2); if (op === 0xD1) fround(); frSt(b1); END();
+    } else if (op === 0xEC || op === 0xD2) {
+      noRoom();
+      IF(); delegate(pc); ELSE(); frLd(b2); box(op === 0xEC ? 0x60 : 0x64, b1); END();
+    } else if (op === 0xE1) { frLd(b2); frSt(b1); }
+    else if ((op >= 0xD5 && op <= 0xD8) || (op >= 0xED && op <= 0xF0)) {
+      const k = op <= 0xD8 ? op - 0xD5 : op - 0xED;
+      frLd(b2); frLd(b3); op1(ARITH[k]); if (op <= 0xD8) fround(); frSt(b1);
+    } else if (op === 0xF1) { get(b2); i32c(1); op1(0x75); op1(0xB7); frSt(b1); }
+    else if (op === 0xF2 || op === 0xF3) { frLd(b2); frLd(b3); op1(op === 0xF2 ? 0x63 : 0x65); i32c(1); op1(0x74); set(b1); }
+    else if (op === 0xFA || op === 0xFB) {
+      const hi = rd32(pc + 2) >>> 0, lo = rd32(pc + 6) >>> 0;
+      const u = new Uint32Array([lo, hi]); let v = new Float64Array(u.buffer)[0];
+      if (op === 0xFB) v = Math.fround(v);
+      f64c(v); frSt(b1);
+    } else if (op === 0xD3 || op === 0xCE) {
+      laneAddr(b2, b3);
+      if (op === 0xCE) { noRoom(); op1(0x72); }
+      IF(); delegate(pc); ELSE();
+        lget(LT2); o.push(0x2A, 0x02, 0x00); op1(0xBB);      // f32.load, promote
+        if (op === 0xD3) frSt(b1); else box(0x64, b1);
+      END();
+    } else if (op === 0xD4 || op === 0xCF) {
+      laneAddr(b1, b2);
+      if (op === 0xCF) { badFloat(b3); op1(0x72); }
+      IF(); delegate(pc); ELSE();
+        lget(LT2);
+        if (op === 0xD4) frLd(b3); else unbox(b3);
+        op1(0xB6); o.push(0x38, 0x02, 0x00);                 // demote, f32.store
+      END();
+    }
+  };
   const delegate = (pc) => { STOREv(); i32c(pc); call(F_EXEC); lset(LCMP); LOAD(); };
 
   const bodies = [];
@@ -558,6 +655,13 @@ function compile(vm, entry, osr) {
         END();
         break;
       }
+      case 0xBE: case 0xBF: case 0xC0: case 0xC1: case 0xF4: case 0xD0: case 0xC2:
+      case 0xC4: case 0xEB: case 0xD1: case 0xEC: case 0xD2: case 0xE1:
+      case 0xD5: case 0xD6: case 0xD7: case 0xD8: case 0xED: case 0xEE: case 0xEF: case 0xF0:
+      case 0xF1: case 0xF2: case 0xF3: case 0xFA: case 0xFB: case 0xD3: case 0xD4: case 0xCE: case 0xCF:
+        if (NOFLOAT) { delegate(pc); break; }
+        floatOp(pc, op, b1, b2, b3);
+        break;
       case 0xB9: case 0x68: case 0xC8: {
         // ALLOC with a count in a register: string (#x31, count = the register,
         // not filled, as vm.allocObj), array (#x32, filled), u8 vector (#x11,
@@ -871,7 +975,8 @@ function compile(vm, entry, osr) {
   // The code section is sized first and every body copied ONCE, straight
   // into the module's bytes: pushing each byte through three JS arrays was
   // most of the translator's time (7.9 of 13 s on web-mvm-calls).
-  const hdrs = allBodies.map((ob) => { const h = []; uleb(h, ob.length + 3); h.push(1); uleb(h, NLOCALS); h.push(I32); return h; });
+  const LOCDECL = [3, NLOCALS, I32, 1, I64, 2, F64];
+  const hdrs = allBodies.map((ob) => { const h = []; uleb(h, ob.length + LOCDECL.length); for (const x of LOCDECL) h.push(x); return h; });
   let codeLen = 0; { const t = []; uleb(t, allBodies.length); codeLen = t.length; }
   for (let k = 0; k < allBodies.length; k++) codeLen += hdrs[k].length + allBodies[k].length;
   mod.push(10); uleb(mod, codeLen); uleb(mod, allBodies.length);

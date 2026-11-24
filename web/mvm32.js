@@ -104,6 +104,14 @@ const DBG = (typeof process !== 'undefined' && process.env) ? process.env : {};
 const FN_UNRESOLVED = 0xFFFFFFF0;
 
 class LongJmp { constructor(esp, ip) { this.esp = esp; this.ip = ip; } }
+// With Wasm code on the stack a longjmp is a WebAssembly.Exception of this tag
+// (Wasm cannot catch a JS object); ljOf() turns either form into a LongJmp.
+const LJ_TAG = typeof WebAssembly !== 'undefined' && WebAssembly.Tag ? new WebAssembly.Tag({ parameters: ['i32', 'i32'] }) : null;
+function ljOf(e) {
+  if (e instanceof LongJmp) return e;
+  if (LJ_TAG && e instanceof WebAssembly.Exception && e.is(LJ_TAG)) return new LongJmp(e.getArg(LJ_TAG, 0), e.getArg(LJ_TAG, 1));
+  return null;
+}
 class MvmExit { constructor(code) { this.code = code; } }
 class MvmFault extends Error {}
 
@@ -182,8 +190,18 @@ class MVM {
     this.heapBase = HEAP_ADDR;
     this.heapEnd = HEAP_ADDR + 2 * this.semi + GUARD;
     if (this.heapEnd > ADDR_LIMIT) throw new Error(`semispace ${this.semi >> 20} MB puts the heap past 2^30 (the 30-bit word limit)`);
-    const size = this.heapEnd - VBASE;
-    this.buf = new ArrayBuffer(size);
+    // The two GC bitmaps (1 bit / 16-byte granule) follow the heap in the same
+    // buffer, so translated Wasm code can mark an allocation inline.
+    const bmpBytes = (((this.heapEnd - this.heapBase) >> 4) >> 3) + 16;
+    this.bmpOff = (this.heapEnd - VBASE + 15) & ~15;
+    const size = this.bmpOff + 2 * bmpBytes;
+    // A WebAssembly.Memory when the engine has one, so translated Wasm code
+    // (wasm32.js, MVM_WASM=1) and this VM share the same bytes.
+    if (typeof WebAssembly !== 'undefined') {
+      const pages = Math.ceil(size / 65536);
+      this.wmem = new WebAssembly.Memory({ initial: pages, maximum: pages });
+      this.buf = this.wmem.buffer;
+    } else this.buf = new ArrayBuffer(size);
     this.m8 = new Uint8Array(this.buf);
     this.m32 = new Int32Array(this.buf);
     this.dv = new DataView(this.buf);
@@ -192,8 +210,10 @@ class MVM {
     this.f64u32 = new Uint32Array(this.f64.buffer);
     this.fr = new Float64Array(16);
     const granules = (this.heapEnd - this.heapBase) >> 4;
-    this.startBmp = new Uint8Array((granules >> 3) + 1);
-    this.consBmp = new Uint8Array((granules >> 3) + 1);
+    if (DBG.MVM_OLD_BMP) { this.startBmp = new Uint8Array((granules >> 3) + 1); this.consBmp = new Uint8Array((granules >> 3) + 1); } else {
+    this.startBmp = new Uint8Array(this.buf, this.bmpOff, (granules >> 3) + 1);
+    this.consBmp = new Uint8Array(this.buf, this.bmpOff + bmpBytes, (granules >> 3) + 1); }
+    this.consBmpOff = this.bmpOff + bmpBytes;
     this.pageBase = this.heapBase + ALLOC_START_OFF;
     this.mmapNext = JIT_ADDR;
     this.code = this.m8;
@@ -704,9 +724,16 @@ class MVM {
     this.ebp = ebp; this.esp = esp; this.pc = ip;
     this.m32[((ebp - VBASE) >> 2) + IX4] = v4;
     this.vrl = TV;
+    if (WASM) throw new WebAssembly.Exception(LJ_TAG, [esp, ip]);
     throw new LongJmp(esp, ip);
   }
 
+  dumpFrame(who) {
+    const b = (this.ebp - VBASE) >> 2, m32 = this.m32, r = [], sl = [];
+    for (let v = 0; v < 16; v++) r.push(this.describe(m32[b + IX[v]]));
+    for (let k = 0; k < 8; k++) sl.push(this.describe(m32[b + (slotOff(k) >> 2)]));
+    this.host.log(`[land ${who} ip=${this.where(this.pc)} VR=${this.describe(this.vrl)} regs ${r.join(',')} slots ${sl.join(',')}]`);
+  }
   // -- traps ------------------------------------------------------------------------
   trap(codeNum, nextPc) {
     const h = this.host;
@@ -896,7 +923,9 @@ class MVM {
     for (;;) {
       try { this.loop(); return; }
       catch (e) {
-        if (e instanceof LongJmp && e.esp <= baseEsp) { this.jd = jd0; continue; }
+        const lj = ljOf(e);
+        if (DBG.MVM_WASM_DEBUG && lj) this.host.log(`[run catch lj.esp=${(lj.esp >>> 0).toString(16)} baseEsp=${(baseEsp >>> 0).toString(16)} ip=${this.where(lj.ip)} -> ${lj.esp <= baseEsp}]`);
+        if (lj && lj.esp <= baseEsp) { this.jd = jd0; continue; }
         throw e;
       }
     }
@@ -929,7 +958,7 @@ class MVM {
       const n = (this.osrCounts.get(t) || 0) + 1;
       if (n < OSR_THRESHOLD || this.trace > 1) { this.osrCounts.set(t, n); return t; }
       const t0 = performance.now();
-      f = this.compileFn(t, true);
+      f = (WASM && this.wmem && WASM.compile(this, t, true)) || this.compileFn(t, true);
       this.compileStats.ms += performance.now() - t0;
       this.osrCompiled.set(t, f);
       if (f) this.compileStats.osr++;
@@ -1308,16 +1337,17 @@ class MVM {
         let r;
         if (r0 !== undefined) { r = r0; r0 = undefined; }
         else try { r = f(this, L); }
-        catch (e) {
-          if (!(e instanceof LongJmp)) throw e;
+        catch (e0) {
+          const e = ljOf(e0);
+          if (!e) throw e0;
           this.jd = jd0;          // fast-path direct calls it unwound did not count down
           let found = false;
-          if (ebp === this.ebp && f.RES && f.RES[e.ip] !== undefined) { L = f.RES[e.ip]; found = true; }
+          if (ebp === this.ebp && f.RES && f.RES[e.ip] !== undefined) { L = f.RES[e.ip]; found = true; if (DBG.MVM_WASM_DEBUG) this.dumpFrame('drive'); }
           while (!found && d > base) {
             d--;
             if (ce[d] === this.ebp && cf[d].RES && cf[d].RES[e.ip] !== undefined) { f = cf[d]; L = cf[d].RES[e.ip]; ebp = ce[d]; found = true; }
           }
-          if (!found) throw e;
+          if (!found) throw e0;
           continue;
         }
         if (r < 0) {
@@ -1336,15 +1366,16 @@ class MVM {
         else {
           this.contDepth = d;
           try { this.run(); }
-          catch (e) {
-            if (!(e instanceof LongJmp)) throw e;
+          catch (e0) {
+            const e = ljOf(e0);
+            if (!e) throw e0;
             this.jd = jd0;
             let found = false;
             while (!found && d > base) {
               d--;
               if (ce[d] === this.ebp && cf[d].RES && cf[d].RES[e.ip] !== undefined) { f = cf[d]; L = cf[d].RES[e.ip]; ebp = ce[d]; found = true; }
             }
-            if (!found) throw e;
+            if (!found) throw e0;
             continue;
           }
           if (d === base) return;
@@ -1360,7 +1391,10 @@ class MVM {
     const n = (this.callCounts.get(t) || 0) + 1;
     if (n < this.compileThreshold) { this.callCounts.set(t, n); return null; }
     const t0 = performance.now();
-    const g = this.compileFn(t);
+    let g = null;
+    if (WASM && this.wmem) g = WASM.compile(this, t, false);
+    if (g && g.wexp) WASM.install(this, t, g);
+    if (!g) g = this.compileFn(t);
     this.compileStats.ms += performance.now() - t0;
     this.compiled.set(t, g);
     return g;
@@ -1788,5 +1822,13 @@ class MVM {
 }
 
 const MVM_EXPORTS = { MVM, loadModule, MvmFault, MvmExit, NIL, TV, VBASE };
+// MVM_WASM=1: translate to WebAssembly (web/wasm32.js) instead of JS.
+let WASM = null;
+if (typeof process !== 'undefined' && process.env && process.env.MVM_WASM && typeof require !== 'undefined') {
+  WASM = require('./wasm32.js');
+  WASM.init({ VBASE, NIL, TV, IX, slotOff, FRAME_SIZE, INSN_LEN, JIT_PHYS, A_WEB_CONSTS, POOL_ADDR,
+              A_MVCOUNT, A_CENV, A_NARGS, RET_SENTINEL, FN_UNRESOLVED, frameEnterParams, ldbMask,
+              JD_MAX, LongJmp, BACK_BRANCH, frameBytes, STACK_ADDR, LJ_TAG });
+}
 if (typeof module !== 'undefined' && module.exports) module.exports = MVM_EXPORTS;
 else if (typeof self !== 'undefined') self.MVM_EXPORTS = MVM_EXPORTS;

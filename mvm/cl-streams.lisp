@@ -37,6 +37,11 @@
 (defun %stream-type (s)
   (car (cdr s)))
 
+;; INLINE, as the file stream's slot accessors built on it (cl-fileio.lisp): a
+;; stream is a list, and every accessor was a call walking it -- a dozen calls a
+;; character written to a file (cl-bench FPRINT).  Honoured by the image build
+;; (*AOT-INLINE*); a caller compiled before this definition keeps its call.
+(declaim (inline %stream-data))
 (defun %stream-data (s)
   (cdr (cdr s)))
 

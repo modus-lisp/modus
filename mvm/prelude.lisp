@@ -1826,11 +1826,27 @@
           (let ((pair (car cur)))
             (when (eq (car pair) key) (return pair)))
           (setq cur (cdr cur)))
-        (loop
-          (when (null cur) (return nil))
-          (let ((pair (car cur)))
-            (when (funcall cmp (car pair) key) (return pair)))
-          (setq cur (cdr cur))))))
+        (if (and (stringp key) (eq cmp (function %equal-fn)))
+            ;; A STRING KEY OF AN EQUAL TABLE: EQUAL of two strings is STRING=, and
+            ;; a length that differs settles it without the call.  A package's
+            ;; small symbol tables are these: a FIND-SYMBOL miss in CL-USER
+            ;; funcalled EQUAL on every name in it, for every symbol printed.
+            ;; (a raw wide string's length is its object's: LENGTH's generic
+            ;; dispatch was a tenth of the scan)
+            (let ((n (if (%prim-simple-string-p key) (%prim-array-length key) (length key))))
+              (loop
+                (when (null cur) (return nil))
+                (let* ((pair (car cur)) (k (car pair)))
+                  (when (and (stringp k)
+                             (= (if (%prim-simple-string-p k) (%prim-array-length k) (length k)) n)
+                             (string= k key))
+                    (return pair)))
+                (setq cur (cdr cur))))
+            (loop
+              (when (null cur) (return nil))
+              (let ((pair (car cur)))
+                (when (funcall cmp (car pair) key) (return pair)))
+              (setq cur (cdr cur)))))))
 
 ;;; PAIRS OF A COMPACT DICT.  A table whose (KEY . VALUE) pairs are held outside
 ;;; it -- the symbol-function table: the JIT bridge's and the interpreter's call

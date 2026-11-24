@@ -133,6 +133,8 @@
   (apply *cab-call* op args))
 
 (defun %cab-fd-entry (fd) (assoc fd *cab-fds*))
+;; inline: asked of every byte written to a file (%FS-WBUF-P), and NIL at once on every hosted image
+(declaim (inline %cab-fd-p))
 (defun %cab-fd-p (fd) (and *cab-call* (>= fd 900) (%cab-fd-entry fd)))
 
 ;;; SOCKET DESCRIPTORS ON BARE METAL.  The cabinet's pattern again: a descriptor >= 2000 that
@@ -140,6 +142,7 @@
 ;;; its close / read / write / flush / readiness to that function instead of a syscall.  NIL
 ;;; (every hosted image) leaves every path exactly as it was.
 (defvar *net-fd-call* nil)
+(declaim (inline %net-fd-p))     ; as %CAB-FD-P
 (defun %net-fd-p (fd) (and *net-fd-call* (integerp fd) (>= fd 2000) (funcall *net-fd-call* :fd-p fd)))
 
 (defun %cab-fd-open (path pos)
@@ -480,6 +483,11 @@
   "Create a closed/dummy file stream."
   (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 (cons nil (cons 0 (cons t (cons (quote character) (cons nil t)))))))))))))
 
+;; inline, as %STREAM-DATA (cl-streams.lisp)
+(declaim (inline %fs-fd %fs-dir %fs-pos-cell %fs-pos %fs-buf %fs-bpos-cell %fs-bpos %fs-blen-cell %fs-blen
+                 %fs-obuf %fs-olen %fs-set-olen %fs-closed-cell %fs-closed %fs-element-type %fs-ef-cell
+                 %fs-external-format %fs-at-bol-p %fs-note-byte %fs-latin-1-p
+                 %fs-set-pos %fs-set-bpos %fs-set-blen %fs-set-closed))
 (defun %fs-fd      (s) (car  (%stream-data s)))
 (defun %fs-dir     (s) (cadr (%stream-data s)))
 (defun %fs-pos-cell (s) (cddr (%stream-data s)))
@@ -856,6 +864,7 @@
   "STREAM on FD may hold buffered output (an output-only regular file)."
   (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd)) (not (%net-fd-p fd))))
 
+(declaim (inline %fs-wbuf-p %fs-obuf-p))   ; per byte written (%FS-PUT-BYTE)
 (defun %fs-wbuf-p (stream fd)
   ;; Unarmed images only: a worker thread writing a file would put its stream
   ;; on the global *FS-BUFFERED-STREAMS* -- a worker object in shared memory,

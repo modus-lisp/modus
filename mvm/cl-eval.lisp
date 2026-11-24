@@ -3402,8 +3402,11 @@
   "Allocate a SMALL bignum from (lo, hi) two's-complement parts."
   (let ((b (%make-bignum))) (aset b 0 lo) (aset b 1 hi) b))
 
-(defun bignum-lo (b) (aref b 0))
-(defun bignum-hi (b) (aref b 1))
+;; %WORD-AREF, not AREF: a bignum (subtag #x30) is none of AREF's inline
+;; shapes, so AREF sent every limb read through %AREF-SLOW's whole type
+;; dispatch to its last arm -- 31% of FRPOLY/FLOAT on the 32-bit web image.
+(defun bignum-lo (b) (%word-aref b 0))
+(defun bignum-hi (b) (%word-aref b 1))
 
 ;;; --- Big-bignum (arbitrary-precision N-limb) infrastructure ---
 
@@ -3412,9 +3415,9 @@
 (defun big-bignum-p (x)
   "True if X is a big-bignum (slot 0 sentinel).  Caller is expected to
    have already verified X is a bignum via `bignump`."
-  (= (aref x 0) +bn-sentinel+))
+  (eql (%word-aref x 0) +bn-sentinel+))
 
-(defun %bb-data (b) (aref b 1))                     ; the limbs array
+(defun %bb-data (b) (%word-aref b 1))                     ; the limbs array
 (defun %bb-sign (b) (aref (%bb-data b) 0))           ; +1 / -1
 (defun %bb-nlimbs (b) (aref (%bb-data b) 1))         ; limb count
 (defun %bb-limb (b k) (aref (%bb-data b) (+ 2 k)))   ; k-th limb (LSB-first)

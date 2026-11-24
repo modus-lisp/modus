@@ -2510,18 +2510,50 @@
   "Whether stores get the shared-store guard: hosted with per-thread windows."
   (and *a64-tls-window* t))
 
+;;; THE BARRIERS' GATES, INLINE.  The shared-store guard and the card barrier are out-of-line subroutines (one
+;;; copy each: a copy per site was 1.8 MB of the image), each opening with "is this on?" -- the threads-live gate
+;;; word, the card table's base -- and almost always answering no.  A store still went out and back to ask: two
+;;; register moves, ADR, B, the subroutine's load and test, and BR x9 home, an indirect branch, around every heap
+;;; store.  The question is now asked at the site -- the word loaded, CBZ past the call -- and the subroutine
+;;; asks it again when it is on.  Three or four instructions and no branch taken when off.
+(defun a64-emit-gate-skip (buf addr wide)
+  "Load the gate at convention ADDR (64-bit when WIDE, else 32) into x12 and emit a CBZ x12 to be patched
+   past what follows; returns the CBZ's index for A64-PATCH-GATE-SKIP.  Clobbers x12."
+  (if (and (a64-pcrel-p)
+           (not (and *a64-x18-base* (>= addr +a64-conv-base+) (< addr (+ +a64-conv-base+ #x1000)))))
+      ;; ADRP to the gate's page, the load at its offset in the page: the ADD of A64-LOAD-REAL-ADDR folded
+      ;; into the LDR (both resolvers patch the ADRP alone; the word's low 12 bits never move)
+      (let ((real (conv-real addr)))
+        (a64-add-fixup buf (a64-current-index buf) real :adrp-abs)
+        (a64-adrp buf +a64-x12+ 0)
+        (if wide
+            (a64-ldr-unsigned buf +a64-x12+ +a64-x12+ (logand real #xFFF))
+            (a64-ldr32-unsigned buf +a64-x12+ +a64-x12+ (logand real #xFFF))))
+      (progn
+        (a64-load-conv-addr buf +a64-x12+ addr)
+        (if wide
+            (a64-ldr-unsigned buf +a64-x12+ +a64-x12+ 0)
+            (a64-ldr32-unsigned buf +a64-x12+ +a64-x12+ 0))))
+  (let ((i (a64-current-index buf)))
+    (a64-emit buf (logior #xB4000000 +a64-x12+))
+    i))
+
+(defun a64-patch-gate-skip (buf i)
+  "Point the CBZ at I (A64-EMIT-GATE-SKIP) here."
+  (setf (aref (a64-buffer-code buf) i)
+        (logior #xB4000000 (ash (logand (- (a64-current-index buf) i) #x7FFFF) 5) +a64-x12+)))
+
 (defun a64-emit-shared-store-guard (buf value target)
   "Call the guard with VALUE (a register) about to be stored into TARGET (the
    tagged object).  Clobbers x9-x15."
   (unless *a64-ssg-label* (setq *a64-ssg-label* (incf *mvm-label-counter*)))
   (a64-mov-reg buf +a64-x10+ value)
   (a64-mov-reg buf +a64-x11+ target)
-  (let ((adr (a64-current-index buf)))
-    (a64-emit buf (logior #x10000000 +a64-x9+))       ; ADR x9, <return>
-    (a64-emit-call-label buf *a64-ssg-label* t)       ; B guard (any length)
-    (setf (aref (a64-buffer-code buf) adr)
-          (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
-                  +a64-x9+))))
+  ;; the threads-live gate (0x10000DB8), asked here once the operands are in x10/x11 (either may have been
+  ;; x12): single-threaded, no call.  BL, and the guard RETs: see A64-EMIT-CARD-CALL
+  (let ((gate (a64-emit-gate-skip buf #x10000DB8 nil)))
+    (a64-emit-call-label buf *a64-ssg-label*)
+    (a64-patch-gate-skip buf gate)))
 
 ;;; ---- BULK-MOVE / BULK-FILL bodies (as/objdump on the Pi 5, 2026-10-13) ----
 ;;; Fixed blocks; every branch is relative and lands inside its block (each
@@ -2626,10 +2658,12 @@
                 (ash (logand (- (a64-current-index buf) idx) #x7FFFF) 5))))
 
 (defun a64-emit-shared-store-guard-sub (buf label)
-  "The guard: x10 = value, x11 = target, x9 = return address.  Traps if the
+  "The guard: x10 = value, x11 = target, entered by BL (x30 the return; copied to x9, which a refusal
+   records as the site).  Traps if the
    value is a heap object in this thread's region pair and the target is not."
   (let ((rets nil) (vmine 0))
     (a64-set-label buf label)
+    (a64-mov-reg buf +a64-x9+ +a64-x30+)                ; the site, for a refusal (entered by BL)
     ;; The threads gate: closed in every single-threaded process.
     (a64-load-conv-addr buf +a64-x12+ #x10000DB8)
     (a64-ldr32-unsigned buf +a64-x12+ +a64-x12+ 0)
@@ -2672,7 +2706,7 @@
     (a64-str-unsigned buf +a64-x13+ +a64-x12+ 24)       ; +0x5058
     (a64-emit buf #x00000000)                           ; UDF #0
     (dolist (idx rets) (a64-ssg-branch-here buf idx))
-    (a64-br buf +a64-x9+)))
+    (a64-emit buf #xD65F03C0)))                         ; RET
 
 ;;; CARD-MARKING WRITE BARRIER (generational GC stage 2, docs/generational-gc.md).
 ;;; After a heap store, the card (512 bytes) holding the stored-to slot is
@@ -2724,13 +2758,12 @@
   (and (<= 0 r 30) (not (<= +a64-x9+ r +a64-x15+)) (/= r 18)))
 
 (defun a64-emit-card-call (buf label)
-  "ADR x9, <return>; B LABEL."
-  (let ((adr (a64-current-index buf)))
-    (a64-emit buf (logior #x10000000 +a64-x9+))       ; ADR x9, <return>
-    (a64-emit-call-label buf label t)                 ; B barrier
-    (setf (aref (a64-buffer-code buf) adr)
-          (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
-                  +a64-x9+))))
+  "BL LABEL; the barrier RETs.  It was ADR x9, <return>; B LABEL, and the barrier came home with BR x9: ONE
+   indirect branch shared by every store in the image, whose target the predictor could not keep -- on a
+   store-heavy loop the barrier, off and doing nothing else, was a fifth of the time (ctak) and more
+   (bitvectors).  BL / RET goes through the return-address stack, which is always right.  x30 is free in a
+   body: every translated function saves it in its prologue (these calls come only from translated code)."
+  (a64-emit-call-label buf label))
 
 (defun a64-emit-card-mark-range (buf first last)
   "Mark the cards of the bytes FIRST..LAST (registers, inclusive) dirty.
@@ -2738,7 +2771,9 @@
   (let ((labels (a64-card-labels)))
     (unless (= first +a64-x10+) (a64-mov-reg buf +a64-x10+ first))
     (unless (= last +a64-x11+) (a64-mov-reg buf +a64-x11+ last))
-    (a64-emit-card-call buf (aref labels 1))))
+    (let ((gate (a64-emit-gate-skip buf +gc-card-base-addr+ t)))
+      (a64-emit-card-call buf (aref labels 1))
+      (a64-patch-gate-skip buf gate))))
 
 (defun a64-emit-card-mark (buf addr offset)
   "Mark the card of the slot at ADDR+OFFSET (ADDR a register; a tagged object
@@ -2747,19 +2782,25 @@
    marks the one or two cards the slot can be in (over-marking only costs a
    card scan).  Clobbers x9-x15."
   (when *a64-card-barrier*
-    (let ((labels (a64-card-labels)))
+    (let ((labels (a64-card-labels)) (gate nil))
+      ;; the card table's base (0 = no table), asked here: no table, no call.  A register entry's ADDR is never
+      ;; x9-x15 (A64-CARD-REG-ENTRY-P), so the gate's x12 cannot be it; any other ADDR is in x10 first.
       (cond ((and (= offset 0) (a64-card-reg-entry-p addr))
+             (setq gate (a64-emit-gate-skip buf +gc-card-base-addr+ t))
              (a64-emit-card-call buf (aref labels (+ 2 (* 2 addr)))))
             ((and (<= 0 offset 255) (a64-card-reg-entry-p addr))
+             (setq gate (a64-emit-gate-skip buf +gc-card-base-addr+ t))
              (a64-emit-card-call buf (aref labels (+ 3 (* 2 addr)))))
             (t
              (if (> offset 0)
                  (a64-add-imm buf +a64-x10+ addr offset)
                  (a64-mov-reg buf +a64-x10+ addr))
-             (a64-emit-card-call buf (aref labels 0)))))))
+             (setq gate (a64-emit-gate-skip buf +gc-card-base-addr+ t))
+             (a64-emit-card-call buf (aref labels 0))))
+      (a64-patch-gate-skip buf gate))))
 
 (defun a64-emit-card-mark-sub (buf labels)
-  "The barrier (see A64-CARD-NEW-LABELS for its entries).  x9 = return."
+  "The barrier (see A64-CARD-NEW-LABELS for its entries).  Entered by BL (an entry B's on), returns RET."
   (let ((ret (incf *mvm-label-counter*))
         (inrange (incf *mvm-label-counter*))
         (loop-l (incf *mvm-label-counter*)))
@@ -2797,7 +2838,7 @@
     (a64-cmp-reg buf +a64-x10+ +a64-x11+)
     (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i loop-l :bcond)) ; LS
     (a64-set-label buf ret)
-    (a64-br buf +a64-x9+)))
+    (a64-emit buf #xD65F03C0)))                         ; RET (entered by BL)
 
 (defconstant +a64-darwin-sys-set-thread-delta+ 1000
   "Pseudo-syscall number the Darwin host shim answers by storing x0 in the

@@ -122,13 +122,14 @@
   (load (merge-pathnames "../lib/load-mvm.lisp"
                          (directory-namestring (truename *load-truename*)))))
 
-;;; THE RUNTIME NATIVE TIERS, ON BY DEFAULT on the CLIs that have one (2026-11-22):
-;;; i386 (mvm/jit-i386-native.lisp) and 68k (mvm/jit-68k.lisp, jit-68k-native.lisp).
-;;; MODUS_I386_JIT=0 / MODUS_68K_JIT=0 builds the interpret-only image.  The bare Mac
-;;; (build-cl-repl-common) keeps its own rule: its map needs a :JIT-AREA.
+;;; THE RUNTIME NATIVE TIERS on the CLIs that have one: i386 (mvm/jit-i386-native.lisp)
+;;; and 68k (mvm/jit-68k.lisp, jit-68k-native.lisp).  OPT-IN: MODUS_I386_JIT=1 /
+;;; MODUS_68K_JIT=1.  Not default-safe yet (CLAUDE.md: the i386 sweep with it on is
+;;; 21653/21681), and a default here also reached the bare i386 images, which build
+;;; through this file with *CLI-ARCH* :I386.  The bare Mac keeps its own rule.
 (defun %cli-tier-knob (name)
   (let ((v (sb-ext:posix-getenv name)))
-    (if (and v (plusp (length v))) (string= v "1") t)))
+    (and v (string= v "1"))))
 (defvar *cli-68k-jit*
   (and (boundp '*cli-arch*) (eq *cli-arch* :68k) (%cli-tier-knob "MODUS_68K_JIT")))
 (defvar *cli-i386-jit*

@@ -986,6 +986,9 @@
         ;; literal.  Same fix as %selfhost-compile-file-uefi.
         (setq *static-keywords-p* t)
         (setq *static-symbols-p* t)
+        ;; packed boot tables (build-cli-common *PACKED-BOOT-TABLES*): the host compiles
+        ;; the init thunks batched, a compiler setting that the source does not carry
+        (when (search \"(defun %sft-auto-text\" src) (setq *init-globals-batched* t))
         (setq *mvm-emit-halves* nil)
         ;; WS5 DECISIVE: force mvm-eval-runtime-p NIL for the OUTPUT codegen — the
         ;; EXACT config modus2-hoststatic uses (which BOOTS + --version works
@@ -1164,6 +1167,9 @@
         ;; diverged at the first symbol literal, 61,440 bytes shorter overall.
         (setq *static-keywords-p* t)
         (setq *static-symbols-p* t)
+        ;; packed boot tables (build-cli-common *PACKED-BOOT-TABLES*): the host compiles
+        ;; the init thunks batched, a compiler setting that the source does not carry
+        (when (search \"(defun %sft-auto-text\" src) (setq *init-globals-batched* t))
         ;; The cons-kind reject is ON for bare x64 (build-cl-repl-common,
         ;; 2026-10-01: off, 3 of 4 library loads died); this must say the same
         ;; or the DDC diverges -- it did, by 61,440 bytes, when SBCL emitted the
@@ -1254,6 +1260,9 @@
         ;; and test/ddc-aarch64-host.lisp sets them on the SBCL side
         (setq *static-keywords-p* t)
         (setq *static-symbols-p* t)
+        ;; packed boot tables (build-cli-common *PACKED-BOOT-TABLES*): the host compiles
+        ;; the init thunks batched, a compiler setting that the source does not carry
+        (when (search \"(defun %sft-auto-text\" src) (setq *init-globals-batched* t))
         (when (search \"(defun %console-write-char\" src)
           (setq *write-char-serial-hook* (quote %console-write-char)))
         ;; Same three codegen knobs the x64 self-compile path uses; they are
@@ -1315,6 +1324,9 @@
         (%init-riscv32-translator)
         (setq *static-keywords-p* t)
         (setq *static-symbols-p* t)
+        ;; packed boot tables (build-cli-common *PACKED-BOOT-TABLES*): the host compiles
+        ;; the init thunks batched, a compiler setting that the source does not carry
+        (when (search \"(defun %sft-auto-text\" src) (setq *init-globals-batched* t))
         (when (search \"(defun %console-write-char\" src)
           (setq *write-char-serial-hook* (quote %console-write-char)))
         (setq *static-build-p* t)

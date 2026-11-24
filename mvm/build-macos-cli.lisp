@@ -74,26 +74,29 @@
       (read-sequence b s)
       b)))
 
-(let* ((image-path (or (macos-env "MODUS_MACOS_IMAGE") (error "build-macos-cli: set MODUS_MACOS_IMAGE")))
-       (out (macos-env "MODUS_MACOS_OUT" "modus"))
+;;; From here on the forms read in MODUS.MACHO and name its symbols unqualified: every build
+;;; READs this file before that package exists (build-checks CHECK E), and a qualified
+;;; MODUS.MACHO:NAME would fail that read and stop every build in the tree.
+(in-package :modus.macho)
+
+(let* ((image-path (or (cl-user::macos-env "MODUS_MACOS_IMAGE")
+                       (error "build-macos-cli: set MODUS_MACOS_IMAGE")))
+       (out (cl-user::macos-env "MODUS_MACOS_OUT" "modus"))
        (leaf (let ((s (position #\/ out :from-end t))) (if s (subseq out (1+ s)) out)))
-       (elf (macos-read image-path))
-       (obj (modus.macho:compile-shim
-             (modus.macho:read-shim-file (merge-pathnames "host/macos/shim.lisp" *macos-tree*)))))
+       (elf (cl-user::macos-read image-path))
+       (obj (compile-shim (read-shim-file (merge-pathnames "host/macos/shim.lisp" cl-user::*macos-tree*))))
+       (sha #'cl-user::macos-sha256))
   #+modus (funcall (find-symbol "JIT-EAGER" "MODUS"))      ; the hashing loop: native first
-  (multiple-value-bind (bytes layout)
-      (modus.macho::build-macho obj elf :ident leaf :sha256 #'macos-sha256)
-    (let ((nseg (modus.macho::verify-macho bytes #'macos-sha256 :elf elf)))
+  (multiple-value-bind (bytes layout) (build-macho obj elf :ident leaf :sha256 sha)
+    (let ((nseg (verify-macho bytes sha :elf elf)))
       (with-open-file (o out :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
         (write-sequence bytes o))
-      (let ((map (macos-env "MODUS_MACOS_SHIM_MAP")))
+      (let ((map (cl-user::macos-env "MODUS_MACOS_SHIM_MAP")))
         (when map
           (with-open-file (o map :direction :output :if-exists :supersede)
-            (dolist (f (modus.macho::shim-object-functions obj))
-              (format o "~(~16,'0X~) ~A~%"
-                      (modus.macho::label-vma obj layout f) (modus.macho::mangle f))))))
+            (dolist (f (shim-object-functions obj))
+              (format o "~(~16,'0X~) ~A~%" (label-vma obj layout f) (mangle f))))))
       (format t "~&build-macos-cli: ~A, ~D bytes (host code ~D bytes, ~D imports, ~D segments, ~
                  signature ~D bytes); verified~%"
-              out (length bytes) (* 4 (length (modus.macho::shim-object-text obj)))
-              (length (modus.macho::shim-object-imports obj)) nseg
-              (modus.macho::layout-sig-size layout)))))
+              out (length bytes) (* 4 (length (shim-object-text obj)))
+              (length (shim-object-imports obj)) nseg (layout-sig-size layout)))))

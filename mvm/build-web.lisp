@@ -368,6 +368,17 @@
 (defun %web-thunk-point (key fn)
   (let ((a (and (hash-table-p *web-thunks*) (gethash key *web-thunks*))))
     (when a (%web-put-tailcall (+ a 2) (%val->word fn)))))
+;; NAME was (re)defined or unbound (mvm-eval's redefinition hook and FMAKUNBOUND
+;; call this with ADDR NIL; x64's version retargets a linkage stub): put its
+;; thunk back to late binding -- +2 is LI V5 again, so a call funcalls whatever
+;; NAME is now -- until the new definition goes native and %WEB-THUNK-POINT
+;; sends it there.  Without it a translated caller kept calling the OLD code.
+(defun %jit-x64-stub-retarget (name addr)
+  (let ((a (and (null addr) (hash-table-p *web-thunks*) (gethash name *web-thunks*))))
+    (when a
+      (%web-put-u32 (+ a 4) #x10000178)
+      (setf (mem-ref (+ a 3) :u8) 5)
+      (setf (mem-ref (+ a 2) :u8) #x11))))
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   (let* ((nlen (length bc))
          (psize (+ nlen 4096))
@@ -383,7 +394,7 @@
             (setq k (+ k 1))))
     (let* ((n (%rt-stub-count rt-table))
            (tab (make-array (if (< n 1) 1 n)))
-           (ok t) (k 0))
+           (ok t) (k 0) (native0 nil))
       (loop (when (>= k n) (return nil))
             (let* ((name (gethash (+ #x40000000 k) rt-table))
                    (fn (and name (%mvm-resolve-runtime-fn name)))
@@ -407,9 +418,24 @@
               ;; is at call time.  Without this, mutually recursive DEFUNs
               ;; (FRPOLY's PTIMES/PPLUS, BOYER's REWRITE/APPLY-SUBST) each
               ;; waited for the other to go native and all stayed interpreted.
+              (setq native0 (and fn (eql (logand word 15) 3)))
               (when (and fn (not (eql (logand word 15) 3)))
                 (let ((th (%web-late-thunk (%mvm-runtime-key name))))
                   (when th
+                    (setq fn (%word->val (%web-thunk-word th))
+                          word (%val->word fn)))))
+              ;; A runtime DEFUN that IS native (a JIT page, at or above the web
+              ;; VM's JIT_ADDR #x12400000; image functions are below): through its
+              ;; thunk too, pointed straight at the code, so that redefining it
+              ;; reaches this caller (%JIT-X64-STUB-RETARGET resets the thunk).
+              ;; Baking the address here was the web's runtime-redefinition bug.
+              ;; NATIVE0, not the tag now: a callee just swapped for its thunk is
+              ;; a JIT-page function too, and pointing a thunk at itself loops.
+              (when (and native0
+                         (>= (+ (ash word -4) #x10000000) #x12400000))
+                (let* ((key (%mvm-runtime-key name)) (th (%web-late-thunk key)))
+                  (when th
+                    (%web-thunk-point key fn)
                     (setq fn (%word->val (%web-thunk-word th))
                           word (%val->word fn)))))
               (if (eql (logand word 15) 3)

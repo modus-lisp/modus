@@ -1387,6 +1387,7 @@
             (puthash name *jit-x64-stubs* (cons a nil))
             a)))))
 
+(declaim (overridable %jit-x64-stub-retarget))   ; the web arm (build-web.lisp): its thunks
 (defun %jit-x64-stub-retarget (name addr)
   "NAME was (re)defined: point its stub, if it has one, at native ADDR -- or,
    with ADDR NIL, at a bridge that resolves NAME when called."

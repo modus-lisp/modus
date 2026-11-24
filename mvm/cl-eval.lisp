@@ -877,8 +877,12 @@
          (expander (car (%get-cenv))))
     (setq *%mexp-trace* nargs)
     (cond
+      ;; The expander's own shape, as MACROEXPAND-1 calls it (%RUN-EXPANDER :ONE-OR-TWO):
+      ;; (form) for modus's compiled expanders, (form env) for a function a program installed
+      ;; with (SETF MACRO-FUNCTION).  A bare one-argument call made that second kind signal
+      ;; PROGRAM-ERROR here though MACROEXPAND-1 of it worked.
       ((= nargs 2)
-       (funcall expander form))
+       (%run-expander expander :one-or-two form))
       (t (%signal-program-error)))))
 
 (defun %interp-macro-shim (form &rest extra)
@@ -1145,9 +1149,41 @@
         ;; cons that the compiled funcall path can't dispatch on.
         ;; macroexpand-1 below uses %raw-macro-expander directly to
         ;; bypass this wrapper and call %call-interp-closure straight.
-        ((%interp-closure-p raw)
-         (%make-closure #'%interp-macro-shim (cons raw nil)))
-        (t (%make-closure #'%macro-expander-shim (cons raw nil)))))))
+        ((%interp-closure-p raw) (%macro-shim-for raw t))
+        (t (%macro-shim-for raw nil))))))
+
+;;; ONE SHIM PER EXPANDER, AND THE WAY BACK FROM IT.
+;;;
+;;; MACRO-FUNCTION hands out a shim, not the expander: the shim arity-checks (form env) and
+;;; calls the expander with (form).  SET-MACRO-FUNCTION used to store whatever it was given, so
+;;; (SETF (MACRO-FUNCTION 'B) (MACRO-FUNCTION 'A)) stored A's SHIM as B's expander, the next
+;;; MACRO-FUNCTION of B wrapped it again, and the outer shim's one-argument call met the inner
+;;; one's two-argument check: (FUNCALL (MACRO-FUNCTION 'B) FORM NIL) signalled a bare
+;;; PROGRAM-ERROR, though MACROEXPAND-1 of B (which skips the shims) worked.  cortez installs
+;;; every TI fexpr's macro exactly so, and expands through *MACROEXPAND-HOOK*, which is handed
+;;; the shim -- every DEFPROP in their sources failed.
+;;;
+;;; So the shim made for an expander is remembered, both ways: MACRO-FUNCTION answers the same
+;;; shim each time (EQ, as SBCL's does), and SET-MACRO-FUNCTION handed one stores the expander
+;;; it stands for.  Both tables hold one entry per expander ever asked for.
+(defvar *%macro-shim-of* nil)
+(defvar *%macro-shim-raw* nil)
+
+(defun %macro-shim-for (raw interp-p)
+  (unless *%macro-shim-of*
+    (setq *%macro-shim-of* (make-hash-table :test 'eq)
+          *%macro-shim-raw* (make-hash-table :test 'eq)))
+  (or (gethash raw *%macro-shim-of*)
+      (let ((shim (if interp-p
+                      (%make-closure #'%interp-macro-shim (cons raw nil))
+                      (%make-closure #'%macro-expander-shim (cons raw nil)))))
+        (setf (gethash raw *%macro-shim-of*) shim
+              (gethash shim *%macro-shim-raw*) raw)
+        shim)))
+
+(defun %macro-shim-unwrap (fn)
+  "The expander FN is MACRO-FUNCTION's shim for, or FN itself."
+  (or (and *%macro-shim-raw* fn (gethash fn *%macro-shim-raw*)) fn))
 
 (defun %shadows-cl-name-p (sym)
   "T when SYM is NOT a COMMON-LISP symbol but has the name of an external
@@ -1204,7 +1240,7 @@
     ;; 3-arg setf shape: (set-macro-function sym env new-value).
     ;; Here `fn` is actually the env argument and `(car env)` is the new value.
     ((and env (null (cdr env)))
-     (let ((real-fn (car env))
+     (let ((real-fn (%macro-shim-unwrap (car env)))
            (key (%macro-sym-key sym)))
        (when key
          (unless *macro-function-table*
@@ -1215,17 +1251,18 @@
          (%mexp-memo-invalidate)
          (unless (%shadows-cl-name-p sym)
            (puthash key *macro-function-table* real-fn))
-         real-fn)))
+         (car env))))
     ;; 2-arg shape (sym, fn) — the original contract.
     ((null env)
-     (let ((key (%macro-sym-key sym)))
+     (let ((key (%macro-sym-key sym))
+           (raw (%macro-shim-unwrap fn)))
        (when key
          (unless *macro-function-table*
            (setq *macro-function-table* (make-hash-table)))
-         (%macro-pkg-put sym key fn)
+         (%macro-pkg-put sym key raw)
          (%mexp-memo-invalidate)
          (unless (%shadows-cl-name-p sym)
-           (puthash key *macro-function-table* fn))
+           (puthash key *macro-function-table* raw))
          fn)))
     ;; 4+ args — illegal.
     (t (%signal-program-error))))

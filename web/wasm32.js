@@ -59,17 +59,23 @@ const IMPORTS = [
   ['fbytes', [I32], [I32]],          // 12 t -> its frame size
   ['syncin', [], []],                // 13 Wasm globals <- VM (after a longjmp)
   ['ljlabel', [I32, I32, I32], [I32]], // 14 function id, ip, frame -> its label there, or -1
+  ['dbgenter', [I32, I32, I32], []],  // 15 debug: a setjmp function entered (id, frame, L)
 ];
 const FNTYPE = 0;   // (i32 L) -> i32, always type 0
 const NOFAST = !!process.env.MVM_WASM_NOFAST;
 const NOTAIL = !!process.env.MVM_WASM_NOTAIL, NOSJ = !!process.env.MVM_WASM_NOSJ;
-const MAXINSN = (process.env.MVM_WASM_MAXINSN && parseInt(process.env.MVM_WASM_MAXINSN, 10)) || 3000;
+const MAXINSN = (process.env.MVM_WASM_MAXINSN && parseInt(process.env.MVM_WASM_MAXINSN, 10)) || 100000;
+// Labels per chunk: a function with more becomes an entry dispatcher plus
+// one Wasm function per CHL labels (the JS translator's CHUNK, for the same
+// reasons: TurboFan's frame and compile time grow with a function's size).
+const CHL = (process.env.MVM_WASM_CHUNK && parseInt(process.env.MVM_WASM_CHUNK, 10)) || 256;
 const NOINL = new Set((process.env.MVM_WASM_NOINL || '').split(',').filter(Boolean).map((x) => parseInt(x, 16)));
 const F_EXEC = 0, F_GC = 1, F_CHECKED = 2, F_FAULT = 3, F_TAIL = 4, F_TRAP = 5, F_CONS = 6,
-      F_CALLREQ = 7, F_DCALL = 8, F_DCALLIND = 9, F_FINISH = 10, F_SLOTFOR = 11, F_FBYTES = 12, F_SYNCIN = 13, F_LJLABEL = 14;
+      F_CALLREQ = 7, F_DCALL = 8, F_DCALLIND = 9, F_FINISH = 10, F_SLOTFOR = 11, F_FBYTES = 12, F_SYNCIN = 13, F_LJLABEL = 14, F_DBGENTER = 15;
 // dep: Wasm-to-Wasm call depth (native stack), not mirrored in the VM.
-const GLOBALS = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc', 'dep'];
-const G_VR = 0, G_VA = 1, G_VL = 2, G_ESP = 3, G_EBP = 4, G_PC = 5, G_DEP = 6;
+// cmp / ovf: the compare and overflow flags across a jump between chunks.
+const GLOBALS = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc', 'dep', 'cmp', 'ovf'];
+const G_VR = 0, G_VA = 1, G_VL = 2, G_ESP = 3, G_EBP = 4, G_PC = 5, G_DEP = 6, G_CMP = 7, G_OVF = 8;
 const WDEPTH = (process.env.MVM_WASM_DEPTH && parseInt(process.env.MVM_WASM_DEPTH, 10)) || 600;
 const SYNCED = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc'];
 
@@ -94,7 +100,7 @@ function state(vm) {
     vm.push(C.RET_SENTINEL); vm.enter(t);
     const g0 = vm.gcCount;
     if (c.RES) vm.drive(c);
-    else { vm.jd++; let q; try { q = c(vm, 0); } finally { vm.jd--; } if (q !== -1) vm.drive(c, 0, q); }
+    else { vm.jd++; let q; try { q = c(vm, 0); } finally { vm.jd--; } if (q !== -1) vm.drive(c, 0, q, vm.ld32(vm.ebp)); }
     syncIn();
     return vm.gcCount !== g0 ? 1 : 0;
   };
@@ -122,6 +128,7 @@ function state(vm) {
     },
     fbytes(t) { return C.frameBytes(vm.m8, t); },
     syncin() { syncIn(); },
+    dbgenter(id, fb, L) { process.stderr.write(`[sj-enter ${vm.where(resMaps[id].keys().next().value)} frame=${((fb + C.VBASE) >>> 0).toString(16)} L=${L}]\n`); },
     ljlabel(id, ip, fb) {
       const l = vm.ebp - C.VBASE === fb ? resMaps[id].get(ip) : undefined;
       if (process.env.MVM_WASM_DEBUG && l === undefined) { const owner = resMaps.findIndex((m) => m.has(ip)); const c = [...vm.compiled].find(([t, f]) => f && f.RES && f.RES[ip] !== undefined); process.stderr.write(`[lj-miss owner-wasm-module=${owner} js-owner=${c ? vm.where(c[0]) + (c[1].wexp ? ' (wasm)' : ' (js)') : 'none (interpreted?)'}]\n`); }
@@ -133,7 +140,7 @@ function state(vm) {
     finish(t, q) {
       syncOut();
       const c = vm.compiled.get(t);
-      vm.jd++; try { vm.drive(c, 0, q); } finally { vm.jd--; }
+      vm.jd++; try { vm.drive(c, 0, q, vm.ld32(vm.ebp)); } finally { vm.jd--; }
       syncIn();
     },
     dcallind(x, pc) {
@@ -179,7 +186,7 @@ function compile(vm, entry, osr) {
     while (!seen.has(pc)) {
       seen.add(pc);
       const op = m8[pc], len = INSN_LEN[op];
-      if (len === 0) { W.stats.failed++; return null; }
+      if (len === 0) { W.stats.failed++; if (process.env.MVM_WASM_DEBUG) process.stderr.write(`[wasm refuse ${vm.where(entry)}: opcode 0x${op.toString(16)} len 0]\n`); return null; }
       insns.push([pc, op, len]);
       if ((op >= 0x41 && op <= 0x46) || op === 0xC7) {
         const t = pc + len + rd32(pc + 1); starts.add(t); work.push(t); starts.add(pc + len);
@@ -188,7 +195,7 @@ function compile(vm, entry, osr) {
       else if (op === 0x82 || op === 0x83) break;
       else if (op === 0x80 || op === 0x81) starts.add(pc + len);
       else if (op === 0x02 && (m8[pc + 1] | (m8[pc + 2] << 8)) === 0x0510) { hasSetjmp = true; starts.add(pc + len); sjResume.push(pc + len); }
-      else if (op === 0x90 || op === 0x91 || op === 0xA2 || op === 0x01) { W.stats.failed++; return null; }
+      else if (op === 0x90 || op === 0x91 || op === 0xA2 || op === 0x01) { W.stats.failed++; if (process.env.MVM_WASM_DEBUG) process.stderr.write(`[wasm refuse ${vm.where(entry)}: opcode 0x${op.toString(16)}]\n`); return null; }
       pc += len;
     }
   }
@@ -206,7 +213,7 @@ function compile(vm, entry, osr) {
   // 2. code
   const LP = 0, LR = (v) => 1 + v, LCMP = 17, LOVF = 18, LFB = 19, LT1 = 20, LT2 = 21, LT3 = 22, LDEP = 23;
   const NLOCALS = 23;           // beyond the param
-  const o = [];                 // current function body bytes
+  let o = [];                   // current function body bytes
   let nglob = GLOBALS.length;   // module-defined globals (call-site caches) follow the imported ones
   let cur = -1;                 // label of the code being emitted
   let nest = 0;                 // extra block nesting inside the current code
@@ -243,14 +250,28 @@ function compile(vm, entry, osr) {
   const setPC = (pc) => { i32c(pc); gset(G_PC); };
   const reloadFB = () => { gget(G_EBP); i32c(-VBASE); op1(0x6A); lset(LFB); };
   // jump to label of address t: forward = br to its block, backward = dispatch
+  const chunked = N > CHL;
+  const chunkOf = (j) => (j / CHL) | 0;
+  let lo = 0, hi = N - 1;       // the current chunk's labels (all of them unchunked)
+  // leave this chunk for label j: registers and flags to memory, ask the entry
+  const crossTo = (j) => {
+    STOREv(); lget(LCMP); gset(G_CMP); lget(LOVF); gset(G_OVF);
+    i32c(-(2 + j)); RET();
+  };
   const jumpTo = (t, cond) => {
     const j = label.get(t);
+    if (chunked && chunkOf(j) !== chunkOf(cur)) {
+      if (cond) IF();
+      crossTo(j);
+      if (cond) END();
+      return;
+    }
     if (j > cur) {
       if (cond) { o.push(0x0D); uleb(o, j - cur - 1 + nest); }
       else { o.push(0x0C); uleb(o, j - cur - 1 + nest); }
     } else {
       if (cond) IF();
-      i32c(j); lset(LP); o.push(0x0C); uleb(o, N - 1 - cur + nest);
+      i32c(j); lset(LP); o.push(0x0C); uleb(o, hi - cur + nest);
       if (cond) END();
     }
   };
@@ -321,6 +342,29 @@ function compile(vm, entry, osr) {
   };
   const delegate = (pc) => { STOREv(); i32c(pc); call(F_EXEC); lset(LCMP); LOAD(); };
 
+  const bodies = [];
+  // the dispatch skeleton of labels lo..hi: loop, a block per label, br_table on LP-lo
+  const skeleton = () => {
+    const n = hi - lo + 1;
+    o.push(0x03, 0x40);                     // loop $top
+    for (let i = 0; i < n; i++) o.push(0x02, 0x40);
+    lget(LP); if (lo) { i32c(lo); op1(0x6B); }
+    o.push(0x0E); uleb(o, n); for (let i = 0; i < n; i++) uleb(o, i); uleb(o, n - 1);
+  };
+  const startChunk = (k) => {
+    o = []; lo = k * CHL; hi = Math.min(N, lo + CHL) - 1;
+    // every register from its home (chunk 0 too: homes past V4 are dead at entry)
+    gget(G_EBP); i32c(-VBASE); op1(0x6A); lset(LFB);
+    LOAD(); gget(G_CMP); lset(LCMP); gget(G_OVF); lset(LOVF);
+    skeleton();
+  };
+  const endChunk = (next) => {
+    if (next !== undefined) crossTo(next);  // fall through into the next chunk
+    o.push(0x0B, 0x00, 0x0B);               // end loop, unreachable, end function
+    bodies.push(o);
+  };
+  if (chunked) startChunk(0);
+  else {
   // entry
   gget(G_EBP); i32c(-VBASE); op1(0x6A); lset(LFB);
   if (osr) LOAD();
@@ -328,11 +372,10 @@ function compile(vm, entry, osr) {
   // A function with setjmp landings: loop $re { try { <dispatch> } catch $lj }.
   // The catch takes a longjmp to THIS frame (ebp) at one of its landings: VM
   // state back from JS, the Wasm depth back to this frame's, re-enter there.
+  if (hasSetjmp && process.env.MVM_WASM_DEBUG) { i32c(resId); lget(LFB); lget(LP); call(F_DBGENTER); }
   if (hasSetjmp) { gget(G_DEP); lset(LDEP); o.push(0x03, 0x40, 0x06, 0x40); }
-  // dispatch skeleton: loop, N blocks, br_table
-  o.push(0x03, 0x40);                       // loop $top
-  for (let i = 0; i < N; i++) o.push(0x02, 0x40);
-  lget(LP); o.push(0x0E); uleb(o, N); for (let i = 0; i < N; i++) uleb(o, i); uleb(o, N - 1);
+  skeleton();
+  }
 
   const guardedCons = (i, pc, b2) => {
     const g1 = insns[i - 1], g2 = insns[i - 2], g3 = insns[i - 3];
@@ -344,7 +387,11 @@ function compile(vm, entry, osr) {
 
   for (let i = 0; i < insns.length; i++) {
     const [pc, op, len] = insns[i];
-    if (label.has(pc)) { o.push(0x0B); cur = label.get(pc); nest = 0; }   // end of block b_cur
+    if (label.has(pc)) {
+      const j = label.get(pc);
+      if (chunked && j > 0 && chunkOf(j) !== chunkOf(j - 1)) { endChunk(j); startChunk(chunkOf(j)); }
+      o.push(0x0B); cur = j; nest = 0;      // end of block b_cur
+    }
     const b1 = m8[pc + 1], b2 = m8[pc + 2], b3 = m8[pc + 3], b4 = m8[pc + 4];
     if (NOINL.has(op)) { delegate(pc); continue; }
     switch (op) {
@@ -628,8 +675,7 @@ function compile(vm, entry, osr) {
     // a block whose last instruction falls through to a non-label is fine; a
     // transfer leaves the rest of the block unreachable, which Wasm accepts.
   }
-  o.push(0x0B);                 // end of the last label's code... closes the loop
-  if (hasSetjmp) {
+  const ljCatch = () => {
     o.push(0x00);               // the dispatch never falls out
     o.push(0x07); uleb(o, 0);   // catch $lj: [esp ip]
     lset(LT2); o.push(0x1A);
@@ -638,7 +684,7 @@ function compile(vm, entry, osr) {
       // this frame, and any label is a landing (as drive()'s RES): ask JS
       i32c(resId); lget(LT2); lget(LFB); call(F_LJLABEL); ltee(LT1); i32c(0); op1(0x4E);
       o.push(0x04, 0x40);
-        lget(LDEP); gset(G_DEP); LOAD();
+        lget(LDEP); gset(G_DEP); if (!chunked) LOAD();
         lget(LT1); lset(LP);
         o.push(0x0C, 0x02);     // br $re: 0 = this if, 1 = the try, 2 = loop $re
       o.push(0x0B);
@@ -646,9 +692,42 @@ function compile(vm, entry, osr) {
     o.push(0x09, 0x00);         // rethrow
     o.push(0x0B);               // end try
     o.push(0x0B);               // end loop $re
+  };
+  let entryBody;
+  if (!chunked) {
+    o.push(0x0B);               // end of the last label's code... closes the loop
+    if (hasSetjmp) ljCatch();
+    o.push(0x00);               // unreachable: fell off the end
+    o.push(0x0B);               // end of function
+    entryBody = o;
+  } else {
+    endChunk(undefined);
+    // the entry: loop { R = chunk[LP / CHL](LP); R < -1 ? LP = -(R+2) : return R }
+    const K = bodies.length, F0 = IMPORTS.length + 1;
+    o = [];
+    gget(G_EBP); i32c(-VBASE); op1(0x6A); lset(LFB);
+    if (hasSetjmp && process.env.MVM_WASM_DEBUG) { i32c(resId); lget(LFB); lget(LP); call(F_DBGENTER); }
+    if (hasSetjmp) { gget(G_DEP); lset(LDEP); o.push(0x03, 0x40, 0x06, 0x40); }
+    o.push(0x03, 0x40);                     // loop $d
+    o.push(0x02, I32);                      // block $chk (result i32)
+    for (let k = 0; k < K; k++) o.push(0x02, 0x40);
+    lget(LP); i32c(CHL); op1(0x6E);         // i32.div_u
+    o.push(0x0E); uleb(o, K); for (let k = 0; k < K; k++) uleb(o, k); uleb(o, K - 1);
+    for (let k = 0; k < K; k++) {
+      o.push(0x0B);                         // end block k
+      lget(LP); call(F0 + k);
+      if (k < K - 1) { o.push(0x0C); uleb(o, K - 1 - k); }
+    }
+    o.push(0x0B);                           // end $chk: R
+    ltee(LT1); i32c(-1); op1(0x48);
+    o.push(0x04, 0x40); i32c(-2); lget(LT1); op1(0x6B); lset(LP); o.push(0x0C, 0x01); o.push(0x0B);
+    lget(LT1); RET();
+    o.push(0x0B);                           // end loop $d
+    if (hasSetjmp) ljCatch();
+    o.push(0x00, 0x0B);
+    entryBody = o;
   }
-  o.push(0x00);                 // unreachable: fell off the end
-  o.push(0x0B);                 // end of function
+  const allBodies = [entryBody, ...bodies];
 
   // 3. module
   const mod = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
@@ -666,15 +745,19 @@ function compile(vm, entry, osr) {
     str(b, 'e'); str(b, 'lj'); b.push(0x04, 0x00); uleb(b, ljType);
     IMPORTS.forEach(([n], i) => { str(b, 'e'); str(b, n); b.push(0x00); uleb(b, impTypes[i]); });
     section(mod, 2, b); }
-  { const b = []; uleb(b, 1); uleb(b, fnType); section(mod, 3, b); }
+  { const b = []; uleb(b, allBodies.length); for (let k = 0; k < allBodies.length; k++) uleb(b, fnType); section(mod, 3, b); }
   if (nglob > GLOBALS.length) {
     const b = []; uleb(b, nglob - GLOBALS.length);
     for (let k = GLOBALS.length; k < nglob; k++) { b.push(I32, 0x01, 0x41); sleb(b, -1); b.push(0x0B); }
     section(mod, 6, b);
   }
   { const b = []; uleb(b, 1); str(b, 'f'); b.push(0x00); uleb(b, IMPORTS.length); section(mod, 7, b); }
-  { const body = []; uleb(body, 1); uleb(body, NLOCALS); body.push(I32); for (let k = 0; k < o.length; k++) body.push(o[k]);
-    const b = []; uleb(b, 1); uleb(b, body.length); for (const x of body) b.push(x); section(mod, 10, b); }
+  { const b = []; uleb(b, allBodies.length);
+    for (const ob of allBodies) {
+      const body = []; uleb(body, 1); uleb(body, NLOCALS); body.push(I32); for (let k = 0; k < ob.length; k++) body.push(ob[k]);
+      uleb(b, body.length); for (let k = 0; k < body.length; k++) b.push(body[k]);
+    }
+    section(mod, 10, b); }
 
   let inst;
   const tA = performance.now();

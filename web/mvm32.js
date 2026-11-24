@@ -1326,11 +1326,16 @@ class MVM {
   }
   // R0: F has already run once and returned R0 (the direct-call fast path
   // hands over a call or tail-call request it cannot finish itself).
-  drive(f, L0 = 0, r0 = undefined) {
+  // R0: F already answered with request R0, before this drive -- its callee
+  // is entered, so the VM's ebp is THAT frame and F's own is EBP0 (the saved
+  // ebp at [vm.ebp]).  Recording the callee's frame as F's filed F's
+  // continuation under the wrong frame, and a longjmp to one of F's landings
+  // then found no owner.
+  drive(f, L0 = 0, r0 = undefined, ebp0 = this.ebp) {
     const cf = this.contF, cl = this.contL, ce = this.contE;
     const base = this.contDepth;
     let d = base;
-    let L = L0, ebp = this.ebp;
+    let L = L0, ebp = ebp0;
     const jd0 = ++this.jd;
     try {
       for (;;) {
@@ -1680,9 +1685,9 @@ class MVM {
             // call returns to the driver as before.  The site re-asks for an
             // untranslated callee: caching the first answer kept a callee that
             // crossed the threshold later interpreted from this site for good.
-            out += `${P}${STORE}if(!${c})${c}=vm.compiledFor(${t});if(${c}&&vm.jd<${JD_MAX}){vm.push(${RET_SENTINEL});vm.enter(${t});const g0=vm.gcCount;if(${c}.RES)vm.drive(${c});else{vm.jd++;const q=${c}(vm,0);vm.jd--;if(q!==-1)vm.drive(${c},0,q);}if(vm.gcCount!==g0){${LOAD48}}}else{vm.resumeL=${label.get(pc + len)};vm.nextF=${c};vm.push(${RET_SENTINEL});vm.enter(${t});return ${t * 2};}`;
+            out += `${P}${STORE}if(!${c})${c}=vm.compiledFor(${t});if(${c}&&vm.jd<${JD_MAX}){vm.push(${RET_SENTINEL});vm.enter(${t});const g0=vm.gcCount;if(${c}.RES)vm.drive(${c});else{vm.jd++;const q=${c}(vm,0);vm.jd--;if(q!==-1)vm.drive(${c},0,q,vm.ld32(vm.ebp));}if(vm.gcCount!==g0){${LOAD48}}}else{vm.resumeL=${label.get(pc + len)};vm.nextF=${c};vm.push(${RET_SENTINEL});vm.enter(${t});return ${t * 2};}`;
           } else {
-            out += `${P}${STORE}{const t=vm.fnAddrToOffset(${R(b1)}),g=vm.compiledFor(t);if(g&&vm.jd<${JD_MAX}){vm.push(${RET_SENTINEL});vm.enter(t);const g0=vm.gcCount;if(g.RES)vm.drive(g);else{vm.jd++;const q=g(vm,0);vm.jd--;if(q!==-1)vm.drive(g,0,q);}if(vm.gcCount!==g0){${LOAD48}}}else{vm.resumeL=${label.get(pc + len)};vm.nextF=g;vm.push(${RET_SENTINEL});vm.enter(t);return t*2;}}`;
+            out += `${P}${STORE}{const t=vm.fnAddrToOffset(${R(b1)}),g=vm.compiledFor(t);if(g&&vm.jd<${JD_MAX}){vm.push(${RET_SENTINEL});vm.enter(t);const g0=vm.gcCount;if(g.RES)vm.drive(g);else{vm.jd++;const q=g(vm,0);vm.jd--;if(q!==-1)vm.drive(g,0,q,vm.ld32(vm.ebp));}if(vm.gcCount!==g0){${LOAD48}}}else{vm.resumeL=${label.get(pc + len)};vm.nextF=g;vm.push(${RET_SENTINEL});vm.enter(t);return t*2;}}`;
           }
           break;
         }

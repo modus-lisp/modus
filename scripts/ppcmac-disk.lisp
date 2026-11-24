@@ -6,7 +6,12 @@
 ;;;; OUT is a raw disk: block 0 the driver descriptor, the Apple Partition Map in
 ;;;; blocks 1-2, and one Apple_HFS partition from block 64 holding an HFS volume
 ;;;; "Modus" with
-;;;;   :modus.elf                    the image (the ELF Open Firmware loads)
+;;;;   :modus.elf                    the image
+;;;;   :modus-boot.elf               the first stage (IMAGE.boot from the build,
+;;;;                                 or --loader): Open Firmware boots it, and it
+;;;;                                 reads modus.elf into place -- a real Mac's
+;;;;                                 firmware cannot load a 37 MB ELF itself
+;;;;                                 (boot-ppcmac.lisp, THE FIRST STAGE)
 ;;;;   :System Folder:bootinfo.txt   a CHRP boot script, file type 'tbxi', that
 ;;;;                                 boots it: what a New World Mac's Open
 ;;;;                                 Firmware looks for in the blessed folder
@@ -32,12 +37,17 @@
 
 (defparameter *base* 64 "The volume's first block.")
 
-(defun bootinfo (elf-name)
+(defun bootinfo (elf-name &optional loader)
   "The CHRP boot script: Open Firmware runs <BOOT-SCRIPT>.  &device; is the
-   device it was loaded from, &partition; its partition."
+   device it was loaded from, &partition; its partition.  With LOADER, the
+   firmware boots it and passes the image's path as its argument."
+  (if loader
+      (format nil "<CHRP-BOOT>~C<COMPATIBLE>~CMacRISC MacRISC3 MacRISC4~C</COMPATIBLE>~C<DESCRIPTION>~CModus~C</DESCRIPTION>~C<BOOT-SCRIPT>~Cboot &device;:&partition;,\\~A &device;:&partition;,\\~A~C</BOOT-SCRIPT>~C</CHRP-BOOT>~C"
+              #\Return #\Return #\Return #\Return #\Return #\Return #\Return #\Return
+              loader elf-name #\Return #\Return #\Return)
   (format nil "<CHRP-BOOT>~C<COMPATIBLE>~CMacRISC MacRISC3 MacRISC4~C</COMPATIBLE>~C<DESCRIPTION>~CModus~C</DESCRIPTION>~C<BOOT-SCRIPT>~Cboot &device;:&partition;,\\~A~C</BOOT-SCRIPT>~C</CHRP-BOOT>~C"
           #\Return #\Return #\Return #\Return #\Return #\Return #\Return #\Return
-          elf-name #\Return #\Return #\Return))
+          elf-name #\Return #\Return #\Return)))
 
 (defconstant +payload-addr+ #x07200000)
 
@@ -89,23 +99,32 @@
 (defun ascii-bytes (s)
   (map '(vector (unsigned-byte 8)) #'char-code s))
 
-(defun main (image out &key (size-mb nil) payload)
-  (let* ((elf (if payload (elf-with-payload (read-bytes image) (payload-bytes payload)) (read-bytes image)))
+(defun main (image out &key (size-mb nil) payload loader)
+  (let* ((loader (or loader (let ((b (concatenate 'string image ".boot"))) (and (probe-file b) b))))
+         (boot (and loader (read-bytes loader)))
+         (elf (if payload (elf-with-payload (read-bytes image) (payload-bytes payload)) (read-bytes image)))
          (vol-bytes (* 512 (ceiling (max (* 4 1024 1024)
                                          (+ (* 2 (length elf)) (* 1024 1024)))
                                     512)))
          (vol-bytes (if size-mb (* size-mb 1024 1024) vol-bytes))
+         (files (list (cons "modus.elf" (fs-apple:make-hfs-file :type "BINA" :creator "MDUS" :data elf))))
+         (files (if boot
+                    (append files (list (cons "modus-boot.elf"
+                                              (fs-apple:make-hfs-file :type "BINA" :creator "MDUS" :data boot))))
+                    files))
          (volume (fs-apple:make-hfs-folder
                   :name "Modus"
                   :entries
-                  (list (cons "modus.elf" (fs-apple:make-hfs-file :type "BINA" :creator "MDUS" :data elf))
-                        (cons "System Folder"
+                  ;; the System Folder FIRST: hfs-write numbers the root's
+                  ;; entries from 16 in order, so its CNID is 16 whatever follows
+                  (cons (cons "System Folder"
                               (fs-apple:make-hfs-folder
                                :name "System Folder"
                                :entries (list (cons "bootinfo.txt"
                                                     (fs-apple:make-hfs-file
                                                      :type "tbxi" :creator "chrp"
-                                                     :data (ascii-bytes (bootinfo "modus.elf"))))))))))
+                                                     :data (ascii-bytes (bootinfo "modus.elf" (and boot "modus-boot.elf"))))))))
+                        files)))
          (vol (fs-apple:hfs-write volume :size vol-bytes :desktopdb nil))
          (volblocks (floor (length vol) 512))
          (total (+ *base* volblocks))
@@ -117,8 +136,8 @@
                 (list :start *base* :count volblocks :name "Modus" :type "Apple_HFS")))
     (replace disk vol :start1 (* *base* 512))
     (write-bytes out disk)
-    (format t "ppcmac-disk: ~A: ~A (~D bytes) on an HFS volume of ~D blocks at block ~D~%"
-            out image (length elf) volblocks *base*)))
+    (format t "ppcmac-disk: ~A: ~A (~D bytes)~:[~; and its first stage~] on an HFS volume of ~D blocks at block ~D~%"
+            out image (length elf) boot volblocks *base*)))
 
 (defun bless-system-folder (vol)
   "Bless the folder named System Folder: its catalog node id into the volume
@@ -132,13 +151,15 @@
   "The CNID hfs-write gave the System Folder: the root is 2, then the
    entries in order from 16.  Found by reading the volume back."
   (declare (ignore vol))
-  ;; hfs-write numbers the root's entries from 16 in the order given:
-  ;; modus.elf 16, System Folder 17.
-  17)
+  ;; hfs-write numbers the root's entries from 16 in the order given, and
+  ;; MAIN puts the System Folder first.
+  16)
 
 (let ((args (argv)))
   (let ((size (let ((p (position "--size" args :test #'string=)))
                 (and p (parse-integer (nth (1+ p) args)))))
         (payload (let ((p (position "--payload" args :test #'string=)))
-                   (and p (nth (1+ p) args)))))
-    (main (first args) (second args) :size-mb size :payload payload)))
+                   (and p (nth (1+ p) args))))
+        (loader (let ((p (position "--loader" args :test #'string=)))
+                  (and p (nth (1+ p) args)))))
+    (main (first args) (second args) :size-mb size :payload payload :loader loader)))

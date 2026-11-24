@@ -895,16 +895,26 @@
    (boot/boot-ppcmac.lisp's map; the stub writes the frame limit).")
 
 (defun ppc-emit-mac-putc (buf rb)
-  "Write the byte in RB (not r0 or r12) to the ESCC's channel A, waiting for the
-   transmit buffer.  Clobbers r0, r12 and CR0."
-  (let ((wait (mvm-make-label)))
+  "Write the byte in RB (not r0, r10 or r12) to the ESCC's channel A, waiting
+   for the transmit buffer -- a BOUNDED wait: a PowerBook's SCC drives only its
+   internal modem and may be unclocked, and an unbounded wait there hung the
+   machine at its first byte.  After #x40000 polls the byte is dropped.
+   Clobbers r0, r10, r12 and CR0."
+  (let ((wait (mvm-make-label)) (gone (mvm-make-label)) (ready (mvm-make-label)))
     (ppc-emit-li buf +ppc-r12+ *ppc-mac-escc-a*)
+    (ppc-emit-li buf +ppc-r10+ #x40000)
     (ppc-emit-label buf wait)
     (ppc-emit-lbz buf +ppc-r0+ +ppc-r12+ 0)
     (ppc-emit-andi-dot buf +ppc-r0+ +ppc-r0+ 4)
-    (ppc-emit-beq buf wait)
+    (ppc-emit-bne buf ready)
+    (ppc-emit-addi buf +ppc-r10+ +ppc-r10+ -1)
+    (ppc-emit-cmpwi buf +ppc-r10+ 0)
+    (ppc-emit-bne buf wait)
+    (ppc-emit-b buf gone)
+    (ppc-emit-label buf ready)
     (ppc-emit-stb buf rb +ppc-r12+ 16)
-    (ppc-emit-eieio buf)))
+    (ppc-emit-eieio buf)
+    (ppc-emit-label buf gone)))
 
 ;;; THE NATIVE TIER (mvm/jit-ppc-native.lisp): a runtime DEFUN translated by this
 ;;; file, baked into the image (MODUS_PPC_JIT=1).  The AOT side gives it:

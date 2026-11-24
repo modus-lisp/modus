@@ -1,4 +1,4 @@
-;;;; ppcmac-input.lisp -- the PowerPC Mac's keyboard and mouse: ADB through CUDA.
+;;;; ppcmac-input.lisp -- the PowerPC Mac's keyboard and mouse: ADB through CUDA or the PMU.
 ;;;;
 ;;;; CUDA is the 6805 microcontroller on the Mac's VIA (mac-io + #x16000), the
 ;;;; G3's and first G4's ADB master (and QEMU mac99's).  The host talks to it a
@@ -78,6 +78,94 @@
    does."
   (cuda-send (list 0 0)))
 
+;;; ---- PMU: a PowerBook's (and a G4 Cube's) ADB master -------------------------
+;;;
+;;; The PowerBooks' power manager, a microcontroller on the same VIA.  Linux's
+;;; drivers/macintosh/via-pmu.c is the reference.  A byte goes through the shift
+;;; register with REQ (ours, port B #x10, active low) held while it moves and
+;;; ACK (the PMU's, #x08) released when the PMU is ready for the next.  A
+;;; command is its byte, then (for a variable-length one) a length byte, then
+;;; its data; a variable-length reply is a length byte, then that many.  ADB
+;;; goes through command #x20; with autopoll on, the PMU raises the VIA's CB1
+;;; when a device has data, and #x78 (interrupt acknowledge) returns the
+;;; interrupt bits and the packet: bit #x10 ADB, then the ADB command byte and
+;;; the device's register 0 -- what CUDA sends after its two header bytes.
+
+(defconstant +pmu-req+ #x10)
+(defconstant +pmu-ack+ #x08)
+
+(defun pmu-wait-ack ()
+  (dotimes (i 200000 nil) (when (logtest (via +via-b+) +pmu-ack+) (return t))))
+
+(defun pmu-send-byte (x)
+  (via-set +via-acr+ (logior (via +via-acr+) #x1C))           ; shift out, ext clock
+  (via-set +via-sr+ x)
+  (via-set +via-b+ (logand (via +via-b+) (lognot +pmu-req+)))
+  (cuda-wait-sr)
+  (via-set +via-b+ (logior (via +via-b+) +pmu-req+))
+  (pmu-wait-ack))
+
+(defun pmu-recv-byte ()
+  (via-set +via-acr+ (logior (logand (via +via-acr+) (lognot #x10)) #x0C))
+  (via +via-sr+)
+  (via-set +via-b+ (logand (via +via-b+) (lognot +pmu-req+)))
+  (cuda-wait-sr)
+  (let ((b (via +via-sr+)))
+    (via-set +via-b+ (logior (via +via-b+) +pmu-req+))
+    (pmu-wait-ack)
+    b))
+
+(defun pmu-command (cmd data &key length-byte reply)
+  "Send CMD with DATA (a length byte first with LENGTH-BYTE); REPLY :VAR reads
+   a length byte and that many bytes, a number that many, NIL none."
+  (pmu-wait-ack)
+  (pmu-send-byte cmd)
+  (when length-byte (pmu-send-byte (length data)))
+  (dolist (b data) (pmu-send-byte b))
+  (cond ((eq reply :var) (let ((n (pmu-recv-byte))) (loop repeat n collect (pmu-recv-byte))))
+        ((integerp reply) (loop repeat reply collect (pmu-recv-byte)))
+        (t nil)))
+
+(defun pmu-init ()
+  (via-set +via-dirb+ (logand (logior (via +via-dirb+) +pmu-req+) (lognot +pmu-ack+)))
+  (via-set +via-acr+ (logior (logand (via +via-acr+) (lognot #x1C)) #x0C))
+  (via-set +via-ier+ #x7F)
+  (via-set +via-b+ (logior (via +via-b+) +pmu-req+))
+  (via-set +via-ifr+ #x7F)
+  (pmu-command #x70 (list #x10))                    ; PMU_SET_INTR_MASK: ADB
+  t)
+
+(defun pmu-adb-reset () (pmu-command #x20 (list 0 0 0 0) :length-byte t))
+(defun pmu-autopoll () (pmu-command #x20 (list 0 #x86 #xFF #xFF) :length-byte t))
+
+(defun pmu-poll ()
+  "Each pending PMU interrupt: its ADB data as a CUDA-shaped packet.  The PMU
+   signals an interrupt on a mac-io GPIO line on the KeyLargo machines (and in
+   QEMU), not the VIA's CB1 -- so ask: interrupt-acknowledge answers 0 when
+   nothing is pending."
+  (let ((n 0))
+    (dotimes (i 8 n)
+      (via-set +via-ifr+ #x10)
+      (let ((r (pmu-command #x78 nil :reply :var)))
+        (unless (and r (logtest (first r) #x10) (rest r)) (return n))
+        ;; [ints cmd data...] -> [0 flags cmd data...]
+        (%mac-adb-packet (list* 0 #x40 (rest r)))
+        (incf n)))))
+
+;;; ---- which one this Mac has: the boot stub's answer -----------------------------
+
+(defvar *mac-via-kind* nil "1 CUDA, 2 PMU (boot-ppcmac's boot info, +28).")
+
+(defun mac-boot-info (off)
+  (+ (* 65536 (mem-ref (+ #x07F80000 off) :u16)) (mem-ref (+ #x07F80002 off) :u16)))
+
+(defun mac-input-init ()
+  (setq *mac-via-kind* (if (and (= (mem-ref #x07F80000 :u16) #x5050) (= (mac-boot-info 28) 2)) 2 1))
+  (if (= *mac-via-kind* 2)
+      (progn (pmu-init) (pmu-adb-reset) (pmu-autopoll))
+      (progn (cuda-init) (adb-reset) (cuda-autopoll t)))
+  *mac-via-kind*)
+
 ;;; ---- events ---------------------------------------------------------------
 
 (defvar *mac-mouse-x* 512)
@@ -154,11 +242,13 @@
                              (list (list :pointer mask *mac-mouse-x* *mac-mouse-y*)))))))))))
 
 (defun mac-input-poll ()
-  "Read every packet CUDA has; queue their events.  How many packets."
-  (let ((n 0))
-    (loop while (cuda-treq-p)
-          do (%mac-adb-packet (cuda-read-packet)) (incf n))
-    n))
+  "Read every packet the ADB master has; queue their events.  How many packets."
+  (if (eql *mac-via-kind* 2)
+      (pmu-poll)
+      (let ((n 0))
+        (loop while (cuda-treq-p)
+              do (%mac-adb-packet (cuda-read-packet)) (incf n))
+        n)))
 
 (defun mac-next-event ()
   (pop *mac-events*))

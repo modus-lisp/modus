@@ -18,8 +18,14 @@ def main():
     log = open(sys.argv[sys.argv.index('--log') + 1], 'w') if '--log' in sys.argv else sys.stdout
     d = tempfile.mkdtemp(prefix='macrun-')
     ser, mon = os.path.join(d, 'ser'), os.path.join(d, 'mon')
-    q = subprocess.Popen(['qemu-system-ppc', '-M', 'mac99', '-m', '1024', '-g', '1024x768x32',
-                          '-display', 'none', '-prom-env', 'output-device=ttya', '-prom-env', 'input-device=ttya', '-drive', f'file={disk},format=raw,media=disk',
+    # MACRUN_MACHINE (mac99; mac99,via=pmu-adb is a PowerBook's input), MACRUN_CPU,
+    # MACRUN_DEPTH (32; 8 and 16 are what a real Mac's firmware may leave), MACRUN_MEM (MB)
+    machine = os.environ.get('MACRUN_MACHINE', 'mac99')
+    cpu = ['-cpu', os.environ['MACRUN_CPU']] if os.environ.get('MACRUN_CPU') else []
+    depth = os.environ.get('MACRUN_DEPTH', '32')
+    mem = os.environ.get('MACRUN_MEM', '1024')
+    q = subprocess.Popen(['qemu-system-ppc', '-M', machine] + cpu + ['-m', mem, '-g', f'1024x768x{depth}',
+                          '-display', 'none', '-prom-env', 'output-device=ttya', '-prom-env', 'input-device=ttya', '-drive', f'file={disk},format=raw,media=disk,snapshot=on',
                           '-serial', f'unix:{ser},server=on,wait=on',
                           '-monitor', f'unix:{mon},server=on,wait=off'],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -61,7 +67,18 @@ def main():
         m.sendall((cmd + '\n').encode())
         time.sleep(0.3)
 
-    emit(read_until(b'MVM-EVAL.\n> ', 3600))
+    # A machine whose firmware console was its screen keeps the desk; a byte on
+    # the serial port hands it back to the REPL (ppcmac-desk.lisp, DESK).
+    out = read_until(b'glass.wm: up', 3600)
+    if b'[TIMEOUT]' in out:
+        emit(out)                                  # no desk: the REPL as it comes
+        out = read_until(b'MVM-EVAL.\n> ', 600)
+    else:
+        emit(out)
+        out = read_until(b'MVM-EVAL.\n> ', 60)
+        if b'[TIMEOUT]' in out:
+            emit(out); s.sendall(b'\r'); out = read_until(b'> ', 600)
+    emit(out)
     log.write(f'\n[boot {time.time() - t0:.0f}s]\n')
     for line in open(script):
         line = line.rstrip('\n')

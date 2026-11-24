@@ -3,9 +3,11 @@
 ;;;; The last entry of the boot payload (scripts/ppcmac-disk.lisp --payload):
 ;;;; glass, scribe and glass/wm-core are already loaded (natively, under the
 ;;;; image's PPC tier), and ppcmac-input.lisp's CUDA/ADB keyboard and mouse.
-;;;; The framebuffer is the one Open Firmware set up: QEMU mac99's at PA
-;;;; #x81000000, VA #x09000000 under boot-ppcmac's DBAT3, 32-bit XRGB in a
-;;;; big-endian word -- glass's own pixel -- 4096 bytes a row.
+;;;; The framebuffer is the one Open Firmware set up, as the boot stub found it
+;;;; (boot-ppcmac.lisp's boot info at #x07F80000: its VA under the stub's BATs,
+;;;; width, height, bytes a row, depth).  At 32 bits a pixel is glass's own
+;;;; (XRGB in a big-endian word); at 16, 1-5-5-5; at 8, an index into the 6x6x6
+;;;; colour cube the stub put in the CLUT (36r + 6g + b).
 ;;;;
 ;;;; Each turn: CUDA's packets become pointer and key events for the window
 ;;;; manager, WM-TICK composites, and the damaged rectangle is copied to the
@@ -18,6 +20,35 @@
 (defvar *screen-pitch* 4096)
 (defvar *screen-w* 1024)
 (defvar *screen-h* 768)
+(defvar *screen-depth* 32)
+(defvar *cube* (let ((v (make-array 256)))
+                 (dotimes (i 256 v) (setf (svref v i) (floor (+ i 25) 51)))))
+
+(defun screen-from-boot-info ()
+  "The screen the boot stub found; NIL when there is none to draw on."
+  (when (and (= (mem-ref #x07F80000 :u16) #x5050) (/= (mac-boot-info 4) 0))
+    (setq *screen-base* (mac-boot-info 4) *screen-w* (mac-boot-info 8)
+          *screen-h* (mac-boot-info 12) *screen-pitch* (mac-boot-info 16)
+          *screen-depth* (mac-boot-info 20)
+          *mac-screen-w* *screen-w* *mac-screen-h* *screen-h*
+          *mac-mouse-x* (floor *screen-w* 2) *mac-mouse-y* (floor *screen-h* 2))
+    t))
+
+(declaim (inline screen-put screen-get))
+(defun screen-put (a xrgb)
+  (case *screen-depth*
+    (32 (setf (mem-ref a :u32) xrgb))
+    (16 (setf (mem-ref a :u16) (logior (ash (ldb (byte 5 19) xrgb) 10)
+                                       (ash (ldb (byte 5 11) xrgb) 5)
+                                       (ldb (byte 5 3) xrgb))))
+    (t (setf (mem-ref a :u8) (+ (* 36 (svref *cube* (ldb (byte 8 16) xrgb)))
+                                (* 6 (svref *cube* (ldb (byte 8 8) xrgb)))
+                                (svref *cube* (ldb (byte 8 0) xrgb)))))))
+(defun screen-get (a)
+  (case *screen-depth* (32 (mem-ref a :u32)) (16 (mem-ref a :u16)) (t (mem-ref a :u8))))
+(defun screen-raw-put (a v)
+  (case *screen-depth* (32 (setf (mem-ref a :u32) v)) (16 (setf (mem-ref a :u16) v))
+    (t (setf (mem-ref a :u8) v))))
 
 (defun %payload-file (name)
   ;; a KERNEL function: named here, it compiles to a direct call (kernel
@@ -34,11 +65,14 @@
     (and r b t)))
 
 (defun desk-blit (fb x0 y0 x1 y1)
-  (let ((px (glass::fb-pixels fb)) (w (glass::fb-width fb)))
+  (let ((px (glass::fb-pixels fb)) (w (glass::fb-width fb)) (bpp (floor *screen-depth* 8)))
     (loop for y from (max 0 y0) below (min y1 *screen-h*)
           do (let ((row (+ *screen-base* (* y *screen-pitch*))) (src (* y w)))
-               (loop for x from (max 0 x0) below (min x1 *screen-w*)
-                     do (setf (mem-ref (+ row (* x 4)) :u32) (aref px (+ src x))))))))
+               (if (= bpp 4)
+                   (loop for x from (max 0 x0) below (min x1 *screen-w*)
+                         do (setf (mem-ref (+ row (* x 4)) :u32) (aref px (+ src x))))
+                   (loop for x from (max 0 x0) below (min x1 *screen-w*)
+                         do (screen-put (+ row (* x bpp)) (aref px (+ src x)))))))))
 
 ;;; --- the pointer ---------------------------------------------------------------
 (defparameter *arrow*
@@ -48,7 +82,7 @@
 (defvar *under* (make-array 176 :initial-element 0))
 (defvar *under-at* nil)
 
-(defun %spx (x y) (+ *screen-base* (* y *screen-pitch*) (* x 4)))
+(defun %spx (x y) (+ *screen-base* (* y *screen-pitch*) (* x (floor *screen-depth* 8))))
 
 (defun pointer-hide ()
   (when *under-at*
@@ -57,7 +91,7 @@
         (dotimes (c 11)
           (let ((sx (+ x c)) (sy (+ y r)))
             (when (and (< sx *screen-w*) (< sy *screen-h*))
-              (setf (mem-ref (%spx sx sy) :u32) (svref *under* (+ (* r 11) c))))))))
+              (screen-raw-put (%spx sx sy) (svref *under* (+ (* r 11) c))))))))
     (setq *under-at* nil)))
 
 (defun pointer-show (x y)
@@ -67,10 +101,10 @@
         (let ((sx (+ x c)) (sy (+ y r)))
           (when (and (< sx *screen-w*) (< sy *screen-h*))
             (let ((a (%spx sx sy)))
-              (setf (svref *under* (+ (* r 11) c)) (mem-ref a :u32))
+              (setf (svref *under* (+ (* r 11) c)) (screen-get a))
               (case (char line c)
-                (#\2 (setf (mem-ref a :u32) #x000000))
-                (#\1 (setf (mem-ref a :u32) #xFFFFFF)))))))))
+                (#\2 (screen-put a #x000000))
+                (#\1 (screen-put a #xFFFFFF)))))))))
   (setq *under-at* (cons x y)))
 
 ;;; --- the desk ------------------------------------------------------------------
@@ -113,15 +147,28 @@
         (pointer-show *mac-mouse-x* *mac-mouse-y*))))
   (incf *desk-turns*))
 
+(defun serial-byte-waiting-p ()
+  "A byte has arrived on the ESCC's channel A (RR0 bit 0): someone at a serial
+   console wants the REPL."
+  (logtest (mem-ref #x08013020 :u8) 1))
+
 (defun desk (&optional turns)
-  "glass.wm on the screen: TURNS turns, or for ever."
+  "glass.wm on the screen: TURNS turns, or until a byte arrives on the serial
+   port (it is left for the REPL to read)."
   (unless *wm*
-    (cuda-init) (adb-reset) (cuda-autopoll t)
+    (unless (screen-from-boot-info) (error "no screen: the firmware named no framebuffer"))
+    (mac-input-init)
     (desk-make))
   (if turns
       (dotimes (i turns) (desk-turn))
-      (loop (desk-turn))))
+      (loop (desk-turn) (when (serial-byte-waiting-p) (return)))))
 
-;; At boot: the desk once, so the screen shows it, then the REPL (DESK runs it).
-(handler-case (progn (desk 1) (modus-int::write-string-serial "glass.wm: up") (modus-int::write-char-serial 10))
+;; At boot: the desk.  With a serial console (the firmware's was one: boot info
+;; +48) it turns once, so the screen shows it, and the REPL follows -- (DESK) runs
+;; it from there.  Without one (a PowerBook: its screen was the console) nobody
+;; could type at that REPL, so the desk keeps the machine.
+(handler-case (progn (desk 1)
+                     (modus-int::write-string-serial "glass.wm: up") (modus-int::write-char-serial 10)
+                     (when (and (= (mem-ref #x07F80000 :u16) #x5050) (= (mac-boot-info 48) 0))
+                       (desk)))
   (error (c) (modus-int::write-string-serial "glass.wm: ") (princ c) (modus-int::write-char-serial 10)))

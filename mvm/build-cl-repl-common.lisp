@@ -4901,9 +4901,17 @@
          (format t "~&;; ppcmac map: image #x10000 .. #x~X (~,1F MB), stack top #x~X, ~
                    heap #x10000000..~%"
                  image-end (/ image-end 1048576.0) stack-top)
-         (when (> image-end #x04000000)
-           (error "ppcmac layout: the image ends at #x~X, past OpenBIOS's load-base ~
-                   #x04000000, where Open Firmware reads the file." image-end))))
+         ;; with its BSS (1 MB), below the native tier's code area at #x02800000
+         (when (> (+ image-end #x100000) #x02800000)
+           (error "ppcmac layout: the image and its BSS end past #x~X, the native ~
+                   tier's code area at #x02800000." (+ image-end #x100000))))
+       ;; the first stage, beside the image: OUT.boot (boot-ppcmac.lisp)
+       (let ((boot (concatenate 'string path ".boot"))
+             (elf (funcall (intern "PPCMAC-LOADER-ELF" "MODUS.MVM"))))
+         (with-open-file (o boot :direction :output :element-type '(unsigned-byte 8)
+                                 :if-exists :supersede)
+           (write-sequence elf o))
+         (format t "~&;; ppcmac first stage: ~A (~D bytes)~%" boot (length elf))))
       ;; ---- ARMv7 QEMU virt (boot-arm32-cl.lisp's map) -----------------
       ;; The image runs at VA #x10000 and grows up; the stack grows DOWN from
       ;; +ARM32-CL-STACK-TOP+, and the L1 table sits above it.  Everything

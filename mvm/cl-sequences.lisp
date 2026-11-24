@@ -963,6 +963,8 @@
    :allow-other-keys T precedes)."
   (when (and (null options) (%prim-simple-string-p a) (%prim-simple-string-p b))
     (return-from string= (%simple-string= a b)))
+  (when (and (null options) (%plain-base-string-p a) (%plain-base-string-p b))
+    (return-from string= (%base-string= a b)))
   (let ((sa (%string-designator a))
         (sb (%string-designator b))
         (s1 0) (e1 nil) (s2 0) (e2 nil)

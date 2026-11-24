@@ -811,16 +811,43 @@
   "SVREF of anything but a plain simple vector: the generic AREF."
   (aref a i))
 
+(declaim (optimize (safety 0)))     ; the index is below both lengths
 (defun %simple-string= (a b)
   "Two plain #x31 strings with the same characters: lengths, then the code
    words.  (STRING= parses keywords and string designators first.)"
+  (declare (optimize (speed 3)))      ; locals in registers (%PROMOTE-LOCALS-P)
   (let ((n (array-length a)))
+    (declare (type fixnum n))
     (and (= n (array-length b))
          (let ((i 0))
+           (declare (type fixnum i))
            (loop
              (when (>= i n) (return t))
              (unless (eq (%word-aref a i) (%word-aref b i)) (return nil))
              (setq i (+ i 1)))))))
+(declaim (optimize (safety 1)))
+
+(declaim (optimize (safety 0)))     ; the index is below both lengths
+(defun %base-string= (a b)
+  "Two plain narrow (#x13, a byte per character) strings with the same characters: lengths, then the bytes.
+   Narrow strings are what the reader, FORMAT and symbol names make; they took STRING='s general path -- its
+   keyword parse, then a dispatched %PRIM-AREF per character on both sides: 137 ns for two 59-character names,
+   where SBCL takes 3, and every EQUAL table keyed by such names (mill's tensor table) paid it per probe."
+  (declare (optimize (speed 3)))      ; locals in registers (%PROMOTE-LOCALS-P)
+  (let ((n (array-length a)))
+    (declare (type fixnum n))
+    (and (= n (array-length b))
+         (let ((i 0))
+           (declare (type fixnum i))
+           (loop
+             (when (>= i n) (return t))
+             (unless (eq (%u8-ref a i) (%u8-ref b i)) (return nil))
+             (setq i (+ i 1)))))))
+(declaim (optimize (safety 1)))
+
+(defun %plain-base-string-p (x)
+  "X is a plain narrow string: a #x13 object, not an array header over one."
+  (and (%prim-base-string-p x) (not (%mda-p x))))
 
 (defun equal (a b)
   "Structural equality: EQL for atoms, recursive for conses,
@@ -836,11 +863,13 @@
               nil)
           (if (and (%prim-simple-string-p a) (%prim-simple-string-p b))
               (%simple-string= a b)
+              (if (and (%plain-base-string-p a) (%plain-base-string-p b))
+                  (%base-string= a b)
               (if (stringp a)
                   (if (stringp b)
                       (string= a b)
                       nil)
-                  (%equal-other a b))))))
+                  (%equal-other a b)))))))
 
 (defun %equal-other (a b)
   "EQUAL's remaining CLHS cases, off the cons/string fast path: BIT VECTORS
@@ -2201,6 +2230,38 @@
         (car (cdr (cdr (cdr (cdr (cdr c))))))
         nil)))
 
+(declaim (optimize (safety 0)))     ; the index is below the length
+(defun %fnv-string-hash (key)
+  "FNV-1a of plain string KEY's characters, 32 bits (%HT-HASH's 64-bit EQUAL-table string hash).  Its own
+   function, at SPEED 3 so its locals live in registers (%PROMOTE-LOCALS-P), H declared to its 32 bits so the
+   multiply needs no overflow check -- the low 32 bits of the product are the same either way.  It was 130 ns
+   for a 59-character name (SBCL's SXHASH: 35).  Every read is a character CODE (a wide string's words are its
+   codes, fixnums), so (UNSIGNED-BYTE 32) bounds it and the XOR and product with it."
+  (declare (optimize (speed 3)))
+  (let ((h 2166136261) (len (array-length key)) (i 0))
+    (declare (type (unsigned-byte 32) h) (type fixnum len i))
+    ;; A plain string here: wide (#x31, a word per character) or narrow
+    ;; (#x13, a byte) -- chosen ONCE, not per character as %PRIM-AREF
+    ;; would.  Both read the CODE, so equal contents hash equally across
+    ;; the two representations, as an EQUAL table needs.
+    (if (%prim-base-string-p key)
+        (loop
+          (when (>= i len) (return nil))
+          (setq h (logand (* (logxor h (the (unsigned-byte 32) (%u8-ref key i))) 16777619) #xFFFFFFFF))
+          (setq i (+ i 1)))
+      (if (%prim-string32-p key)
+        ;; ...or a 32-bit string (#x15): a u32 code per character
+        (loop
+          (when (>= i len) (return nil))
+          (setq h (logand (* (logxor h (the (unsigned-byte 32) (%c32-ref key i))) 16777619) #xFFFFFFFF))
+          (setq i (+ i 1)))
+        (loop
+          (when (>= i len) (return nil))
+          (setq h (logand (* (logxor h (the (unsigned-byte 32) (%word-aref key i))) 16777619) #xFFFFFFFF))
+          (setq i (+ i 1)))))
+    h))
+(declaim (optimize (safety 1)))
+
 (defun %ht-hash (key strcmp? mask)
   "Cheap bucket index for KEY, or :NOHASH for a key we can't index by structure.
    STRINGS are only bucketed when STRCMP? (EQUAL tables, content compare); under
@@ -2249,27 +2310,7 @@
          ;; exhausted the heap.  Every intermediate here is below 2^28.  The
          ;; 64-bit path is FNV-1a exactly as before.
          (if (> +fixnum-bits+ 32)
-             (let ((h 2166136261) (len (array-length key)) (i 0))
-               ;; A plain string here: wide (#x31, a word per character) or narrow
-               ;; (#x13, a byte) -- chosen ONCE, not per character as %PRIM-AREF
-               ;; would.  Both read the CODE, so equal contents hash equally across
-               ;; the two representations, as an EQUAL table needs.
-               (if (%prim-base-string-p key)
-                   (loop
-                     (when (>= i len) (return nil))
-                     (setq h (logand (* (logxor h (%u8-ref key i)) 16777619) #xFFFFFFFF))
-                     (setq i (+ i 1)))
-                 (if (%prim-string32-p key)
-                   ;; ...or a 32-bit string (#x15): a u32 code per character
-                   (loop
-                     (when (>= i len) (return nil))
-                     (setq h (logand (* (logxor h (%c32-ref key i)) 16777619) #xFFFFFFFF))
-                     (setq i (+ i 1)))
-                   (loop
-                     (when (>= i len) (return nil))
-                     (setq h (logand (* (logxor h (%word-aref key i)) 16777619) #xFFFFFFFF))
-                     (setq i (+ i 1)))))
-               (logand h mask))
+             (logand (%fnv-string-hash key) mask)
              (let ((h 1162397) (len (array-length key)) (i 0))   ; #x11BC9D
                (loop
                  (when (>= i len) (return nil))

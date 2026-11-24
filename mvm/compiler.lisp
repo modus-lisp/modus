@@ -15564,11 +15564,36 @@
    30 frames 495 → 596 ms, +1.1 M instructions/frame on reel), so it was
    opt-in; dedicated registers do not touch the temp pool, so it is on.")
 
+(defvar *promote-this-function* nil
+  "T while an IMAGE compile compiles a function whose body declares (OPTIMIZE (SPEED 3)) (%BODY-SPEED-3-P).")
+
+(defun %body-speed-3-p (body)
+  "BODY's leading declarations name (OPTIMIZE (SPEED 3))."
+  (loop
+    (cond ((and (consp body) (stringp (car body)) (consp (cdr body)))
+           (setq body (cdr body)))
+          ((and (consp body) (consp (car body)) (symbolp (caar body))
+                (name-eq (caar body) "DECLARE"))
+           (dolist (spec (cdar body))
+             (when (and (consp spec) (symbolp (car spec)) (name-eq (car spec) "OPTIMIZE"))
+               (dolist (q (cdr spec))
+                 (when (and (consp q) (symbolp (car q)) (name-eq (car q) "SPEED")
+                            (consp (cdr q)) (eql (cadr q) 3))
+                   (return-from %body-speed-3-p t)))))
+           (setq body (cdr body)))
+          (t (return nil)))))
+
 (defun %promote-locals-p ()
+  "Locals may live in the dedicated local registers: in a run-time compile for aarch64 (every function), and in
+   an aarch64 IMAGE compile in a function that declares (OPTIMIZE (SPEED 3)) -- the runtime's own hot loops
+   (STRING=, the hash tables') kept every local in its frame slot, a load and a store per use.  Opt-in: the
+   whole image promoted the run-time way miscompiled at boot (not yet isolated)."
   (and *promote-locals*
-       *mvm-eval-runtime-p*
-       (boundp (quote *jit-target-arch*))
-       (eq (symbol-value (quote *jit-target-arch*)) :aarch64)))
+       (if *mvm-eval-runtime-p*
+           (and (boundp (quote *jit-target-arch*))
+                (eq (symbol-value (quote *jit-target-arch*)) :aarch64))
+           (and *promote-this-function* *compile-target*
+                (eq (compile-target-name *compile-target*) :aarch64)))))
 (defun %local-vregs-active-p ()
   "Local registers (V9/V10) are reserved for promotion in this compile."
   (and (%promote-locals-p) (not *promote-inhibit*)))
@@ -33606,13 +33631,21 @@
             (setq new-params (cons g new-params)))
           (setq new-params (cons p new-params))))
     (setq body (%rebind-boxed-params params body))
-    (if renames
-        (mvm-compile-function-internal-1
-         name (nreverse new-params)
-         (list (cons 'let (cons (nreverse renames) body)))
-         parent-env rest-slot opt-start opt-count)
-        (mvm-compile-function-internal-1
-         name params body parent-env rest-slot opt-start opt-count))))
+    (let ((promote (and (not *mvm-eval-runtime-p*) (%body-speed-3-p body))))
+      (if renames
+          (%mvm-cfi-promoting promote
+           name (nreverse new-params)
+           (list (cons 'let (cons (nreverse renames) body)))
+           parent-env rest-slot opt-start opt-count)
+          (%mvm-cfi-promoting promote
+           name params body parent-env rest-slot opt-start opt-count)))))
+
+(defun %mvm-cfi-promoting (promote name params body parent-env rest-slot opt-start opt-count)
+  "MVM-COMPILE-FUNCTION-INTERNAL-1 with *PROMOTE-THIS-FUNCTION* bound to PROMOTE for this function (a nested
+   FLET or lambda binds its own).  The only special this function binds (see %COMPILE-LET-AT-SAFETY)."
+  (let ((*promote-this-function* promote))
+    (declare (special *promote-this-function*))
+    (mvm-compile-function-internal-1 name params body parent-env rest-slot opt-start opt-count)))
 
 (defun %rebind-boxed-params (params body)
   "BODY with each parameter that needs a cell rebound by a LET of itself, so

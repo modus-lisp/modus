@@ -1431,8 +1431,13 @@ python3 -I host/macos/check-macho.py modus --modus --elf modus-darwin.elf
 host/macos/mac-test.sh ./modus [./modus-ld]                            # on a Mac
 ```
 
-**NOT YET RUN ON A MAC.**  Everything below is checked on Linux; `host/macos/mac-test.sh`
-is the first-run script, step by step, with what each step rules out.
+**RUN ON A MAC, 2026-11-24: `host/macos/mac-test.sh` PASSES** (an M-series Mac, against a
+`build-macos.sh` control from the same image): `codesign -v` valid (CodeDirectory 0x20400,
+flags `adhoc,linker-signed`, 13,630 hashes), `--eval` prints 3, the 19-check script passes
+(files, directories, clocks, GC, a caught fault, the JIT, a loopback socket, threads,
+threads with GC), the GC loop and the REPL on a pipe work, and every output is identical to
+the control's.  `mac-test.sh` is the script to rerun after a change to the host or the
+writer; it says what each step rules out.
 
 ### Why not the MVM compiler, and not assembly by hand
 

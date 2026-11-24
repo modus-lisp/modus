@@ -53,10 +53,10 @@ for (const [ops, n] of [[[0x74,0x7C,0x7D,0x7E],3],[[0x6A,0x6B,0x6C,0x6D,0x6E,0x6
   [[0x69],6]]) for (const o of ops) INSN_LEN[o] = n;
 const BACK_BRANCH = new Uint8Array(256);
 for (const o of [0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0xC7]) BACK_BRANCH[o] = 1;
-const OSR_THRESHOLD = 500;
 // Environment: node's process.env, or in a browser worker the MVM_ENV object
 // worker.js sets on its global (the URL's ?wasm= / MVM_* parameters).
 const ENV = typeof process !== 'undefined' && process.env ? process.env : ((typeof self !== 'undefined' && self.MVM_ENV) || {});
+const OSR_THRESHOLD = (ENV.MVM_OSR_THRESHOLD && parseInt(ENV.MVM_OSR_THRESHOLD, 10)) || 500;
 const NO_OSR = !!ENV.MVM_NO_OSR;
 const NO_EXEC = new Uint8Array(256);
 for (const o of [0xD9,0xDA,0xDB,0xDC,0xDD,0xDE,0xDF,0xE0,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xAA,0xAB,0xAC]) NO_EXEC[o] = 1;
@@ -238,7 +238,7 @@ class MVM {
     this.dcount = new Map();
     this.contF = []; this.contL = []; this.contE = []; this.contDepth = 0;
     this.compileOn = opts.compile !== false;
-    this.compileThreshold = opts.compileThreshold || 20;
+    this.compileThreshold = opts.compileThreshold || (ENV.MVM_COMPILE_THRESHOLD && parseInt(ENV.MVM_COMPILE_THRESHOLD, 10)) || 20;
     this.callCounts = new Map();
     this.osrCounts = new Map(); this.osrCompiled = new Map();
     this.compileStats = { fns: 0, insns: 0, failed: 0, ms: 0, osr: 0, delegated: new Map() };
@@ -617,6 +617,7 @@ class MVM {
     this.startBmp.fill(0, g0 >> 3, g1 >> 3);
     this.consBmp.fill(0, g0 >> 3, g1 >> 3);
     this.gcCount++;
+    if (this._w) this._w.g.gcn.value = this.gcCount;   // wasm32.js: reload after a call only if this moved
     this.st64(A_GC_COUNT, this.gcCount, 0);
     if (this.trace) this.host.log(`[gc #${this.gcCount}: ${used >> 10}K -> ${(free - toStart) >> 10}K, ${Date.now() - t0}ms]`);
   }

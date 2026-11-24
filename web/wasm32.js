@@ -82,9 +82,11 @@ const F_EXEC = 0, F_GC = 1, F_CHECKED = 2, F_FAULT = 3, F_TAIL = 4, F_TRAP = 5, 
 // cmp / ovf: the compare and overflow flags across a jump between chunks.
 const FB_BIAS = 4096;          // see LOAD
 const DIRTYOFF = !!ENV.MVM_WASM_NODIRTY;
-const NOINLSJ = !!ENV.MVM_WASM_NOINLSJ;      // bisect: setjmp / handler-pop through JS   // bisect: spill every register every time
-const GLOBALS = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc', 'dep', 'cmp', 'ovf'];
-const G_VR = 0, G_VA = 1, G_VL = 2, G_ESP = 3, G_EBP = 4, G_PC = 5, G_DEP = 6, G_CMP = 7, G_OVF = 8;
+const NOINLSJ = !!ENV.MVM_WASM_NOINLSJ;
+const NOGCSKIP = !!ENV.MVM_WASM_NOGCSKIP;   // bisect: reload V4-V15 after every call      // bisect: setjmp / handler-pop through JS   // bisect: spill every register every time
+// gcn: the VM's collection count, which vm.gc() bumps itself (see fastCall).
+const GLOBALS = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc', 'dep', 'cmp', 'ovf', 'gcn'];
+const G_VR = 0, G_VA = 1, G_VL = 2, G_ESP = 3, G_EBP = 4, G_PC = 5, G_DEP = 6, G_CMP = 7, G_OVF = 8, G_GCN = 9;
 const WDEPTH = (ENV.MVM_WASM_DEPTH && parseInt(ENV.MVM_WASM_DEPTH, 10)) || 600;
 const SYNCED = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc'];
 
@@ -225,8 +227,8 @@ function compile(vm, entry, osr) {
 
   const tCfg = performance.now(); W.stats.cfgMs = (W.stats.cfgMs || 0) + (tCfg - t0);
   // 2. code
-  const LP = 0, LR = (v) => 1 + v, LCMP = 17, LOVF = 18, LFB = 19, LT1 = 20, LT2 = 21, LT3 = 22, LDEP = 23;
-  const NLOCALS = 23;           // beyond the param
+  const LP = 0, LR = (v) => 1 + v, LCMP = 17, LOVF = 18, LFB = 19, LT1 = 20, LT2 = 21, LT3 = 22, LDEP = 23, LGC = 24;
+  const NLOCALS = 24;           // beyond the param
   let o = [];                   // current function body bytes
   let nglob = GLOBALS.length;   // module-defined globals (call-site caches) follow the imported ones
   let cur = -1;                 // label of the code being emitted
@@ -363,10 +365,14 @@ function compile(vm, entry, osr) {
       lget(LT3); gset(G_EBP); lget(LT3); F(); op1(0x6B); gset(G_ESP);
       T(); gset(G_PC);
       gget(G_DEP); i32c(1); op1(0x6A); gset(G_DEP);
+      gget(G_GCN); lset(LGC);
       i32c(0); S(); o.push(0x11); uleb(o, FNTYPE); o.push(0x00); lset(LT1);
       gget(G_DEP); i32c(1); op1(0x6B); gset(G_DEP);
       lget(LT1); i32c(-1); op1(0x47); IF(); T(); lget(LT1); call(F_FINISH); END();
-      LOAD(4, 15);
+      // V4-V15's homes change during a call only if a collection rewrote
+      // them as roots: reload when the count moved, not after every call.
+      if (NOGCSKIP) LOAD(4, 15);
+      else { gget(G_GCN); lget(LGC); op1(0x47); IF(); LOAD(4, 15); END(); }
   };
   // absolute address A as a memory operand base (adr's form, from a constant)
   const absA = (a) => i32c(a - VBASE);

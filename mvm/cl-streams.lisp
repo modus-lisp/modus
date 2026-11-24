@@ -16,7 +16,7 @@
 ;;;        5=broadcast, 6=concatenated, 7=synonym, 8=serial-io
 ;;;
 ;;; String-input data:  (cons string (cons position unread-char-or-nil))
-;;; String-output data: (cons char-list nil)
+;;; String-output data: (cons buffer element-flag), buffer NIL or (VEC . FILL) -- see %SOS-ADD
 ;;; Echo data:          (cons input-stream output-stream)
 ;;; Two-way data:       (cons input-stream output-stream)
 ;;; Broadcast data:     list-of-streams
@@ -36,6 +36,115 @@
 
 (defun %stream-type (s)
   (car (cdr s)))
+
+;;; STRING-OUTPUT BUFFER.  A string-output stream's data is (BUFFER . FLAG): BUFFER
+;;; is NIL until something is written, then (VEC FILL DONE . CHUNKS): VEC a
+;;; simple-vector of character CODES (whatever the build's string representation)
+;;; filled to FILL, CHUNKS the full vectors before it, newest first, holding DONE
+;;; codes.  A full VEC joins CHUNKS and a new one twice its size takes over, so
+;;; nothing is copied until the string is made (once, %SOS-TAKE-STRING).  It was
+;;; a list, one cons per character newest first: 16 bytes of garbage a character,
+;;; so FORMAT NIL, PRINC-TO-STRING and every WITH-OUTPUT-TO-STRING paid an
+;;; allocation per character (cl-bench STRING-CONCAT: 210 ns a 9-character
+;;; WRITE-SEQUENCE, SBCL 28).  Every reader of the buffer goes through these.
+(declaim (inline %sos-add))
+(defun %sos-add (data code)
+  "Append the character CODE to string-output DATA."
+  (let ((b (car data)))
+    (if b
+        (let ((r (cdr b)))
+          (if (< (car r) (%prim-array-length (car b)))
+              (progn (%word-aset (car b) (car r) code)
+                     (set-car r (+ (car r) 1)))
+              (%sos-add-slow data code)))
+        (%sos-add-slow data code))))
+(defun %sos-room (data)
+  "DATA's buffer with at least one free slot in its VEC."
+  (let ((b (car data)))
+    (cond ((null b)
+           (let ((nb (list* (make-array 64) 0 0 nil)))
+             (set-car data nb)
+             nb))
+          ((< (car (cdr b)) (%prim-array-length (car b))) b)
+          (t
+           ;; the full VEC joins the chunks; a fresh one twice its size
+           (let* ((v (car b)) (r (cdr b)) (n (car r)) (r2 (cdr r)))
+             (set-cdr r2 (cons v (cdr r2)))
+             (set-car r2 (+ (car r2) n))
+             (set-car r 0)
+             (set-car b (make-array (* 2 (%prim-array-length v))))
+             b)))))
+(defun %sos-add-slow (data code)
+  (let* ((b (%sos-room data)) (r (cdr b)) (n (car r)))
+    (%word-aset (car b) n code)
+    (set-car r (+ n 1))))
+(defun %sos-count (data)
+  "How many characters string-output DATA holds."
+  (let ((b (car data))) (if b (+ (car (cdr b)) (car (cdr (cdr b)))) 0)))
+(defun %sos-last (data)
+  "The code of the last character written to DATA, or NIL."
+  (let ((b (car data)))
+    (cond ((null b) nil)
+          ((> (car (cdr b)) 0) (%word-aref (car b) (- (car (cdr b)) 1)))
+          ((cdr (cdr (cdr b)))                    ; the newest full chunk's last
+           (let ((c (car (cdr (cdr (cdr b)))))) (%word-aref c (- (%prim-array-length c) 1))))
+          (t nil))))
+(defun %sos-pop-last (data)
+  "Drop the last character written to DATA (an echo stream's PEEK-CHAR)."
+  (let ((b (car data)))
+    (when b
+      (let ((r (cdr b)))
+        (cond ((> (car r) 0) (set-car r (- (car r) 1)))
+              ((cdr (cdr r))
+               ;; VEC is empty: the newest chunk becomes VEC again, less its last
+               (let* ((r2 (cdr r)) (c (car (cdr r2))) (len (%prim-array-length c)))
+                 (set-car b c)
+                 (set-car r (- len 1))
+                 (set-car r2 (- (car r2) len))
+                 (set-cdr r2 (cdr (cdr r2))))))))))
+(defun %sos-column (data)
+  "Characters written to DATA since its last newline."
+  (let ((b (car data)))
+    (if (null b)
+        0
+        (let ((col 0) (v (car b)) (i (- (car (cdr b)) 1)) (chunks (cdr (cdr (cdr b)))))
+          (loop
+            (cond ((>= i 0)
+                   (when (eql (%word-aref v i) 10) (return col))
+                   (setq col (+ col 1))
+                   (setq i (- i 1)))
+                  ((null chunks) (return col))
+                  (t (setq v (car chunks))
+                     (setq chunks (cdr chunks))
+                     (setq i (- (%prim-array-length v) 1)))))))))
+(defun %sos-take-string (data)
+  "A fresh string of string-output DATA's characters; DATA is left empty (its
+   newest vector kept for the next ones)."
+  (let* ((b (car data)) (len (%sos-count data)))
+    (if (= len 0)
+        (if (eq (cdr data) :nil-element)
+            (make-array 0 :element-type nil)
+            (%make-string-array 0))
+        (let* ((s (%make-string-array len)) (r (cdr b)) (fill (car r))
+               (chunks (reverse (cdr (cdr r)))) (pos 0)
+               (wide (not (or (%prim-string32-p s) (%prim-base-string-p s)))))
+          (labels ((put (v n)
+                     (if wide
+                         ;; codes into a wide string's words: the same words (%BULK-COPY,
+                         ;; one block move where the target has it)
+                         (%bulk-copy s pos v 0 n)
+                         (let ((i 0))
+                           (if (%prim-string32-p s)
+                               (loop (when (>= i n) (return nil)) (%c32-set s (+ pos i) (%word-aref v i)) (setq i (+ i 1)))
+                               (loop (when (>= i n) (return nil)) (%base-string-set s (+ pos i) (%word-aref v i)) (setq i (+ i 1))))))
+                     (setq pos (+ pos n))))
+            (dolist (c chunks) (put c (%prim-array-length c)))
+            (put (car b) fill))
+          ;; empty again: the newest (largest) vector is kept
+          (set-car r 0)
+          (set-car (cdr r) 0)
+          (set-cdr (cdr r) nil)
+          s))))
 
 ;; INLINE, as the file stream's slot accessors built on it (cl-fileio.lisp): a
 ;; stream is a list, and every accessor was a call walking it -- a dozen calls a
@@ -232,8 +341,11 @@
 
 (defun get-output-stream-string (stream)
   (let ((data (if (streamp stream) (%stream-data stream) stream)))
-    ;; The codes are newest first: fill the string from its end rather than
-    ;; NREVERSE the list and walk it again.
+    (when (or (null (car data)) (%prim-simple-vector-p (car (car data))))
+      (return-from get-output-stream-string (%sos-take-string data)))
+    ;; A LEGACY char-list (a bare cons WRITE-CHAR-TO-STREAM pushed onto, not a
+    ;; stream): the codes are newest first: fill the string from its end
+    ;; rather than NREVERSE the list and walk it again.
     (let ((chars (car data)))
       (set-car data nil)
       (let ((len (list-length chars)))

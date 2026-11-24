@@ -6047,12 +6047,25 @@
   ;; slots (find-symbol.17 / shadow.8 build names with MAKE-ARRAY
   ;; :element-type 'base-char).  Flatten it first.
   (when (%mda-p name-string) (setq name-string (%flat-string name-string)))
+  ;; TYPED, and each character read by its string's own primitive: the state is
+  ;; 16 bits, the index below the length.  Untyped, with %PRIM-AREF's dispatch
+  ;; per character, a 16-character name took 52 ns -- and FIND-SYMBOL hashes the
+  ;; name and the package's name on every miss (%FIND-SYMBOL-BAKED), the
+  ;; compiler on every NAME-EQ of a fresh string.
   (let ((h1 40389) (h2 48879)          ; #x9DC5 / #xBEEF
         (len (array-length name-string))
-        (i 0))
+        (i 0)
+        (kind (cond ((%prim-simple-string-p name-string) 0)
+                    ((%prim-base-string-p name-string) 1)
+                    (t 2))))
+    (declare (type (unsigned-byte 16) h1 h2) (type (unsigned-byte 56) len i) (type fixnum kind)
+             (optimize (speed 3) (safety 0)))
     (loop
       (when (>= i len) (return nil))
-      (let ((c (%prim-aref name-string i)))
+      (let ((c (cond ((eql kind 0) (the (unsigned-byte 32) (%word-aref name-string i)))
+                     ((eql kind 1) (the (unsigned-byte 32) (%u8-ref name-string i)))
+                     (t (the (unsigned-byte 32) (%prim-aref name-string i))))))
+        (declare (type (unsigned-byte 32) c))
         (when (and (>= c 97) (<= c 122))
           (setq c (- c 32)))
         (setq c (logand c 65535))

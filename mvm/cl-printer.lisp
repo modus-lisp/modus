@@ -2979,19 +2979,11 @@
 
 ;;; Current output column of a string-output stream (type 2).  Returns the
 ;;; number of chars written since the last newline, or NIL if the column is
-;;; not recoverable (non-string-output stream).  A type-2 stream stores its
-;;; output as a REVERSED char-code list in (car (%stream-data stream)) — the
-;;; head is the most-recently-written char — so walking forward from the head
-;;; until a newline (code 10) yields the count of chars on the current line.
+;;; not recoverable (non-string-output stream).  The buffer's codes are read
+;;; back from its end to the last newline (cl-streams.lisp %SOS-COLUMN).
 (defun %stream-column (stream)
   (if (and (streamp stream) (= (%stream-type stream) 2))
-      (let ((p (car (%stream-data stream)))
-            (col 0))
-        (loop
-          (when (null p) (return col))
-          (when (= (car p) 10) (return col))
-          (setq col (+ col 1))
-          (setq p (cdr p))))
+      (%sos-column (%stream-data stream))
       nil))
 
 ;;; Emit N spaces to STREAM.
@@ -5449,11 +5441,9 @@
   (if (streamp s)
       (let ((ty (%stream-type s)))
         (cond
-          ((= ty 2) ;; string-output: check char-list
-           (let ((chars (car (%stream-data s))))
-             (if (null chars)
-                 t  ;; nothing written = at BOL
-                 (= (car chars) 10))))  ;; last char was newline
+          ((= ty 2) ;; string-output: nothing written, or the last was a newline
+           (let ((c (%sos-last (%stream-data s))))
+             (or (null c) (= c 10))))
           ((= ty 4) ;; two-way: check output side
            (%stream-at-bol-p (cdr (%stream-data s))))
           ((= ty 3) ;; echo: check output side
@@ -5473,13 +5463,17 @@
 ;; ANSI: (write-string str &optional stream &key start end)
 ;; Honor :start/:end for substring writes.
 (defun %sos-push-codes (data str start end)
-  "Push the codes of plain string STR[START,END) onto string-output DATA."
-  (let ((acc (car data)) (i start))
+  "Append the codes of plain (wide) string STR[START,END) to string-output DATA:
+   as many as fit into its current vector at a time, the words copied as a block
+   (a wide string's words are its codes)."
+  (let ((i start))
     (loop
       (when (>= i end) (return nil))
-      (setq acc (cons (%word-aref str i) acc))
-      (setq i (+ i 1)))
-    (set-car data acc)))
+      (let* ((b (%sos-room data)) (v (car b)) (r (cdr b)) (n (car r))
+             (k (min (- end i) (- (%prim-array-length v) n))))
+        (%bulk-copy v n str i k)
+        (set-car r (+ n k))
+        (setq i (+ i k))))))
 
 (defun write-string (str &rest args)
   ;; FAST PATH: a plain string onto a string-output stream, with no keywords
@@ -5637,8 +5631,7 @@
     ;; A string-output stream takes the code inline (it went through
     ;; %RESOLVE-OUTPUT-STREAM and %WRITE-CHAR-TO-STREAM's dispatch).
     (if (and (consp sa) (eql (car sa) 7770001) (consp (cdr sa)) (eql (car (cdr sa)) 2))
-        (let ((data (cdr (cdr sa))))
-          (set-car data (cons code (car data))))
+        (%sos-add (cdr (cdr sa)) code)
         (%write-char-to-stream code (%resolve-output-stream sa))))
   ch)
 
@@ -5929,6 +5922,14 @@
     (let ((actual-end (if end end (length seq)))
           (i start)
           (s (%resolve-output-stream stream)))
+      ;; a plain string onto a string-output stream: its codes appended at once
+      ;; (%SOS-PUSH-CODES, as WRITE-STRING), not a dispatched write per character
+      (when (and (%prim-simple-string-p seq) (consp s) (eql (car s) 7770001)
+                 (consp (cdr s)) (eql (car (cdr s)) 2)
+                 (fixnump i) (fixnump actual-end) (<= 0 i) (<= i actual-end)
+                 (<= actual-end (array-length seq)))
+        (%sos-push-codes (cdr (cdr s)) seq i actual-end)
+        (return-from write-sequence seq))
       ;; a byte vector to a 1-byte file stream: bulk (cl-fileio %FS-WRITE-BYTES)
       (when (%fs-write-bytes s seq i actual-end)
         (return-from write-sequence seq))

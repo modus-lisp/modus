@@ -1674,8 +1674,7 @@
           ;; String-output: position == count of chars written so far.
           ((= ty 2)
            (if (null args)
-               (let ((chars (car (%stream-data stream))))
-                 (list-length chars))
+               (%sos-count (%stream-data stream))
                ;; Cannot rewind a string-output stream (would require
                ;; truncating the char-list); return nil per CLHS.
                nil))
@@ -3373,10 +3372,7 @@
    final echo (the peeked-at character must not appear in the echo
    output, per CLHS 21.1.4.1)."
   (when (and (streamp out-stream) (= (%stream-type out-stream) 2))
-    (let ((data (%stream-data out-stream)))
-      (let ((chars (car data)))
-        (when (consp chars)
-          (set-car data (cdr chars)))))))
+    (%sos-pop-last (%stream-data out-stream))))
 
 (defun %whitespace-p (ch)
   "Check if character is whitespace."
@@ -3461,9 +3457,8 @@
   ;; A string-output stream first, inline (STREAMP was a call per character).
   (when (and (consp stream) (eql (car stream) 7770001) (consp (cdr stream))
              (eql (car (cdr stream)) 2))
-    (let ((data (cdr (cdr stream))))
-      (set-car data (cons code (car data)))
-      (return-from %write-char-to-stream nil)))
+    (%sos-add (cdr (cdr stream)) code)
+    (return-from %write-char-to-stream nil))
   (if (not (streamp stream))
       (if (and *gray-root-class* (%clos-instance-p stream) (typep stream *gray-root-class*))
           (funcall *gray-write-char-fn* stream code)
@@ -3472,8 +3467,7 @@
         (cond
           ;; String-output: collect char codes
           ((= ty 2)
-           (let ((data (%stream-data stream)))
-             (set-car data (cons code (car data)))))
+           (%sos-add (%stream-data stream) code))
           ;; Echo stream: write to output side
           ((= ty 3)
            (%write-char-to-stream code (cdr (%stream-data stream))))

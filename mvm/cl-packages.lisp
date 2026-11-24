@@ -62,7 +62,20 @@
 
 (defun %pkg-set-name (pkg v)
   (setq *%find-package-cache* nil)
+  (aset (%pkg-data pkg) 7 nil)          ; the name's hash (%PKG-NAME-HASH)
   (aset (%pkg-data pkg) 0 v))
+
+(defun %pkg-name-hash (pkg)
+  "COMPUTE-NAME-HASH of PKG's name, kept in its data slot 7 (a fixnum: a
+   worker thread may store one into a shared package; %PKG-SET-NAME clears
+   it).  %FIND-SYMBOL-BAKED hashed the package's name on every FIND-SYMBOL
+   miss -- \"COMMON-LISP-USER\" for each symbol PRINT qualified."
+  (let* ((data (%pkg-data pkg)) (h (aref data 7)))
+    (if (fixnump h)
+        h
+        (let ((h2 (compute-name-hash (%pkg-name pkg))))
+          (aset data 7 h2)
+          h2))))
 (defun %pkg-set-nicknames (pkg v)
   (setq *%find-package-cache* nil)
   (aset (%pkg-data pkg) 1 v))
@@ -775,7 +788,7 @@
     (aset data 4 nil)         ; use-list
     (aset data 5 nil)         ; used-by-list
     (aset data 6 nil)         ; shadowing-symbols
-    (aset data 7 nil)         ; internal-symbols hash index (slot 2 + 5)
+    (aset data 7 nil)         ; the name's COMPUTE-NAME-HASH, once asked (%PKG-NAME-HASH)
     (aset data 8 nil)         ; external-symbols hash index (slot 3 + 5)
     (aset data 9 nil)         ; package-local nicknames: ((NAME . PKG) ...)
     (cons *pkg-tag* data)))
@@ -1111,7 +1124,7 @@
    check as %CL-INTERN-IN; reads only, so no lock."
   (let* ((g (mem-ref #x10000088 :u64))
          (e (and g (gethash (%symbol-pkg-key (compute-name-hash name-str)
-                                             (compute-name-hash (%pkg-name pkg)))
+                                             (%pkg-name-hash pkg))
                             g))))
     (if (and e (symbolp e) (string= (symbol-name e) name-str)
              (eq (symbol-package e) pkg))

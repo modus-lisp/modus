@@ -11105,8 +11105,8 @@
             (%compile-lexical-exit (caddr form) (caddr entry)
                                    (or (cadddr entry) 0) (cadr entry) env))
            ;; Cross-unit: BLOCK lives in an enclosing function/lambda.
-           ((assoc (normalize-name bname) *nonlocal-blocks* :test #'=)
-            (let ((tag-val (cadr (assoc (normalize-name bname)
+           ((assoc (%block-name-hash bname) *nonlocal-blocks* :test #'=)
+            (let ((tag-val (cadr (assoc (%block-name-hash bname)
                                         *nonlocal-blocks* :test #'=))))
               ;; (%nlx-throw TAG-VAL value) — the BLOCK's CATCH frame
               ;; catches.  %nlx-throw (not THROW) so the handler-bind-safe
@@ -21557,6 +21557,16 @@
                 (progn (setq cur (car r)) (setq n (+ n 1)))
                 (return cur)))))))
 
+(defun %block-name-hash (name)
+  "The key a BLOCK named NAME is filed under: COMPILE-BLOCK's -- 0 for the NIL
+   block, else NORMALIZE-NAME.  (NORMALIZE-NAME NIL) is NOT 0, so comparing a
+   RETURN-FROM's NORMALIZE-NAME against a block's hash never matched the NIL
+   block: (block nil (funcall (lambda () (return-from nil :x))) :fell) installed
+   no catch frame, the RETURN-FROM lowered to a return from the lambda, and the
+   block fell through to :FELL.  TI's PROG is (BLOCK NIL (LET ...)) around their
+   RETURN, so every PROG that RETURNs from inside a lambda lost its exit."
+  (if name (normalize-name name) 0))
+
 (defun %return-from-escapes-block-p (body block-hash crossed-lambda shadowed)
   "Scan BODY (a list of forms) for a RETURN-FROM (or RETURN if BLOCK-HASH
    is 0, the NIL block) targeting BLOCK-HASH that lives INSIDE a lambda
@@ -21580,7 +21590,7 @@
                    ;; its body (RETURN-FROM there targets the inner block).
                    ((%form-op-is form 372279278 "BLOCK")
                     (let ((inner-sh (or sh
-                                        (= (normalize-name (cadr form))
+                                        (= (%block-name-hash (cadr form))
                                            block-hash))))
                       (let ((cur (cddr form)))
                         (loop while (consp cur) do
@@ -21648,7 +21658,7 @@
                    ;; RETURN-FROM <name> — check target + lambda boundary
                    ((%form-op-is form 164933334 "RETURN-FROM")
                     (when (and xl (not sh)
-                               (= (normalize-name (cadr form)) block-hash))
+                               (= (%block-name-hash (cadr form)) block-hash))
                       (setq found t))
                     (walk (caddr form) xl sh))
                    ;; RETURN (== return-from NIL) — only for the NIL block.
@@ -21762,7 +21772,7 @@
    through the THROW (we do NOT register a lexical *block-labels* entry):
    a lexical :br out of the middle of the catch's handler-case would skip
    its setjmp-frame teardown and corrupt the handler-case stack."
-  (let* ((name-hash (if name (normalize-name name) 0)))
+  (let* ((name-hash (%block-name-hash name)))
     (if (and (%return-from-escapes-block-p body name-hash nil nil)
              ;; ...but only when the catch frame can nest safely.  An
              ;; UNWIND-PROTECT or a cross-unit GO in the body shares the
@@ -22835,6 +22845,17 @@
       (when (not (symbolp op)) (return-from tail-form-is-values-p nil))
       (let ((hash (normalize-name op)))
         (cond
+          ;; A symbol that SHADOWS a CL name is not that operator, whatever its
+          ;; hash: judge its expansion, as the catch-all below judges any macro.
+          ;; cortez's RETURN takes several values, (RETURN T BA), and the RETURN
+          ;; arm read its first argument as the whole value: T, single-valued,
+          ;; so the epilogue set the count to 1 and the caller got (T).  TI's
+          ;; SHEET-PREPARE-FOR-EXPOSE returns (RETURN T :CLEAN) out of a PROG.
+          ((%shadows-cl-p op)
+           (let ((r (%quiet-macroexpand-1 form)))
+             (if (and (cdr r) (not (equal (car r) form)))
+                 (tail-form-is-values-p (list (car r)))
+                 t)))
           ;; Direct values call
           ((= hash 18794783) t)  ; VALUES
           ;; VALUES-LIST also returns multiple values
@@ -23146,6 +23167,17 @@
    multiple values so the function epilogue doesn't clobber MV-COUNT."
   (cond
     ((atom forms) nil)
+    ;; A RETURN / RETURN-FROM that shadows CL's is a macro of its own (cortez's
+    ;; RETURN takes several values): look at what it expands to.
+    ((and (symbolp (car forms))
+          (let ((h (compute-name-hash (symbol-name (car forms)))))
+            (or (= h #.(compute-name-hash "RETURN"))
+                (= h #.(compute-name-hash "RETURN-FROM"))))
+          (%shadows-cl-p (car forms)))
+     (let ((r (%quiet-macroexpand-1 forms)))
+       (if (and (cdr r) (not (equal (car r) forms)))
+           (loop-body-has-mv-return-p (car r))
+           (loop-body-has-mv-return-p (cdr forms)))))
     ((and (consp forms) (symbolp (car forms))
           (let ((h (compute-name-hash (symbol-name (car forms)))))
             (or (= h #.(compute-name-hash "RETURN"))
@@ -26402,20 +26434,27 @@
 ;;; arithmetic plus at most one %MAKE-BIGNUM -- no generic arithmetic, which is
 ;;; what the M3a first cut called (%W32-HI-OF / -LO-OF / -BOX in the prelude:
 ;;; measured 11% SLOWER on SHA-256 and 1.8x slower on ChaCha20 than the bignum
-;;; code it replaced).
+;;; code it replaced).  The limbs are read and written with %WORD-AREF /
+;;; %WORD-ASET, not %PRIM-AREF / %PRIM-ASET: the argument is always a bignum, a
+;;; word object, and %PRIM-AREF compiles a dispatch on the array's kind (byte,
+;;; 32-bit lane, word) at every use, whose bignum arm is %WORD-AREF anyway.
+;;; Measured: a (LOGAND (+ A B) #xFFFFFFFF) DEFUN over two declared words
+;;; compiles in 28 ms instead of 62 on the hosted 68k CLI (undeclared, 3 ms) --
+;;; what the Mac pays at its REPL -- and ChaCha20 runs 38-46% faster, SHA-256
+;;; 6-19% (riscv32, arm32, i386), since the dispatch ran on every bignum leaf.
 (defun %w32-hi-form (g)
   "Bits 31..16 of integer G (a fixnum or a small bignum), as a fixnum."
   (let ((lb (ct-limb-bits)))
     (list 'if (list 'fixnump g)
           (list 'logand (list 'ash g -16) #xFFFF)
-          (list 'logand (list 'logior (list 'ash (list '%prim-aref g 1) (- lb 16))
-                              (list 'ash (list '%prim-aref g 0) -16))
+          (list 'logand (list 'logior (list 'ash (list '%word-aref g 1) (- lb 16))
+                              (list 'ash (list '%word-aref g 0) -16))
                 #xFFFF))))
 (defun %w32-lo-form (g)
   "Bits 15..0 of integer G (a fixnum or a small bignum), as a fixnum."
   (list 'if (list 'fixnump g)
         (list 'logand g #xFFFF)
-        (list 'logand (list '%prim-aref g 0) #xFFFF)))
+        (list 'logand (list '%word-aref g 0) #xFFFF)))
 (defun %w32-box-form (hi lo)
   "The non-negative integer HI*2^16 + LO (HI, LO forms yielding fixnums
    0..65535): a fixnum when it is one, else a small bignum built directly."
@@ -26425,9 +26464,9 @@
           (list 'if (list '< bh (ash 1 k))
                 (list 'logior (list 'ash bh 16) bl)
                 (list 'let (list (list b (list '%make-bignum)))
-                      (list '%prim-aset b 0
+                      (list '%word-aset b 0
                             (list 'logior (list 'ash (list 'logand bh (- (ash 1 k) 1)) 16) bl))
-                      (list '%prim-aset b 1 (list 'ash bh (- 0 k)))
+                      (list '%word-aset b 1 (list 'ash bh (- 0 k)))
                       b)))))
 
 (defvar *w32-leaves* nil)

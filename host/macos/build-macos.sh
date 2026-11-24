@@ -97,6 +97,8 @@ case $KIND in
   <key>NSSpeechRecognitionUsageDescription</key><string>Listen: what you say becomes text.</string>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Chat: messages travel to nearby devices over Bluetooth.</string>
   <key>NSCameraUsageDescription</key><string>Camera: photos and video, taken here.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Finding printers, and the computers you connect to, on your network.</string>
+  <key>NSLocationUsageDescription</key><string>Where you are, when you ask: the sun's place in your sky, say.</string>
   <key>NSMotionUsageDescription</key><string>Your head, followed through your headphones, so a sound stays where it is as you turn.</string>
 </dict>
 </plist>
@@ -123,7 +125,7 @@ if [ "$KIND" = gui ]; then
     "$HERE/../ios/swift/Term.swift" "$HERE/../ios/swift/GPU.swift" "$HERE/../ios/swift/Speech.swift" \
     "$HERE/../ios/swift/Bluetooth.swift" "$HERE/../ios/swift/Files.swift" "$HERE/../ios/swift/Camera.swift" \
     "$HERE/../ios/swift/Microphone.swift" "$HERE/../ios/swift/NowPlaying.swift" \
-    "$HERE/../ios/swift/Gamepad.swift" "$HERE/../ios/swift/Spatial.swift" "$HERE/../ios/swift/Notify.swift" \
+    "$HERE/../ios/swift/Gamepad.swift" "$HERE/../ios/swift/Spatial.swift" "$HERE/../ios/swift/Notify.swift" "$HERE/../ios/swift/Location.swift" \
     "$HERE/../ios/swift/Motion.swift" "$HERE/../ios/swift/Link.swift" \
     "$HERE"/swift/*.swift
   LINKX=""

@@ -88,6 +88,14 @@
   "The process argc, stored by the boot stub at 0x10000200."
   (mem-ref #x10000200 :u32))
 
+(defvar *cli-argv-base* nil
+  "argv[0]'s slot, recorded by a runtime that moves region 0's stack base
+   (COROUTINES-START, before its first transfer), or NIL: then
+   %CLI-ARGV-BASE computes it from that base.  A transfer points region 0's
+   stack base at the stack it enters, so a coroutine computing it walks its
+   own stack as argv and envp: GETENV answered NIL, or faulted on whatever
+   the walk read as a pointer.")
+
 (declaim (overridable %cli-argv-base))
 (defun %cli-argv-base ()
   "Real byte address of argv[0]'s slot = initial-RSP + 8 (RSP holds argc).
@@ -98,7 +106,7 @@
    address operand wants (mem-ref SHRs the tagged machine word back).
    Region 0's base, not the active region's: in an actor the active region
    is the actor's, and getenv from an actor walked its stack as envp."
-  (+ (* 2 (%gc-stack-base-0)) 8))
+  (or *cli-argv-base* (+ (* 2 (%gc-stack-base-0)) 8)))
 
 (declaim (overridable %cli-collect-argv))
 (defun %cli-collect-argv ()

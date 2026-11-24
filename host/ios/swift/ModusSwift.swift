@@ -120,6 +120,7 @@ final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
         send("DELETE", [.int(Int(handle)), .int(row.index)])
     }
 
+    #if !os(tvOS)   // a TV's lists have no swipe actions
     // Swipe actions for a row, from the actions set with list_actions: a button for each, and a tap on one sends a
     // ROWACTION event with the list's handle and the button's index (the row is the one swiped).
     func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath)
@@ -133,6 +134,7 @@ final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
         }
         return UISwipeActionsConfiguration(actions: items)
     }
+    #endif
 }
 
 // The rows out of a list term: each element a plist (:KEY value ...); keys are symbols by name.
@@ -198,6 +200,9 @@ let symbolButtonSet: Call = { h, on, _, _, _, _ in
 }
 
 // switch_new(on, x, y): a switch; its frame is its own size.
+#if os(tvOS)
+let switchNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let switchNew: Call = { on, x, y, _, _, _ in
     let sw = UISwitch()
     sw.frame.origin = CGPoint(x: CGFloat(x), y: CGFloat(y))
@@ -207,8 +212,12 @@ let switchNew: Call = { on, x, y, _, _, _ in
                  for: .valueChanged)
     return handle
 }
+#endif
 
 // slider_new(value, x, y, w, h): a slider from 0 to 100.
+#if os(tvOS)
+let sliderNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let sliderNew: Call = { value, x, y, w, h, _ in
     let slider = UISlider(frame: rect(x, y, w, h))
     slider.minimumValue = 0
@@ -219,6 +228,7 @@ let sliderNew: Call = { value, x, y, w, h, _ in
                      for: .valueChanged)
     return handle
 }
+#endif
 
 // text_field_new(placeholder, length, x, y, w, h): a rounded text field.
 let textFieldNew: Call = { p, n, x, y, w, h in
@@ -304,6 +314,9 @@ let spinnerNew: Call = { x, y, w, h, _, _ in
 
 // stepper_new(value, x, y): a stepper from 0 to 100, one step at a time.  Each change sends a STEP event with
 // its value (a double).
+#if os(tvOS)
+let stepperNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let stepperNew: Call = { value, x, y, _, _, _ in
     let stepper = UIStepper()
     stepper.minimumValue = 0
@@ -317,6 +330,7 @@ let stepperNew: Call = { value, x, y, _, _, _ in
                       for: .valueChanged)
     return handle
 }
+#endif
 
 // page_new(pages, current, x, y): a page control, a dot per page, the current one lit.  A tap on a dot sends a
 // PAGE event with its index.
@@ -336,6 +350,9 @@ let pageNew: Call = { pages, current, x, y, _, _ in
 
 // date_new(seconds, x, y): a date picker showing the date (seconds since 1970), compact.  A change sends a DATE
 // event with the new date's seconds (a double).
+#if os(tvOS)
+let dateNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let dateNew: Call = { seconds, x, y, _, _, _ in
     let picker = UIDatePicker()
     picker.datePickerMode = .date
@@ -349,6 +366,7 @@ let dateNew: Call = { seconds, x, y, _, _, _ in
                      for: .valueChanged)
     return handle
 }
+#endif
 
 // A long press's target: UIKit keeps a gesture's target weakly, so the view's handle keeps it here.
 final class ModusGesture: NSObject {
@@ -450,6 +468,9 @@ let tabBarNew: Call = { p, n, x, y, w, h in
 
 // refresh_on(list): pulling the list down sends a REFRESH event with the list's handle.  The spinner stops when
 // set_value sets the list to 0.
+#if os(tvOS)
+let refreshOn: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let refreshOn: Call = { h, _, _, _, _, _ in
     guard let table = views[h] as? UITableView else { return 0 }
     let control = UIRefreshControl()
@@ -458,6 +479,7 @@ let refreshOn: Call = { h, _, _, _, _, _ in
     table.refreshControl = control
     return 1
 }
+#endif
 
 // The search bar's delegate: each change of its text sends a TEXT event (read the text with text_value).
 final class ModusSearchBar: NSObject, UISearchBarDelegate {
@@ -475,6 +497,9 @@ final class ModusSearchBar: NSObject, UISearchBarDelegate {
 private var searchBarDelegates: [UInt: ModusSearchBar] = [:]
 
 // search_bar_new(placeholder, length, x, y, w, h): a search bar, its placeholder text, white on the dark screen.
+#if os(tvOS)
+let searchBarNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let searchBarNew: Call = { p, n, x, y, w, h in
     let bar = UISearchBar(frame: rect(x, y, w, h))
     bar.placeholder = text(p, n)
@@ -487,9 +512,13 @@ let searchBarNew: Call = { p, n, x, y, w, h in
     searchBarDelegates[handle] = delegate
     return handle
 }
+#endif
 
 // toolbar_new(titles, length, x, y, w, h): a toolbar with a button per title (a term: a list of strings), spaced
 // evenly.  Tapping a button sends a SELECT event with its index.
+#if os(tvOS)
+let toolbarNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let toolbarNew: Call = { p, n, x, y, w, h in
     let bar = UIToolbar(frame: rect(x, y, w, h))
     bar.tintColor = .white
@@ -505,8 +534,10 @@ let toolbarNew: Call = { p, n, x, y, w, h in
     bar.items = items
     return handle
 }
+#endif
 
 // The picker's data source and delegate: one wheel of rows, the titles; a choice sends a SELECT event with its row.
+#if !os(tvOS)
 final class ModusPicker: NSObject, UIPickerViewDataSource, UIPickerViewDelegate {
     let handle: UInt
     var rows: [String] = []
@@ -531,11 +562,17 @@ final class ModusPicker: NSObject, UIPickerViewDataSource, UIPickerViewDelegate 
         send("SELECT", [.int(Int(handle)), .int(row)])
     }
 }
+#endif
 
+#if !os(tvOS)
 private var pickers: [UInt: ModusPicker] = [:]
+#endif
 
 // picker_new(titles, length, x, y, w, h): a wheel of rows, one per title (a term: a list of strings).  Choosing a
 // row sends a SELECT event with its index.
+#if os(tvOS)
+let pickerNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let pickerNew: Call = { p, n, x, y, w, h in
     let wheel = UIPickerView(frame: rect(x, y, w, h))
     let handle = adopt(wheel)
@@ -546,13 +583,18 @@ let pickerNew: Call = { p, n, x, y, w, h in
     pickers[handle] = source
     return handle
 }
+#endif
 
 // blur_new(x, y, w, h): a blur of what is behind it, dark.  Its children (ui_add) go in its content view.
+#if os(tvOS)
+let blurNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let blurNew: Call = { x, y, w, h, _, _ in
     let view = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
     view.frame = rect(x, y, w, h)
     return adopt(view)
 }
+#endif
 
 // The pan gesture's target: a pan that ends sends a PAN event with the horizontal distance dragged (a double).
 final class ModusPan: NSObject {
@@ -660,6 +702,9 @@ private func colorOf(_ rgb: UInt) -> UIColor {
 
 // color_well_new(rgb, x, y, w, h): a colour well showing the colour.  Choosing a colour sends a COLOR event with the
 // new colour as 0xRRGGBB.
+#if os(tvOS)
+let colorWellNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let colorWellNew: Call = { rgb, x, y, w, h, _ in
     let well = UIColorWell(frame: rect(x, y, w, h))
     well.selectedColor = colorOf(rgb)
@@ -672,6 +717,7 @@ let colorWellNew: Call = { rgb, x, y, w, h, _ in
     }, for: .valueChanged)
     return handle
 }
+#endif
 
 // The navigation bar's delegate: a pop (the back button, or a pop from code) sends a POP event.
 final class ModusNavBar: NSObject, UINavigationBarDelegate {
@@ -689,6 +735,9 @@ final class ModusNavBar: NSObject, UINavigationBarDelegate {
 private var navBarDelegates: [UInt: ModusNavBar] = [:]
 
 // nav_bar_new(x, y, w, h): a navigation bar, dark, with no items.  nav_push pushes an item.
+#if os(tvOS)
+let navBarNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let navBarNew: Call = { x, y, w, h, _, _ in
     let bar = UINavigationBar(frame: rect(x, y, w, h))
     bar.barStyle = .black
@@ -700,6 +749,7 @@ let navBarNew: Call = { x, y, w, h, _, _ in
     navBarDelegates[handle] = delegate
     return handle
 }
+#endif
 
 // nav_push(bar, title, length, right, length): pushes an item with the title and, unless the right title is empty,
 // a right button.  Tapping the right button sends a NAVTAP event with the bar's handle.
@@ -815,6 +865,9 @@ let swipeOn: Call = { h, dir, _, _, _, _ in
 
 // share_present(text, length): the share sheet, with the text as its item.  Its completion is a SHARE event with the
 // handle and 1 (an activity was completed) or 0 (it was not).  Returns the handle.
+#if os(tvOS)
+let sharePresent: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let sharePresent: Call = { p, n, _, _, _, _ in
     guard let root = keyRoot()?.window?.rootViewController else { return 0 }
     let handle = nextHandle
@@ -832,6 +885,7 @@ let sharePresent: Call = { p, n, _, _, _, _ in
     root.present(sheet, animated: true)
     return handle
 }
+#endif
 
 // set_accessibility(handle, text, length): the view's accessibility label, what VoiceOver reads and what a test finds.
 let setAccessibility: Call = { h, p, n, _, _, _ in
@@ -840,11 +894,15 @@ let setAccessibility: Call = { h, p, n, _, _, _ in
 }
 
 // haptic(style): an impact feedback, 0 light, 1 medium, 2 heavy.
+#if os(tvOS)
+let haptic: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let haptic: Call = { style, _, _, _, _, _ in
     let weight: UIImpactFeedbackGenerator.FeedbackStyle = style == 0 ? .light : (style == 1 ? .medium : .heavy)
     UIImpactFeedbackGenerator(style: weight).impactOccurred()
     return 0
 }
+#endif
 
 // fade_to(handle, percent, ms): the view's alpha moves to percent (0 to 100) over ms milliseconds.  Its completion
 // is a FADE event with the handle.
@@ -888,6 +946,9 @@ let modalNew: Call = { _, _, _, _, _, _ in
 }
 
 // modal_present(handle, large): the sheet comes up over the app, at medium height, or at large (large != 0).
+#if os(tvOS)
+let modalPresent: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let modalPresent: Call = { h, large, _, _, _, _ in
     guard let controller = modalControllers[h], let root = keyRoot()?.window?.rootViewController else { return 0 }
     controller.modalPresentationStyle = .pageSheet
@@ -898,6 +959,7 @@ let modalPresent: Call = { h, large, _, _, _, _ in
     modalDelegates[h] = delegate
     return 1
 }
+#endif
 
 // modal_dismiss(handle): the sheet goes away.
 let modalDismiss: Call = { h, _, _, _, _, _ in
@@ -930,6 +992,9 @@ private var pagings: [UInt: ModusPaging] = [:]
 
 // paging_new(pages, x, y, w, h): a scroll view of pages, each as wide as the view, that snap to a page (ui_add puts
 // each page's content in place, at its own x).  A page that comes to rest is a PAGE event with its index.
+#if os(tvOS)
+let pagingNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let pagingNew: Call = { pages, x, y, w, h, _ in
     let scroll = UIScrollView(frame: rect(x, y, w, h))
     scroll.isPagingEnabled = true
@@ -942,6 +1007,7 @@ let pagingNew: Call = { pages, x, y, w, h, _ in
     pagings[handle] = delegate
     return handle
 }
+#endif
 
 // announce(text, length): VoiceOver announces the text, with no change on the screen.
 let announce: Call = { p, n, _, _, _, _ in
@@ -1001,6 +1067,9 @@ let tabContentOf: Call = { h, i, _, _, _, _ in
 // modal_present.
 private var navContent: [UInt: [UInt]] = [:]
 
+#if os(tvOS)
+let navControllerNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let navControllerNew: Call = { _, _, _, _, _, _ in
     let root = UIViewController()
     root.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
@@ -1018,6 +1087,7 @@ let navControllerNew: Call = { _, _, _, _, _, _ in
     navContent[handle] = [rootContent]
     return handle
 }
+#endif
 
 // nav_root(controller): the view of the navigation controller's root.
 let navRoot: Call = { h, _, _, _, _, _ in
@@ -1245,6 +1315,7 @@ let listEditing: Call = { h, on, _, _, _, _ in
 
 // The edit menu's target: a long press on the view opens the edit menu of the choices; a choice sends an EDIT event
 // with the view's handle and the choice's index.
+#if !os(tvOS)
 final class ModusEditMenu: NSObject, UIEditMenuInteractionDelegate {
     let handle: UInt
     let choices: [String]
@@ -1268,11 +1339,17 @@ final class ModusEditMenu: NSObject, UIEditMenuInteractionDelegate {
                                                                   sourcePoint: recognizer.location(in: view)))
     }
 }
+#endif
 
+#if !os(tvOS)
 private var editMenus: [UInt: ModusEditMenu] = [:]
+#endif
 
 // edit_menu_on(handle, choices, length): a long press on the view opens an edit menu of the choices (a term: a list
 // of strings).
+#if os(tvOS)
+let editMenuOn: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let editMenuOn: Call = { h, p, n, _, _, _ in
     guard let view = views[h] else { return 0 }
     let menu = ModusEditMenu(handle: h, choices: titlesOf(p, n))
@@ -1284,9 +1361,13 @@ let editMenuOn: Call = { h, p, n, _, _, _ in
     editMenus[h] = menu
     return 1
 }
+#endif
 
 // popover_present(content, source): the modal content shown as a popover from the source view.  On a phone a popover
 // is a sheet; on a tablet it points at the source.
+#if os(tvOS)
+let popoverPresent: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let popoverPresent: Call = { h, source, _, _, _, _ in
     guard let controller = modalControllers[h], let root = keyRoot()?.window?.rootViewController,
           let anchor = views[source] else { return 0 }
@@ -1296,6 +1377,7 @@ let popoverPresent: Call = { h, source, _, _, _, _ in
     root.present(controller, animated: true)
     return 1
 }
+#endif
 
 // split_present(primary, secondary): a split view controller of two modal contents, shown as a sheet.  Returns its
 // handle (ui_modal_dismiss takes it).  On a phone it collapses: the secondary shows first, and the primary is behind
@@ -1333,6 +1415,9 @@ let gravityDrop: Call = { h, _, _, _, _, _ in
 private var keyboardObservers: [UInt: [NSObjectProtocol]] = [:]
 private var keyboardOriginals: [UInt: CGRect] = [:]
 
+#if os(tvOS)
+let keyboardAvoidOn: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let keyboardAvoidOn: Call = { h, _, _, _, _, _ in
     guard let view = views[h] else { return 0 }
     let center = NotificationCenter.default
@@ -1357,9 +1442,13 @@ let keyboardAvoidOn: Call = { h, _, _, _, _, _ in
     keyboardObservers[h] = [show, hide]
     return 1
 }
+#endif
 
 // keyboard_post(height): posts the keyboard notifications UIKit posts when a keyboard of this height (points) comes
 // up, or goes down (0).  For tests: the simulator presents no keyboard for the storybook's text.
+#if os(tvOS)
+let keyboardPost: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let keyboardPost: Call = { height, _, _, _, _, _ in
     let width = keyRoot()?.bounds.width ?? 402
     let screen = keyRoot()?.bounds.height ?? 874
@@ -1370,14 +1459,19 @@ let keyboardPost: Call = { height, _, _, _, _, _ in
     NotificationCenter.default.post(name: name, object: nil, userInfo: info)
     return 1
 }
+#endif
 
 // document_picker_show(): the system's document picker, for opening a text file, shown over the app.  Its Cancel
 // closes it.
+#if os(tvOS)
+let documentPickerShow: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let documentPickerShow: Call = { _, _, _, _, _, _ in
     guard let root = keyRoot()?.window?.rootViewController else { return 0 }
     root.present(UIDocumentPickerViewController(documentTypes: ["public.text"], in: .open), animated: true)
     return 1
 }
+#endif
 
 // The collection's data source and delegate: sections of tiles under a header each.  A tap on a tile sends a SELECT
 // event with the tile's index among all the rows.
@@ -1484,6 +1578,9 @@ let collectionNew: Call = { p, n, x, y, w, h in
 
 // image_picker_show(): the system's photo picker over the app (the photo library, or the saved photos where there is
 // no library).  Its Cancel closes it.
+#if os(tvOS)
+let imagePickerShow: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let imagePickerShow: Call = { _, _, _, _, _, _ in
     guard let root = keyRoot()?.window?.rootViewController else { return 0 }
     let picker = UIImagePickerController()
@@ -1491,6 +1588,7 @@ let imagePickerShow: Call = { _, _, _, _, _, _ in
     root.present(picker, animated: true)
     return 1
 }
+#endif
 
 // A gesture's target for the simple recognizers: when the gesture is recognised it sends its event with the view's
 // handle.  The recognizer is kept by UIKit; the target is kept here (UIKit keeps it weakly).
@@ -1531,6 +1629,9 @@ let tapOn: Call = { h, _, _, _, _, _ in
 // handle names the event.
 private var edgeRecognizers: [UInt: UIGestureRecognizer] = [:]
 
+#if os(tvOS)
+let edgePanOn: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let edgePanOn: Call = { h, _, _, _, _, _ in
     guard let root = keyRoot() else { return 0 }
     let target = ModusRecognized(handle: h, event: "EDGE")
@@ -1542,8 +1643,10 @@ let edgePanOn: Call = { h, _, _, _, _, _ in
     recognizedTargets.append(target)
     return 1
 }
+#endif
 
 // The calendar's selection delegate: a day picked sends a DATE event with its seconds since 1970 (a double).
+#if !os(tvOS)
 final class ModusCalendar: NSObject, UICalendarSelectionSingleDateDelegate {
     let handle: UInt
 
@@ -1556,10 +1659,16 @@ final class ModusCalendar: NSObject, UICalendarSelectionSingleDateDelegate {
         send("DATE", [.int(Int(handle)), .double(date.timeIntervalSince1970)])
     }
 }
+#endif
 
+#if !os(tvOS)
 private var calendarDelegates: [UInt: ModusCalendar] = [:]
+#endif
 
 // calendar_new(seconds, x, y, w, h): a calendar (UICalendarView) showing the month of the date, one day selectable.
+#if os(tvOS)
+let calendarNew: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let calendarNew: Call = { seconds, x, y, w, h, _ in
     let calendar = UICalendarView(frame: rect(x, y, w, h))
     calendar.overrideUserInterfaceStyle = .dark
@@ -1571,6 +1680,7 @@ let calendarNew: Call = { seconds, x, y, w, h, _ in
     calendarDelegates[handle] = delegate
     return handle
 }
+#endif
 
 // unavailable_new(text, length, x, y, w, h): a content-unavailable view (UIContentUnavailableView): an image and the
 // text, as an empty screen shows.
@@ -1587,6 +1697,7 @@ let unavailableNew: Call = { p, n, x, y, w, h in
 
 // The colour and font pickers' delegate: a colour picked sends a COLOR event (0xRRGGBB), a font a FONT event; the
 // pickers are system view controllers, shown over the app.
+#if !os(tvOS)
 final class ModusPickers: NSObject, UIColorPickerViewControllerDelegate, UIFontPickerViewControllerDelegate {
     let handle: UInt
 
@@ -1606,11 +1717,17 @@ final class ModusPickers: NSObject, UIColorPickerViewControllerDelegate, UIFontP
         viewController.dismiss(animated: true)
     }
 }
+#endif
 
+#if !os(tvOS)
 private var pickerDelegates: [UInt: ModusPickers] = [:]
+#endif
 
 // color_picker_show() and font_picker_show(): the system colour picker and font picker, shown over the app.  Each
 // returns a handle that names its events.
+#if os(tvOS)
+let colorPickerShow: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let colorPickerShow: Call = { _, _, _, _, _, _ in
     guard let root = keyRoot()?.window?.rootViewController else { return 0 }
     let handle = nextHandle
@@ -1622,7 +1739,11 @@ let colorPickerShow: Call = { _, _, _, _, _, _ in
     root.present(picker, animated: true)
     return handle
 }
+#endif
 
+#if os(tvOS)
+let fontPickerShow: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let fontPickerShow: Call = { _, _, _, _, _, _ in
     guard let root = keyRoot()?.window?.rootViewController else { return 0 }
     let handle = nextHandle
@@ -1634,6 +1755,7 @@ let fontPickerShow: Call = { _, _, _, _, _, _ in
     root.present(picker, animated: true)
     return handle
 }
+#endif
 
 // input_keys_on(field, keys, length): the text field's keyboard is replaced by an input view (UIInputView) of a key
 // per title (a term: a list of strings); a key types its title into the field.
@@ -1660,10 +1782,14 @@ let inputKeysOn: Call = { h, p, n, _, _, _ in
 
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
+#if os(tvOS)
+let sendRefresh: Call = { _, _, _, _, _, _ in 0 }   // not on a TV: no view (handle 0), nothing shown
+#else
 let sendRefresh: Call = { h, _, _, _, _, _ in
     (views[h] as? UITableView)?.refreshControl?.sendActions(for: .valueChanged)
     return 0
 }
+#endif
 
 // panel_new(x, y, w, h, rgb): a plain view of one colour; w = 0 makes it the whole screen.
 let panelNew: Call = { x, y, w, h, rgb, _ in
@@ -1751,18 +1877,20 @@ let setText: Call = { h, p, n, _, _, _ in
 // set_value(handle, value): a switch's state (0 or 1), a slider's value (0..100), a progress bar's percent
 // (0..100), or an activity indicator's state (0 stops it, 1 starts it).
 let setValue: Call = { h, value, _, _, _, _ in
+    if let bar = views[h] as? UIProgressView {
+        bar.progress = Float(min(value, 100)) / 100
+    } else if let spinner = views[h] as? UIActivityIndicatorView {
+        if value != 0 { spinner.startAnimating() } else { spinner.stopAnimating() }
+    } else if let page = views[h] as? UIPageControl {
+        page.currentPage = Int(value)
+    }
+    #if !os(tvOS)   // a TV has none of these
     if let sw = views[h] as? UISwitch {
         sw.isOn = value != 0
     } else if let slider = views[h] as? UISlider {
         slider.value = Float(value)
-    } else if let bar = views[h] as? UIProgressView {
-        bar.progress = Float(min(value, 100)) / 100
-    } else if let spinner = views[h] as? UIActivityIndicatorView {
-        if value != 0 { spinner.startAnimating() } else { spinner.stopAnimating() }
     } else if let stepper = views[h] as? UIStepper {
         stepper.value = Double(value)
-    } else if let page = views[h] as? UIPageControl {
-        page.currentPage = Int(value)
     } else if let picker = views[h] as? UIDatePicker {
         picker.date = Date(timeIntervalSince1970: TimeInterval(value))
     } else if let table = views[h] as? UITableView {
@@ -1772,6 +1900,7 @@ let setValue: Call = { h, value, _, _, _, _ in
     } else if let well = views[h] as? UIColorWell {
         well.selectedColor = colorOf(value)
     }
+    #endif
     return 0
 }
 
@@ -1887,17 +2016,26 @@ func register(_ name: String, _ fn: Call) {
 public func modusSwiftInstall() {
     installGPU()                                   // GPU.swift: Metal, under WebGPU's shape
     installSpeech()                                // Speech.swift: the platform's voice and ear
+    #if !os(tvOS)
     installBluetooth()                             // Bluetooth.swift: LE links, for a mesh
+    #endif
     installFiles()                                 // Files.swift: Documents, and the document picker (iCloud Drive)
     installCamera()                                // Camera.swift: a preview, frames, photos and video
     installMicrophone()                            // Microphone.swift: its samples, for Lisp
     installNowPlaying()                            // NowPlaying.swift: Now Playing and the media keys
     installGamepad()                               // Gamepad.swift: game controllers
     installSpatial()                               // Spatial.swift: sound placed in three dimensions
+    #if !os(tvOS)
     installNotify()                                // Notify.swift: the system's notifications
+    #endif
+    #if !os(tvOS)
+    installLocation()                              // Location.swift: where the device is
+    #endif
     installMotion()                                // Motion.swift: how the device itself is turned
     installLink()                                  // Link.swift: messages to and from the watch
+    #if !os(tvOS)
     installNative()                                // Native.swift: app-grade components (an app, not the desk)
+    #endif
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
     register("ui_symbol_button_new", symbolButtonNew)

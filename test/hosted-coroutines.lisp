@@ -123,6 +123,17 @@
   (check "EVAL'd code in a coroutine sees its own condition, its own clause, its own binding"
          (equal (coroutine-transfer ev nil) '("fresh" "typed" (:bound-in-eval)))))
 
+;; 7. The process environment reads the same inside a coroutine.  A transfer
+;; re-points region 0's stack base, which GETENV used to find argv and envp
+;; from: in a coroutine it walked the coroutine's own stack and answered NIL,
+;; or faulted on a word it took for a pointer.
+(let* ((name (if (sb-ext:posix-getenv "HOME") "HOME" "PATH"))
+       (on-main (sb-ext:posix-getenv name))
+       (en (coroutine-create (lambda (v) (declare (ignore v))
+                               (list (sb-ext:posix-getenv name) (uiop:getenv name))))))
+  (check "GETENV in a coroutine answers what it answers on main"
+         (and on-main (equal (coroutine-transfer en nil) (list on-main on-main)))))
+
 (defun deep (n) (if (zerop n) 0 (+ 1 (deep (- n 1)))))
 (let ((dp (coroutine-create (lambda (n) (deep n)))))
   (check "a coroutine recurses 100000 deep on its own stack" (eql (coroutine-transfer dp 100000) 100000)))

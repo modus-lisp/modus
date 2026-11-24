@@ -42,6 +42,10 @@ private func documentsURL() -> URL {
     let url = support.appendingPathComponent("org.modus-lisp.modus/Documents", isDirectory: true)
     try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+    #elseif os(tvOS)
+    // a TV's Documents cannot be written: the shim moved HOME to Library/Caches and made Documents there
+    URL(fileURLWithPath: ProcessInfo.processInfo.environment["HOME"] ?? NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("Documents", isDirectory: true)
     #else
     FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     #endif
@@ -100,7 +104,7 @@ let filesChooseFolder: Call = { _, _, _, _, _, _ in
     }
     return handle
 }
-#else
+#elseif os(iOS)
 // A folder of the person's, chosen once and kept: the document picker for folders hands back a URL that is the
 // app's only while it is "accessing" it, so what is kept is its security-scoped bookmark (UserDefaults, under
 // the caller's key), and FILES_FOLDER_PATH resolves it again on a later run.  Writing into it is then ordinary
@@ -214,9 +218,11 @@ let filesCopy: Call = { sp, sn, dp, dn, _, _ in
 func installFiles() {
     register("files_copy", filesCopy)
     register("files_documents", filesDocuments)
+    #if !os(tvOS)   // a TV has no document picker: Documents alone
     register("files_pick", filesPick)
     register("files_choose_folder", filesChooseFolder)
-    #if !os(macOS)
+    #endif
+    #if os(iOS)
     register("files_folder_path", filesFolderPath)
     #endif
 }

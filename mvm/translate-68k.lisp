@@ -5261,6 +5261,25 @@
         (m68k-emit-andi buf +68k-d0+ 15)
         (m68k-emit-cmpi buf +68k-d0+ 15)
         (m68k-emit-bne buf notfwd)
+        ;; ...AND it names a copy made THIS collection: an object in
+        ;; [to_start, A2) or a cons in [A3, to_end).  A cons's car can be an
+        ;; odd RAW word (the interpreter's operand stack holds raw machine
+        ;; words as values), and the nibble-only test took one for a forward
+        ;; and never copied the cons -- see translate-i386's
+        ;; I386-EMIT-GCNATIVE-FWD-TEST.
+        (let ((isfwd (lbl)))
+          (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d0+)
+          (m68k-emit-andi buf +68k-d0+ (logand (lognot 15) #xFFFFFFFF))
+          (m68k-emit-word buf #xB0B9) (m68k-emit-long buf (+ meta #x08)) ; CMP.L to_start,D0
+          (m68k-emit-bcc-word buf +68k-cc-cs+ notfwd)                     ; < to_start
+          (m68k-emit-cmpa buf +68k-a2+ +68k-d0+)                          ; A2 - D0
+          (m68k-emit-bcc-word buf +68k-cc-hi+ isfwd)                      ; < object free
+          (m68k-emit-cmpa buf +68k-a3+ +68k-d0+)                          ; A3 - D0
+          (m68k-emit-bcc-word buf +68k-cc-hi+ notfwd)                     ; in the gap
+          (m68k-emit-word buf #x90B9) (m68k-emit-long buf (+ meta #x08)) ; SUB.L to_start,D0
+          (m68k-emit-word buf #xB0B9) (m68k-emit-long buf (+ meta #x10)) ; CMP.L size,D0
+          (m68k-emit-bcc-word buf +68k-cc-cc+ notfwd)                     ; >= to_end
+          (here isfwd))
         ;; already forwarded: (fwd & ~15) | tag
         (m68k-emit-andi buf +68k-d3+ (logand (lognot 15) #xFFFFFFFF))
         (m68k-emit-or-dn-dn buf +68k-d1+ +68k-d3+)

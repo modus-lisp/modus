@@ -965,7 +965,11 @@ let imageNew: Call = { p, n, x, y, w, h in
 // plain view's subviews.
 let addChild: Call = { parent, child, _, _, _, _ in
     guard let c = views[child] else { return 0 }
-    if let inside = glassContent[parent] {
+    if let inside = windowContent[parent] {
+        // a window's: placed from its top left; a view that fills its parent (a GPU view made to) fills the window
+        inside.addSubview(c)
+        if c.autoresizingMask.contains([.width, .height]) { c.frame = inside.bounds }
+    } else if let inside = glassContent[parent] {
         inside.addSubview(c)                // a glass panel's: its x and y are now from the panel's top left
     } else if let content = scrollContent[parent] {
         content.addArrangedSubview(c)
@@ -1146,6 +1150,7 @@ public func modusSwiftInstall() {
     installGamepad()                               // Gamepad.swift: game controllers
     installSpatial()                               // Spatial.swift: sound placed in three dimensions
     installNotify()                                // Notify.swift: the system's notifications
+    installLocation()                              // Location.swift: where the device is
     installMotion()                                // Motion.swift: how the device itself is turned
     installLink()                                  // Link.swift: messages to and from the watch
     installChrome()                                // MacChrome.swift: glass, menus, status items

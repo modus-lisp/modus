@@ -19,12 +19,25 @@
 //   status_item_title(item, title, len)    its text, changed
 //   status_item_menu(item, menu)           the menu it opens when clicked
 //
+// WINDOWS, more than the one the desk is in:
+//   window_new(title, len, w, h, palette)   a window, W x H points, centred, shown -- PALETTE 1 a floating palette
+//                                          (a small-titled panel over the app's windows, hidden while another app is
+//                                          in front); a UI handle -- what ui_add puts in
+//                                          it sits inside, placed from its top left (a view that fills its parent fills
+//                                          the window).  Closed by its button, a WINCLOSE event (handle), and it is
+//                                          hidden, not gone: window_show brings it back.  Resized, WINRESIZE (handle
+//                                          w * 65536 + h, points)
+//   window_show(win)   window_hide(win)   window_retitle(win, title, len)
+//
 // THE APP'S OWN EVENTS (handle 0): OPENED (a file's path, or a link, opened with the app: Finder's Open With, `open`,
 // the app's URL scheme), DROPPED (a file dropped on the window), APPSTATE ("active", "inactive", "hidden",
 // "shown"), and QUIT once mac_on_quit(1) asked for it -- the app then waits (five seconds at most) for mac_quit_reply.
 //   mac_on_quit(on)   mac_quit_reply()
 //   dock_badge(text, len)                  the Dock icon's badge ("" clears it)
 //   dock_bounce(critical)                  the Dock icon bounces once (until the app is active, if CRITICAL)
+//
+// PRINTING: print_window(title, len)      the window's picture (the desk's framebuffer) to the print panel; a GPU
+//                                          view's frame prints with gpu_view_print (GPU.swift)
 
 import AppKit
 
@@ -165,6 +178,79 @@ let statusItemMenu: Call = { s, m, _, _, _, _ in
     return 1
 }
 
+// ---- windows ----------------------------------------------------------------------------------------------------
+
+/// A window's content view, by the window's handle: where ui_add puts what goes inside (ModusSwiftMac.swift).
+var windowContent: [UInt: NSView] = [:]
+private var windows: [UInt: NSWindow] = [:]
+private var windowDelegates: [UInt: WindowDelegate] = [:]
+
+private final class WindowDelegate: NSObject, NSWindowDelegate {
+    let handle: UInt
+    init(_ handle: UInt) { self.handle = handle }
+    // closed by its button: hidden, and Lisp told; it can be shown again
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        send("WINCLOSE", [.int(Int(handle))])
+        return false
+    }
+    func windowDidResize(_ n: Notification) {
+        guard let w = n.object as? NSWindow, let c = w.contentView else { return }
+        send("WINRESIZE", [.int(Int(handle)), .int(Int(c.bounds.width) * 65536 + Int(c.bounds.height))])
+    }
+}
+
+let windowNew: Call = { p, n, w, h, palette, _ in
+    let frame = CGRect(x: 0, y: 0, width: Int(max(w, 100)), height: Int(max(h, 80)))
+    let window: NSWindow
+    if palette != 0 {
+        let panel = NSPanel(contentRect: frame, styleMask: [.titled, .closable, .resizable, .utilityWindow],
+                            backing: .buffered, defer: false)
+        panel.isFloatingPanel = true             // over the app's own windows
+        panel.hidesOnDeactivate = true            // and gone while another app is in front
+        panel.becomesKeyOnlyIfNeeded = true       // the keys stay with the main window
+        window = panel
+    } else {
+        window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                          backing: .buffered, defer: false)
+    }
+    window.title = text(p, n)
+    window.isReleasedWhenClosed = false
+    window.appearance = darkAppearance
+    let content = FlippedView(frame: window.contentLayoutRect)
+    content.autoresizingMask = [.width, .height]
+    window.contentView = content
+    let handle = nextHandle
+    nextHandle += 1
+    let delegate = WindowDelegate(handle)
+    window.delegate = delegate
+    windowDelegates[handle] = delegate
+    windows[handle] = window
+    windowContent[handle] = content
+    views[handle] = content
+    window.center()
+    window.makeKeyAndOrderFront(nil)
+    return handle
+}
+
+let windowShow: Call = { h, _, _, _, _, _ in
+    guard let window = windows[h] else { return 0 }
+    window.makeKeyAndOrderFront(nil)
+    return 1
+}
+
+let windowHide: Call = { h, _, _, _, _, _ in
+    guard let window = windows[h] else { return 0 }
+    window.orderOut(nil)
+    return 1
+}
+
+let windowRetitle: Call = { h, p, n, _, _, _ in
+    guard let window = windows[h] else { return 0 }
+    window.title = text(p, n)
+    return 1
+}
+
 // ---- the app's own events, and the Dock -------------------------------------------------------------------------------
 
 private var quitWanted = false
@@ -205,7 +291,18 @@ private func installAppEvents() {
     }
 }
 
+let printWindow: Call = { p, n, _, _, _, _ in
+    guard let image = modus_mac_snapshot() else { return 0 }
+    printImage(image, title: text(p, n).isEmpty ? "Window" : text(p, n))
+    return 1
+}
+
 func installChrome() {
+    register("print_window", printWindow)
+    register("window_new", windowNew)
+    register("window_show", windowShow)
+    register("window_hide", windowHide)
+    register("window_retitle", windowRetitle)
     installAppEvents()
     register("mac_on_quit", macOnQuit)
     register("mac_quit_reply", macQuitReply)

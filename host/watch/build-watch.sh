@@ -23,6 +23,10 @@
 #
 # Files named in MODUS_WATCH_FILES are copied into the bundle, for "@NAME"
 # arguments (host/macos/modus-shim.c).
+#
+# MODUS_WATCH_COMPANION=ID makes it a phone app's companion (the phone app ID; its own id is that plus a suffix),
+# linked to it by Link.swift, with the heart rate (Heart.swift: HealthKit's usage strings, and the workout
+# background mode that keeps it running with the wrist down).  MODUS_WATCH_NAME is the name it shows.
 set -eu
 IMAGE=$1; OUT=$2; KIND=${3:-sim}; IDENT=${4:-}; PROFILE=${5:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -44,6 +48,7 @@ cc() { xcrun --sdk $SDKN clang -target $TARGET -isysroot "$SDK" "$@"; }
 xcrun --sdk $SDKN swiftc -target $TARGET -sdk "$SDK" -parse-as-library -O -wmo \
   -module-name ModusWatch -import-objc-header "$HERE/../ios/swift/bridge.h" \
   -c "$HERE/modus-watch.swift" "$HERE/modus-watch-ui.swift" "$HERE/../ios/swift/Term.swift" \
+  "$HERE/../ios/swift/Motion.swift" "$HERE/../ios/swift/Link.swift" "$HERE/Heart.swift" \
   -o "$OBJ/modus-watch.o"
 cc -O2 -Wall -c "$MAC/modus-shim.c" -o "$OBJ/modus-shim.o"
 # The speaker, where the SDK has AudioToolbox; watchOS 27's has none, and gets a stub that answers ENOSYS.
@@ -68,16 +73,27 @@ cc -o "$OUT/modus" "$OBJ/modus-watch.o" "$OBJ/modus-shim.o" "$OBJ/modus-audio.o"
   "$OBJ/modus-objc.m.o" "$OBJ/modus-swift.m.o" "$OBJ/modus-keychain.m.o" \
   -L"$SDK/usr/lib/swift" -L"$TOOLCHAIN/lib/swift/$SDKN" \
   -framework SwiftUI $AUDIO_FW -framework CoreGraphics -framework CoreFoundation \
+  -framework CoreMotion -framework WatchConnectivity -framework HealthKit \
   -framework Foundation -framework Security $WHERE
 
+# a phone app's companion, or a watch app on its own
+if [ -n "${MODUS_WATCH_COMPANION:-}" ]; then
+  WATCH_KEYS="  <key>WKCompanionAppBundleIdentifier</key><string>$MODUS_WATCH_COMPANION</string>
+  <key>WKRunsIndependentlyOfCompanionApp</key><true/>
+  <key>WKBackgroundModes</key><array><string>workout-processing</string></array>
+  <key>NSHealthShareUsageDescription</key><string>Your heart rate, shown on the phone as you play.</string>
+  <key>NSHealthUpdateUsageDescription</key><string>A workout keeps the sensors running with your wrist down. It is not saved.</string>"
+else
+  WATCH_KEYS="  <key>WKWatchOnly</key><true/>"
+fi
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleIdentifier</key><string>${MODUS_WATCH_BUNDLE_ID:-org.modus-lisp.modus.watch}</string>
   <key>CFBundleExecutable</key><string>modus</string>
-  <key>CFBundleName</key><string>modus</string>
-  <key>CFBundleDisplayName</key><string>modus</string>
+  <key>CFBundleName</key><string>${MODUS_WATCH_NAME:-modus}</string>
+  <key>CFBundleDisplayName</key><string>${MODUS_WATCH_NAME:-modus}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
@@ -85,7 +101,7 @@ cat > "$OUT/Info.plist" <<PLIST
   <key>UIDeviceFamily</key><array><integer>4</integer></array>
   <key>CFBundleSupportedPlatforms</key><array><string>$PLATFORM</string></array>
   <key>WKApplication</key><true/>
-  <key>WKWatchOnly</key><true/>
+$WATCH_KEYS
 </dict></plist>
 PLIST
 for f in ${MODUS_WATCH_FILES:-}; do cp "$f" "$OUT/"; done
@@ -93,6 +109,8 @@ if [ -n "$PROFILE" ]; then cp "$PROFILE" "$OUT/embedded.mobileprovision"; fi
 if [ -n "$IDENT" ]; then
   ENT=$(mktemp); security cms -D -i "$PROFILE" > "$ENT.plist" 2>/dev/null && \
     /usr/libexec/PlistBuddy -x -c "Print :Entitlements" "$ENT.plist" > "$ENT" || echo '<plist version="1.0"><dict/></plist>' > "$ENT"
+  # HealthKit's clinical records come with the profile; the heart rate is not one
+  /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.healthkit.access" "$ENT" 2>/dev/null || true
   codesign --force --sign "$IDENT" --entitlements "$ENT" "$OUT"
 else
   codesign --force --sign - "$OUT"

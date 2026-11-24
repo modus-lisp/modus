@@ -37,6 +37,14 @@
 ;;; add a CAPABILITY there (both arches get it), add a HARDWARE FACT here.
 ;;; ============================================================
 
+;;; On a modus host (no SBCL), the SB-EXT entry points this script and the build call.
+#+modus (load (merge-pathnames "../lib/host-modus.lisp" (directory-namestring (truename *load-truename*))))
+;; The build's helpers and the knob recorder (lib/image-config.lisp) BEFORE the first
+;; MODUS_* read below: a knob read earlier is missing from the image's record, and was
+;; on SBCL and CCL while ABCL's driver (which loads this first) recorded it.
+(unless (fboundp (find-symbol "MVM-TEXT" "COMMON-LISP-USER"))
+  (load (merge-pathnames "../lib/load-mvm.lisp" (directory-namestring (truename *load-truename*)))))
+
 (defvar *cli-arch* :x64)
 (defvar *cli-win64* nil)   ; T from mvm/build-win64-cli.lisp
 
@@ -192,7 +200,7 @@
   (dolist (f '("net/win32-window.lisp" "net/win32-api.lisp" "net/win32-audio.lisp"
                "net/win32-winrt-ids.lisp"
                "net/win32-winrt.lisp" "net/win32-ble.lisp"
-               "net/win32-entropy.lisp" "net/win32-time.lisp"))
+               "net/win32-entropy.lisp" "net/win32-time.lisp" "net/win32-self.lisp"))
     (setq *cli-scan-extra-source*
           (concatenate 'string *cli-scan-extra-source*
                        (with-open-file (s (merge-pathnames (concatenate 'string "../" f)
@@ -207,7 +215,7 @@
 ;;; 6. Build the image
 ;;; ============================================================
 
-(mvm-load "boot/boot-linux-x64.lisp")
+(mvm-load "boot/boot-linux-x64.lisp")   ; a modus host adopts its constants (MVM-LOAD)
 ;; WINDOWS (mvm/build-win64-cli.lisp sets *CLI-WIN64*): the same image as a
 ;; PE32+ EXE.  Each difference below is guarded by the flag; see boot/boot-win64.lisp.
 (when cl-user::*cli-win64* (mvm-load "boot/boot-win64.lisp"))
@@ -221,7 +229,8 @@
 (when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
   (setq *narrow-literals-p* t))
 
-(funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
+;; a modus host registered its targets at boot (mvm/builder.lisp %BUILDER-BOOT-INIT)
+#-modus (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
 (setf modus.mvm.x64::*x64-linux-mode* t)
 ;; Boot preamble for linux-x64 ends 541 bytes into the file (397 before the
 ;; save-and-die fixed-mapping block, which is padded to 144 = 9*16) (ELF header
@@ -234,7 +243,11 @@
 ;; was in RAX).  See reference_append_funcall_bug.md.
 (if cl-user::*cli-win64*
     (modus.mvm::win64-configure-build)   ; native offset, shim, Windows runtime source
-    (setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset)))  ; computed from the stub, see boot-linux-x64.lisp
+    (progn
+      (setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset))  ; computed from the stub, see boot-linux-x64.lisp
+      ;; set, not left to the default: a Windows-hosted builder's runtime JIT
+      ;; has its own shim address in this variable
+      (setf modus.mvm.x64::*x64-win-shim-va* nil)))
 
 ;; NATIVE THREADS, STEP 1: the hosted actor scheduler gets a REAL spinlock.
 ;; net/actors.lisp hands the lock's RELEASE to RESTORE-CONTEXT; with this set,
@@ -329,16 +342,22 @@
 ;; allocation walked all the way to the end — too late for a Cheney
 ;; copy that needs the other half free.
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
+;; The native code offset was measured from the stub above; the stub must still
+;; be that long, or every function entry moves (and loses its tag-3 alignment).
+(unless (or cl-user::*cli-win64*
+            (not (boundp 'modus.mvm.x64::*x64-native-code-offset*))
+            (null modus.mvm.x64::*x64-native-code-offset*)
+            (= modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset)))
+  (error "x64 boot stub length changed after *X64-NATIVE-CODE-OFFSET* was measured (~D, now ~D)"
+         modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset)))
 ;; MCGC page-pinning test knob (stage 4).  OFF by default.  MODUS_MCGC_PINNING=1
 ;; enables the page-pool allocator + page collector for a pinning test build.
-#+sbcl
 (when (let ((v (sb-ext:posix-getenv "MODUS_MCGC_PINNING")))
         (and v (plusp (length v)) (not (string= v "0"))))
   (setf modus.mvm.x64::*mcgc-pinning-enabled* t)
   (format t "~&;; MCGC PAGE-PINNING ENABLED (test build)~%"))
 ;; Test knob: MODUS_MCGC_TORUN_CAP=<pages> caps each to-run segment so the
 ;; copy_object refill / to-run-chain path is exercised on ordinary workloads.
-#+sbcl
 (let ((cap (sb-ext:posix-getenv "MODUS_MCGC_TORUN_CAP")))
   (when (and cap (> (length cap) 0))
     (setf modus.mvm.x64::*mcgc-torun-cap-pages* (parse-integer cap))
@@ -347,7 +366,6 @@
 ;; Debug knob: MODUS_GC_R14=<hex-or-dec bytes> forces R14 to a small offset
 ;; so GC fires early (fast repro of GC-from-runtime-EVAL faults).  Leaves
 ;; the from/to semispaces 448MB apart (unchanged), only moves the trigger.
-#+sbcl
 (let ((dbg (sb-ext:posix-getenv "MODUS_GC_R14")))
   (when (and dbg (> (length dbg) 0))
     (let ((v (parse-integer dbg :radix (if (and (> (length dbg) 1)
@@ -356,24 +374,20 @@
                             :start (if (char= (char dbg 0) #\#) 1 0))))
       (setf modus.mvm::*linux-x64-r14-offset* v)
       (format t "~%[DEBUG] R14 offset forced to ~X (GC fires early)~%" v))))
-#+sbcl
 (when (let ((d (sb-ext:posix-getenv "MODUS_GC_WATCH"))) (and d (> (length d) 0)))
   (setf modus.mvm.x64::*x64-gc-watch* t)
   (format t "~%[DEBUG] GC watch log at #x1DE00000 enabled~%"))
-#+sbcl
 (when (let ((d (sb-ext:posix-getenv "MODUS_GC_DEBUG"))) (and d (> (length d) 0)))
   (setf modus.mvm.x64::*x64-gc-debug* t)
   (format t "~%[DEBUG] GC trampoline debug bytes enabled~%"))
 ;; A/B knob: MODUS_MCGC_KINDCHECK=0 keeps the cons-kind bitmap SET side
 ;; (image layout ~unchanged) but DISABLES the scan_word reject, to prove the
 ;; CHECK — not incidental layout shift — restores correctness.  Default on.
-#+sbcl
 (let ((kc (sb-ext:posix-getenv "MODUS_MCGC_KINDCHECK")))
   (when (and kc (string= kc "0"))
     (setf modus.mvm.x64::*mcgc-kind-check-enabled* nil)
     (format t "~%[DEBUG] MCGC cons-kind CHECK disabled (set side still on)~%")))
 
-#+sbcl
 (let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
   (when (and sm (> (length sm) 0))
     (setf modus.mvm::*write-symmap-path* sm)))
@@ -383,7 +397,6 @@
 ;; 0 removes them from the image rather than skipping them at runtime.
 ;; Source-level `(declaim (optimize (safety N)))' overrides this from its
 ;; point on; see *compile-safety* in compiler.lisp.
-#+sbcl
 (let ((sv (sb-ext:posix-getenv "MODUS_SAFETY")))
   (when (and sv (> (length sv) 0))
     (let ((n (parse-integer sv :junk-allowed t)))
@@ -394,11 +407,11 @@
 (format t "~%Compiling generic image (~D chars)...~%"
         (length cl-user::*full-source*))
 
-(let ((image (build-image :target (if cl-user::*cli-win64* :win64 :linux-x64)
-                          :source-text cl-user::*full-source*)))
+(let ((image (cl-user::host-build-image :target (if cl-user::*cli-win64* :win64 :linux-x64)
+                                         :source-text cl-user::*full-source*)))
   (let ((path (if cl-user::*cli-win64*
-                  (or #+sbcl (sb-ext:posix-getenv "MODUS_WIN64_OUT") "modus.exe")
-                  (or #+sbcl (sb-ext:posix-getenv "MODUS_CLI_OUT") "modus"))))
+                  (or (sb-ext:posix-getenv "MODUS_WIN64_OUT") "modus.exe")
+                  (or (sb-ext:posix-getenv "MODUS_CLI_OUT") "modus"))))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)
@@ -416,7 +429,9 @@
         (write-sequence (kernel-image-native-code image) o))
       (format t "  native code: ~D bytes -> ~A.native~%"
               (length (kernel-image-native-code image)) path))
-    #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
+    #-modus (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
+    ;; a Windows host has no mode bits (chmod is ENOSYS there); nothing to do
+    #+modus (ignore-errors (funcall (find-symbol "CHMOD" "SB-POSIX") path #o755))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
     (format t "Usage: ~A <script.lisp>~%" path)))

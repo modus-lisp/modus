@@ -876,6 +876,7 @@
         (setf (gethash h *setf-expanders-pkg*)
               (%reg-pkg-alist-put (gethash h *setf-expanders-pkg*) p expander))))
     (%mexp-memo-invalidate)   ; a SETF form expanded before this registration is stale
+    (%macro-defs-changed)
     (setf (gethash h *setf-expanders*) expander)))
 
 (defun mvm-find-setf-expander (name)
@@ -2412,10 +2413,12 @@
   rest-param-p    ; T if function has &rest parameter
   required-count  ; number of required params (before &rest)
   optional-count  ; number of &optional params (between required and &rest)
-  qualified-name) ; #211: "PKG::NAME" when the defun's name symbol has a
+  qualified-name  ; #211: "PKG::NAME" when the defun's name symbol has a
                   ; foldable home package, else NIL.  NAME stays BARE — the
                   ; emitted native FN table and its by-name probes read that.
                   ; See %FN-KEY-PKG-OF / %FN-REGISTER-INFO.
+  (arity nil))    ; (REQUIRED . MAX), MAX NIL for &rest / &key: what the entry
+                  ; check accepts, kept as data for %FUNCTION-ARITY
 
 (defstruct compile-env
   (bindings nil)       ; list of binding structs
@@ -4371,6 +4374,17 @@
                   (or (not fallback) (fboundp (car exp))))))
        t))
 
+(defun %setf-site-setter (site name)
+  "Refill a SETF site's cache cons SITE (REGISTRY . SETTER) for accessor NAME, and
+   return the setter (or NIL): the registry as it stands, and what it says for
+   NAME.  The setter is stored before the registry it answers for, so a reader
+   that sees the new head also sees its answer."
+  (let ((reg *setf-function-registry*)
+        (fn (%find-setf-function name)))
+    (setf (cdr site) fn)
+    (setf (car site) reg)
+    fn))
+
 (defun %find-setf-function (name)
   "SETTER-SYMBOL registered for accessor NAME by (defun (setf NAME) …), or
    NIL.  Most-recent registration wins (entries are PUSHed), matching
@@ -4588,6 +4602,8 @@
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
+  (let ((rw (%w32-raw-scope-rewrite 'let bindings body)))
+    (when rw (return-from compile-let (compile-form rw env dest))))
   (let ((level (%body-safety body)))
     (if level
         (%compile-let-at-safety level bindings body env dest)
@@ -4598,6 +4614,8 @@
 (defun compile-let* (bindings body env dest)
   "Compile (let* ((var val)*) body*).
    Values are evaluated sequentially; each can see earlier bindings."
+  (let ((rw (%w32-raw-scope-rewrite 'let* bindings body)))
+    (when rw (return-from compile-let* (compile-form rw env dest))))
   (let ((level (%body-safety body)))
     (if level
         (%compile-let*-at-safety level bindings body env dest)
@@ -5192,6 +5210,31 @@
     (let ((tb (or *%not-macro* (setq *%not-macro* (make-hash-table :test 'eql)))))
       (setf (gethash h tb) (cons sym (gethash h tb))))))
 
+;;; THE MACRO-DEFINITIONS EPOCH.  EVAL caches the code it compiled for a form
+;;; (*MVM-EVAL-CACHE*), and that code is the form AS EXPANDED: a head that was a
+;;; macro is gone, replaced by its expansion; a head that was not is a CALL.  So
+;;; the code is only the form's meaning while every macro it saw -- and every
+;;; one it did not see -- is as it was.  SBCL expands again on every EVAL; a
+;;; cache hit did not, so (EVAL '(M X)) before M was a macro, and again after,
+;;; called a function M with the value of X both times, and a REDEFINED macro
+;;; kept its old expansion.  TI's (DEFINE-LOOP-MACRO LOOP) was the case: cortez
+;;; evaluates it once while DEFINE-LOOP-MACRO is still being fetched, and every
+;;; later EVAL of it -- with the macro standing -- said LOOP was an unbound
+;;; variable, so their LOOP never existed and no flavor did either.
+;;;
+;;; This counts DEFINITIONS -- a macro, a SETF expander, or the loss of one --
+;;; and an EVAL-cache entry stands only at the count it was compiled under.  Not
+;;; %MEXP-MEMO-INVALIDATE's count: that also fires for the compiler's own
+;;; temporary shadows (FLET over a macro name, MACROLET), which put the table
+;;; back and would empty the cache on every compile.
+(defvar *macro-defs-epoch* nil
+  "Bumped by every macro / SETF-expander definition or removal.  NIL until the
+   first: a DEFVAR's initform does not run at boot, and the boot's own macro
+   registrations are the first callers.")
+
+(defun %macro-defs-changed ()
+  (setq *macro-defs-epoch* (if *macro-defs-epoch* (+ 1 *macro-defs-epoch*) 1)))
+
 ;;; The memo is keyed by the form's ADDRESS in the image, and the copying
 ;;; collector moves every form: after a GC every entry MISSED (the EQ
 ;;; validation kept hits honest but nothing found them), so each analysis
@@ -5262,6 +5305,15 @@
       (multiple-value-bind (x p) (%macroexpand-1-mvm-raw form)
         (declare (ignore p))
         x)))
+  ;; A user's *MACROEXPAND-HOOK* is called on EVERY expansion (CLHS
+  ;; MACROEXPAND-1), so while one is in effect nothing is answered from the
+  ;; memo: an entry made by a look that ran with the hook at FUNCALL (the
+  ;; compiler's own, and EVAL's pre-scan) would hand COMPILE-FORM its
+  ;; expansion without the hook ever seeing the form -- and a hook that
+  ;; carries a missing name out by THROW never got to throw.
+  (when (and (consp form)
+             (let ((h *macroexpand-hook*)) (and h (not (eq h 'funcall)))))
+    (return-from macroexpand-1-mvm (%macroexpand-1-mvm-raw form)))
   (if (not (consp form))
       (%macroexpand-1-mvm-raw form)
       (let* ((k (progn (%mexp-memo-sync) (%form-key form)))
@@ -5532,6 +5584,7 @@
           (setq *shadowing-macro-table* (make-hash-table :test 'eq)))
         (setf (gethash name *shadowing-macro-table*) expander)
         (%mexp-memo-invalidate)
+        (%macro-defs-changed)
         (set-macro-function name expander))
       (mvm-define-macro (normalize-name name) expander)))
 
@@ -5550,6 +5603,7 @@
         (setq *macro-name-table* (make-hash-table :test 'eql)))
       (setf (gethash hash *macro-name-table*) (string name)))
     (%mexp-memo-invalidate)
+    (%macro-defs-changed)
     (setf (gethash hash *macro-table*) expander)))
 
 (defun %ordinary-macro-lambda-list-p (ll)
@@ -5648,6 +5702,15 @@
                 (nth-value 1 (gethash (normalize-name sym) *global-symbol-macros*)))
            (list sym (gethash (normalize-name sym) *global-symbol-macros*))))))
 
+(defun %boxed-cell-expansion-p (x)
+  "True of the (CAR cell) a cell-boxed LET variable stands for: its cell is
+   the fresh uninterned symbol %COMPILE-LET-1 makes from CELL-VAR-NAME,
+   named %CELL-<var>..."
+  (and (consp x) (eq (car x) 'car) (consp (cdr x)) (null (cddr x))
+       (symbolp (cadr x)) (cadr x) (null (symbol-package (cadr x)))
+       (let ((n (symbol-name (cadr x))))
+         (and (> (length n) 6) (string= n "%CELL-" :end1 6)))))
+
 (defun %variable-information (sym &optional env)
   "What SYM names as a variable in ENV -- SB-CLTL2 VARIABLE-INFORMATION's
    first value: :LEXICAL, :SYMBOL-MACRO, :SPECIAL, :CONSTANT or NIL.  A
@@ -5656,7 +5719,15 @@
    with the name."
   (let ((b (and env (not (consp env)) (symbolp sym) (env-lookup env sym))))
     (cond
-      (b (if (eq (binding-location b) :symbol-macro) :symbol-macro :lexical))
+      ;; A LET variable that is cell-boxed is compiled as a symbol macro for
+      ;; (CAR cell), but it is the program's lexical variable all the same,
+      ;; and SBCL says so.  Answering :SYMBOL-MACRO sent cortez's
+      ;; VARIABLE-LOCATION down its global branch inside the very closure the
+      ;; box was made for.
+      (b (if (and (eq (binding-location b) :symbol-macro)
+                  (not (%boxed-cell-expansion-p (binding-expansion b))))
+             :symbol-macro
+             :lexical))
       ((not (and (symbolp sym) sym)) (if (null sym) :constant nil))
       ((%macro-env-symbol-macro sym env) :symbol-macro)
       ((or (keywordp sym) (eq sym t) (constantp sym)) :constant)
@@ -7311,6 +7382,42 @@
                       (mvm-find-setf-expander (car place)))
                  (funcall (mvm-find-setf-expander (car place))
                           (cdr place) value))
+                ;; A (DEFUN (SETF NAME) ...) for a LIBRARY's own symbol is that
+                ;; place's store, whatever its name spells.  The built-in cases
+                ;; below match by NAME (NAME-EQ), so a package that shadows CAR,
+                ;; CDR, FIRST, AREF ... and defines (SETF CDR) on its own CDR was
+                ;; given CL:CDR's store instead -- SET-CDR of an object that is
+                ;; not a cons ("is not of type CONS"), where SBCL calls the
+                ;; package's setter.  cortez's CDR, which takes a locative,
+                ;; stopped TI's screen at (SETF (CDR loc) ...).  Asked only of a
+                ;; symbol whose home folds (%FN-KEY-PKG-OF): COMMON-LISP's own
+                ;; places, and Modus's, never reach the registry here.
+                ;;
+                ;; IN CLHS 5.1.2's ORDER, which is the point: a place that is a
+                ;; MACRO form is expanded and the expansion is the place
+                ;; (5.1.2.7); a (SETF NAME) function is for a place that is not
+                ;; one (5.1.2.9).  Calling the setf function first sent TI's
+                ;; accessor macros -- DEFSUBSTs and the like, that also have a
+                ;; (SETF NAME) -- to the function, and their Release 6 patches
+                ;; went from 97 to 44 of 99 forms ("SHEET is not a flavor").
+                ;; The function call is the registry clause's expansion further
+                ;; down: subforms once, left to right, then the value, FIRST.
+                ((and (consp place) (symbolp (car place)) (car place)
+                      (%fn-key-pkg-of (car place))
+                      (not (and *macrolet-names*
+                                (member (normalize-name (car place)) *macrolet-names*)))
+                      (or (cdr (%macroexpand-1-mvm-raw place))
+                          (%find-setf-function (car place))))
+                 (let ((ex (%macroexpand-1-mvm-raw place)))
+                   (if (cdr ex)
+                       `(setf ,(car ex) ,value)
+                       (let* ((setter (%find-setf-function (car place)))
+                              (gargs  (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "SFA"))
+                                              (cdr place)))
+                              (gval   (%mvm-gensym "SFV")))
+                         `(let* (,@(mapcar #'list gargs (cdr place))
+                                 (,gval ,value))
+                            (,setter ,gval ,@gargs))))))
                 ;; (setf (car x) v) → (set-car x v)
                 ((and (consp place) (name-eq (car place) "CAR"))
                  `(set-car ,(cadr place) ,value))
@@ -7566,9 +7673,54 @@
                  ;; package, exactly where its DEFSTRUCT/DEFCLASS setter went.
                  ;; Ordered MODUS.MVM-first so the HOST build is unchanged (and
                  ;; so SBCL is never asked to intern into its locked CL package).
+                 ;;
+                 ;; AND ONLY WHEN NO (SETF NAME) IS DEFINED BY THEN.  The
+                 ;; registry clause above sees the setf functions defined at
+                 ;; COMPILE time; a use compiled first and its setter defined
+                 ;; after (a file of accessors loaded after the file that uses
+                 ;; them -- cortez's REMPROP and its C...R setters) was bound to
+                 ;; SET-<NAME> for good, and signalled it undefined while
+                 ;; (SETF NAME) stood.  SBCL calls #'(SETF NAME) as of the
+                 ;; call.  So under runtime EVAL the choice is made when the
+                 ;; form runs: the setter a (DEFUN (SETF NAME) ...) registered
+                 ;; by then -- new value first, CLHS 5.1.2.9 -- else SET-<NAME>
+                 ;; exactly as before, which is what Modus's own SET-* helpers
+                 ;; are reached by.  Asked of the registry the clause above
+                 ;; asks, not of FBOUNDP: FBOUNDP of (SETF FDEFINITION) answers
+                 ;; T through the image's SET-FDEFINITION, whose arguments come
+                 ;; value-LAST, and calling it value-first broke SETF of
+                 ;; FDEFINITION and MACRO-FUNCTION (FDEFINITION.4, MACRO-
+                 ;; FUNCTION.8).  Subforms evaluated once, left to right, then
+                 ;; the value.
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
                                        (%setter-pkg (car place)))))
-                   `(,setter ,@(cdr place) ,value)))))))))
+                   ;;
+                   ;; AND THE LOOKUP IS CACHED AT THE SITE.  Asked on every call, it
+                   ;; was a registry walk per store -- a struct accessor takes this
+                   ;; path, and pigment's JPEG bit reader (INCF / SETF of DEFSTRUCT
+                   ;; slots) went 30x slower.  Each site owns a cons (REGISTRY .
+                   ;; SETTER): the registry is a list every registration pushes a
+                   ;; new head onto, so while its head is EQ the one cached here no
+                   ;; (SETF NAME) has been defined since and SETTER still answers.
+                   ;; It starts :UNSET, which no registry is EQ to; a FASL replays
+                   ;; the cons as a fresh copy, whose car no live registry is EQ to
+                   ;; either, so it refills on first use (%SETF-SITE-SETTER).
+                   (if *mvm-eval-runtime-p*
+                       (let ((gargs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "SFA"))
+                                            (cdr place)))
+                             (gval (%mvm-gensym "SFV"))
+                             (gfn (%mvm-gensym "SFF"))
+                             (gsite (%mvm-gensym "SFS")))
+                         `(let* (,@(mapcar #'list gargs (cdr place))
+                                 (,gval ,value)
+                                 (,gsite (quote ,(cons :unset nil)))
+                                 (,gfn (if (eq (car ,gsite) *setf-function-registry*)
+                                           (cdr ,gsite)
+                                           (%setf-site-setter ,gsite ',(car place)))))
+                            (if ,gfn
+                                (funcall ,gfn ,gval ,@gargs)
+                                (,setter ,@gargs ,gval))))
+                       `(,setter ,@(cdr place) ,value))))))))))
 
   ;; DEFSETF — register a setf expander.
   ;;   Short form:  (defsetf accessor setter-fn [doc])
@@ -9091,7 +9243,17 @@
         ;; %clos-make-initform-thunk bridge the initform path uses (an
         ;; in-module closure escaping unwrapped executes garbage when a
         ;; later make-instance funcalls it cross-module).
-        (let ((default-initarg-pairs nil))
+        (let ((default-initarg-pairs nil)
+              ;; (:METACLASS FUNCALLABLE-STANDARD-CLASS), by name: SB-MOP's
+              ;; and any package's spelling of it.  Other metaclasses are
+              ;; still ignored, as they were.
+              (funcallable (dolist (opt (cddddr form) nil)
+                             (when (and (consp opt) (symbolp (car opt))
+                                        (string= (symbol-name (car opt)) "METACLASS")
+                                        (consp (cdr opt)) (symbolp (cadr opt))
+                                        (string= (symbol-name (cadr opt))
+                                                 "FUNCALLABLE-STANDARD-CLASS"))
+                               (return t)))))
           (dolist (opt (cddddr form))
             (when (and (consp opt) (symbolp (car opt))
                        (name-eq (car opt) "DEFAULT-INITARGS"))
@@ -9107,6 +9269,10 @@
           `(progn
              (%defclass-name-check ',class-name)
              (%defclass ',class-name ',slot-names ',supers)
+             ;; always at run time, so a redefinition without the option
+             ;; clears it; in the image only where a class has it
+             ,@(when (or funcallable *mvm-eval-runtime-p*)
+                 `((%register-clos-funcallable ',class-name ',funcallable)))
              (%register-clos-slot-info ',class-name
                                        (list ,@(nreverse initarg-pairs))
                                        (list ,@(nreverse initform-pairs)))
@@ -10133,7 +10299,7 @@
     "LIDT" "NCONCING" "SYMBOLS" "STRINGP"
     "ACROSS" "<" "DEFPACKAGE" "%FLOAT-TO-INT"
     "NULL" "ROTATEF" "MUL26LO" "PERCPU-REF" "%APPLY-SPREAD"
-    "%MUL-SPLIT-LO" "%MUL-SPLIT-HI" "%W32"
+    "%MUL-SPLIT-LO" "%MUL-SPLIT-HI" "%W32" "%IF-W32"
     "GET-ALLOC-LIMIT" "BLOCK" ">" "COLLECTING"
     "USE-PACKAGE" "DOTIMES" "MEMORY-BARRIER" "%MAKE-FLOAT"
     "FIXNUMP" "EVAL-WHEN" "BIGNUMP" "ALWAYS"
@@ -10939,8 +11105,8 @@
             (%compile-lexical-exit (caddr form) (caddr entry)
                                    (or (cadddr entry) 0) (cadr entry) env))
            ;; Cross-unit: BLOCK lives in an enclosing function/lambda.
-           ((assoc (normalize-name bname) *nonlocal-blocks* :test #'=)
-            (let ((tag-val (cadr (assoc (normalize-name bname)
+           ((assoc (%block-name-hash bname) *nonlocal-blocks* :test #'=)
+            (let ((tag-val (cadr (assoc (%block-name-hash bname)
                                         *nonlocal-blocks* :test #'=))))
               ;; (%nlx-throw TAG-VAL value) — the BLOCK's CATCH frame
               ;; catches.  %nlx-throw (not THROW) so the handler-bind-safe
@@ -11402,6 +11568,8 @@
       ((= op-name #.(compute-name-hash "%MUL-SPLIT-HI")) (compile-mul-split (cdr form) env dest t))
       ;; W32 M2: the test-only intrinsic (see COMPILE-W32)
       ((= op-name #.(compute-name-hash "%W32")) (compile-w32 (cdr form) env dest))
+      ;; W32 M3b: (%IF-W32 W32-FORM OTHER-FORM), chosen by the compilation's target
+      ((= op-name #.(compute-name-hash "%IF-W32")) (compile-if-w32 (cdr form) env dest))
       ((= op-name 13026604224746835194) (compile-mul64lo (cdr form) env dest))
       ((= op-name 12591721202407133616) (compile-mul64hi (cdr form) env dest))
       ((= op-name 920227542902379435) (compile-acc128 (cdr form) env dest))
@@ -13178,7 +13346,9 @@
               (cdr e)))))
 (defun %test-operand-width (x env)
   "%expr-width extended to integer literals (a fixnum literal is a fixnum)."
-  (cond ((integerp x) (and (<= (integer-length x) 61) (+ 1 (integer-length x))))
+  ;; a FIXNUM literal of THIS target: 61 bits on x64; the literal 61 treated
+  ;; -27907941364 as a fixnum on the 30-bit towers (ANSI MISC.509, i386 native)
+  (cond ((integerp x) (and (<= (integer-length x) (- (ct-fixnum-bits) 1)) (+ 1 (integer-length x))))
         ((or (and x (symbolp x)) (consp x)) (%expr-width x env))
         (t nil)))
 (defun %operand-reg (form env)
@@ -13190,6 +13360,21 @@
   "Compile TEST so that control falls through when it is true and branches
    to FALSE-LABEL when it is false.  DEST is scratch."
   (cond
+    ;; NOT ONE OF OURS: COMPILE-COMPOUND's shadowing guards, applied here too.
+    ;; Every clause below matches the head by NAME (NOT, ZEROP, EQ, AND, OR,
+    ;; and %COMPILE-PREDICATE-BRANCH's CHARACTERP, CONSP ...), so a head that
+    ;; shadows a CL external, or a user package's own function named like an
+    ;; intrinsic, got the intrinsic whenever it was an IF test -- and the very
+    ;; same call as a value got the program's function.  cortez's CHARACTERP
+    ;; (true of the integers it reads characters as) answered NIL in TI's
+    ;; (IF (CHARACTERP NAME) ...), and their editor's comtabs failed to build.
+    ;; The ordinary value path, which applies those guards, then a NIL test.
+    ((and (consp test) (symbolp (car test))
+          (or (%shadows-cl-p (car test))
+              (and *mvm-eval-runtime-p* (fboundp '%user-own-function-p)
+                   (funcall '%user-own-function-p (car test)))))
+     (compile-form test env dest)
+     (emit-ir :bnull dest false-label))
     ((and (consp test) (symbolp (car test)) (consp (cdr test)) (null (cddr test))
           (or (name-eq (car test) "NOT") (name-eq (car test) "NULL")))
      ;; (not X): X true ⇒ branch to FALSE-LABEL; X false ⇒ fall through.
@@ -14271,7 +14456,32 @@
         (scan f)))
     result))
 
+(defun %lexical-macro-env (vars)
+  "The environment a macro expanded inside a LET over VARS sees there: VARS
+   lexical (specials excepted), on top of the one current now.  For the
+   walks that pre-expand a body before it is compiled."
+  (make-compile-env
+   :bindings (mapcar (lambda (v) (make-binding :name v :location :stack))
+                     (remove-if-not (lambda (v) (and (symbolp v) v (not (%runtime-special-p v))))
+                                    vars))
+   :parent (and *%macroexpand-env* (not (consp *%macroexpand-env*)) *%macroexpand-env*)))
+
 (defun %boxed-vars-for-let (scan-forms let-vars)
+  "LET-VARS lexical to every expander the walks below run (run-time compiles;
+   the build never binds the variable): the walks pre-expand the body, and
+   an expander that asks its &ENVIRONMENT must give them the expansion the
+   compile will.  With none, cortez's VARIABLE-LOCATION took a LET variable
+   for a global -- SETF of its SYMBOL-VALUE, no SETQ -- so no walk saw the
+   assignment, the variable was captured by value, and the locative stored
+   into a copy: TI's LOOP ... COLLECT, which collects through a locative to
+   its result variable, returned NIL."
+  (if *mvm-eval-runtime-p*
+      (let ((*%macroexpand-env* (%lexical-macro-env let-vars)))
+        (declare (special *%macroexpand-env*))
+        (%boxed-vars-for-let-1 scan-forms let-vars))
+      (%boxed-vars-for-let-1 scan-forms let-vars)))
+
+(defun %boxed-vars-for-let-1 (scan-forms let-vars)
   "The cell-boxing set for a LET/LET* over LET-VARS with SCAN-FORMS (body,
    plus init forms for LET*): vars mutated INSIDE a closure (the classic
    case), UNION vars READ inside a closure and mutated ANYWHERE (the
@@ -14299,6 +14509,15 @@
                              (not (member v base :test #'name-equal)))
                     (setq base (cons v base))))))))
         base)))
+
+(defun %cell-var-prefix (var)
+  "CELL-VAR-NAME's name, for a cell that is a fresh gensym and needs no symbol
+   of that name: interning one put %CELL-<var> into whatever package was
+   current, a symbol the program never wrote (DO-ALL-SYMBOLS.2, IMPORT.ERROR.4
+   saw it appear mid-test)."
+  (concatenate 'string "%CELL-" (cond ((symbolp var) (symbol-name var))
+                                      ((stringp var) var)
+                                      (t (format nil "~A" var)))))
 
 (defun cell-var-name (var)
   "Generate the cell variable name for a boxed variable."
@@ -15977,7 +16196,7 @@
              ;; quicklisp's PARSE-URLSTRING read an unbound %CELL-POS.
              (cells (mapcar (lambda (b)
                               (let ((var (if (consp b) (car b) b)))
-                                (cons var (%mvm-gensym (symbol-name (cell-var-name var))))))
+                                (cons var (%mvm-gensym (%cell-var-prefix var)))))
                             (remove-if-not (lambda (b)
                                              (member (if (consp b) (car b) b) boxed-vars
                                                      :test #'name-equal))
@@ -16162,7 +16381,7 @@
                         `(let* ,after ,@body-stripped)
                         `(progn ,@body-stripped)))
              ;; A fresh cell symbol: see compile-let.
-             (cell (%mvm-gensym (symbol-name (cell-var-name var)))))
+             (cell (%mvm-gensym (%cell-var-prefix var))))
         (return-from %compile-let*-1
           (compile-form `(let* (,@before (,cell (cons ,init nil)))
                            (symbol-macrolet ((,var (car ,cell)))
@@ -21338,6 +21557,16 @@
                 (progn (setq cur (car r)) (setq n (+ n 1)))
                 (return cur)))))))
 
+(defun %block-name-hash (name)
+  "The key a BLOCK named NAME is filed under: COMPILE-BLOCK's -- 0 for the NIL
+   block, else NORMALIZE-NAME.  (NORMALIZE-NAME NIL) is NOT 0, so comparing a
+   RETURN-FROM's NORMALIZE-NAME against a block's hash never matched the NIL
+   block: (block nil (funcall (lambda () (return-from nil :x))) :fell) installed
+   no catch frame, the RETURN-FROM lowered to a return from the lambda, and the
+   block fell through to :FELL.  TI's PROG is (BLOCK NIL (LET ...)) around their
+   RETURN, so every PROG that RETURNs from inside a lambda lost its exit."
+  (if name (normalize-name name) 0))
+
 (defun %return-from-escapes-block-p (body block-hash crossed-lambda shadowed)
   "Scan BODY (a list of forms) for a RETURN-FROM (or RETURN if BLOCK-HASH
    is 0, the NIL block) targeting BLOCK-HASH that lives INSIDE a lambda
@@ -21361,7 +21590,7 @@
                    ;; its body (RETURN-FROM there targets the inner block).
                    ((%form-op-is form 372279278 "BLOCK")
                     (let ((inner-sh (or sh
-                                        (= (normalize-name (cadr form))
+                                        (= (%block-name-hash (cadr form))
                                            block-hash))))
                       (let ((cur (cddr form)))
                         (loop while (consp cur) do
@@ -21429,7 +21658,7 @@
                    ;; RETURN-FROM <name> — check target + lambda boundary
                    ((%form-op-is form 164933334 "RETURN-FROM")
                     (when (and xl (not sh)
-                               (= (normalize-name (cadr form)) block-hash))
+                               (= (%block-name-hash (cadr form)) block-hash))
                       (setq found t))
                     (walk (caddr form) xl sh))
                    ;; RETURN (== return-from NIL) — only for the NIL block.
@@ -21543,7 +21772,7 @@
    through the THROW (we do NOT register a lexical *block-labels* entry):
    a lexical :br out of the middle of the catch's handler-case would skip
    its setjmp-frame teardown and corrupt the handler-case stack."
-  (let* ((name-hash (if name (normalize-name name) 0)))
+  (let* ((name-hash (%block-name-hash name)))
     (if (and (%return-from-escapes-block-p body name-hash nil nil)
              ;; ...but only when the catch frame can nest safely.  An
              ;; UNWIND-PROTECT or a cross-unit GO in the body shares the
@@ -22215,12 +22444,25 @@
                  (symbolp name)
                  (null unique-name)
                  (or (%e2-name-names-gf-p name)
+                     ;; NOT DEFINED when this form is compiled, and not a function
+                     ;; of this module either: read the cell when the form RUNS.
+                     ;; The baked :LI-FUNC of an undefined name loaded NIL, so
+                     ;; (eval '(function undefined)) answered NIL where SBCL, and
+                     ;; this image's own FDEFINITION, signal UNDEFINED-FUNCTION.
+                     ;; TI's (DEFF INTERNAL-READ #'READ) ran before their READ was
+                     ;; pulled, stored NIL, and their Lisp Listener died calling it
+                     ;; ("The function NIL is undefined") on every turn of its loop;
+                     ;; signalled, cortez's resolver pulls READ and runs it again.
+                     (and (not (fboundp name))
+                          (not (%e2-fn-in-module-p resolved-name)))
                      ;; A closure stored with (SETF FDEFINITION): read the
                      ;; cell so #'NAME is EQ to it (see %E2-NAME-SET-FUNCTION-P).
                      (and (fboundp (quote %e2-name-set-function-p))
                           (%e2-name-set-function-p fn-name)
                           (not (%e2-fn-in-module-p resolved-name)))))
-            (compile-form (list 'symbol-function (list 'quote name)) env dest)
+            (compile-form (list (if (fboundp name) 'symbol-function 'fdefinition)
+                                (list 'quote name))
+                          env dest)
             (if (and *mvm-eval-runtime-p*
                      (symbolp name)
                      (%e2-fn-in-module-p resolved-name))
@@ -22616,6 +22858,17 @@
       (when (not (symbolp op)) (return-from tail-form-is-values-p nil))
       (let ((hash (normalize-name op)))
         (cond
+          ;; A symbol that SHADOWS a CL name is not that operator, whatever its
+          ;; hash: judge its expansion, as the catch-all below judges any macro.
+          ;; cortez's RETURN takes several values, (RETURN T BA), and the RETURN
+          ;; arm read its first argument as the whole value: T, single-valued,
+          ;; so the epilogue set the count to 1 and the caller got (T).  TI's
+          ;; SHEET-PREPARE-FOR-EXPOSE returns (RETURN T :CLEAN) out of a PROG.
+          ((%shadows-cl-p op)
+           (let ((r (%quiet-macroexpand-1 form)))
+             (if (and (cdr r) (not (equal (car r) form)))
+                 (tail-form-is-values-p (list (car r)))
+                 t)))
           ;; Direct values call
           ((= hash 18794783) t)  ; VALUES
           ;; VALUES-LIST also returns multiple values
@@ -22927,6 +23180,17 @@
    multiple values so the function epilogue doesn't clobber MV-COUNT."
   (cond
     ((atom forms) nil)
+    ;; A RETURN / RETURN-FROM that shadows CL's is a macro of its own (cortez's
+    ;; RETURN takes several values): look at what it expands to.
+    ((and (symbolp (car forms))
+          (let ((h (compute-name-hash (symbol-name (car forms)))))
+            (or (= h #.(compute-name-hash "RETURN"))
+                (= h #.(compute-name-hash "RETURN-FROM"))))
+          (%shadows-cl-p (car forms)))
+     (let ((r (%quiet-macroexpand-1 forms)))
+       (if (and (cdr r) (not (equal (car r) forms)))
+           (loop-body-has-mv-return-p (car r))
+           (loop-body-has-mv-return-p (cdr forms)))))
     ((and (consp forms) (symbolp (car forms))
           (let ((h (compute-name-hash (symbol-name (car forms)))))
             (or (= h #.(compute-name-hash "RETURN"))
@@ -23958,7 +24222,7 @@
              (or (/= dest +vreg-vr+)
                  (and leaf (< *temp-reg-counter* 5)
                       (or (symbolp arg)
-                          (and (integerp arg) (<= (integer-length arg) 60)))))))
+                          (and (integerp arg) (<= (integer-length arg) (- (ct-fixnum-bits) 2))))))))
       ;; Leaf / pure right operand: no push/mov/pop round trip is needed.
       (let ((temp (alloc-temp-reg)))
         (compile-form arg env temp)
@@ -25825,6 +26089,13 @@
       ((string= name "W32-FROM-FIX")
        (%w32-leaf (cadr node) env dst)
        (emit-ir :w32-from-fix dst dst))
+      ;; (w32-ref V): V's slot read RAW -- V holds a W32 word a (w32-raw ...)
+      ;; root stored there (M3b: a raw word kept in a variable between trees).
+      ((string= name "W32-REF")
+       (let ((v (cadr node)))
+         (unless (and (symbolp v) v (not (eq v t)))
+           (error "%W32: w32-ref needs a variable: ~S" node))
+         (compile-form v env dst)))
       ((string= name "W32-JOIN")
        (%w32-leaf (cadr node) env dst)
        (let ((tmp (alloc-temp-reg)))
@@ -25855,6 +26126,19 @@
          (free-temp-reg)))
       (t (error "%W32: unknown W32 form ~S" node)))))
 
+;;; (%IF-W32 W32-FORM OTHER-FORM): W32-FORM when this compilation's target is
+;;; W32-capable (CT-W32-CAPABLE-P: the 30-bit towers), else OTHER-FORM -- and
+;;; only that one is compiled, so a 64-bit image's code is OTHER-FORM's exactly
+;;; (spec C1).  The choice is the target descriptor's (C2), never the running
+;;; image's.  This is how one source carries a field operation written in W32
+;;; words for the 32-bit targets beside its fixnum form (net/crypto-fast.lisp
+;;; FE-MUL, docs/w32.md M3b): W32-FORM may use %W32, which is an error on a
+;;; 64-bit target.
+(defun compile-if-w32 (args env dest)
+  (unless (= (length args) 2)
+    (error "%IF-W32 takes exactly two forms: ~S" args))
+  (compile-form (if (ct-w32-capable-p) (first args) (second args)) env dest))
+
 (defun compile-w32 (args env dest)
   "(%W32 TREE) -- see the block comment above."
   (unless (ct-w32-capable-p)
@@ -25883,7 +26167,196 @@
            (emit-ir :w32-store dest tmp off)
            (free-temp-reg))
          (emit-li-tagged dest 0)))
-      (t (error "%W32: the root must be w32-hi16/lo16/ltu/lts/eq/store: ~S" tree)))))
+      ;; (w32-raw W): the RAW word in DEST -- only as the value of a SETQ of a
+      ;; variable a (declare (w32-raw ...)) LET binds, which
+      ;; %W32-RAW-SCOPE-REWRITE has checked and turned into W32-RAW-CHECKED
+      ;; (spec C3: split around every GC point while it is live).
+      ((and name (string= name "W32-RAW-CHECKED"))
+       (%w32-node (cadr tree) env dest))
+      ((and name (string= name "W32-RAW"))
+       (error "%W32: (w32-raw ...) outside a LET that declares its variable (declare (w32-raw V)): ~S" tree))
+      (t (error "%W32: the root must be w32-hi16/lo16/ltu/lts/eq/store/raw: ~S" tree)))))
+
+;;; ---- RAW WORDS IN VARIABLES: THE (DECLARE (W32-RAW V ...)) SCOPE ---------
+;;; (docs/w32.md, "Raw words and the collector").  M3b keeps raw 32-bit words
+;;; in lexical variables between %W32 trees: (setq v (%w32 (w32-raw W))) then
+;;; (w32-ref v).  A raw word in a slot the collector scans is only safe while
+;;; no GC point can run (spec C3): a word whose bits happen to be a tagged
+;;; from-space address is "forwarded" by the collector, and the arithmetic
+;;; reads back the new address.  So such variables must be DECLARED, on the
+;;; LET or LET* that binds them, and the compiler checks the body:
+;;;
+;;;   (let ((w 0) ...) (declare (w32-raw w ...)) FORM*)
+;;;
+;;; * FORM* is flattened: each form is macroexpanded at its top and PROGNs are
+;;;   spliced (a form whose expansion touches no %W32 and no raw variable is
+;;;   kept as written).  A flat form is a W32 FORM -- (setq X (%w32 ROOT)) or
+;;;   (%w32 ROOT) -- or anything else, which counts as a GC POINT.
+;;; * A raw variable may appear only in W32 forms.  Anywhere else (a call
+;;;   argument, a closure, a nested IF) is a compile-time error: the analysis is
+;;;   over the flat sequence only, so a raw word cannot hide inside a form.
+;;; * (w32-raw W) is legal only as the root of a SETQ of a declared variable in
+;;;   such a body; anywhere else it is an error.
+;;; * Liveness, backwards over the flat forms: a raw variable read (anywhere in
+;;;   ROOT) after a GC point, and not set in between, is LIVE across it.  Each
+;;;   live variable is SPLIT around that point -- its high half into a hidden
+;;;   variable, its low half into itself, both 16-bit fixnums (no allocation,
+;;;   nothing for the collector to mistake), and joined again after -- so the
+;;;   value reads back unchanged.  fe-mul has no GC point while a raw word is
+;;;   live, so nothing is split there and its code is as before.
+;;; * MODUS_W32_UNSAFE_LIVE=1 (build time, *W32-UNSAFE-LIVE*) skips the split:
+;;;   the negative control of the collector rung (test/w32-gc-live.lisp), which
+;;;   must then FAIL.
+(defvar *w32-unsafe-live* nil
+  "T: do not split raw W32 variables live across a GC point (the collector
+   rung's negative control; MODUS_W32_UNSAFE_LIVE=1, set by the build).")
+
+(defun %w32-raw-decl-vars (body)
+  "The variables BODY's leading declarations name in (W32-RAW ...) specs."
+  (let ((vars nil))
+    (loop
+      (if (and (consp body) (consp (car body)) (symbolp (caar body))
+               (name-eq (caar body) "DECLARE"))
+          (progn
+            (dolist (spec (cdar body))
+              (when (and (consp spec) (symbolp (car spec)) (name-eq (car spec) "W32-RAW"))
+                (dolist (v (cdr spec)) (push v vars))))
+            (setq body (cdr body)))
+          (return (nreverse vars))))))
+
+(defun %w32-strip-raw-decl (body)
+  "BODY with every (W32-RAW ...) spec removed from its leading declarations;
+   (values declarations forms)."
+  (let ((decls nil))
+    (loop
+      (if (and (consp body) (consp (car body)) (symbolp (caar body))
+               (name-eq (caar body) "DECLARE"))
+          (let ((keep nil))
+            (dolist (spec (cdar body))
+              (unless (and (consp spec) (symbolp (car spec)) (name-eq (car spec) "W32-RAW"))
+                (push spec keep)))
+            (when keep (push (cons (caar body) (nreverse keep)) decls))
+            (setq body (cdr body)))
+          (return (values (nreverse decls) body))))))
+
+(defun %w32-tree-mentions (tree vars)
+  "The members of VARS that occur anywhere in TREE (as atoms)."
+  (let ((found nil) (stack (list tree)))
+    (loop
+      (when (null stack) (return found))
+      (let ((x (pop stack)))
+        (cond ((consp x) (push (car x) stack) (push (cdr x) stack))
+              ((and x (symbolp x) (member x vars) (not (member x found)))
+               (push x found)))))))
+
+(defun %w32-tree-has-op (tree name)
+  "True when an operator named NAME heads some cons in TREE."
+  (let ((stack (list tree)))
+    (loop
+      (when (null stack) (return nil))
+      (let ((x (pop stack)))
+        (when (consp x)
+          (when (and (symbolp (car x)) (car x) (string= (symbol-name (car x)) name))
+            (return t))
+          (push (car x) stack) (push (cdr x) stack))))))
+
+(defun %w32-form-root (f)
+  "For a W32 form (setq X (%w32 ROOT)) or (%w32 ROOT): (values ROOT X-or-NIL);
+   otherwise NIL."
+  (cond ((and (consp f) (symbolp (car f)) (name-eq (car f) "%W32")
+              (consp (cdr f)) (null (cddr f)))
+         (values (cadr f) nil))
+        ((and (consp f) (symbolp (car f)) (name-eq (car f) "SETQ")
+              (consp (cdr f)) (symbolp (cadr f)) (consp (cddr f)) (null (cdddr f))
+              (consp (caddr f)) (symbolp (car (caddr f))) (name-eq (car (caddr f)) "%W32")
+              (consp (cdr (caddr f))) (null (cddr (caddr f))))
+         (values (cadr (caddr f)) (cadr f)))
+        (t nil)))
+
+(defun %w32-flatten (forms raw)
+  "FORMS macroexpanded at their tops with PROGNs spliced; a form whose
+   expansion has no %W32 and mentions no RAW variable is kept as written."
+  (let ((out nil))
+    (dolist (f forms)
+      (let ((e (if (consp f) (macroexpand-mvm f) f)))
+        (cond ((and (consp e) (symbolp (car e)) (name-eq (car e) "PROGN"))
+               (dolist (g (%w32-flatten (cdr e) raw)) (push g out)))
+              ((or (%w32-tree-has-op e "%W32") (%w32-tree-mentions e raw))
+               (push e out))
+              (t (push f out)))))
+    (nreverse out)))
+
+(defun %w32-raw-scope-rewrite (head bindings body)
+  "For a LET / LET* (HEAD) whose body declares (W32-RAW ...): the checked,
+   split form to compile instead (see the block comment); NIL otherwise."
+  (let ((raw (%w32-raw-decl-vars body)))
+    (when raw
+      (dolist (v raw)
+        (unless (and (symbolp v) v
+                     (member v (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)))
+          (error "W32-RAW: ~S is not bound by this ~A" v head)))
+      (multiple-value-bind (decls forms) (%w32-strip-raw-decl body)
+        (let* ((flat (%w32-flatten forms raw))
+               (n (length flat))
+               (kinds (make-array n :initial-element nil)) (uses (make-array n :initial-element nil))
+               (defs (make-array n :initial-element nil))
+               (i 0))
+          ;; classify
+          (dolist (f flat)
+            (multiple-value-bind (root target) (%w32-form-root f)
+              (cond
+                (root
+                 (let ((rname (%w32-op-name root)))
+                   (when (and rname (string= rname "W32-RAW")
+                              (not (and target (member target raw))))
+                     (error "W32-RAW: (w32-raw ...) must be the value of a SETQ of a declared variable: ~S" f))
+                   (when (%w32-tree-has-op (cdr root) "W32-RAW")
+                     (error "W32-RAW: a nested (w32-raw ...): ~S" f))
+                   (setf (aref kinds i) (if (and rname (string= rname "W32-RAW")) :raw :w32))
+                   (setf (aref uses i) (%w32-tree-mentions root raw))
+                   (setf (aref defs i) (and target (member target raw) target))))
+                (t
+                 (let ((m (%w32-tree-mentions f raw)))
+                   (when m
+                     (error "W32-RAW: raw variable ~S used outside a W32 form: ~S" (car m) f)))
+                 (when (%w32-tree-has-op f "W32-RAW")
+                   (error "W32-RAW: (w32-raw ...) inside a compound form: ~S" f))
+                 (setf (aref kinds i) :gc))))
+            (setq i (+ i 1)))
+          (when (and (> n 0) (eq (aref kinds (- n 1)) :raw))
+            (error "W32-RAW: the ~A's value would be a raw word: ~S" head (car (last flat))))
+          ;; liveness, backwards: LIVE-OUT of each GC point
+          (let ((live nil) (split (make-array n :initial-element nil)))
+            (setq i (- n 1))
+            (loop
+              (when (< i 0) (return))
+              (when (eq (aref kinds i) :gc) (setf (aref split i) live))
+              (when (aref defs i) (setq live (remove (aref defs i) live)))
+              (dolist (u (aref uses i)) (unless (member u live) (push u live)))
+              (setq i (- i 1)))
+            ;; rebuild, splitting around each GC point (unless the knob says not to)
+            (let ((his nil) (out nil))
+              (setq i 0)
+              (dolist (f flat)
+                (let ((l (if *w32-unsafe-live* nil (aref split i))))
+                  (dolist (v l)
+                    (let ((h (or (cdr (assoc v his))
+                                 (let ((g (%mvm-gensym "W32H"))) (push (cons v g) his) g))))
+                      (push (list 'setq h (list '%w32 (list 'w32-hi16 (list 'w32-ref v)))) out)
+                      (push (list 'setq v (list '%w32 (list 'w32-lo16 (list 'w32-ref v)))) out)))
+                  (push (if (eq (aref kinds i) :raw)
+                            (list 'setq (cadr f)
+                                  (list '%w32 (cons 'w32-raw-checked (cdr (cadr (caddr f))))))
+                            f)
+                        out)
+                  (dolist (v l)
+                    (push (list 'setq v (list '%w32 (list 'w32-raw-checked
+                                                          (list 'w32-join (cdr (assoc v his)) v))))
+                          out)))
+                (setq i (+ i 1)))
+              (list* head
+                     (append bindings (mapcar (lambda (p) (list (cdr p) 0)) (reverse his)))
+                     (append decls (nreverse out))))))))))
 
 ;;; ---- THE W32 EXPRESSION REWRITE (docs/w32.md, M3a) -----------------------
 ;;; On a W32-capable target, an integer expression whose value is provably a
@@ -25974,20 +26447,27 @@
 ;;; arithmetic plus at most one %MAKE-BIGNUM -- no generic arithmetic, which is
 ;;; what the M3a first cut called (%W32-HI-OF / -LO-OF / -BOX in the prelude:
 ;;; measured 11% SLOWER on SHA-256 and 1.8x slower on ChaCha20 than the bignum
-;;; code it replaced).
+;;; code it replaced).  The limbs are read and written with %WORD-AREF /
+;;; %WORD-ASET, not %PRIM-AREF / %PRIM-ASET: the argument is always a bignum, a
+;;; word object, and %PRIM-AREF compiles a dispatch on the array's kind (byte,
+;;; 32-bit lane, word) at every use, whose bignum arm is %WORD-AREF anyway.
+;;; Measured: a (LOGAND (+ A B) #xFFFFFFFF) DEFUN over two declared words
+;;; compiles in 28 ms instead of 62 on the hosted 68k CLI (undeclared, 3 ms) --
+;;; what the Mac pays at its REPL -- and ChaCha20 runs 38-46% faster, SHA-256
+;;; 6-19% (riscv32, arm32, i386), since the dispatch ran on every bignum leaf.
 (defun %w32-hi-form (g)
   "Bits 31..16 of integer G (a fixnum or a small bignum), as a fixnum."
   (let ((lb (ct-limb-bits)))
     (list 'if (list 'fixnump g)
           (list 'logand (list 'ash g -16) #xFFFF)
-          (list 'logand (list 'logior (list 'ash (list '%prim-aref g 1) (- lb 16))
-                              (list 'ash (list '%prim-aref g 0) -16))
+          (list 'logand (list 'logior (list 'ash (list '%word-aref g 1) (- lb 16))
+                              (list 'ash (list '%word-aref g 0) -16))
                 #xFFFF))))
 (defun %w32-lo-form (g)
   "Bits 15..0 of integer G (a fixnum or a small bignum), as a fixnum."
   (list 'if (list 'fixnump g)
         (list 'logand g #xFFFF)
-        (list 'logand (list '%prim-aref g 0) #xFFFF)))
+        (list 'logand (list '%word-aref g 0) #xFFFF)))
 (defun %w32-box-form (hi lo)
   "The non-negative integer HI*2^16 + LO (HI, LO forms yielding fixnums
    0..65535): a fixnum when it is one, else a small bignum built directly."
@@ -25997,9 +26477,9 @@
           (list 'if (list '< bh (ash 1 k))
                 (list 'logior (list 'ash bh 16) bl)
                 (list 'let (list (list b (list '%make-bignum)))
-                      (list '%prim-aset b 0
+                      (list '%word-aset b 0
                             (list 'logior (list 'ash (list 'logand bh (- (ash 1 k) 1)) 16) bl))
-                      (list '%prim-aset b 1 (list 'ash bh (- 0 k)))
+                      (list '%word-aset b 1 (list 'ash bh (- 0 k)))
                       b)))))
 
 (defvar *w32-leaves* nil)
@@ -27838,10 +28318,16 @@
     ;; inline fixnum fast path, with BIGNUM-ASH kept as the out-of-line slow
     ;; path.  See %COMPILE-ASH-VAR-FAST.  (setq *cg-var-ash* :off) at runtime
     ;; restores the plain call, for A/B in one binary.
+    ;; 64-BIT FIXNUMS, asked of the compile target: *JIT-TARGET-ARCH* is :X64 by
+    ;; default on every image, so the i386 and 68k CLIs' native tiers took this
+    ;; path with 30-bit fixnums and (ash 1 31) came out -2^30 (ANSI MISC.461,
+    ;; and the OPEN.* element-size masks).
     ((and (null count) *mvm-eval-runtime-p*
+          (> (ct-fixnum-bits) 32)
           (boundp (quote *jit-target-arch*))
           (let ((a (symbol-value (quote *jit-target-arch*))))
             (or (eq a :x64) (eq a :aarch64)))
+          (> (ct-fixnum-bits) 40)
           (%cg-on-p (quote *cg-var-ash*)))
      (%compile-ash-var-fast value-form count-form env dest))
     ;; Large constant or variable count — call bignum-ash so we
@@ -31673,7 +32159,7 @@
       (if (and *mvm-eval-runtime-p* (numberp dest)
                (%cg-on-p (quote *cg-minmax-lit*))
                (%expr-width x env)
-               (<= (integer-length lit) 61))
+               (<= (integer-length lit) (- (ct-fixnum-bits) 1)))
           (let ((tmp (alloc-temp-reg))
                 (skip (make-compiler-label)))
             (compile-form x env dest)
@@ -33357,6 +33843,16 @@
                            (let ((q (%fn-key-qualify name bare-name)))
                              (if (equal q bare-name) nil q)))
                     :param-count (length params)
+                    ;; The counts the arity prologue above checks, in its
+                    ;; terms.  After PREPROCESS-PARAMS a &key list is a
+                    ;; REST-SLOT too, so MAX is NIL for both.
+                    :arity (let ((req (cond ((and opt-count (> opt-count 0)) opt-start)
+                                            (rest-slot rest-slot)
+                                            (t (length params)))))
+                             (cons req (cond (rest-slot nil)
+                                             ((and opt-count (> opt-count 0))
+                                              (+ opt-start opt-count))
+                                             (t req))))
                     :bytecode-offset 0
                     :bytecode-length 0
                     :stack-frame-size 0)))

@@ -27,7 +27,10 @@ Mac's floppy runtime (`mvm/mac68k-files.lisp`, `mvm/mac68k-disk-io.lisp`) and it
 assembly -- boot blocks, the LZMA loader and decoder, the cold-code disk driver, disk 2's
 prompt, the SCSI boot, the chain loader (`scripts/mac68k-*.s`, `mac68k-lzma.inc`) -- are
 vessel's too (2026-11-21); the Mac disk scripts assemble them through
-`MAC68K-TOOLS:KERNEL-SOURCE` / `kernel_source`, MODUS-SOURCE's rule.  What
+`MAC68K-TOOLS:KERNEL-SOURCE`, MODUS-SOURCE's rule.  The Mac's emulator workbench -- the
+period-Lisp MAME harness, the profile readers, the screen-console REPL driver -- is vessel's
+`tools/mac68k/`.  (The Mac disk builders, which read the translator's layouts, and the
+68k ladder stay here; all of it Lisp now, no Python.)  What
 hosted modus reads too (`ip`, `ssh`, `crypto*`, `actors`, the `sb-*` shims) stays here.  So
 do the boot descriptors (`boot/*.lisp`), by decision rather than by omission: they are the
 compiler's knowledge of how to emit a freestanding image for each target, `lib/load-mvm.lisp`
@@ -86,7 +89,7 @@ net/            Networking, crypto, USB, actor system
   usb-hid-split.lisp   USB keyboard console (the Pi board image)
   ip.lisp              ARP/IP/TCP/UDP/DHCP/DNS
   crypto.lisp          SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519
-  crypto-fast.lisp     limb-vector field arithmetic;  crypto-32-fast.lisp: 32-bit
+  crypto-fast.lisp     limb-vector field arithmetic (all widths; docs/w32.md M4)
   ssh.lisp             SSH-2 server (key exchange, auth, channels)
   ne2000.lisp          NE2000 ISA NIC driver (i386)
   http-client.lisp     HTTP client (URL parsing, GET, fetch)
@@ -1066,9 +1069,27 @@ the boot stub STAGED into the BSS at `0x10009000` rather than the live initial
 stack (4-byte slots, and the kernel stack at `0x40800390` is above the 2^30
 ceiling a tagged `mem-ref` address can express); and `*cstr-scratch*` /
 `*io-buf-addr*`, which must sit in the `0x10004000..0x10009000` BSS window
-because every syscall address travels as a tagged fixnum. There is **no in-image JIT** on i386 (`*JIT-ON*` is forced NIL) —
-`translate-i386.lisp` builds the image but has no runtime arm; `mvm-eval` falls
-back to `mvm-interpret`, which is correct, just slower.
+because every syscall address travels as a tagged fixnum. i386 has no x64-style
+JIT (`*JIT-ON*` is x64-only), but it has a **native tier**: `mvm/jit-i386-native.lisp`.
+The image carries `translate-i386.lisp`, and a runtime DEFUN is translated at its
+first call, `(compile 'f)` at once, and closure-building top-level forms natively.
+It is ON by default in the CLI since 2026-11-24 (`MODUS_I386_JIT=0` builds it off; the
+bare i386 images still opt in with `MODUS_I386_JIT=1`); without it `mvm-eval` interprets
+all runtime code. Whatever the tier refuses stays
+interpreted, with the reason in `*N386-REFUSED*`. The i386 ANSI sweep with it on:
+2026-11-23, 21653/21681; **2026-11-24, 21681/21681** (dos386 38d896fa, main merged:
+the variable-count ASH guard and the 32-bit collector fix cleared all 28 below).
+On 2026-11-23 the 28 lost were 20
+`OPEN.*` (the `(unsigned-byte 1)`/`(unsigned-byte 2)` generator gives 0..3),
+`MISC.461`/`509`/`569` (integer arithmetic at the fixnum/bignum boundary),
+`DEFUN.5`-`7` (a DEFUN in a LET with special/optional defaults calls NIL), and
+`TRACE.9` and `DOCUMENTATION.NEW-METHOD.1` (native direct calls bypass TRACE).
+On the bare PC image the boot stub maps the code area at `#x12000000` (a
+sixteenth of the RAM, 256 KB up to all the VA below the stack, ~103 MB) and
+the build overrides `%N386-AREA`.  The tier stays off while the image boots to
+be saved (`%N386-ALLOWED-P`, SAVECORE); once a core is being built it runs, and
+the saved core carries the code area (header +44, copied back at restore) --
+`kiln t420` translates every module before the save (17 MB, 1857 modules).
 
 **THE i386 CL IMAGE USED TO DIE AT ITS FIRST COLLECTION — three defects, all
 fixed (2026-09-26).**  Any `--script` of ~1300 toplevel forms (each allocates
@@ -1142,31 +1163,43 @@ writes to bignums.  **A byte vector's payload is NOT at word+7 on i386** — a
 on 32 bits.
 
 **SSH (`MODUS_SSH_BUILD=1`, `(ssh-boot)` at the REPL) works: a real OpenSSH
-client gets `= 3` over curve25519 / Ed25519 / ChaCha20-Poly1305, ~60 s a
-connection (x64: ~50 s).  Three 32-bit facts it took:**
-- **crypto-fast's field arithmetic caches RAW limb addresses across
-  ALLOCATION.**  `(+ (ash (logand fe (- 0 4)) 1) 8)` is computed once per call;
-  on 30-bit fixnums the 26x26-bit limb products are bignums, so a collection
-  inside `fe-mul` moves the arrays under the cached address.  Measured:
-  `ed25519-public-key` right in every run with no collection, wrong in exactly
-  the run where `%GC-EPOCH` moved.  The i386 build splices
-  `net/crypto-32-fast.lisp` (cons-free, `MUL26LO`/`MUL26HI`, scratch at
-  `FE-SCRATCH-BASE`) after crypto-fast, its limb offset rewritten to
-  crypto-fast's.  **Any 32-bit CL target running crypto-fast has this bug** —
-  bare arm32 next.
+client gets `= 3` over curve25519 / Ed25519 / ChaCha20-Poly1305, 3-4 s a
+connection since W32 M3b (it was ~60 s; x64: ~50 s).  The boot stub maps the
+NIC/SSH state it lives in: a 4 MB net block at `#x04000000` and a 4 MB SSH
+block at `#x0C000000`, on machines of 32 MB or more.  Three 32-bit facts it took:**
+- **crypto-fast's limbs are FIXNUMS IN THE VECTOR'S SLOTS, not raw u32
+  words behind a computed address.**  On 30-bit fixnums the 26x26-bit limb
+  products are bignums, so a collection inside `fe-mul` moved the arrays under
+  a cached address: every bare-i386 X25519 that saw a collection was wrong.
+  Taking each address after the last allocation cut that to 4 in 154 but not
+  to zero; with `svref` (declared `simple-vector`, local `(safety 0)`) it is
+  0 in 300, one source serves every width, and x64 got faster (1.50 -> 0.99 ms
+  per X25519).  The old i386 splice, `crypto-32-fast.lisp`, is deleted
+  (docs/w32.md M4).  On the 30-bit towers FE-MUL takes a second body in raw 32-bit words
+  (`%IF-W32`, W64 pairs, no allocation): bare-i386 X25519 5-6.5 s -> 73 ms,
+  arm32 3.9 s -> 55 ms; x64 compiles the generic body, unchanged
+  (docs/w32.md M3b).  (Those were at load ~400: at ~130 both take 13-16 ms.)
+  FE-SQ has its own W32 body (55 products, -17% / -30% per squaring on
+  i386 / arm32, ~1-6% on an X25519).  A LET that keeps raw words declares them
+  `(declare (w32-raw ...))`; the compiler rejects one in any other position,
+  and SPLITS one live across a possible GC point into two 16-bit fixnums.
+  `test/run-w32-gc-live.sh` is the collector check: safe CLIs answer 15,
+  `MODUS_W32_UNSAFE_LIVE=1` ones 11 (docs/w32.md "After M3b").
 - **A 32-bit TCP sequence number is a bignum** (>= 2^29), so ip.lisp's
   `(eq their-seq expected)` was false for most of them: `EQL` now.
 - `*CLI-ARCH*` was `:AARCH64` for this image (machine-type "aarch64", aarch64's
   layout co-init); `:I386` now.  And a `:U64` store is ONE 32-bit store here,
   so the net/SSH texts' 8-byte-stride zero loops are rewritten for i386.
 
-**OPEN: a reconnect can fail.**  The first connection after `(ssh-boot)`
-works in every run; a later one sometimes closes right after the client's
-KEXINIT, which run moves (2 failing, 3 failing, or both).  The server never
-sees the client's version-string segment (only pure ACKs reach
-NET-DELIVER-DATA).  Suspect, not finding: between sessions the server spends
-tens of seconds recomputing ephemeral keys while SYN retransmits fill the
-NE2000's 32 KB ring, and `ne2k-receive` has no ring-overflow (OVW) recovery.
+**Reconnects (fixed 2026-11-22).**  A later connection used to close right
+after the client's version line.  The cause was the version wait: 50 polls of
+one packet each, with no clock, while the NE2000 ring still held the last
+connection's tail (the client's final segments, slirp's retransmits).  The
+server gave up with an empty buffer 6 ms before the client's version arrived
+(an instrumented build printed 51 polls, 0 bytes, peer open).  i386's SSH waits
+now also need wall time on the PIT clock (`%BIND-I386-SSH-SEAMS`,
+build-cl-repl-common; ssh-x64-cl.lisp's policy): 10 of 10 back-to-back
+connections get `= 3`.
 
 Debugging it: `qemu -s -S` + gdb-multiarch with `hbreak` on an address from
 `MODUS_SYMMAP`, walking the EBP chain.  A CONDITIONAL hbreak on a hot function
@@ -1174,6 +1207,34 @@ costs a gdb round trip per hit (a 10x slower boot); instead write a code cave
 into free RAM from gdb at the kernel entry (`0x100020` — the multiboot ROM
 copies the kernel after reset, so patch there, not at `0xfff0`) and patch the
 function to jump to it.
+
+### The modern PC matrix: `scripts/pc-matrix.py` (2026-11-20)
+
+```bash
+scripts/pcboot.sh /tmp/pc.img CORE.bin        # a disk that boots modus with no DOS
+scripts/pc-matrix.py /tmp/pc.img              # 45 cells, about a minute
+scripts/pc-matrix.py /tmp/pc.img 't420' 'bochs-*' --keep    # some; transcripts in /dev/shm
+```
+
+The 86Box matrix (`scripts/dos386-86box/`) runs real 1990s BIOSes; nothing emulates a
+later machine's own firmware (a T420's Lenovo UEFI + CSM, its chipset, its EC), so this
+covers what an emulator can after them.  **QEMU**: i440FX and q35; CPUs n270 Atom, Core 2,
+Nehalem .. Sandy Bridge (the T420) .. Ice Lake, Athlon .. EPYC-Milan; SeaBIOS booting off
+IDE, AHCI, NVMe, virtio, SCSI and a USB stick on UHCI/EHCI/xHCI; 6 MB .. 8 GB; 4 CPUs --
+typed on the PS/2 keyboard (QMP send-key) and read out of VGA text memory, a laptop's own
+console.  **Bochs** (2.7): its own models, Pentium II .. Tiger Lake and Ryzen, under its own
+BIOS -- typed through its VNC server (key events, so its 8042 model is in the loop), read
+on COM1.  Every cell must ANSWER seven forms correctly (bignum, double float, 100 x 10000
+conses, a hash table), and reports the RAM, semispace and code pool the stub chose.
+**It refuses to report unless a control cell, expecting `(+ 1 2)` to be 4, FAILs on that
+form**; a disk with its image zeroed fails every cell (QEMU: the guest resets; Bochs: no
+prompt).  Bochs's build here has its debugger compiled in and stops at the first
+instruction (`-rc` a file holding `c`); it has no headless display but `rfb`, and no rfb
+port option (it takes the first free one from 5900, found with `ss`).
+
+Above 4 GB the stub sees what is below the PCI hole: 2 GB on q35, 3 GB on i440FX (32-bit
+paging, no PAE).  What none of this exercises: a real CSM's quirks, SMM, an EC-routed
+keyboard and USB legacy emulation -- one boot on the real machine.
 
 ### QEMU arm32 (virt) — the bare-metal CL image (2026-10-24)
 
@@ -1206,8 +1267,8 @@ needed a bare variant.  Bare clock: CNTVCT >> 16 (#x0310) and CNTFRQ >> 16
 three syscall traps, signal-handler install and the four JIT/mmap traps are
 hosted-only and become an unhandled SWI on bare metal; nothing in boot or the
 REPL reaches them.  **The 32-bit lessons from i386 apply here unchanged before
-networking or SSH is added**: a byte vector's payload is at word−5, crypto-fast
-must be replaced by crypto-32-fast, and TCP sequence numbers are bignums.
+networking or SSH is added**: a byte vector's payload is at word−5, and TCP sequence
+numbers are bignums.
 
 ### QEMU x64 / i386 PC images (Multiboot) — SSH over E1000 / NE2000
 ```bash
@@ -1404,7 +1465,33 @@ these at collection time.
 
 ## Garbage Collector
 
-Cheney semi-space copying collector. Two ~469MB semispaces within the mmap'd heap.
+Cheney semi-space copying collector, two semispaces within the mmap'd heap.
+
+### Hosted x64 sizes its heap AT STARTUP: `--dynamic-space-size` (2026-11-24)
+
+`./modus --dynamic-space-size 8GB` (MB by default, or KB / MB / GB, as SBCL takes it):
+semispaces of N/2, rounded down to 1 MB, kept within 32 MB .. 24 GB each (the heap at
+`0x2000000000`, the JIT arena at `0x3000000000`).  No flag: the build's
+`MODUS_X64_MIDPOINT` default, 896 MB semispaces.  `EMIT-LINUX-X64-CHOOSE-HEAP`
+(boot-linux-x64.lisp) parses argv before the heap is mapped and lays the heap out with
+`X64-HEAP-LAYOUT`'s arithmetic, storing three words the heap tail reads: `0x10000F88`
+midpoint, `0x10000F90` data size, `0x10000F98` the cons-kind bitmap's offset from the
+start bitmap.  **Nothing compiled depends on the heap size**: the translator adds the kind
+offset from `0x10000F98` (`EMIT-X64-ADD-KIND-DELTA`); bare x64 and the Windows stub store
+their fixed values there.  A saved core restores only under the size it was saved with.
+- **The stub's length is measured before a build script finishes setting it up**
+  (`*X64-NATIVE-CODE-OFFSET*`, build-generic-cli): a stub whose length depends on a
+  later setting moves every function entry.  A branch 8 bytes longer made every function
+  word end `#xB`, the runtime JIT's tag-3 test took half the kernel for not native, and
+  `(make-hash-table :test #'equal)` in a DEFUN made an EQL table -- with ANSI still at
+  21681/21681.  build-generic-cli now fails if the stub's length changed.
+- **A sized check (`:gc-check-n` / `:gc-check-r`) re-tests after collecting** and calls the
+  unit's exhausted routine (`translate-state-exhausted-label`) when the allocation still
+  does not fit: "heap exhausted -- an allocation does not fit", exit 137.  It used to go
+  ahead, run past the limit into memory the next collection copies over, and corrupt the
+  heap silently (the builder building the Darwin CLI in 896 MB).  Hosted only.
+- Small heaps: threads fault with 256 MB semispaces (hosted-stw, hosted-many-regions),
+  as they did before this, when such a heap took a build-time MODUS_X64_MIDPOINT.
 
 - **GC check**: `CMP R12, R14; JB skip; CALL gc_trampoline` after every allocation
 - **Roots**: stack scan (RSP to stack_base) + globals alist + symbol table

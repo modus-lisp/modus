@@ -100,6 +100,17 @@
 ;;;; do not assume: `cmp modus <pristine>' after building both.
 
 (in-package :modus.mvm)
+;;; ENCAPSULATE on any host.  SBCL's SB-INT:ENCAPSULATE (looked up at run time, so
+;;; no other reader ever sees the symbol); elsewhere the function cell is replaced
+;;; by a wrapper over the old definition, which is what an encapsulation is.
+(defun %gck-encapsulate (name tag fn)
+  (let ((enc (and (find-package "SB-INT") (find-symbol "ENCAPSULATE" "SB-INT"))))
+    (if (and enc (fboundp enc))
+        (funcall enc name tag fn)
+        (let ((orig (fdefinition name)))
+          (setf (fdefinition name)
+                (lambda (&rest args) (apply fn orig args)))))))
+
 
 ;;; ------------------------------------------------------------------
 ;;; REPRODUCIBILITY — no pin needed here any more (task #251)
@@ -428,7 +439,7 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
 ;;; ============================================================
 
 (defun %gck-mode ()
-  (let ((v (sb-ext:posix-getenv "MODUS_GLOBAL_CHECK")))
+  (let ((v (modus.image-config:getenv-unrecorded "MODUS_GLOBAL_CHECK")))
     (cond ((null v) :error)
           ((string= v "0") :off)
           ((string-equal v "warn") :warn)
@@ -469,15 +480,19 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
    That — not the target keyword — is the identity of an image here: #242 was
    two build scripts for the SAME target disagreeing about whether an
    initialiser gets called."
-  (or (sb-ext:posix-getenv "MODUS_GLOBAL_CHECK_LABEL")
+  (or (modus.image-config:getenv-unrecorded "MODUS_GLOBAL_CHECK_LABEL")
       ;; `sbcl --script foo.lisp' leaves *POSIX-ARGV* = (\"sbcl\") — the script
       ;; path is NOT in it (measured).  It IS in the SB-IMPL::PROCESS-SCRIPT
       ;; stack frame, and that is the OUTERMOST script, which is what we want:
       ;; *LOAD-TRUENAME* here would say \"build-ansi-common\" for all four ANSI
       ;; gate runners, collapsing four distinct images into one label.
-      (let ((frames (ignore-errors (sb-debug:list-backtrace :count 400))))
+      (let ((frames (ignore-errors
+                     (let ((bt (and (find-package "SB-DEBUG")
+                                    (find-symbol "LIST-BACKTRACE" "SB-DEBUG"))))
+                       (and bt (fboundp bt) (funcall bt :count 400)))))
+            (ps (and (find-package "SB-IMPL") (find-symbol "PROCESS-SCRIPT" "SB-IMPL"))))
         (dolist (f frames)
-          (when (and (consp f) (eq (car f) 'sb-impl::process-script)
+          (when (and (consp f) ps (eq (car f) ps)
                      (stringp (cadr f)))
             (let ((n (pathname-name (pathname (cadr f)))))
               (when n (return-from %gck-build-label n))))))
@@ -491,7 +506,7 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
   (let ((mode (%gck-mode)))
     (when (eq mode :off) (return-from check-global-inits nil))
     (when (eq mode :dump)
-      (let ((out (or (sb-ext:posix-getenv "MODUS_GLOBAL_CHECK_OUT")
+      (let ((out (or (modus.image-config:getenv-unrecorded "MODUS_GLOBAL_CHECK_OUT")
                      "/tmp/modus-blob.lisp")))
         (with-open-file (s out :direction :output :if-exists :supersede
                              :if-does-not-exist :create)
@@ -1151,11 +1166,48 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
   "CHECK E is tree-wide, not blob-wide, so it is worth running once per SBCL
    process — not once per BUILD-IMAGE call (the fixpoint build makes several).")
 
+(defun %gck-ensure-qualified-names (path stub-sink)
+  "Before reading PATH: every PKG:NAME / PKG::NAME token in it names a package that
+   exists and, for an SB- package, a NAME it exports.  A missing package is made
+   (and handed to STUB-SINK for deletion, as the retry below does); a missing SB-
+   external is interned and exported.  SBCL's own SB- packages export everything a
+   first-party file names (SBCL reads these files), so there this does nothing;
+   CCL's and ABCL's shims export only what the build CALLS, and their readers do
+   not all signal the PACKAGE-ERROR the retry recovers from.  The sweep checks
+   parens and strings, the same on every host -- not which SBCL symbols exist."
+  (let ((text (with-open-file (f path) (let ((s (make-string (file-length f))))
+                                         (subseq s 0 (read-sequence s f)))))
+        (i 0))
+    (flet ((token-char-p (c) (or (alphanumericp c) (find c "+-*/%.<>=!?&_$^~"))))
+      (loop
+        (let ((colon (position #\: text :start i)))
+          (unless colon (return))
+          (setq i (1+ colon))
+          (let ((ps colon))
+            (loop while (and (> ps 0) (token-char-p (char text (1- ps)))) do (decf ps))
+            (when (and (< ps colon) (alpha-char-p (char text ps))
+                       (or (= ps 0) (find (char text (1- ps)) '(#\( #\Space #\Newline #\Tab #\' #\` #\, #\#))))
+              (let* ((pkg (string-upcase (subseq text ps colon)))
+                     (ns (if (and (< (1+ colon) (length text)) (char= (char text (1+ colon)) #\:))
+                             (+ colon 2) (1+ colon)))
+                     (ne (or (position-if-not #'token-char-p text :start ns) (length text)))
+                     (name (string-upcase (subseq text ns ne))))
+                (when (plusp (length name))
+                  (unless (find-package pkg)
+                    (make-package pkg :use '(:cl))
+                    (funcall stub-sink pkg))
+                  (when (and (= ns (1+ colon)) (eql 0 (search "SB-" pkg)))
+                    (multiple-value-bind (s status) (find-symbol name pkg)
+                      (declare (ignore s))
+                      (unless (eq status :external)
+                        (ignore-errors (export (intern name pkg) pkg))))))))))))))
+
 (defun %gck-parse-one (path stub-sink)
   "Read PATH the way CHECK-PARSES does.  Returns NIL on success or a one-line
    description of the reader error.  A `package X does not exist' error is not
    a parse failure — create X, hand its name to STUB-SINK for later deletion,
    and retry the file."
+  (%gck-ensure-qualified-names path stub-sink)
   (loop for attempt from 0 below 16 do
     (let ((outcome
             (handler-case
@@ -1438,7 +1490,7 @@ that no list has ***~%" (length missing))
   (let ((cnt (symbol-value (find-symbol "*GV-CACHE-COUNT*" :modus.mvm)))
         (ix  (symbol-value (find-symbol "*GV-CACHE-INDEX*" :modus.mvm)))
         (nm  (symbol-value (find-symbol "*GV-CACHE-NAMES*" :modus.mvm)))
-        (dump (sb-ext:posix-getenv "MODUS_GVCACHE_DUMP")))
+        (dump (modus.image-config:getenv-unrecorded "MODUS_GVCACHE_DUMP")))
     (format t "~&;; gv-cache: ~D global slots assigned~%" cnt)
     (when (and dump (plusp (length dump)) ix)
       (with-open-file (o dump :direction :output :if-exists :supersede)
@@ -1452,7 +1504,7 @@ that no list has ***~%" (length missing))
 (defun %gck-redef-mode ()
   "MODUS_REDEF_CHECK: unset or error = an undeclared redefinition fails the
    build; warn = report it and build anyway; 0 = say nothing."
-  (let ((v (sb-ext:posix-getenv "MODUS_REDEF_CHECK")))
+  (let ((v (modus.image-config:getenv-unrecorded "MODUS_REDEF_CHECK")))
     (cond ((equal v "warn") :warn) ((equal v "0") :off) (t :error))))
 
 (defun check-undeclared-redefinitions ()
@@ -1478,7 +1530,7 @@ that no list has ***~%" (length missing))
    current BUILD-IMAGE, newest first.  Host-side only (see below).")
 
 (defun %gck-defun-inventory-path ()
-  (let ((path (sb-ext:posix-getenv "MODUS_DEFUN_INVENTORY")))
+  (let ((path (modus.image-config:getenv-unrecorded "MODUS_DEFUN_INVENTORY")))
     (and path (plusp (length path)) path)))
 
 (defun %gck-defun-inventory ()
@@ -1496,7 +1548,7 @@ that no list has ***~%" (length missing))
           (format o "~A~C~A~%" (car e) #\Tab (or (cdr e) "?")))))))
 
 (when (%gck-defun-inventory-path)
-  (sb-int:encapsulate 'mvm-compile-function 'defun-inventory
+  (%gck-encapsulate 'mvm-compile-function 'defun-inventory
     (lambda (f name &rest args)
       (push (cons name *current-source-location*) *gck-defun-log*)
       (apply f name args))))
@@ -1509,7 +1561,7 @@ that no list has ***~%" (length missing))
    it means.  Filled only under MODUS_FN_FALLBACK_CENSUS=FILE.")
 
 (defun %gck-fallback-census-path ()
-  (let ((p (sb-ext:posix-getenv "MODUS_FN_FALLBACK_CENSUS")))
+  (let ((p (modus.image-config:getenv-unrecorded "MODUS_FN_FALLBACK_CENSUS")))
     (and p (plusp (length p)) p)))
 
 (defvar *gck-registered-keys* (make-hash-table :test 'equal)
@@ -1521,12 +1573,12 @@ that no list has ***~%" (length missing))
 (progn
   ;; Always on: the census is also the enforcement (CHECK-CROSS-PACKAGE-CALLS).
   (setf *gck-fallback-census* (make-hash-table :test 'equal))
-  (sb-int:encapsulate '%fn-register-info 'fallback-census
+  (%gck-encapsulate '%fn-register-info 'fallback-census
     (lambda (f info)
       (let ((q (function-info-qualified-name info)))
         (when q (setf (gethash q *gck-registered-keys*) t)))
       (funcall f info)))
-  (sb-int:encapsulate '%fn-info-for-key 'fallback-census
+  (%gck-encapsulate '%fn-info-for-key 'fallback-census
     (lambda (f key)
       (let ((r (funcall f key)))
         (when (and r *functions* (not (gethash key *functions*)))
@@ -1541,7 +1593,7 @@ that no list has ***~%" (length missing))
 (defun %gck-pkg-check-mode ()
   "MODUS_PKG_CHECK: unset or error = a cross-package call that resolved only
    through the bare-name fallback fails the build; warn = report; 0 = silent."
-  (let ((v (sb-ext:posix-getenv "MODUS_PKG_CHECK")))
+  (let ((v (modus.image-config:getenv-unrecorded "MODUS_PKG_CHECK")))
     (cond ((equal v "warn") :warn) ((equal v "0") :off) (t :error))))
 
 (defun check-cross-package-calls ()
@@ -1601,7 +1653,7 @@ that no list has ***~%" (length missing))
                 (second c) (first c) (third c)))
       (dolist (c coll)
         (format t ";;   GLOBAL-COLLISION ~A defined in ~{~A~^, ~}~%" (first c) (second c)))
-      (when (and (not (member (sb-ext:posix-getenv "MODUS_GLOBAL_PKG_CHECK")
+      (when (and (not (member (modus.image-config:getenv-unrecorded "MODUS_GLOBAL_PKG_CHECK")
                               '("warn" "0") :test 'equal))
                  (or cross coll))
         (error "global-pkg-check: ~D cross-package global reference~:P, ~D collision~:P"
@@ -1633,7 +1685,7 @@ that no list has ***~%" (length missing))
       (dolist (s split)
         (format t ";;   QUOTE-SPLIT ~A in ~{~A~^, ~}~%" (first s) (second s)))
       (when (and split
-                 (not (member (sb-ext:posix-getenv "MODUS_QUOTE_PKG_CHECK")
+                 (not (member (modus.image-config:getenv-unrecorded "MODUS_QUOTE_PKG_CHECK")
                               '("warn" "0") :test 'equal)))
         (error "quote-pkg-check: ~D name~:P quoted in two kernel packages (first: ~A in ~{~A~^, ~})"
                (length split) (first (first split)) (second (first split)))))))
@@ -1672,7 +1724,7 @@ that no list has ***~%" (length missing))
     (dolist (c coll)
       (format t ";;   FUNCTION-COLLISION ~A in ~{~A~^, ~}~%" (first c) (second c)))
     (when (and coll
-               (not (member (sb-ext:posix-getenv "MODUS_FN_COLLISION_CHECK")
+               (not (member (modus.image-config:getenv-unrecorded "MODUS_FN_COLLISION_CHECK")
                             '("warn" "0") :test 'equal)))
       (error "fn-collision-check: ~D function name~:P defined in two kernel packages (first: ~A in ~{~A~^, ~})"
              (length coll) (first (first coll)) (second (first coll))))))
@@ -2102,11 +2154,11 @@ that no list has ***~%" (length missing))
         (format *ir-dump-stream* "@FN ~S~%~S~%"
                 (function-info-name (car r)) (%ir-norm-fn (cdr r)))))))
 
-(let ((path (sb-ext:posix-getenv "MODUS_IR_DUMP")))
+(let ((path (modus.image-config:getenv-unrecorded "MODUS_IR_DUMP")))
   (when (and path (> (length path) 0))
     (setf *ir-dump-stream* (open path :direction :output :if-exists :append
                                       :if-does-not-exist :create))
-    (sb-int:encapsulate 'mvm-compile-toplevel 'ir-dump
+    (%gck-encapsulate 'mvm-compile-toplevel 'ir-dump
       (lambda (f form &rest args)
         (let ((*ir-dump-depth* (1+ *ir-dump-depth*)))
           (let ((r (apply f form args)))
@@ -2118,11 +2170,14 @@ that no list has ***~%" (length missing))
     ;; global reference added anywhere earlier renumbers every later one.
     ;; Write the build's whole map (slot -> name key) at exit, so the
     ;; comparing script (scripts/irdiff.py) can read slot operands as names.
-    (push (lambda ()
+    ;; (SBCL's exit hooks; another host just has no slot map in the dump)
+    (let ((hooks (and (find-package "SB-EXT") (find-symbol "*EXIT-HOOKS*" "SB-EXT"))))
+     (when hooks
+      (push (lambda ()
             (when (and *ir-dump-stream* (hash-table-p *gv-cache-index*))
               (maphash (lambda (key slot)
                          (format *ir-dump-stream* "~&@GVMAP ~D ~D~%" slot key))
                        *gv-cache-index*)
               (finish-output *ir-dump-stream*)))
-          sb-ext:*exit-hooks*)
+          (symbol-value hooks))))
     (format t "~&;; MODUS_IR_DUMP -> ~A~%" path)))

@@ -15,6 +15,10 @@
 ;;;;   VA #x10000000, 128 KB        -> PA after it   fixed block, globals,
 ;;;;                                                 handler frames, FP slots
 ;;;;   VA #x18700000 .. #x18800000  -> PA            the stack (1 MB)
+;;;;   VA #x04000000, 4 MB          -> PA            the net block: NIC buffers
+;;;;                                                 and state (32 MB+ machines)
+;;;;   VA #x0C000000, 4 MB          -> PA            the SSH block: e1000-state,
+;;;;                                                 ssh-conn, ssh-ipc (32 MB+)
 ;;;;   VA #xDEAD0000                -> PA            NIL's page, all NIL
 ;;;;   VA #x19000000, S + M         -> PA            the heap: two semispaces
 ;;;;                                                 of S/2, the guard M
@@ -49,6 +53,15 @@
 (defconstant +i386-cl-low-va+     #x10000000)
 (defconstant +i386-cl-low-size+   #x20000 "+linux-i386-bss-end+ - #x10000000.")
 (defconstant +i386-cl-pt-reserve+ #x40000 "RAM kept back for the heap's page tables.")
+(defconstant +i386-cl-fb-window+ #x0E000000
+  "VA of the 16 MB framebuffer window: four page tables at +I386-CL-FB-PTS+,
+   empty until the image's own Lisp has set a VBE mode and fills them with
+   its framebuffer's pages.  Not #x0C000000, where it was: that is the shared
+   network code's SSH state (net/arch-x86-cl.lisp), which bare i386 maps too.")
+(defconstant +i386-cl-fb-pts+ #x20000
+  "PA (= VA: the low megabyte is identity-mapped) of the framebuffer window's
+   four page tables -- where MODUS.COM ran, which nothing uses once the image
+   does.  x86 caches no not-present entry, so filling them needs no flush.")
 ;; the stub's own variables, in the low megabyte (identity-mapped, unused)
 (defconstant +i386-cl-v-panext+ #x8000 "next free physical byte")
 (defconstant +i386-cl-v-pd+     #x8004 "the page directory")
@@ -102,6 +115,47 @@
 (defconstant +i386-cl-bootrec+ #x0580
   "scripts/pcboot2.s's boot record: 'PCBT', PM_READ, the image's first sector,
    the drive.")
+(defconstant +i386-cl-v-jitsz+ #x80A8
+  "The native tier's code area (mvm/jit-i386-native.lisp, MODUS_I386_JIT=1): its
+   size, mapped at +I386-CL-JIT-AREA+ from RAM before the heap is sized -- a
+   sixteenth of the RAM, 256 KB to +I386-CL-JIT-MAX+ (all the VA below the stack).  0: no area (no native tier).")
+(defconstant +i386-cl-jit-max+ (- #x18700000 #x12000000)
+  "The code area's largest size: all the VA from +I386-CL-JIT-AREA+ up to the
+   bottom of the 1 MB stack (#x18700000), ~103 MB, reached at ~1.6 GB of RAM (a
+   sixteenth).  It was 8 MB, which a whole desk does not fit: kiln t420 compiles
+   every function before it saves the core (no first-use translation pauses), and
+   8 MB ran out at 1023 of 4416 modules.  Bigger needs VA, not RAM: a code address
+   is a fixnum below 2^30, shared with the heap (#x19000000 up) and the windows.")
+(defconstant +i386-cl-jit-area+ #x12000000
+  "jit-i386-native.lisp's +N386-AREA-ADDR+: the hosted layout's code area.")
+(defconstant +i386-cl-v-jitb+ #x80B0
+  "A restored core's native code bytes (its header +44, scripts/dos386-core.py): copied
+   back to +I386-CL-JIT-AREA+ after the bitmap slices, where the core keeps them.")
+(defconstant +i386-cl-v-netpa+ #x80AC
+  "The net block's PHYSICAL address (0: none): RAM mapped at +I386-CL-NET-VA+ on
+   a machine of 32 MB or more, for the NIC drivers' state and DMA rings -- a
+   device needs the physical address of what it reads (e1000.lisp's
+   E1000-DMA-ADDR seam, arch-i386-cl.lisp).")
+(defconstant +i386-cl-net-va+ #x0F000000
+  "The net block's VA: the NIC and SSH state and the T420's EHCI area (vessel
+   kernel/net/arch-i386-cl.lisp, src/t420-usb.lisp), #x0F000000 .. #x0F400000,
+   between the framebuffer window and the low block.  It was #x04000000, where a
+   saved core's file is mapped too (+gap above its physical address): a 57 MB core
+   (kiln t420, every function native) reached past #x04000000, and the net block
+   took the place of its native code's tail and its code store.")
+(defconstant +i386-cl-net-size+ #x400000)
+(defconstant +i386-cl-mmio-window+ #x0D000000
+  "VA of a 4 MB window for device registers (a PCI BAR is far above what a
+   fixnum address can name): one page table at +I386-CL-MMIO-PT+, filled by the
+   image's Lisp, uncached.")
+(defconstant +i386-cl-mmio-pt+ #x2A000
+  "PA (= VA) of the MMIO window's page table, past pc-vbe.lisp's buffers.")
+(defconstant +i386-cl-ssh-va+ #x0C000000
+  "The SSH block's VA: build-cl-repl-common's *SSH-ADDR-MAP-SOURCE* puts
+   ssh-conn (#x0C200000), ssh-ipc (#x0C280000 .. #x0C316000), e1000-state
+   (#x0C320000) and fe-scratch (#x0C320900) here on the PC images.  CPU-only
+   state (no DMA), so its physical address is not recorded.")
+(defconstant +i386-cl-ssh-size+ #x400000)
 (defconstant +i386-cl-v-stacksz+ #x80A4
   "The stack's bytes: 1 MB, or 384 KB on a machine under 16 MB.")
 (defvar *i386-cl-gc-static*
@@ -236,6 +290,21 @@
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-imgend+)
        '(#xC1 #xE9 #x0C) '(:call 0 map)                    ; shr ecx, 12
        '(:label map-image-done)
+       ;; the framebuffer window: its four page tables, empty, in the PD
+       (cons #xBF (i386l-le32-list +i386-cl-fb-pts+))
+       (cons #xB9 (i386l-le32-list #x4000)) '(:call 0 zero)
+       (i386cl-abs '(#x8B #x1D) +i386-cl-v-pd+)              ; ebx = PD
+       (cons :splice
+             (loop for i below 4                              ; mov [ebx+PDE], PT | 3
+                   collect (append (list #xC7 #x83)
+                                   (i386l-le32-list (* 4 (+ (ash +i386-cl-fb-window+ -22) i)))
+                                   (i386l-le32-list (logior (+ +i386-cl-fb-pts+ (* i 4096)) 3)))))
+       ;; the MMIO window: its page table, empty, in the PD
+       (cons #xBF (i386l-le32-list +i386-cl-mmio-pt+))
+       (cons #xB9 (i386l-le32-list #x1000)) '(:call 0 zero)
+       (i386cl-abs '(#x8B #x1D) +i386-cl-v-pd+)              ; ebx = PD
+       (append (list #xC7 #x83) (i386l-le32-list (* 4 (ash +i386-cl-mmio-window+ -22)))
+               (i386l-le32-list (logior +i386-cl-mmio-pt+ 3)))
        ;; the fixed block, zeroed (hosted: a fresh mapping)
        (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 alloc)
        '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 zero)
@@ -261,6 +330,50 @@
        (cons #xBF (i386l-le32-list +i386-cl-stack-top+))
        (i386cl-abs '(#x2B #x3D) +i386-cl-v-stacksz+)          ; edi = top - size
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-stacksz+) '(#xC1 #xE9 #x0C) '(:call 0 map)
+       ;; the native tier's code area, a sixteenth of the RAM (256 KB .. ~103 MB);
+       ;; none under 16 MB, whose heap cannot spare it (measured: 6 MB QEMU and
+       ;; 8 MB Bochs ran out of young space) -- runtime code stays interpreted
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-jitsz+) (i386l-le32-list 0))
+       (cons :splice
+             (when (and (find-package "MODUS.MVM.I386")
+                        (symbol-value (find-symbol "*I386-NATIVE-TIER*" "MODUS.MVM.I386")))
+               (list (cons #x81 (cons #x3D (append (i386l-le32-list +i386-cl-v-ramend+)
+                                                   (i386l-le32-list #x1000000))))
+                     '(:jcc32 #x72 jit-none)                          ; RAM < 16 MB: none
+                     (i386cl-abs '(#xA1) +i386-cl-v-ramend+)
+                     '(#xC1 #xE8 #x04)                                 ; shr eax, 4
+                     (cons #x3D (i386l-le32-list #x40000)) '(:j8 #x73 jit-min)
+                     (cons #xB8 (i386l-le32-list #x40000))
+                     '(:label jit-min)
+                     (cons #x3D (i386l-le32-list +i386-cl-jit-max+)) '(:j8 #x76 jit-max)
+                     (cons #xB8 (i386l-le32-list +i386-cl-jit-max+))
+                     '(:label jit-max)
+                     (cons #x25 (i386l-le32-list #xFFFFF000))
+                     (i386cl-abs '(#xA3) +i386-cl-v-jitsz+)
+                     '(#x89 #xC1) '(:call 0 alloc) '(#x89 #xC6)        ; esi = PA
+                     (cons #xBF (i386l-le32-list +i386-cl-jit-area+))
+                     (i386cl-abs '(#x8B #x0D) +i386-cl-v-jitsz+)
+                     '(#xC1 #xE9 #x0C) '(:call 0 map)
+                     '(:label jit-none))))
+       ;; the net block and the SSH block: 4 MB each on a machine of 32 MB or
+       ;; more (a smaller one has no network); the net block's physical
+       ;; address at +I386-CL-V-NETPA+ for DMA
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-netpa+) (i386l-le32-list 0))
+       (cons #x81 (cons #x3D (append (i386l-le32-list +i386-cl-v-ramend+)
+                                     (i386l-le32-list #x2000000))))
+       '(:jcc32 #x72 net-none)                                 ; RAM < 32 MB: none
+       (cons #xB9 (i386l-le32-list +i386-cl-net-size+)) '(:call 0 alloc)
+       (i386cl-abs '(#xA3) +i386-cl-v-netpa+)
+       '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-net-size+)) '(:call 0 zero)
+       '(#x5E)                                                ; esi = PA
+       (cons #xBF (i386l-le32-list +i386-cl-net-va+))
+       (cons #xB9 (i386l-le32-list (floor +i386-cl-net-size+ 4096))) '(:call 0 map)
+       (cons #xB9 (i386l-le32-list +i386-cl-ssh-size+)) '(:call 0 alloc)
+       '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-ssh-size+)) '(:call 0 zero)
+       '(#x5E)                                                ; esi = PA
+       (cons #xBF (i386l-le32-list +i386-cl-ssh-va+))
+       (cons #xB9 (i386l-le32-list (floor +i386-cl-ssh-size+ 4096))) '(:call 0 map)
+       '(:label net-none)
        ;; NIL's page, all NIL
        (cons #xB9 (i386l-le32-list 4096)) '(:call 0 alloc)
        '(#x50) '(#x89 #xC7) (cons #xB8 (i386l-le32-list nil-value))
@@ -658,6 +771,18 @@
        '(#x0F #x20 #xD0) '(:call 0 pf-hex)                    ; cr2
        '(#xB0 #x20) '(:call 0 pf-putc)
        '(#x8B #x44 #x24 #x24) '(:call 0 pf-hex)               ; the faulting EIP
+       ;; ... then its EBP and the top 32 words of its stack (it ran at our privilege level,
+       ;; so its ESP is just above the error code, EIP, CS and EFLAGS): the return addresses
+       ;; there name the callers through MODUS_SYMMAP.  Read at ESP only -- following a
+       ;; possibly broken EBP chain from here could fault inside the fault handler.
+       '(#xB0 #x20) '(:call 0 pf-putc) '(#xB0 #x45) '(:call 0 pf-putc)
+       '(#x8B #x44 #x24 #x08) '(:call 0 pf-hex)               ; EBP, as PUSHAD saved it
+       '(#x8D #x74 #x24 #x30)                                 ; esi = the faulting ESP
+       (cons #xBB (i386l-le32-list 32))                       ; ebx = 32 words
+       '(:label pf-stk)
+       '(#xB0 #x20) '(:call 0 pf-putc)
+       '(#x8B #x06) '(:call 0 pf-hex)                         ; [esi]
+       '(#x83 #xC6 #x04) '(#x4B) '(:jcc32 #x75 pf-stk)        ; esi += 4; --ebx
        '(#xB0 #x0A) '(:call 0 pf-putc)
        '(:label pf-halt) '(#xFA) '(#xF4) '(:j8 #xEB pf-halt)
        '(:label pf-putc)                                      ; AL to COM1
@@ -696,6 +821,7 @@
        (i386cl-abs '(#xA3) +i386-cl-v-count+)
        '(#x8B #x43 #x0C) (i386cl-abs '(#xA3) +i386-cl-v-heapb+)
        '(#x8B #x43 #x10) (i386cl-abs '(#xA3) +i386-cl-v-bmb+)
+       '(#x8B #x43 #x2C) (i386cl-abs '(#xA3) +i386-cl-v-jitb+)   ; native code bytes (0: none)
        (list #x8D #x73 +i386-cl-core-data+)                   ; lea esi, [ebx+64]
        (cons #xBF (i386l-le32-list +i386-cl-low-va+))
        (cons #xB9 (i386l-le32-list (floor +i386-cl-low-size+ 4))) '(#xF3 #xA5)   ; rep movsd
@@ -705,6 +831,18 @@
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-bmb+) '(#xC1 #xE9 #x02) '(#xF3 #xA5)
        (i386cl-abs '(#x8B #x3D) +i386-cl-v-bm2+)
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-bmb+) '(#xC1 #xE9 #x02) '(#xF3 #xA5)
+       ;; the native tier's code, right after the slices: back to the code area it was
+       ;; translated into, which is mapped by now.  A machine whose area is smaller (under
+       ;; 16 MB of RAM there is none) skips the copy: the heap is still restored, but its
+       ;; natively translated functions point at nothing there -- such a core is for
+       ;; machines with the RAM of the one that saved it (kiln t420: 1 GB under QEMU, so
+       ;; a 64 MB area, as on any machine of 1 GB or more)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-jitb+)
+       '(#x85 #xC9) '(:jcc32 #x74 core-nojit)                 ; none
+       (i386cl-abs '(#x3B #x0D) +i386-cl-v-jitsz+) '(:jcc32 #x77 core-nojit)   ; ja: too big
+       (cons #xBF (i386l-le32-list +i386-cl-jit-area+))
+       '(#xC1 #xE9 #x02) '(#xF3 #xA5)
+       '(:label core-nojit)
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-core+) (i386l-le32-list 1))
        '(:label no-core)
        ;; ---- what the hosted stub does after its mmaps (boot-linux-i386) ----
@@ -917,6 +1055,28 @@
       (i386l-bytes buf #x81 #xE2) (i386l-le32 buf #xFFFF0000)
       (i386l-bytes buf #x81 #xCA) (i386l-le32 buf #x8E00)          ; present, 32-bit interrupt gate
       (i386l-bytes buf #x89 #x15) (i386l-le32 buf (+ gate 4)))
+    ;; EVERY PIC VECTOR HAS A GATE (the dos386 branch's 42ef0576, by hand).  The
+    ;; IDT had the timer's (20h) and the NE2000's (29h); any other vector met a
+    ;; zeroed descriptor -- #GP, #DF, a triple fault.  Measured there: a SPURIOUS
+    ;; IRQ 15 (an 8259 raises vector 2Fh when a line drops before it is
+    ;; acknowledged; the BIOS disk reads PM_READ makes are the usual cause)
+    ;; reset the machine in the middle of DHCP.  Handlers, next to the existing
+    ;; two: 90420h EOI the master; 90440h return only.  20h..2Fh:
+    ;;   21-26 master EOI | 27 spurious (no EOI) | 28,2A-2E both (90410h)
+    ;;   2F slave spurious: the master's EOI only (its cascade line was real)
+    (i386l-bytes buf #xC7 #x05) (i386l-le32 buf #x90420) (i386l-le32 buf #xE620B050) ; push eax; mov al,20h; out 20h,al
+    (i386l-bytes buf #xC7 #x05) (i386l-le32 buf #x90424) (i386l-le32 buf #x90CF5820) ; ... pop eax; iret
+    (i386l-bytes buf #xC7 #x05) (i386l-le32 buf #x90440) (i386l-le32 buf #x909090CF) ; iret
+    (dolist (v (loop for v from #x21 to #x2F unless (= v #x29) collect v))
+      (let ((isr (cond ((= v #x27) #x90440)
+                       ((= v #x2F) #x90420)
+                       ((>= v #x28) #x90410)
+                       (t #x90420)))
+            (gate (+ #x90000 (* v 8))))
+        (i386l-bytes buf #xC7 #x05) (i386l-le32 buf gate)
+        (i386l-le32 buf (logior (logand isr #xFFFF) (ash 8 16)))
+        (i386l-bytes buf #xC7 #x05) (i386l-le32 buf (+ gate 4))
+        (i386l-le32 buf (logior (ash (ash isr -16) 16) #x8E00))))
     (i386l-bytes buf #xFB)                                    ; sti: the clock ticks
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xE5)        ; mov ebp, esp
     ;; native byte 0 on a 16-byte boundary (OR-3 tagged entries): the JMP

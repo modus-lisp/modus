@@ -1,5 +1,5 @@
 #!/bin/sh
-# build-ios.sh IMAGE.elf OUT.app [sim|device] [SIGN-IDENTITY] [PROFILE.mobileprovision]
+# build-ios.sh IMAGE.elf OUT.app [sim|device|tvsim|tvdevice] [SIGN-IDENTITY] [PROFILE.mobileprovision]
 #
 # Wrap a Darwin-layout, JIT-off modus image in a minimal iOS app bundle
 # (docs/macos-hosting.md, M5).  The same shim as macOS (host/macos), built with
@@ -14,7 +14,10 @@
 # to name one, or list the arguments one per line in a bundled modus.args.
 # MODUS_CORE=FILE puts a snapshot's compiled code in the app (image-segments.sh).
 # MODUS_IOS_ROTATES=1: the app turns with the phone (portrait and both landscapes); otherwise iOS's default.
+# tvsim and tvdevice: the same app for an Apple TV (tvOS, its Simulator or a device): the desk on the TV,
+# driven by the remote; the phone's native controls, pickers and dictation are not there (#if os(tvOS)).
 # MODUS_IOS_ICON=PNG: the app's icon, 1024x1024, square (iOS rounds it); MODUS_IOS_ICON_DARK=PNG its dark one.
+# On a TV the same square icon becomes its layered icon and Top Shelf banner (tv-icon.swift).
 set -eu
 IMAGE=$1; OUT=$2; KIND=${3:-sim}; IDENT=${4:-}; PROFILE=${5:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -22,7 +25,18 @@ MAC=$HERE/../macos
 case $KIND in
   sim)    SDKN=iphonesimulator; TARGET=arm64-apple-ios18.0-simulator ;;
   device) SDKN=iphoneos;        TARGET=arm64-apple-ios18.0 ;;
-  *) echo "kind must be sim or device" >&2; exit 2 ;;
+  tvsim)    SDKN=appletvsimulator; TARGET=arm64-apple-tvos18.0-simulator ;;
+  tvdevice) SDKN=appletvos;        TARGET=arm64-apple-tvos18.0 ;;
+  *) echo "kind must be sim, device, tvsim or tvdevice" >&2; exit 2 ;;
+esac
+TV=0; case $KIND in tv*) TV=1 ;; esac
+# the frameworks only the phone has: Speech's recognizer, Quick Look
+PHONE_FW="-framework Speech -framework QuickLook"
+# and the TV's: AVKit, whose UIWindow.avDisplayManager (a category, so nothing pulls it in) sets the TV's mode
+[ $TV = 1 ] && PHONE_FW="-framework AVKit -framework CoreMedia"
+case $KIND in
+  sim) PLATFORM=iPhoneSimulator ;; device) PLATFORM=iPhoneOS ;;
+  tvsim) PLATFORM=AppleTVSimulator ;; tvdevice) PLATFORM=AppleTVOS ;;
 esac
 SDK=$(xcrun --sdk $SDKN --show-sdk-path)
 rm -rf "$OUT"; mkdir -p "$OUT"
@@ -61,7 +75,8 @@ done
 # signature (an ad-hoc signature that carries them is not launched): without an application identifier
 # and its keychain group, every keychain write is refused (errSecMissingEntitlement), so nothing the app
 # keeps there -- an SSH key, a password -- outlives the call that made it.
-if [ "$KIND" = sim ]; then
+case $KIND in *sim) SIMSIG=1 ;; *) SIMSIG=0 ;; esac
+if [ $SIMSIG = 1 ]; then
   SIMENT=$OBJS/sim.entitlements
   APPID=SIMULATOR.${MODUS_IOS_BUNDLE_ID:-org.modus-lisp.modus}
   cat > "$SIMENT" <<ENT
@@ -77,7 +92,7 @@ fi
 # shellcheck disable=SC2086  # LINKX is a flag list
 xcrun --sdk $SDKN swiftc -target $TARGET -sdk "$SDK" -o "$OUT/modus" "$OBJS"/*.o \
   -framework AudioToolbox -framework AVFoundation -framework UIKit -framework QuartzCore \
-  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal -framework Speech -framework QuickLook $LINKX
+  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal $PHONE_FW $LINKX
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -93,6 +108,8 @@ cat > "$OUT/Info.plist" <<PLIST
   <key>LSRequiresIPhoneOS</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>modus listens when you ask it to: the Listen app transcribes what it hears.</string>
   <key>NSCameraUsageDescription</key><string>${MODUS_IOS_NAME:-modus} takes photos and video when you ask it to.</string>
+  <key>NSLocationWhenInUseUsageDescription</key><string>${MODUS_IOS_NAME:-modus} uses where you are when you ask: the sun's place in your sky, say.</string>
+  <key>NSMotionUsageDescription</key><string>${MODUS_IOS_NAME:-modus} follows your head through your headphones, so a sound stays where it is as you turn.</string>
 $( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
   '<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>' )
   <key>NSLocalNetworkUsageDescription</key><string>${MODUS_IOS_NAME:-modus} connects to computers on your network and on your VPN: the servers you add, over SSH.</string>
@@ -101,7 +118,7 @@ $( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
   <key>UILaunchScreen</key><dict/>
   <key>UIFileSharingEnabled</key><true/>
   <key>LSSupportsOpeningDocumentsInPlace</key><true/>
-  <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+  <key>UIDeviceFamily</key><array>$( [ $TV = 1 ] && echo '<integer>3</integer>' || echo '<integer>1</integer><integer>2</integer>' )</array>
   <key>UIApplicationSceneManifest</key><dict>
     <key>UIApplicationSupportsMultipleScenes</key><false/>
     <key>UISceneConfigurations</key><dict>
@@ -111,12 +128,22 @@ $( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
       </dict></array>
     </dict>
   </dict>
-  <key>CFBundleSupportedPlatforms</key><array><string>$( [ $KIND = sim ] && echo iPhoneSimulator || echo iPhoneOS )</string></array>
+  <key>CFBundleSupportedPlatforms</key><array><string>$PLATFORM</string></array>
 </dict></plist>
 PLIST
 # THE ICON: an asset catalog of one 1024-point image (and its dark one), compiled as Xcode compiles it --
 # Assets.car and the icon's keys, which go into the Info.plist
-if [ -n "${MODUS_IOS_ICON:-}" ]; then
+if [ -n "${MODUS_IOS_ICON:-}" ] && [ $TV = 1 ]; then
+  # A TV'S ICON is a stack of layers the system tilts under the remote's thumb, in a brand-assets set with the Top
+  # Shelf's banners: tv-icon.swift makes them all from the same square icon (a TV has no dark mode for icons)
+  rm -rf "$OBJS/Assets.xcassets"
+  xcrun swift "$(dirname "$0")/tv-icon.swift" "$MODUS_IOS_ICON" "$OBJS/Assets.xcassets"
+  xcrun actool --compile "$OUT" --platform $SDKN --minimum-deployment-target 18.0 \
+    --target-device tv --app-icon "App Icon & Top Shelf Image" \
+    --output-partial-info-plist "$OBJS/icon.plist" "$OBJS/Assets.xcassets" > "$OBJS/actool.log"
+  /usr/libexec/PlistBuddy -c "Merge $OBJS/icon.plist" "$OUT/Info.plist" > /dev/null
+  rm -rf "$OBJS/Assets.xcassets"          # the sources, megabytes of banners: Assets.car has them
+elif [ -n "${MODUS_IOS_ICON:-}" ]; then
   SET=$OBJS/Assets.xcassets/AppIcon.appiconset
   mkdir -p "$SET"
   cp "$MODUS_IOS_ICON" "$SET/icon.png"
@@ -137,6 +164,9 @@ JSON
   /usr/libexec/PlistBuddy -c "Merge $OBJS/icon.plist" "$OUT/Info.plist" > /dev/null
 fi
 for f in ${MODUS_IOS_FILES:-}; do cp -R "$f" "$OUT/"; done
+# THE WATCH APP that goes with it (MODUS_IOS_WATCH_APP, already signed: build-watch.sh), in Watch/, where the phone
+# looks for its companion -- installed beside it on the paired watch, and linked to it (WatchConnectivity)
+if [ -n "${MODUS_IOS_WATCH_APP:-}" ]; then mkdir -p "$OUT/Watch"; cp -R "$MODUS_IOS_WATCH_APP" "$OUT/Watch/"; fi
 if [ -n "$PROFILE" ]; then cp "$PROFILE" "$OUT/embedded.mobileprovision"; fi
 if [ -n "$IDENT" ]; then
   ENT=$(mktemp); security cms -D -i "$PROFILE" > "$ENT.plist" 2>/dev/null && \

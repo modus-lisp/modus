@@ -38,6 +38,8 @@
                 (subseq str 0 (read-sequence str s)))))
        (image (progn
                 (setq *static-keywords-p* t *static-symbols-p* t)
+                ;; packed boot tables: batched init thunks, as build-modus-selfhost --compile-* sets
+                (when (search "(defun %sft-auto-text" src) (setq *init-globals-batched* t))
                 (when (search "(defun %console-write-char" src)
                   (setq *write-char-serial-hook* '%console-write-char))
                 (build-image :target :linux-aarch64 :source-text src)))

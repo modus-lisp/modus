@@ -60,10 +60,11 @@ final class Nodes: ObservableObject {
 let nodesModel = Nodes()
 private var nodes: [UInt: Node] = [:]
 private var alerts: [UInt: AlertModel] = [:]
-private var nextHandle: UInt = 1
+// these three are the shared files' too (Motion.swift, Link.swift, Heart.swift), as on the phone
+var nextHandle: UInt = 1
 private var events: [Term] = []
 
-private func send(_ name: String, _ args: [Term]) {
+func send(_ name: String, _ args: [Term]) {
     events.append(.list([.symbol(name: name, package: "KEYWORD")] + args))
 }
 
@@ -550,7 +551,7 @@ let eventsNext: Call = { buf, cap, _, _, _, _ in
 
 // MARK: - registration
 
-private func register(_ name: String, _ fn: Call) {
+func register(_ name: String, _ fn: Call) {
     let p = unsafeBitCast(fn, to: UnsafeMutableRawPointer.self)
     name.withCString { modus_swift_register($0, p) }
 }
@@ -598,4 +599,7 @@ public func modusSwiftInstall() {
     register("ui_tab_controller_new", tabControllerNew)
     register("ui_tab_content", tabContent)
     register("ui_events_next", eventsNext)
+    installMotion()                                // Motion.swift: how the watch is turned
+    installLink()                                  // Link.swift: messages to and from the phone
+    installHeart()                                 // Heart.swift: the heart rate, through a workout
 }

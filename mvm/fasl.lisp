@@ -569,10 +569,57 @@
   (let ((names (mapcar (lambda (f) (if (symbolp f) (symbol-name f) (princ-to-string f))) *features*)))
     (format nil "~{~a~^,~}" (sort names (function string<)))))
 
+(defvar *fasl-build-key* nil
+  "This image's build configuration as a hash string, made once (%FASL-BUILD-KEY).")
+
+(defun %fasl-build-key ()
+  "THE BUILD, as far as it decides what a module's code means.  The compiler
+   fingerprint names the compiler's SOURCE and the architecture, not how this
+   image was built from it, and replay crosses builds: the cache is shared.
+   A FASL recorded by an aarch64 CLI in its default layout faulted at its first
+   module (MEMORY-FAULT-ERROR in %FASL-MODULE-MARKER) when the same commit,
+   built PC-relative in kiln's iOS layout (MODUS_PCREL, MODUS_CODE_BASE,
+   MODUS_HEAP_BASE ...), replayed it.  So the key carries the image's own build
+   record (lib/image-config.lisp: every MODUS_* knob the build read, with the
+   emission flags, and a hash of its whole source text) minus what cannot
+   change code: which commit, and the commit / build-id knobs.  The source
+   hash is for the other way the cache crossed builds: two Mac builds of ONE
+   layout from different commits replayed each other's modules (a module's
+   function-table indices belong to the image that recorded it) and faulted in
+   %FASL-MODULE-MARKER.  Output paths are already recorded without their
+   values.  A knob added tomorrow is in the key without anyone listing it,
+   which errs toward a miss.  Rebuilding the same source and configuration
+   still shares (builds are reproducible)."
+  (or *fasl-build-key*
+      (setq *fasl-build-key*
+            ;; A direct call: the record's DEFUN is MODUS-INT's, as this file is,
+            ;; and both are in every image's source (build-cli-common appends the
+            ;; record last; a kernel function has no symbol FIND-SYMBOL could see).
+            (let ((rec (ignore-errors (%image-build-configuration))))
+              (if (and (consp rec) (eq (first rec) :script))
+                  (%fasl-hash-string
+                   ;; Strings, keywords, integers and lists only: these are all the
+                   ;; printer settings that reach them (no WITH-STANDARD-IO-SYNTAX: a
+                   ;; runtime helper, and this file is the kernel's).
+                   (let ((*print-pretty* nil) (*print-base* 10) (*print-radix* nil)
+                         (*print-case* :upcase) (*print-escape* t))
+                     (prin1-to-string
+                      (list (getf rec :script) (getf rec :target) (getf rec :flags)
+                            (getf rec :source-hash)
+                            (remove-if (lambda (k)
+                                         (and (consp k) (stringp (first k))
+                                              (member (first k) '("MODUS_SOURCE_COMMIT" "MODUS_BUILD_ID")
+                                                      :test (function string=))))
+                                       (getf rec :knobs))))))
+                  ;; No finalized record (a source dump compiled without one): the
+                  ;; key is what it was.
+                  "")))))
+
 (defun %fasl-key (text)
   (%fasl-hash-string
-   (format nil "~a~a|~a|~a|~a|~a|~a"
+   (format nil "~a~a|~a|~a|~a|~a|~a|~a"
            (%fasl-compiler-fingerprint)
+           (%fasl-build-key)
            ;; A CODEGEN KNOB SET BY THE CO-INIT, not by the compiler's source:
            ;; with *PARK-SAFEPOINTS* (compiler.lisp; the hosted threaded JIT
            ;; images) a loop's back-edge compiles to SAFEPOINT, without it to

@@ -19,6 +19,7 @@
 #include <os/lock.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -84,6 +85,34 @@ static void push_pointer(long type, long x, long y) {
     if (x >= fb_w) x = fb_w - 1;
     if (y >= fb_h) y = fb_h - 1;
     queue_event(((uint64_t)type << 40) | ((uint64_t)y << 20) | (uint64_t)x);
+}
+
+// THE POINTER LOCKED (a game's mouse-look): the cursor hidden and held where it is, and each move sent as how far
+// it went (type 13), not where it is -- it never reaches the screen's edge.  DX in the low 20 bits and DY in the
+// next 20, each two's complement, in points.
+static int pointer_locked;
+
+static void push_motion(double dx, double dy) {
+    long x = lround(dx), y = lround(dy);
+    if (!x && !y) return;
+    queue_event(((uint64_t)13 << 40) | (((uint64_t)y & 0xFFFFF) << 20) | ((uint64_t)x & 0xFFFFF));
+}
+
+// A TRACKPAD GESTURE (type 15): which, in bits 32-35 -- 0 pinch (magnification), 1 rotation, 2 smart zoom (two
+// fingers double-tapped), 3 swipe -- its phase in bits 36-37 (0 began, 1 changed, 2 ended), and its amount, a signed
+// 32-bit number in the low bits: a pinch's change in thousandths (positive spreading), a rotation's in thousandths of
+// a degree (positive counter-clockwise), a swipe's direction (1 left, 2 right, 3 up, 4 down).  The pointer's place is
+// where it was last sent.
+static void push_gesture(int kind, int phase, double amount) {
+    long a = lround(amount);
+    queue_event(((uint64_t)15 << 40) | ((uint64_t)(phase & 3) << 36) | ((uint64_t)(kind & 15) << 32)
+                | (uint32_t)(int32_t)a);
+}
+
+static int gesture_phase(NSEventPhase p) {
+    if (p & NSEventPhaseBegan) return 0;
+    if (p & (NSEventPhaseEnded | NSEventPhaseCancelled)) return 2;
+    return 1;
 }
 
 static void push_resize(long w, long h) {
@@ -179,6 +208,12 @@ static BOOL moving_window;
 
 @interface ModusView : NSView
 @end
+static void opened(int kind, NSString *url);       // below: a file or link for the image
+
+// THE POINTER'S SHAPE over the window, as the image last said (modus_mac_pointer_shape); the arrow until it does.
+static NSCursor *pointer_shape;
+static NSView *fb_view_for_cursor;
+
 @implementation ModusView
 - (BOOL)isFlipped { return YES; }                  // y grows down, as the framebuffer does
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -186,8 +221,21 @@ static BOOL moving_window;
 // mouse-down unless it accepts first mouse.  The desk should react to that first click too.
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
 - (BOOL)wantsUpdateLayer { return NO; }
+- (void)resetCursorRects {
+    [self addCursorRect:self.bounds cursor:pointer_shape ? pointer_shape : NSCursor.arrowCursor];
+}
+// FILES DROPPED on the window go to the image (a DROPPED event each), as files opened with the app do.
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info { (void)info; return NSDragOperationCopy; }
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)info {
+    NSArray<NSURL *> *urls = [info.draggingPasteboard readObjectsForClasses:@[ NSURL.class ]
+                                                                    options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }];
+    for (NSURL *u in urls) opened(1, u.path);
+    return urls.count > 0;
+}
+
 // THE POINTER'S MOVES over the view, while the window is key (for hover): a tracking area that follows the view's size
 - (void)viewDidMoveToWindow {
+    if (self.window) [self registerForDraggedTypes:@[ NSPasteboardTypeFileURL ]];
     if (self.window && self.trackingAreas.count == 0)
         [self addTrackingArea:[[NSTrackingArea alloc]
                                   initWithRect:NSZeroRect
@@ -211,6 +259,7 @@ static BOOL moving_window;
     push_pointer(1, (long)p.x, (long)p.y);
 }
 - (void)mouseDragged:(NSEvent *)e {
+    if (pointer_locked) { push_motion(e.deltaX, e.deltaY); return; }
     if (moving_window) return;
     NSPoint p = [self pixelPointOf:e];
     push_pointer(2, (long)p.x, (long)p.y);
@@ -229,7 +278,10 @@ static BOOL moving_window;
     push_mask(buttons, (long)p.x, (long)p.y);
 }
 - (void)rightMouseDown:(NSEvent *)e { [self button:4 down:YES at:e]; }
-- (void)rightMouseDragged:(NSEvent *)e { [self button:4 down:YES at:e]; }
+- (void)rightMouseDragged:(NSEvent *)e {
+    if (pointer_locked) { push_motion(e.deltaX, e.deltaY); return; }
+    [self button:4 down:YES at:e];
+}
 - (void)rightMouseUp:(NSEvent *)e { [self button:4 down:NO at:e]; }
 - (void)otherMouseDown:(NSEvent *)e { if (e.buttonNumber == 2) [self button:2 down:YES at:e]; }
 - (void)otherMouseDragged:(NSEvent *)e { if (e.buttonNumber == 2) [self button:2 down:YES at:e]; }
@@ -237,6 +289,7 @@ static BOOL moving_window;
 
 // HOVER: the pointer moving with no button down (type 5), as a mouse does and a finger cannot.
 - (void)mouseMoved:(NSEvent *)e {
+    if (pointer_locked) { push_motion(e.deltaX, e.deltaY); return; }
     if (buttons) return;
     NSPoint p = [self pixelPointOf:e];
     push_pointer(5, (long)p.x, (long)p.y);
@@ -245,6 +298,13 @@ static BOOL moving_window;
 // SCROLLING, as the wheel's notches: a press and a release of its button each.  A mouse wheel counts in lines, a
 // trackpad in points (about 16 to a notch); the sign is the person's own (natural scrolling or not): content that
 // should move down is the wheel turned up.
+- (void)magnifyWithEvent:(NSEvent *)e { push_gesture(0, gesture_phase(e.phase), e.magnification * 1000); }
+- (void)rotateWithEvent:(NSEvent *)e { push_gesture(1, gesture_phase(e.phase), e.rotation * 1000); }
+- (void)smartMagnifyWithEvent:(NSEvent *)e { (void)e; push_gesture(2, 2, 0); }
+- (void)swipeWithEvent:(NSEvent *)e {
+    int dir = e.deltaX > 0 ? 1 : e.deltaX < 0 ? 2 : e.deltaY > 0 ? 3 : e.deltaY < 0 ? 4 : 0;
+    if (dir) push_gesture(3, 2, dir);
+}
 - (void)scrollWheel:(NSEvent *)e {
     static double acc_y, acc_x;
     double per = e.hasPreciseScrollingDeltas ? 16 : 1;
@@ -341,8 +401,57 @@ static void command_chord(uint32_t letter) {
 - (void)selectAll:(id)sender { (void)sender; command_chord('a'); }
 @end
 
+// THE APP'S OWN EVENTS, for the image: files and links opened with the app (Finder's Open With, `open`, a link in the
+// app's URL scheme) and files dropped on its window, and a quit the image may hold up to finish what it is doing.
+// The Swift side sets the hooks (host/macos/swift/MacChrome.swift); what comes before it does -- a file opened at
+// launch -- is kept and handed over then (modus_mac_opened_flush).
+void (*modus_mac_opened_hook)(int kind, const char *url);   // KIND 0 opened, 1 dropped
+int (*modus_mac_quit_hook)(void);   // 1: the image is told and answers (Swift's mac_quit_reply); 0: quit now
+static NSMutableArray *pending_opened;
+
+static void opened(int kind, NSString *url) {
+    if (!url) return;
+    if (modus_mac_opened_hook) { modus_mac_opened_hook(kind, url.UTF8String); return; }
+    if (!pending_opened) pending_opened = [NSMutableArray array];
+    [pending_opened addObject:@[ @(kind), url ]];
+}
+
+void modus_mac_opened_flush(void) {
+    if (!modus_mac_opened_hook) return;
+    for (NSArray *a in pending_opened) modus_mac_opened_hook([a[0] intValue], [a[1] UTF8String]);
+    [pending_opened removeAllObjects];
+}
+
 // Modifiers held when the window stops taking keys are released in the image (their releases go elsewhere).
 static void release_modifiers(void) { set_modifiers(0); }
+
+// The pointer's shape over the window: 0 arrow, 1 I-beam (text), 2 pointing hand (a link, a button), 3 open hand
+// (something that can be dragged), 4 closed hand (being dragged), 5 crosshair, 6 resize left-right, 7 resize
+// up-down, 8 not allowed.  Main thread.
+void modus_mac_pointer_shape(int kind) {
+    NSArray<NSCursor *> *all = @[ NSCursor.arrowCursor, NSCursor.IBeamCursor, NSCursor.pointingHandCursor,
+                                  NSCursor.openHandCursor, NSCursor.closedHandCursor, NSCursor.crosshairCursor,
+                                  NSCursor.resizeLeftRightCursor, NSCursor.resizeUpDownCursor,
+                                  NSCursor.operationNotAllowedCursor ];
+    NSCursor *c = all[(kind >= 0 && kind < (int)all.count) ? kind : 0];
+    if (c == pointer_shape) return;
+    pointer_shape = c;
+    if (fb_view_for_cursor) [fb_view_for_cursor.window invalidateCursorRectsForView:fb_view_for_cursor];
+    // and now, if the pointer is already over the window (cursor rects take effect as it moves)
+    if (fb_view_for_cursor && !pointer_locked) {
+        NSPoint p = [fb_view_for_cursor convertPoint:fb_view_for_cursor.window.mouseLocationOutsideOfEventStream fromView:nil];
+        if (NSPointInRect(p, fb_view_for_cursor.bounds)) [c set];
+    }
+}
+
+// Lock the pointer (ON) or let it go.  Main thread.  The window losing the keyboard lets it go too: a locked,
+// hidden pointer must never be left behind in another app.
+void modus_mac_pointer_lock(int on) {
+    if (on == pointer_locked) return;
+    pointer_locked = on;
+    CGAssociateMouseAndMouseCursorPosition(on ? false : true);
+    if (on) [NSCursor hide]; else [NSCursor unhide];
+}
 
 // The menu bar: an application menu with Quit, which is what Cmd-Q and the user expect.
 @interface ModusAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
@@ -402,6 +511,23 @@ static NSString *app_name(void) {
     (void)app;
     return YES;
 }
+// A FILE OR LINK OPENED WITH THE APP: a file's path, or a link as it is.
+- (void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls {
+    (void)app;
+    for (NSURL *u in urls) opened(0, u.isFileURL ? u.path : u.absoluteString);
+}
+// A QUIT the image asked to hear of: it finishes what it is doing and says so (mac_quit_reply) -- or, five seconds on,
+// the app quits anyway.
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
+    (void)app;
+    if (modus_mac_quit_hook && modus_mac_quit_hook()) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            [NSApp replyToApplicationShouldTerminate:YES];
+        });
+        return NSTerminateLater;
+    }
+    return NSTerminateNow;
+}
 - (void)applicationWillTerminate:(NSNotification *)n {
     (void)n;
     _exit(0);                      // the image thread is still running; do not run atexit under it
@@ -412,6 +538,7 @@ static NSString *app_name(void) {
 }
 - (void)windowDidResignKey:(NSNotification *)n {
     (void)n;
+    modus_mac_pointer_lock(0);
     release_modifiers();
 }
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
@@ -441,6 +568,7 @@ static NSString *app_name(void) {
     v.layer.masksToBounds = YES;                   // the window cuts off the rest of the (larger) surface
     if (show_surface) v.layer.contents = (__bridge id)show_surface;
     fb_view = v;
+    fb_view_for_cursor = v;
     window.contentView = v;
     if (show_surface) v.layer.contents = (__bridge id)show_surface;   // again: the view joined a window
     [window makeFirstResponder:v];
@@ -501,6 +629,26 @@ static void build_menu(void) {
 // launching, and found no window.
 static void wait_ui(void);
 void modus_mac_wait_ready(void) { if (ui_ready) wait_ui(); }
+
+// The window's picture as the image last shown, fb_w x fb_h pixels (the framebuffer, not the native views over it): to
+// print it.  The caller releases it.  Main thread.
+CGImageRef modus_mac_snapshot(void) {
+    if (!show_fb || fb_w <= 0 || fb_h <= 0) return NULL;
+    size_t row = (size_t)fb_w * 4;
+    NSMutableData *pixels = [NSMutableData dataWithLength:row * (size_t)fb_h];
+    IOSurfaceLock(show_surface, kIOSurfaceLockReadOnly, NULL);
+    for (long y = 0; y < fb_h; y++)
+        memcpy((uint8_t *)pixels.mutableBytes + (size_t)y * row, show_fb + y * show_stride, row);
+    IOSurfaceUnlock(show_surface, kIOSurfaceLockReadOnly, NULL);
+    CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)pixels);
+    CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+    CGImageRef image = CGImageCreate((size_t)fb_w, (size_t)fb_h, 8, 32, row, rgb,
+                                     kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little, provider, NULL, true,
+                                     kCGRenderingIntentDefault);
+    CGColorSpaceRelease(rgb);
+    CGDataProviderRelease(provider);
+    return image;
+}
 
 // The window's content view, for the native components (host/macos/swift/): they are its subviews, over the
 // framebuffer.  Main thread only, as AppKit is; NULL before the window is up.

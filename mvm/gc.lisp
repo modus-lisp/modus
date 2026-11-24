@@ -473,6 +473,21 @@
    Only the low nibble matters, so the high half is irrelevant."
   (= (logand lo 15) 15))
 
+(defun %gc-fwd-target-ok (lo hi sc free-ptr)
+  "T if the forwarding word with halves LO/HI names a copy made THIS collection: to-space
+   below FREE-PTR.  A cons's car can be an odd RAW word -- the interpreter keeps raw machine
+   words as values -- and the nibble alone took one for a forward and never copied the cons
+   (the native collectors' fix; test/gc-raw-car.lisp).  No allocation: the address is
+   composed only when HI is small, as %GC-CAND-ADDR does."
+  (if (> hi 65535)
+      nil
+      (let ((addr (if (= hi 0)
+                      (logand lo (lognot 15))
+                      (+ (* (* hi 65536) 65536) (logand lo (lognot 15))))))
+        (if (< addr (- (%gc-to-end sc) (%gc-space-size)))
+            nil
+            (< addr free-ptr)))))
+
 (defun %gc-is-pointer-lo (lo)
   "T if the machine word whose low half is LO carries a cons (1) or object (9)
    tag.  Only the low nibble matters."
@@ -832,7 +847,7 @@
     ((= tag 1)
      (let ((car-lo (%gc-word-lo raw-addr))
            (car-hi (%gc-word-hi raw-addr)))
-       (if (%gc-is-forward-lo car-lo)
+       (if (if (%gc-is-forward-lo car-lo) (%gc-fwd-target-ok car-lo car-hi sc free-ptr) nil)
            ;; Already forwarded — the from-space word IS (new-addr | 15);
            ;; hand back (new-addr | 1), high half untouched.
            (progn
@@ -865,7 +880,9 @@
     ((= tag 9)
      (let ((hdr-lo (%gc-word-lo raw-addr))
            (hdr-hi (%gc-word-hi raw-addr)))
-       (if (%gc-is-forward-lo hdr-lo)
+       ;; a forward only if it names a copy made THIS collection, as for a cons (above): no
+       ;; subtag ends in #xF today, so the nibble alone is right only by that coincidence
+       (if (if (%gc-is-forward-lo hdr-lo) (%gc-fwd-target-ok hdr-lo hdr-hi sc free-ptr) nil)
            ;; Already forwarded
            (progn
              (%gc-set-halves sc

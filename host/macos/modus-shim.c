@@ -80,10 +80,11 @@ extern void modus_syscall_stub(void);
 extern int64_t modus_keychain_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2);   // host/macos/modus-keychain.m
 
 extern void modus_enter(uint64_t sp, uint64_t entry) __attribute__((noreturn));
-// sigaltstack is prohibited on watchOS: there the fault handler runs on the
+// sigaltstack is prohibited on watchOS and tvOS: there the fault handler runs on the
 // faulting thread's own stack.
+#define MODUS_NO_ALTSTACK (TARGET_OS_WATCH || TARGET_OS_TV)
 static inline void modus_altstack(stack_t *ss) {
-#if TARGET_OS_WATCH
+#if MODUS_NO_ALTSTACK
     (void)ss;
 #else
     sigaltstack(ss, NULL);
@@ -565,9 +566,9 @@ static lw dx_rt_sigaction(lw lsig, struct lx_sigaction *nw, struct lx_sigaction 
 // thread (trap #x0520 for main, net/hosted-sync %THR-SIGALTSTACK for a worker) for SA_ONSTACK.
 struct lx_stack { uint64_t sp; int32_t flags, pad; uint64_t size; };
 static lw dx_sigaltstack(const struct lx_stack *nw, struct lx_stack *old) {
-#if TARGET_OS_WATCH
+#if MODUS_NO_ALTSTACK
     if (old) memset(old, 0, sizeof *old);
-    (void)nw; return 0;                     // a watch has no fault handlers (MODUS_NO_FATAL_SIGNALS)
+    (void)nw; return 0;                     // none here: a fault is handled on the faulting stack
 #else
     stack_t dn, dold;
     if (nw) {
@@ -1298,7 +1299,28 @@ static void log_to_documents(void) {
 }
 #endif
 
+#if TARGET_OS_TV
+// A TV GIVES AN APP NO DOCUMENTS: its container's Documents cannot be written, and only Caches (which the system
+// may clear when space runs low) and tmp can.  So HOME is moved to Library/Caches, with a Documents folder of its
+// own, before anything reads it: the image's HOME/Documents and Files.swift's files_documents both land there.
+extern void modus_keep_restore(void);
+static void home_in_caches(void) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char caches[1024], docs[1100];
+    snprintf(caches, sizeof caches, "%s/Library/Caches", home);
+    snprintf(docs, sizeof docs, "%s/Documents", caches);
+    mkdir(caches, 0755);
+    mkdir(docs, 0755);
+    setenv("HOME", caches, 1);
+    modus_keep_restore();                    // what the defaults kept of it, if Caches was emptied (modus-ui.m)
+}
+#endif
+
 int main(int argc, char **argv, char **envp) {
+#if TARGET_OS_TV
+    home_in_caches();
+#endif
 #if TARGET_OS_IPHONE && !TARGET_OS_WATCH
     log_to_documents();
 #endif
@@ -1391,9 +1413,15 @@ int main(int argc, char **argv, char **envp) {
     char exedir0[4096] = "";
     { char exe[4096]; uint32_t n = sizeof exe;
       if (_NSGetExecutablePath(exe, &n) == 0) strncpy(exedir0, dirname(exe), sizeof exedir0 - 1); }
+    // A Mac app's are in its Resources (Contents/MacOS holds only code, as codesign wants): `kiln mac' writes
+    // them there, so the app opens from the Finder, the Dock or `open' as well as from `kiln mac run'.
     if (argc == 1 && exedir0[0]) {
         char path[4200]; snprintf(path, sizeof path, "%s/modus.args", exedir0);
         FILE *af = fopen(path, "r");
+        if (!af) {
+            snprintf(path, sizeof path, "%s/../Resources/modus.args", exedir0);
+            af = fopen(path, "r");
+        }
         if (af) {
             char **nv = calloc(64, sizeof *nv); int nc = 0; char line[4096];
             nv[nc++] = argv[0];

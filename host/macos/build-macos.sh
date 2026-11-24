@@ -48,9 +48,22 @@ case $KIND in
     #   MODUS_MAC_NAME       default "modus"
     #   MODUS_MAC_BUNDLE_ID  default org.modus-lisp.modus
     #   MODUS_MAC_ICON       a square PNG (1024 x 1024 is best), made into the bundle's AppIcon.icns
+    #   MODUS_MAC_URL_SCHEME a URL scheme ("modus"): a NAME://... link opens the app, and the image hears it
+    #   MODUS_MAC_OPENS      what the Finder offers to open with it, as UTIs ("public.audio,public.movie"), as an
+    #                        alternative, never taking a type over from the app that has it
     NAME=$(printf '%s' "${MODUS_MAC_NAME:-modus}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
     BUNDLE_ID=${MODUS_MAC_BUNDLE_ID:-org.modus-lisp.modus}
     ICON_KEY=""
+    URL_KEY=""
+    if [ -n "${MODUS_MAC_URL_SCHEME:-}" ]; then
+      URL_KEY="<key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>$BUNDLE_ID</string><key>CFBundleURLSchemes</key><array><string>$MODUS_MAC_URL_SCHEME</string></array></dict></array>"
+    fi
+    OPENS_KEY=""
+    if [ -n "${MODUS_MAC_OPENS:-}" ]; then
+      UTIS=""
+      for u in $(printf '%s' "$MODUS_MAC_OPENS" | tr ',' ' '); do UTIS="$UTIS<string>$u</string>"; done
+      OPENS_KEY="<key>CFBundleDocumentTypes</key><array><dict><key>CFBundleTypeName</key><string>Media</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array>$UTIS</array></dict></array>"
+    fi
     if [ -n "${MODUS_MAC_ICON:-}" ]; then
       SET=$(mktemp -d)/AppIcon.iconset
       mkdir -p "$SET" "$OUT/Contents/Resources"
@@ -71,6 +84,8 @@ case $KIND in
   <key>CFBundleDisplayName</key><string>$NAME</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   $ICON_KEY
+  $URL_KEY
+  $OPENS_KEY
   <key>CFBundleExecutable</key><string>modus</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
@@ -82,6 +97,9 @@ case $KIND in
   <key>NSSpeechRecognitionUsageDescription</key><string>Listen: what you say becomes text.</string>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Chat: messages travel to nearby devices over Bluetooth.</string>
   <key>NSCameraUsageDescription</key><string>Camera: photos and video, taken here.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Finding printers, and the computers you connect to, on your network.</string>
+  <key>NSLocationUsageDescription</key><string>Where you are, when you ask: the sun's place in your sky, say.</string>
+  <key>NSMotionUsageDescription</key><string>Your head, followed through your headphones, so a sound stays where it is as you turn.</string>
 </dict>
 </plist>
 PLIST
@@ -107,6 +125,8 @@ if [ "$KIND" = gui ]; then
     "$HERE/../ios/swift/Term.swift" "$HERE/../ios/swift/GPU.swift" "$HERE/../ios/swift/Speech.swift" \
     "$HERE/../ios/swift/Bluetooth.swift" "$HERE/../ios/swift/Files.swift" "$HERE/../ios/swift/Camera.swift" \
     "$HERE/../ios/swift/Microphone.swift" "$HERE/../ios/swift/NowPlaying.swift" \
+    "$HERE/../ios/swift/Gamepad.swift" "$HERE/../ios/swift/Spatial.swift" "$HERE/../ios/swift/Notify.swift" "$HERE/../ios/swift/Location.swift" \
+    "$HERE/../ios/swift/Motion.swift" "$HERE/../ios/swift/Link.swift" \
     "$HERE"/swift/*.swift
   LINKX=""
   for W in $WHERE; do

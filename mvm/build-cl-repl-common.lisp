@@ -206,6 +206,12 @@
    output, PS/2 keyboard input, beside COM1.  MODUS_PC_CONSOLE=1 / =0
    overrides the default (on for bare i386, and for UEFI unless SEV-SNP).")
 
+(defparameter *pc-vbe-entry-points*
+  '(vbe-init vbe-test-pattern vbe-fill vbe-on-p vbe-base vbe-pitch vbe-width vbe-height
+    %vbe-edid-size %vbe-mode-list %vbe-mode-info %vbe-choose %pcbios-int %pcbios-out)
+  "net/pc-vbe.lisp's entry points: their names, here in code, keep them through MODUS_SHAKE
+   (which keeps every name the build scripts spell) until the image calls them itself.")
+
 (defun %pc-console-text ()
   "net/pc-console.lisp with the data it reads: boot/boot-uefi-x64.lisp's 8x8
    font and PS/2 scancode tables, and whether a GOP framebuffer may be used
@@ -220,7 +226,13 @@
             (coerce (symbol-value (find-symbol "*PS2-SCANCODE-NORMAL*" :modus.mvm)) 'list)
             (coerce (symbol-value (find-symbol "*PS2-SCANCODE-SHIFTED*" :modus.mvm)) 'list)
             (if *cl-repl-uefi-p* "t" "nil")
-            (%rpi-net-text "pc-console.lisp"))))
+            (concatenate 'string (%rpi-net-text "pc-console.lisp")
+                         ;; bare i386: a VBE framebuffer, chosen in Lisp through the pcboot
+                         ;; shim's PM_BIOS (net/pc-vbe.lisp); MODUS_PC_VBE=0 leaves it out
+                         (if (and *cl-repl-i386-p*
+                                  (not (equal (sb-ext:posix-getenv "MODUS_PC_VBE") "0")))
+                             (%rpi-net-text "pc-vbe.lisp")
+                             "")))))
 
 (defun %mac-console-text ()
   "mac/mac-console.lisp (vessel) with the 8x8 font it draws in: the bare Mac's
@@ -485,6 +497,23 @@
   nil)
 (defun %monotonic-ns ()
   (floor (* (rdtsc) 1000000000) (cntfrq)))
+;; net/bare-sync.lisp's mutex arena: 32 KB of low RAM nothing else uses (the pcboot shim and
+;; MODUS.COM keep to segments #x1000-#x4000 and #x7000; the stub to #x8000-#x8300, #x1B000-
+;; #x2AFFF and #x90000), identity-mapped by the stub: 511 cells.  The prologue zeroes its
+;; count on every boot, a restored core's included (the arena is not in the core).
+(declaim (overridable %bare-sync-arena))
+(defun %bare-sync-arena () (values #x50000 #x58000))
+;; ... and its cells are handed out round-robin, never exhausted.  bare-sync never reclaims a
+;; cell, and a desk makes framebuffers (two mutexes each) as windows open, so a fixed pool
+;; would run out mid-session.  With one thread a mutex is a flag store and nothing waits, so
+;; two objects sharing a cell cannot block each other.  A cell is zeroed on its first use only.
+(declaim (overridable %sync-cell))
+(defun %sync-cell ()
+  (let* ((n (mem-ref #x50000 :u32))
+         (a (+ #x50000 64 (* (mod n 511) 64))))
+    (when (< n 511) (dotimes (i 8) (%gc-write64 (+ a (* i 8)) 0)))
+    (setf (mem-ref #x50000 :u32) (+ n 1))
+    a))
 "
         "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
@@ -1646,25 +1675,14 @@
   (if *ssh-build-p*
       (concatenate 'string
         (%rpi-net-text "crypto.lisp")        (string #\Newline)
-        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline)
-        ;; :I386 -- crypto-fast's field arithmetic reaches a field element's
-        ;; limbs through a RAW address computed once per call, and on 30-bit
-        ;; fixnums its 26x26-bit limb products are BIGNUMS: an allocation, so a
-        ;; collection can move the arrays under the cached address.  Measured:
-        ;; ed25519-public-key correct in every run with no collection, wrong in
-        ;; exactly the run where %GC-EPOCH moved.  crypto-32-fast.lisp is the
-        ;; cons-free 32-bit field layer (MUL26LO/MUL26HI, intermediates in fixed
-        ;; scratch at FE-SCRATCH-BASE): nothing in a field operation allocates,
-        ;; so nothing moves.  Its limb offset is rewritten from the mini-Lisp's
-        ;; header (+4) to crypto-fast's (+8), so every field function in the
-        ;; image agrees on where limb 0 is (inside the 40-slot array either way).
-        (if *cl-repl-i386-p*
-            (concatenate 'string
-              (%replace-all (%rpi-net-text "crypto-32-fast.lisp")
-                            "(- 0 4)) 1) 4)" "(- 0 4)) 1) 8)")
-              (string #\Newline))
-            ""))
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
       ""))
+;; (:I386 used to splice net/crypto-32-fast.lisp here, with its limb offset
+;; rewritten by %REPLACE-ALL: crypto-fast cached raw limb addresses across its
+;; bignum products, which a 30-bit tower makes an allocation.  crypto-fast
+;; now keeps its limbs as fixnums in the vector's slots and takes no raw
+;; address at all (docs/w32.md, M4), so every image runs the one field source
+;; and crypto-32-fast.lisp is deleted.)
 
 ;; Actor/SSH address map for the CL host image's memory layout.  The legacy
 ;; block (arch-raspi3b) sits at 0x0200_0000/0x0600_0000, which lands INSIDE this
@@ -1774,6 +1792,33 @@
               (*cl-repl-rpi-p* (%rpi-net-text "hwrng-bcm2835.lisp"))
               (t "")) (string #\Newline)
         "(defun native-eval (form) (eval form))"  (string #\Newline)
+        ;; :I386: SSH's waits on the PIT clock (GET-INTERNAL-REAL-TIME), not
+        ;; poll counts alone -- ssh-x64-cl.lisp's policy, with the PIT for the
+        ;; TSC.  The default version wait is 50 polls of one packet each; after
+        ;; a connection, the NE2000 ring still holds its tail (the client's last
+        ;; segments, slirp's retransmits), and the 50 polls went on those: the
+        ;; next client's version arrived 6 ms after the banner and the server
+        ;; had already given up ("#VX 51 0 0": 51 polls, buffer empty, peer
+        ;; open).  Every connection after the first failed that way once the
+        ;; key exchange stopped taking long enough for the ring to drain.
+        (if *cl-repl-i386-p*
+            "(defun %i386-ssh-clock () (get-internal-real-time))
+(defun %i386-ssh-wait-expired-p (count limit since)
+  (or (modus.ssh:ssh-peer-closed-p)
+      (and (> count limit)
+           (> (- (get-internal-real-time) since) (* 15 internal-time-units-per-second)))))
+(defun %i386-ssh-version-wait-expired-p (count since)
+  (or (modus.ssh:ssh-peer-closed-p)
+      (and (> count 50)
+           (> (- (get-internal-real-time) since) (* 2 internal-time-units-per-second)))))
+(defun %bind-i386-ssh-seams ()
+  (setf (fdefinition 'modus.ssh:ssh-preauth-clock) (function %i386-ssh-clock))
+  (setf (fdefinition 'modus.ssh:ssh-wait-expired-p) (function %i386-ssh-wait-expired-p))
+  (setf (fdefinition 'modus.ssh:ssh-version-wait-expired-p)
+        (function %i386-ssh-version-wait-expired-p)))
+"
+            "")
+        (string #\Newline)
         ;; ssh-handle-connection fix + trace live in net/ssh.lisp.
         ;; FIX: single-threaded server handles ONE connection at a time.  Guard
         ;; against RE-ENTRANT net-accept-connection: while inside a connection
@@ -1960,14 +2005,27 @@
 ;;; block and arch-aarch64's 0x41000000 block both land INSIDE this ~57 MB
 ;;; kernel image, so the NIC would DMA over native code.  See each -cl file's
 ;;; header.
+;; :ARM32 has no NIC adapter: arch-arm32 went with the mini-Lisp (d4ae00fe),
+;; and the fall-through below is the Raspberry Pi board stack -- DWC2, R8152,
+;; the VideoCore mailbox at #x3F00B880 -- which on QEMU virt data-aborts at the
+;; first mailbox read (HDMI-RD) and, with no abort handler, loops at the vector
+;; right after "DTB ptr".  Refuse rather than build that image.
+(when (and *net-build-p* *cl-repl-arm32-p*)
+  (error "MODUS_NET_BUILD=1 on :ARM32: there is no arm32 NIC adapter (the Pi's ~
+          board stack is the only fall-through, and it cannot run on QEMU virt). ~
+          For the crypto layer alone: MODUS_CRYPTO_BUILD=1."))
 (defvar *net-nic-source*
   (if (not *net-build-p*)
       ""
       (if *cl-repl-i386-p*
           (concatenate 'string
-            ;; NE2000 ISA (port I/O).  The adapter comes AFTER the driver: it
-            ;; moves the driver's host buffers out of the image (see its header).
+            ;; NE2000 ISA (port I/O) and the E1000 family on PCI (QEMU's e1000,
+            ;; a ThinkPad T420's 82579LM), picked when NIC-PROBE runs.  The
+            ;; adapter comes AFTER both drivers: it moves the NE2000's host
+            ;; buffers out of the image and overrides e1000.lisp's two seams
+            ;; (E1000-MAP-BAR, E1000-DMA-ADDR) -- see its header.
             (%rpi-net-text "ne2000.lisp")          (string #\Newline)
+            (%rpi-net-text "e1000.lisp")           (string #\Newline)
             (%rpi-net-text "arch-i386-cl.lisp")    (string #\Newline))
       (if *cl-repl-x64-p*
           (concatenate 'string
@@ -2067,11 +2125,22 @@
                    send receive rx-buf probe read-reg)))
     (cond
       (*cl-repl-i386-p*
-       (format nil "~%(defun %bind-nic-seams ()
+       ;; an E1000 on PCI if there is one (and a net block to DMA from), else
+       ;; the NE2000: NIC-PROBE rebinds the interface to whichever answered
+       (format nil "~%(defun %pick-e1000-or-ne2k ()
+  (if (and (modus.board::pc-net-block-p) (= (modus.net.e1000:e1000-hw-probe) 1))
+      (progn
+        (setf (fdefinition 'modus.net:nic-send) (function modus.net.e1000:e1000-hw-send))
+        (setf (fdefinition 'modus.net:nic-receive) (function modus.net.e1000:e1000-hw-receive))
+        (setf (fdefinition 'modus.net:nic-rx-buf) (function modus.net.e1000:e1000-hw-rx-buf))
+        (setf (fdefinition 'modus.net:nic-read-reg) (function modus.net.e1000:e1000-read-reg))
+        1)
+      (modus.net.ne2000:ne2k-probe)))
+(defun %bind-nic-seams ()
   (modus.net::%define-nic-seams)
 ~A)~%"
                (bind "modus.net.ne2000:ne2k-send" "modus.net.ne2000:ne2k-receive"
-                     "modus.net.ne2000:ne2k-rx-buf" "modus.net.ne2000:ne2k-probe"
+                     "modus.net.ne2000:ne2k-rx-buf" "%pick-e1000-or-ne2k"
                      "modus.net::no-read-reg")))
       (*cl-repl-x64-p*
        ;; virtio or E1000, decided when NIC-PROBE runs: it probes virtio, and
@@ -2127,9 +2196,11 @@
                      ;; the SSH interface (net/ssh.lisp): its defaults, then
                      ;; what this image's adapters replace
                      (if *ssh-build-p*
-                         (format nil "  (modus.ssh::%bind-ssh-seams)~%~A~A"
+                         (format nil "  (modus.ssh::%bind-ssh-seams)~%~A~A~A"
                                  (if (or *cl-repl-x64-p* *cl-repl-rpi-p*)
                                      (format nil "  (modus.board::%bind-board-ssh-seams)~%") "")
+                                 (if *cl-repl-i386-p*
+                                     (format nil "  (%bind-i386-ssh-seams)~%") "")
                                  (if *ssh-isolated-p*
                                      (format nil "  (%bind-isolated-ssh-seams)~%") ""))
                          ""))))
@@ -2647,8 +2718,10 @@
 ;; An autostart SSH image is a server: it has no library to fetch, and on a
 ;; real network the slirp address the fetch targets does not exist, so the
 ;; attempt only delays the SSH server.
+;; ... nor does an image that only wants the network up (MODUS_NET_NOFETCH=1: kiln t420's desk,
+;; whose pipeline otherwise spent two TCP timeouts on a slirp address at every boot).
 (defvar *net-x64-fetch-block*
-  (if *ssh-autostart-p*
+  (if (or *ssh-autostart-p* (equal (sb-ext:posix-getenv "MODUS_NET_NOFETCH") "1"))
       "          (write-string-serial \"NET-FETCH-SKIPPED\") (write-char-serial 10))))"
       "          (handler-case (ql-net-setup) (t (c) nil))
           (net-install-and-call (%net-fetch-url)))))"))
@@ -2988,12 +3061,55 @@
           (%rpi-net-text "snp-ghcb.lisp") (string #\Newline))
         "")))
 
+;;; MODUS_CRYPTO_BUILD=1 -- the crypto layer (crypto.lisp + crypto-fast.lisp)
+;;; WITHOUT a NIC, for a platform that has no network adapter: today :ARM32,
+;;; whose net adapter went with the mini-Lisp (d4ae00fe).  The one thing crypto
+;;; needs from an adapter is its fixed state block: the SHA-256 K table at
+;;; (e1000-state-base)+0x100, the Ed25519 constants, and FE-SCRATCH-BASE.  On
+;;; arm32 that is VA #x0F900000 -- mapped DRAM between the L1 table
+;;; (#x0F800000, 16 KB) and the I/O scratch pages (#x0FE00000), below 2^29, and
+;;; not heap memory, so nothing moves it.  test/w32-x25519-bare.py uses it
+;;; (W32_X25519_ARCH=arm32) for the 30-bit collector check of crypto-fast.
+(defvar *crypto-only-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_CRYPTO_BUILD")))
+    (and v (string= v "1"))))
+(when (and *crypto-only-p* *net-build-p*)
+  (error "MODUS_CRYPTO_BUILD=1 is crypto WITHOUT the net stack; MODUS_NET_BUILD=1 ~
+          MODUS_SSH_BUILD=1 already includes it."))
+(when (and *crypto-only-p* (not *cl-repl-arm32-p*))
+  (error "MODUS_CRYPTO_BUILD=1: only :ARM32 has a state block defined for it; ~
+          this platform has a NIC adapter -- MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 ~
+          MODUS_NET_NOAUTO=1 builds crypto in without starting the NIC."))
+(defvar *crypto-only-source*
+  (if *crypto-only-p*
+      (concatenate 'string
+        (format nil "~%(defun e1000-state-base () #x0F900000)~%~
+                     (defun fe-scratch-base () #x0F900900)~%~
+                     (defun usb-keepalive () 0)~%")
+        ;; The two byte-buffer helpers crypto.lisp takes from net/ip.lisp (not
+        ;; in this image: it is the IP stack).  Copies of ip.lisp's, same names
+        ;; and results, as net/hosted-ssh.lisp carries for the same reason; the
+        ;; SHA-256/512 vectors on the arm32 crypto image are their check.
+        "(defun buf-read-u32 (buf off)
+  (logior (ash (aref buf off) 24) (ash (aref buf (+ off 1)) 16)
+          (ash (aref buf (+ off 2)) 8) (aref buf (+ off 3))))
+(defun buf-write-u32 (buf off val)
+  (aset buf off (logand (ash val -24) #xFF))
+  (aset buf (+ off 1) (logand (ash val -16) #xFF))
+  (aset buf (+ off 2) (logand (ash val -8) #xFF))
+  (aset buf (+ off 3) (logand val #xFF)))
+"
+        (%rpi-net-text "crypto.lisp")        (string #\Newline)
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
+      ""))
+
 (defvar *cli-bare-metal-net-source*
   ;; *cl-repl-jit-region-source* LAST: its %jit-exec-* defuns must come after
   ;; translate-aarch64.lisp's defaults so last-defun-wins picks the :virt DRAM
   ;; window.  Empty string on :rpi, which keeps the translator's own values.
   (concatenate 'string *snp-ghcb-source*
-               *net-source* *net-url-source* *net-driver-source*
+               *net-source* *crypto-only-source*
+               *net-url-source* *net-driver-source*
                *rpi-jit-coinit-override* *cl-repl-jit-region-source*
                *snp-attest-source* *ssh-key-override-source*))
 
@@ -3322,6 +3438,28 @@
       (defvar cl-user::*compiler-source* text)   ; build-cli-common's (in CL-USER)
       (format t "~&;; split-dispatch: COMPILE-COMPOUND -> ~D handlers over ~D keys~%"
               handlers keys))))
+
+;;; Bare i386 + MODUS_I386_JIT=1: the native tier (mvm/jit-i386-native.lisp) in
+;;; build-cli-common's late arch slot, its code area the one the boot stub maps
+;;; (a bare PC has no mmap): %N386-AREA, by last-defun-wins.
+(when (and *cl-repl-i386-p* (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1"))
+  (defvar cl-user::*cli-arch-late-source*
+    (concatenate 'string (mvm-text "mvm/jit-i386-native.lisp") "
+(defun %n386-area ()
+  \"Bare metal: the code area boot/boot-i386-cl.lisp mapped at +N386-AREA-ADDR+,
+   its size in the stub's word at #x80A8 (0: none, and runtime code stays
+   interpreted).\"
+  (let ((n (mem-ref #x80A8 :u32)))
+    (when (zerop n) (error \"jit-i386-native: the boot stub mapped no code area\"))
+    (setq *n386-ptr* +n386-area-addr+ *n386-end* (+ +n386-area-addr+ n))))
+(defun %n386-allowed-p ()
+  \"Not while booting to be saved as a core (SAVECORE, scripts/dos386-core.py):
+   the core holds the heap, not the code area, so a function translated now
+   would be a pointer into an empty area after the restore -- measured: every
+   form boot had run natively jumped into zeros.  The restored image starts
+   the tier at its first DEFUN.  SAVELATER the same: the save comes after an install.\"
+  (not (or (%i386-core-save-requested-p) (%i386-core-save-later-p))))
+")))
 
 ;;; :MAC68K + MODUS_68K_JIT=1: the runtime threaded JIT (mvm/jit-68k.lisp) in
 ;;; build-cli-common's late arch slot, with the layout's :JIT-AREA as its code
@@ -3704,29 +3842,47 @@
   ;; stub zeroed the whole block on a cold one)
   (let ((at (search "  (write-string-serial \"MODUS-CL\")" *cli-arch-kernel-prologue*)))
     (unless at (error "i386 core: the prologue's banner moved"))
+    ;; THE MUTEX ARENA (net/bare-sync.lisp, %BARE-SYNC-ARENA below) is low RAM, not heap:
+    ;; a core does not carry it, so its cell count is reset on EVERY boot, a restored one
+    ;; included -- a count left in RAM by the firmware would make every MAKE-MUTEX (two per
+    ;; glass framebuffer) answer "arena exhausted".  A restored mutex and a new one may then
+    ;; share a cell; with one thread a lock is a flag store, so that is harmless.
     (setq *cli-arch-kernel-prologue*
-          (concatenate 'string "  (unless (eql (mem-ref #x8024 :u32) 1)
+          (concatenate 'string "  (setf (mem-ref #x50000 :u32) 0)
+  (setf (mem-ref #x50004 :u32) 0)
+  (unless (eql (mem-ref #x8024 :u32) 1)
 " (subseq *cli-arch-kernel-prologue* 0 at) "  )
 " (subseq *cli-arch-kernel-prologue* at))))
   (setq *cli-arch-override-source*
         (concatenate 'string *cli-arch-override-source* "
 (defun %core-requested-p () (eql (mem-ref #x8024 :u32) 1))
+;; What a restored core runs before the REPL: a function designator, set before the save
+;; (kiln t420: (setq modus-int::*core-restart-hook* 'kiln-t420-main)), carried by the heap.
+(defvar *core-restart-hook* nil)
 (defun %core-pre-restore () t)
 (defun %restore-image () nil)
 (defun %core-post-restore () nil)
-(defun %i386-core-save-requested-p ()
-  ;; SAVECORE in the Multiboot command line (QEMU -append), which the entry
-  ;; stub copied to #x8200 (boot-i386-cl.lisp +I386-CL-CMDLINE+).
-  (let ((i 0) (hit nil))
+(defun %i386-cmdline-has-p (word)
+  ;; WORD in the Multiboot command line (QEMU -append), which the entry stub
+  ;; copied to #x8200 (boot-i386-cl.lisp +I386-CL-CMDLINE+).
+  (let ((i 0) (hit nil) (n (length word)))
     (loop
       (when (or hit (>= i 248) (eql (mem-ref (+ #x8200 i) :u8) 0)) (return nil))
-      (when (and (eql (mem-ref (+ #x8200 i) :u8) 83) (eql (mem-ref (+ #x8201 i) :u8) 65)
-                 (eql (mem-ref (+ #x8202 i) :u8) 86) (eql (mem-ref (+ #x8203 i) :u8) 69)
-                 (eql (mem-ref (+ #x8204 i) :u8) 67) (eql (mem-ref (+ #x8205 i) :u8) 79)
-                 (eql (mem-ref (+ #x8206 i) :u8) 82) (eql (mem-ref (+ #x8207 i) :u8) 69))
-        (setq hit t))
+      (let ((k 0))
+        (loop
+          (when (>= k n) (setq hit t) (return nil))
+          (unless (eql (mem-ref (+ #x8200 i k) :u8) (char-code (char word k))) (return nil))
+          (setq k (+ k 1))))
       (setq i (+ i 1)))
     hit))
+(defun %i386-core-save-requested-p ()
+  ;; SAVECORE: save the core as boot init ends, before the REPL
+  (%i386-cmdline-has-p \"SAVECORE\"))
+(defun %i386-core-save-later-p ()
+  ;; SAVELATER: this boot will be saved, but later -- by whoever drives the REPL
+  ;; (kiln t420: install the desk, then (%I386-CORE-SAVE)) -- so the native tier
+  ;; stays off as for SAVECORE, and nothing saves at boot
+  (%i386-cmdline-has-p \"SAVELATER\"))
 (defun %i386-core-save ()
   \"Collect until the live data is at the bottom of the lower semispace, say
    where it ends, and stop: scripts/dos386-core.py reads the guest from here.
@@ -3743,6 +3899,12 @@
     (print-dec (mem-ref #x10000E00 :u32))
     (write-string-serial \" handlers=\")
     (print-dec (mem-ref #x10000400 :u32))
+    ;; the native tier's code in use, from the area's base (#x12000000): a core saved
+    ;; after it ran carries this too, and the stub puts it back where it was
+    (write-string-serial \" jit=\")
+    (print-dec (if (and (boundp (quote *n386-ptr*)) (integerp *n386-ptr*))
+                   (- *n386-ptr* #x12000000)
+                   0))
     (write-char-serial 10)
     (halt)))
 "))
@@ -3756,8 +3918,17 @@
                        "  (when (%i386-core-save-requested-p) (%i386-core-save))
 "
                        (subseq *cli-arch-kernel-epilogue* at))))
+  ;; A restored core runs its restart hook (kiln t420's desk) when it was saved with one, as
+  ;; the Pi's does; the REPL when the hook returns, or when there is none.
   (setq *cli-arch-core-resume* "    (write-string-serial \"MODUS-CORE\")
     (write-char-serial 10)
+    (when (and (boundp (quote *core-restart-hook*)) *core-restart-hook*)
+      (write-string-serial \"CORE-RESTART-HOOK\")
+      (write-char-serial 10)
+      (handler-case (funcall *core-restart-hook*)
+        (t (c) (write-string-serial \"RESTART-HOOK-DIED: \")
+               (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+               (write-char-serial 10))))
     (handler-case (cl-serial-repl)
       (t (c) (write-string-serial \"REPL-DIED: \")
              (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
@@ -3817,6 +3988,11 @@
 ;; Narrow AOT string literals (compiler.lisp *NARROW-LITERALS-P*) wherever
 ;; *CL-REPL-RPI-CORE-SOURCE* turns %NARROW-STRINGS-P on.
 (when cl-user::*cl-repl-rpi-p* (setq *narrow-literals-p* t))
+
+;; MODUS_W32_UNSAFE_LIVE=1: the collector rung's NEGATIVE CONTROL -- raw W32
+;; variables are not split around GC points (compiler.lisp *W32-UNSAFE-LIVE*,
+;; test/w32-gc-live.lisp).  Never for a real image.
+(setq modus.mvm::*w32-unsafe-live* (equal (sb-ext:posix-getenv "MODUS_W32_UNSAFE_LIVE") "1"))
 ;; i386: AOT string literals POOLED (compiler.lisp *NARROW-LITERALS-P*), each
 ;; evaluation a %FRESH-STRING copy of the pooled one -- wide here, i386 has no
 ;; narrow strings -- instead of one LI and one OBJ-SET per character: 919 KB of
@@ -3870,11 +4046,21 @@
   (cl-user::mvm-load "boot/boot-linux-i386.lisp")
   (cl-user::mvm-load "boot/boot-i386-cl.lisp")
   (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
+  ;; MODUS_SYMMAP=FILE: the image's symbol map (cross.lisp WRITE-SYMMAP), so a fault
+  ;; address in the image can be named.
+  (let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
+    (when (and sm (plusp (length sm)))
+      (setf (symbol-value (intern "*WRITE-SYMMAP-PATH*" "MODUS.MVM")) sm)))
   (funcall (intern "I386-SET-CL-BARE-MODE" "MODUS.MVM.I386")
            (symbol-value (intern "+LINUX-I386-GLOBALS+" "MODUS.MVM"))
            (symbol-value (intern "+LINUX-I386-HEAP-MARGIN-ADDR+" "MODUS.MVM"))
            ;; the clock: the PIT's ticks (a 486 has no RDTSC)
            (symbol-value (intern "+I386-CL-TICK-ADDR+" "MODUS.MVM")))
+  ;; MODUS_I386_JIT=1: the native tier (mvm/jit-i386-native.lisp), as on the
+  ;; hosted CLI -- the image carries the export table and the constant root,
+  ;; and the boot stub maps its code area (boot-i386-cl.lisp +I386-CL-V-JITSZ+)
+  (setf (symbol-value (intern "*I386-NATIVE-TIER*" "MODUS.MVM.I386"))
+        (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1"))
   ;; MODUS_I386_FP=x87: floats on the x87 (a 486DX has no SSE2, nor a CR4 to
   ;; enable it with), as build-i386-cli.lisp reads it
   (let ((v (sb-ext:posix-getenv "MODUS_I386_FP")))
@@ -3942,7 +4128,7 @@
   ;; (%CONV-ADDR K), or a number that only looks like one.  Listed after the build.
   (when (let ((v (sb-ext:posix-getenv "MODUS_CONV_VALUE_AUDIT"))) (and v (string/= v "0")))
     (defparameter cl-user::*conv-value-hits* (make-hash-table :test 'equal))
-    (sb-int:encapsulate (intern "COMPILE-INTEGER" "MODUS.MVM") 'conv-value-audit
+    (modus.mvm::%gck-encapsulate (intern "COMPILE-INTEGER" "MODUS.MVM") 'conv-value-audit
       (lambda (f value dest)
         (when (and (integerp value) (<= #x10000000 value #x1001FFFF))
           (push value (gethash (symbol-value (intern "*CURRENT-FUNCTION-NAME*" "MODUS.MVM"))
@@ -4558,6 +4744,18 @@
 ;; integer-literal DEFCONSTANT found in the text.  DEFCONSTANT emits no code, so
 ;; the SBCL artifact must be byte-identical with this block (verified by
 ;; test/run-uefi-ddc.sh's md5 of the SBCL image before/after).
+(defun %ddc-in-mvm-package-p (text p)
+  "NIL when position P of TEXT is in a baked TRANSLATOR's package (MODUS.MVM.<arch>,
+   by the nearest (in-package ...) before it).  The forward block hoists into
+   MODUS.MVM, so the i386 translator's constants -- baked under MODUS_I386_JIT=1 --
+   came out defined twice (GLOBAL-COLLISION +I386-EAX+ in MODUS.MVM.I386 and
+   MODUS-INT).  Every other package hoists as it always did."
+  (let ((ip (search "(in-package " text :from-end t :end2 p)))
+    (or (null ip)
+        (let* ((end (position #\) text :start ip))
+               (name (string-downcase (string-trim " :#'" (subseq text (+ ip 12) end)))))
+          (not (and (> (length name) 10) (string= "modus.mvm." name :end2 10)))))))
+
 (defun %ddc-constants-forward-block (text)
   (let ((out (make-string-output-stream)) (n 0) (pos 0))
     (format out "(in-package :modus.mvm)~%;; DDC constants forward block (auto)~%")
@@ -4574,7 +4772,7 @@
         (let* ((close (position #\) text :start p))
                (form (and close (subseq text p (1+ close)))))
           ;; only the simple shape "(defconstant +NAME+ <integer>)" on one line
-          (when (and form (not (find #\Newline form)))
+          (when (and form (not (find #\Newline form)) (%ddc-in-mvm-package-p text p))
             (let* ((sp1 (position #\Space form :start 13))
                    (name (and sp1 (subseq form 13 sp1)))
                    (rest (and sp1 (string-trim " " (subseq form (1+ sp1) (1- (length form)))))))

@@ -7,6 +7,10 @@
 ;;;; Usage from build scripts:
 ;;;;   (load "lib/load-mvm.lisp")  ; or via mvm-load after *modus-base* is set
 
+;;; A modus host: the SB-EXT entry points the build scripts call (lib/host-modus.lisp).
+#+modus
+(load (merge-pathnames "host-modus.lisp" (directory-namestring (truename *load-truename*))))
+
 ;;; Base directory (parent of mvm/)
 (defvar *modus-base*
   (let* ((this-dir (directory-namestring (truename *load-truename*)))
@@ -33,6 +37,16 @@
                             :name nil :type nil :defaults dir))))
   "The vessel checkout modus's bare-metal builds read their drivers from, or NIL.")
 
+(defun host-symbol (name package)
+  "The symbol NAME a build script sets in PACKAGE (a compiler or translator
+   variable).  FIND-SYMBOL, else INTERN: on a modus host (the builder CLI) a
+   kernel global the source never quotes has no symbol object -- compiled code
+   reaches its cell by name -- and FIND-SYMBOL is NIL, so a bare
+   (SETF (SYMBOL-VALUE (FIND-SYMBOL ...))) set NIL.  A modus host interns it
+   in MODUS-INT, where the kernel's globals are homed."
+  (or (find-symbol name package)
+      (intern name (or (find-package "MODUS-INT") package))))
+
 (defun modus-source (relative-path)
   "The file a build means by RELATIVE-PATH: modus's own if modus has it, else vessel's
    kernel/ copy.  Signals, naming both places, when neither has it -- a missing vessel
@@ -49,7 +63,87 @@
                     (if *vessel-base* (merge-pathnames "kernel/" *vessel-base*) "no checkout found"))))))
 
 (defun mvm-load (relative-path)
+  "LOAD a first-party file.  On a modus host a compiler, boot or translator file
+   (mvm/, boot/) is NOT loaded -- the running image is made of it already, and
+   loading it would redefine the live compiler (lib/load-mvm.lisp's note below) --
+   but its constants are adopted (%HOST-ADOPT-CONSTANTS), which is all of it a
+   build script can see that the image does not already answer."
+  #+modus
+  (when (or (eql 0 (search "mvm/" relative-path)) (eql 0 (search "boot/" relative-path)))
+    (return-from mvm-load (%host-adopt-constants relative-path)))
   (load (modus-source relative-path) :verbose nil :print nil))
+
+;;; ON A MODUS HOST: the ISA's constants, as values.  The sources read them at READ
+;;; time (#.+OP-W32-ADD+ -- 185 names, interp.lisp and the translators), so the build's
+;;; parse check and reader need them bound; in a running image they were folded into its
+;;; code and are not.  Only mvm/mvm.lisp's DEFCONSTANTs whose symbol is unbound are
+;;; evaluated -- not its DEFPACKAGE or its structs, which are the running kernel's.
+(defvar *host-opcode-entries* nil
+  "The opcode table read from mvm/mvm.lisp's DEFOPCODE forms, in the file's order.")
+;;; Every host reads the opcode table this way (%OPCODE-ENTRIES); a host that has
+;;; loaded mvm/mvm.lisp has every constant bound already, so it only collects.
+(defun %form-reads-env-p (x)
+  "Does form X call POSIX-GETENV (any package)?"
+  (cond ((symbolp x) (and x (string= (symbol-name x) "POSIX-GETENV")))
+        ((consp x) (or (%form-reads-env-p (car x)) (%form-reads-env-p (cdr x))))
+        (t nil)))
+
+(defun %host-adopt-constants (relative-path)
+  "READ RELATIVE-PATH and evaluate its DEFPACKAGEs, each DEFCONSTANT whose symbol is
+   unbound, in the file's order (later ones are computed from earlier ones), and each
+   DEFVAR / DEFPARAMETER that reads a knob; collect mvm/mvm.lisp's DEFOPCODE forms.  Nothing else in the file is evaluated.  Returns the number bound.
+   A form that does not read or evaluate is reported, not fatal: what a script then
+   misses is an unbound variable naming itself."
+  (let ((*package* (find-package "COMMON-LISP-USER")) (n 0)
+        (opcodes (string= relative-path "mvm/mvm.lisp")) (entries nil))
+    (with-open-file (in (modus-source relative-path))
+      (loop for form = (handler-case (read in nil in)
+                         (error (e)
+                           (format t "~&;; modus host: ~A stops reading: ~A~%" relative-path e)
+                           in))
+            until (eq form in)
+            do (cond ((and (consp form) (eq (car form) 'in-package))
+                      (setq *package* (find-package (cadr form))))
+                     ;; the file's packages as a loading host has them -- their exports and
+                     ;; uses.  DEFPACKAGE of an existing package updates it in place
+                     ;; (CLHS 11.1.1.1; mvm/cl-packages.lisp), so the running image's own
+                     ;; packages gain what the build's reader expects of them: MODUS.ASM's
+                     ;; exported register names, which MODUS.MVM.X64 then inherits, as on
+                     ;; SBCL (without them the builder read 'RAX there as a new symbol --
+                     ;; 17 extra static-literal slots).
+                     ((and (consp form) (eq (car form) 'defpackage))
+                      (handler-case (eval form)
+                        (error (e)
+                          (format t "~&;; modus host: ~A DEFPACKAGE ~S: ~A~%" relative-path (cadr form) e))))
+                     ((and (consp form) (eq (car form) 'defconstant)
+                           (not (boundp (cadr form))))
+                      (handler-case (progn (eval form) (incf n))
+                        (error (e)
+                          (format t "~&;; modus host: ~A ~S: ~A~%" relative-path (cadr form) e))))
+                     ;; a DEFVAR / DEFPARAMETER whose initform reads a MODUS_* knob: a
+                     ;; host that LOADS this file reads it there (and records it in the
+                     ;; image's knob record); so does this one, and the image's own
+                     ;; variable gets the value a fresh load would give it
+                     ((and (not opcodes) (consp form) (member (car form) '(defvar defparameter))
+                           (consp (cdr form)) (consp (cddr form))
+                           (%form-reads-env-p (caddr form)))
+                      (handler-case (setf (symbol-value (cadr form)) (eval (caddr form)))
+                        (error (e)
+                          (format t "~&;; modus host: ~A ~S: ~A~%" relative-path (cadr form) e))))
+                     ;; (DEFOPCODE name code operands description): the opcode table,
+                     ;; as the data %OPCODE-ENTRIES answers, in the file's order
+                     ((and opcodes (consp form) (symbolp (car form))
+                           (string= (symbol-name (car form)) "DEFOPCODE"))
+                      (destructuring-bind (name code operands description) (cdr form)
+                        (let ((hit (assoc code entries)))
+                          (if hit
+                              (setf (cdr hit) (list name operands description))
+                              (push (list code name operands description) entries))))))))
+    (when opcodes (setq *host-opcode-entries* (nreverse entries)))
+    n))
+
+(defun %host-bind-isa-constants () (%host-adopt-constants "mvm/mvm.lisp"))
+;; (a modus host: MVM-LOAD below adopts each file's constants instead of loading it)
 
 ;; HOST-ONLY: record every MODUS_* variable this build reads, FIRST, so the knobs
 ;; the compiler and translators read while loading are in the record too.  The
@@ -68,6 +162,16 @@
 ;; makes those refs silent while STILL reporting anything genuinely never
 ;; defined (this improves the signal-to-noise of the build log; it changes
 ;; only warning reporting, never codegen).
+;;; ON A MODUS HOST (a build running on modus itself, no SBCL): the compiler, the
+;;; boot descriptors and the translators are ALREADY IN THE RUNNING IMAGE -- in the
+;;; packages the build would load them into (MODUS-INT, MODUS.ASM, MODUS.MVM.X64 ...),
+;;; because a baked symbol records its home by package NAME.  Loading this tree's copy
+;;; over them would redefine the running compiler in place (a DEFSTRUCT of a live
+;;; kernel struct kills the process), so a modus host USES its own: MVM-LOAD adopts
+;;; each file's constants and loads nothing else, and the forms marked #-modus below
+;;; are what it skips outright.  That is the two-stage bootstrap -- a release image
+;;; builds a stage-1 image from this tree, and stage 1, whose compiler IS this tree's,
+;;; builds again (docs: project memory "build without SBCL").
 (with-compilation-unit ()
 
 ;; Packages and x86-64 assembler
@@ -79,7 +183,7 @@
 ;; the kernel's packages beyond MODUS-INT (builder packages step 3), made now
 ;; so the build can read source into them
 (mvm-load "mvm/kernel-packages.lisp")
-(funcall (find-symbol "%ENSURE-KERNEL-PACKAGES" "MODUS.MVM"))
+#-modus (funcall (find-symbol "%ENSURE-KERNEL-PACKAGES" "MODUS.MVM"))
 (mvm-load "mvm/target.lisp")
 (mvm-load "mvm/compiler.lisp")
 (mvm-load "mvm/interp.lisp")
@@ -106,6 +210,19 @@
 (mvm-load "mvm/translate-68k.lisp")
 (mvm-load "mvm/translate-arm32.lisp")
 
+;; The x64 translator's build-time knobs, read HERE on every host (a modus host never
+;; loads translate-x64.lisp, so a read inside it was SBCL's alone, and so was the entry
+;; in the image's knob record).
+(flet ((set-x64 (name value)
+         (let ((s (find-symbol name "MODUS.MVM.X64")))
+           (when s (setf (symbol-value s) value)))))
+  (let ((v (sb-ext:posix-getenv "MODUS_FAULT_DUMP")))
+    (set-x64 "*X64-FAULT-DUMP*" (if v t nil)))
+  (let ((v (sb-ext:posix-getenv "MODUS_STW_SCANMODE")))
+    (set-x64 "*X64-STW-SCAN-MODE*" (if (and v (plusp (length v))) (parse-integer v) 1)))
+  (let ((v (sb-ext:posix-getenv "MODUS_STW_VERIFY")))
+    (set-x64 "*X64-STW-VERIFY*" (if v t nil))))
+
 ;; The image code that runs the x64 JIT is read in MODUS.MVM (mvm-eval.lisp's
 ;; page translator, the %JIT-BOOT-INIT glue) and calls the assembler and the
 ;; translator.  Make the names it writes unqualified READ as the symbols those
@@ -115,6 +232,7 @@
 ;; package exists in a running image yet (step 4), and the self-host image
 ;; re-reads this text.  %INIT-X64-TRANSLATOR is interned here, before the
 ;; co-init text that defines it is read in MODUS.ASM.
+#-modus
 (let ((mvm (find-package "MODUS.MVM")))
   (dolist (s (list (find-symbol "LABEL-POSITION" "MODUS.ASM")
                    (find-symbol "CODE-BUFFER-POSITION" "MODUS.ASM")
@@ -190,27 +308,27 @@
       (off (sb-ext:posix-getenv "MODUS_NO_GVCACHE"))
       (md  (sb-ext:posix-getenv "MODUS_GVCACHE_MODE")))
   (when (and on (plusp (length on)) (not (string= on "0")))
-    (setf (symbol-value (find-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) t)
+    (setf (symbol-value (host-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) t)
     (format t ";; MODUS_GVCACHE: AOT special reads use the cached cell~%"))
   (when (and off (plusp (length off)) (not (string= off "0")))
-    (setf (symbol-value (find-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) nil)
+    (setf (symbol-value (host-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) nil)
     (format t ";; MODUS_NO_GVCACHE: AOT special reads use the %GV-REF call~%"))
   (dolist (k '("MODUS_GVCACHE_LO" "MODUS_GVCACHE_HI"))
     (let ((v (sb-ext:posix-getenv k)))
       (when (and v (plusp (length v)))
-        (setf (symbol-value (find-symbol (if (search "_LO" k) "*GV-CACHE-LO*" "*GV-CACHE-HI*") :modus.mvm))
+        (setf (symbol-value (host-symbol (if (search "_LO" k) "*GV-CACHE-LO*" "*GV-CACHE-HI*") :modus.mvm))
               (parse-integer v))
         (format t ";; ~A=~A~%" k v))))
   (let ((o (sb-ext:posix-getenv "MODUS_GVCACHE_ONLY")))
     (when (and o (plusp (length o)))
-      (setf (symbol-value (find-symbol "*GV-CACHE-ONLY*" :modus.mvm))
+      (setf (symbol-value (host-symbol "*GV-CACHE-ONLY*" :modus.mvm))
             (let ((r nil) (start 0))
               (loop for i = (position #\, o :start start)
                     do (push (subseq o start i) r)
                        (if i (setq start (1+ i)) (return (nreverse r))))))
       (format t ";; MODUS_GVCACHE_ONLY=~A~%" o)))
   (when (and md (plusp (length md)))
-    (setf (symbol-value (find-symbol "*GV-CACHE-MODE*" :modus.mvm))
+    (setf (symbol-value (host-symbol "*GV-CACHE-MODE*" :modus.mvm))
           (intern (string-upcase md) :keyword))
     (format t ";; MODUS_GVCACHE_MODE=~A~%" md)))
 
@@ -237,3 +355,26 @@
   (let ((path (modus-source relative-path)))
     (modus.mvm::check-parses path)
     (modus.mvm::%build-package-scoped-source (read-file-text path) relative-path)))
+
+(defun %opcode-entries ()
+  "The MVM opcode table as data, in its order: a list of (CODE NAME OPERANDS
+   DESCRIPTION).  What the build generates an image's own table from.  Read from
+   mvm/mvm.lisp's DEFOPCODE forms on every host (%HOST-BIND-ISA-CONSTANTS), in the
+   file's order: walking MODUS.MVM's hash table answered in SBCL's insertion order
+   and in CCL's hash order, and the table's text differed by host."
+  (or *host-opcode-entries*
+      (progn (%host-bind-isa-constants) *host-opcode-entries*)))
+
+(defun host-build-image (&rest args)
+  "BUILD-IMAGE as a build script calls it, on any host.  A host that loaded the
+   compiler (SBCL, CCL, ABCL): its BUILD-IMAGE, through mvm/build-checks.lisp's encapsulation (which fills
+   the image-configuration placeholder).  A modus host -- the builder CLI,
+   MODUS_BUILDER=1: the placeholder is filled here, and %BUILDER-BUILD-IMAGE
+   (mvm/builder.lisp) runs the image's own BUILD-IMAGE with this image's
+   runtime settings out of the way."
+  #-modus (apply 'modus.mvm::build-image args)
+  #+modus
+  (apply #'modus-int::%builder-build-image
+         :finalize (lambda (src target)
+                     (modus.image-config:finalize-image-configuration src target))
+         args))

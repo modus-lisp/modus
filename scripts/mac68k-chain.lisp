@@ -119,7 +119,7 @@
   "What the Finder shows the application by: its icons (ICN# and ics# 128),
    FREF 128 (an APPL, local icon 0), BNDL 128 (signature MDUS, ICN# and ics#
    local 0 -> 128, FREF local 0 -> 128) and the signature's owner resource,
-   MDUS 0.  The file needs the hasBundle and hasCustomIcon flags (period-lisps'
+   MDUS 0.  The file needs the hasBundle and hasCustomIcon flags (vessel's tools/mac68k/period-lisps
    volume builder sets them)."
   (let ((fref (octets "APPL" (be 0 2) 0))
         (bndl (apply #'octets *creator* (be 0 2) (be 2 2)

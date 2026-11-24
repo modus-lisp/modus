@@ -15,23 +15,42 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 typedef uintptr_t (*swift_fn)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 
 enum { F_NARGS = 0, F_ARGS = 8, F_RESULT = 64, F_NAME = 128 };
 
-#define MAX_FNS 256
-static struct { const char *name; void *fn; } table[MAX_FNS];
+// THE NAMES, hashed (open addressing): a call looks its name up every time, and there are hundreds.  Fixed at
+// SLOTS (a power of two), kept under three quarters full; a full table says so, rather than dropping names
+// silently -- a 256-entry list once lost every name past the 256th, and the window's events with them.
+#define SLOTS 2048
+static struct { const char *name; void *fn; } table[SLOTS];
 static int nfns;
 static int installed;
+
+static uint32_t name_hash(const char *s) {
+    uint32_t h = 2166136261u;                        // FNV-1a
+    for (; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
+    return h;
+}
 
 extern void modus_swift_install(void) __attribute__((weak));
 
 void modus_swift_register(const char *name, void *fn) {
-    if (nfns < MAX_FNS) {
-        table[nfns].name = strdup(name);
-        table[nfns].fn = fn;
-        nfns++;
+    for (uint32_t i = name_hash(name) & (SLOTS - 1);; i = (i + 1) & (SLOTS - 1)) {
+        if (!table[i].name) {
+            if (nfns >= SLOTS * 3 / 4) {
+                fprintf(stderr, "modus-swift: too many Swift functions (%d): raise SLOTS; %s is not registered\n",
+                        nfns, name);
+                return;
+            }
+            table[i].name = strdup(name);
+            table[i].fn = fn;
+            nfns++;
+            return;
+        }
+        if (strcmp(table[i].name, name) == 0) { table[i].fn = fn; return; }   // registered again: the later
     }
 }
 
@@ -45,7 +64,7 @@ static long run(uint8_t *f) {
         if (modus_swift_install) modus_swift_install();
     }
     const char *name = (const char *)(f + F_NAME);
-    for (int i = 0; i < nfns; i++) {
+    for (uint32_t i = name_hash(name) & (SLOTS - 1); table[i].name; i = (i + 1) & (SLOTS - 1)) {
         if (strcmp(table[i].name, name) == 0) {
             swift_fn fn = (swift_fn)table[i].fn;
             // a Swift function takes six words; one that takes fewer ignores the rest (arm64's

@@ -1231,11 +1231,10 @@
       (emit-label buf db-done))))
 
 (defvar *x64-fault-dump*
-  ;; NOTE the shape: `(and #+sbcl (getenv ...) t)' would read as `(and t)' — i.e.
-  ;; ON — on any host that is not SBCL, because the reader DELETES the guarded
-  ;; form rather than yielding NIL.  Bind first, then test.
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_FAULT_DUMP") #-sbcl nil))
-    (if v t nil))
+  ;; MODUS_FAULT_DUMP: read by lib/load-mvm.lisp on every host -- a knob read here, at
+  ;; LOAD time, was read only by a host that loads this file (never a modus host), and
+  ;; its #+SBCL form compiled into the image as a call to SB-EXT:POSIX-GETENV.
+  nil
   "TEMPORARY DIAGNOSTIC, off unless MODUS_FAULT_DUMP is set in the build
    environment.  When on, the SIGSEGV/SIGBUS/SIGFPE/SIGILL stub's
    no-handler-active path writes its six captured diagnostic words (RIP, RSP,
@@ -1701,6 +1700,19 @@
    WRONG tag (e.g. symbol_base|1) can no longer be copied as the wrong type
    — the bug that truncated a 40-byte symbol into a 16-byte cons.")
 
+
+(defconstant +mcgc-kind-delta-addr+ #x10000F98
+  "The cons-kind bitmap's offset from the object-start bitmap's base, as the boot
+   code laid them out: hosted x64 computes it from the heap it maps at startup
+   (--dynamic-space-size), bare x64 stores *MCGC-KINDBITMAP-DELTA*.")
+
+(defun emit-x64-add-kind-delta (buf reg)
+  "add REG, [+MCGC-KIND-DELTA-ADDR+] -- REG one of RCX RSI RDI R8."
+  (multiple-value-bind (rex modrm)
+      (ecase reg (rcx (values #x48 #x0C)) (rsi (values #x48 #x34))
+                 (rdi (values #x48 #x3C)) (r8 (values #x4C #x04)))
+    (emit-bytes buf rex #x03 modrm #x25)
+    (emit-u32 buf +mcgc-kind-delta-addr+)))
 (defun emit-mcgc-set-start-bit (buf addr-reg)
   "Set the MCGC object-start bitmap bit for the object whose RAW start
    address is in ADDR-REG (a tagged-pointer's untagged base — i.e. the
@@ -1754,6 +1766,10 @@
   (entry-table nil)
   ;; GC helper label (one per translated unit)
   (gc-label nil)
+  ;; HEAP EXHAUSTED for a SIZED gc-check (:gc-check-n / :gc-check-r): one fatal
+  ;; routine per unit, called when the allocation still does not fit after the
+  ;; collection.  NIL (no re-test) where there is no hosted syscall to say so.
+  (exhausted-label nil)
   ;; Handler-stack helper labels (one per translated unit). The push helper
   ;; saves the current [#x10000180/+8/+16] state to a memory stack so nested
   ;; handler-cases don't clobber their parent's setjmp frame; the pop helper
@@ -5997,11 +6013,20 @@
                 (page-lbl (and (mcgc-pinning-on-p) (mcgc-page-gc-label)))
                 (gc-lbl (or page-lbl (translate-state-gc-label state))))
            (when gc-lbl
-             (let ((skip-label (make-label)))
+             (let ((skip-label (make-label))
+                   (ex (translate-state-exhausted-label state)))
                (emit-lea buf +scratch-reg+ 'r12 nbytes)
                (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
                (emit-jcc buf :l skip-label)
                (emit-call buf gc-lbl)
+               ;; AND AGAIN AFTER THE COLLECTION: an object that still does not fit
+               ;; would run past the limit into memory the next collection copies
+               ;; over -- silent corruption.  Say so and stop.
+               (when ex
+                 (emit-lea buf +scratch-reg+ 'r12 nbytes)
+                 (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
+                 (emit-jcc buf :l skip-label)
+                 (emit-call buf ex))
                (emit-label buf skip-label)))))
 
         ((op= +op-gc-check-r+)
@@ -6042,19 +6067,29 @@
                 (page-lbl (and (mcgc-pinning-on-p) (mcgc-page-gc-label)))
                 (gc-lbl (or page-lbl (translate-state-gc-label state))))
            (when gc-lbl
-             (let ((skip-label (make-label)))
-               (when keep (emit-push buf +scratch-reg+))
-               (if pc
-                   (emit-mov-reg-reg buf +scratch-reg+ pc)
-                   (emit-load-vreg buf vcount +scratch-reg+))
-               (if (= kind 0)
-                   (emit-shl-reg-imm buf +scratch-reg+ 3)   ; untagged slots
-                   (emit-sar-reg-imm buf +scratch-reg+ 1))  ; tagged bytes
-               (emit-add-reg-imm buf +scratch-reg+ 32)
-               (emit-add-reg-reg buf +scratch-reg+ 'r12)
-               (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
-               (emit-jcc buf :l skip-label)
-               (emit-call buf gc-lbl)
+             (let ((skip-label (make-label))
+                   (ex (translate-state-exhausted-label state)))
+               (flet ((end-of-alloc ()
+                        ;; RAX = where R12 will be after the allocation
+                        (cond (keep (emit-mov-reg-mem buf +scratch-reg+ 'rsp 0)) ; the pushed count
+                              (pc (emit-mov-reg-reg buf +scratch-reg+ pc))
+                              (t (emit-load-vreg buf vcount +scratch-reg+)))
+                        (if (= kind 0)
+                            (emit-shl-reg-imm buf +scratch-reg+ 3)   ; untagged slots
+                            (emit-sar-reg-imm buf +scratch-reg+ 1))  ; tagged bytes
+                        (emit-add-reg-imm buf +scratch-reg+ 32)
+                        (emit-add-reg-reg buf +scratch-reg+ 'r12)))
+                 (when keep (emit-push buf +scratch-reg+))
+                 (end-of-alloc)
+                 (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
+                 (emit-jcc buf :l skip-label)
+                 (emit-call buf gc-lbl)
+                 ;; and again after the collection (the :gc-check-n arm above)
+                 (when ex
+                   (end-of-alloc)
+                   (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
+                   (emit-jcc buf :l skip-label)
+                   (emit-call buf ex)))
                (emit-label buf skip-label)
                (when keep (emit-pop buf +scratch-reg+))))))
 
@@ -8163,8 +8198,7 @@
   (emit-shr-reg-imm buf 'rax 4)                 ; granule
   (emit-bytes buf #x48 #x8B #x0C #x25)          ; mov rcx, [bitmap_base]
   (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-  (emit-bytes buf #x48 #x81 #xC1)               ; add rcx, imm32 (kind delta)
-  (emit-u32 buf *mcgc-kindbitmap-delta*)
+  (emit-x64-add-kind-delta buf 'rcx)            ; add rcx, [kind delta]
   (emit-bytes buf #x48 #x0F #xAB #x01)          ; bts [rcx], rax
   (emit-pop buf 'rdx)
   (emit-pop buf 'rcx)
@@ -8197,8 +8231,7 @@
     (emit-shr-reg-imm buf 'rdx 4)                 ; granule
     (emit-bytes buf #x4C #x8B #x04 #x25)          ; mov r8, [bitmap_base]
     (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-    (emit-bytes buf #x49 #x81 #xC0)               ; add r8, imm32 (kind delta)
-    (emit-u32 buf *mcgc-kindbitmap-delta*)
+    (emit-x64-add-kind-delta buf 'r8)             ; add r8, [kind delta]
     (emit-bytes buf #x49 #x0F #xAB #x10)          ; bts [r8], rdx
     (emit-pop buf 'r8)
     (emit-pop buf 'rdx)
@@ -8227,8 +8260,7 @@
   (emit-shr-reg-imm buf 'rdx 4)                     ; granule
   (emit-bytes buf #x4C #x8B #x04 #x25)              ; mov r8, [bitmap_base]
   (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-  (emit-bytes buf #x49 #x81 #xC0)                   ; add r8, imm32 (kind delta)
-  (emit-u32 buf *mcgc-kindbitmap-delta*)
+  (emit-x64-add-kind-delta buf 'r8)                 ; add r8, [kind delta]
   (emit-bytes buf #x49 #x0F #xA3 #x10)              ; bt [r8], rdx  (CF = cons-kind bit)
   (emit-pop buf 'r8)
   (emit-pop buf 'rdx)
@@ -8973,8 +9005,7 @@
     (emit-label buf db-done)))
 
 (defvar *x64-stw-scan-mode*
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_STW_SCANMODE") #-sbcl nil))
-    (if (and v (plusp (length v))) (parse-integer v) 1))
+  1   ; MODUS_STW_SCANMODE (read by lib/load-mvm.lisp, every host)
   "Which of the pieces ported from operandi's own STW thread scan
    EMIT-X64-STW-EXTRA-ROOTS emits: bit 1 = a thread running an actor is
    scanned over the ACTOR's stack (window +0x50C0/+0x50C8), bit 2 = its
@@ -9177,7 +9208,7 @@
       (emit-label buf skip))))
 
 (defvar *x64-stw-verify*
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_STW_VERIFY") #-sbcl nil)) (if v t nil))
+  nil   ; MODUS_STW_VERIFY (read by lib/load-mvm.lisp, every host)
   "DIAGNOSTIC, off unless MODUS_STW_VERIFY is set at build time: after a
    stop-the-world collection, walk the extra roots again and count every word
    still pointing into the old from-space (table +0x68 count, +0x70 first
@@ -9294,7 +9325,7 @@
       (x64-stw-zero-bytes buf)
       (when (mcgc-kind-bitmap-on-p)
         (emit-mov-reg-reg buf 'rdi 'r10)
-        (emit-bytes buf #x48 #x81 #xC7) (emit-u32 buf *mcgc-kindbitmap-delta*)       ; add rdi, delta
+        (emit-x64-add-kind-delta buf 'rdi)                                          ; add rdi, delta
         (emit-mov-reg-reg buf 'rcx 'r11)
         (x64-stw-zero-bytes buf)))
     ;; the arena itself
@@ -9508,8 +9539,7 @@
         (emit-u32 buf +mcgc-cfg-bitmap-addr+)
         (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = object-start bit)
         (emit-jcc buf :nc scan-it)
-        (emit-bytes buf #x49 #x81 #xC0)                ; add r8, imm32 (cons-kind delta)
-        (emit-u32 buf *mcgc-kindbitmap-delta*)
+        (emit-x64-add-kind-delta buf 'r8)              ; add r8, [cons-kind delta]
         (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = cons-kind bit)
         (emit-jcc buf :c scan-it)                      ; a cons: scan its two words as before
         (emit-mov-reg-mem buf 'rsi 'r10 0)             ; rsi = header
@@ -9700,6 +9730,75 @@
     (emit-mov-mem-reg buf 'r9 'rax 24)
     (emit-label buf out)))
 
+;;; A FORWARD is the first word of a from-space object overwritten with
+;;; (new-address | #xF).  The low nibble alone does not say so: a cons's car is
+;;; a value slot, and the interpreter keeps RAW machine words as values
+;;; (interp.lisp REG-SET; its operand stack is a Lisp list), so a raw odd word
+;;; can be a car.  Taken for a forward, it returned (word & ~15) | tag -- an
+;;; address in no space -- and left the cons uncopied, its memory reused
+;;; (test/gc-raw-car.lisp; the 32-bit collectors' fix, same rule).  So a forward
+;;; must also NAME A COPY MADE THIS COLLECTION: in [to_start, R13), or with
+;;; generational GC in the old area's promotions [old_hi at entry, R12) or (a
+;;; major's phase 2, which chases it) in from-space [RBX, RCX).
+(defun emit-x64-fwd-test (buf fwd-label)
+  "RAX = the first word of the from-space object.  Jump to FWD-LABEL iff it is
+   a forward (above); fall through otherwise.  Clobbers R8 and R9 only."
+  (let ((no (make-label)) (not-to (make-label)))
+    (emit-mov-reg-reg buf 'r8 'rax)
+    (emit-and-reg-imm buf 'r8 #x0F)
+    (emit-cmp-reg-imm buf 'r8 #x0F)
+    (emit-jcc buf :ne no)
+    (emit-mov-reg-reg buf 'r8 'rax)
+    (emit-and-reg-imm buf 'r8 -16)
+    (emit-load-gc-region buf 'r9)
+    (emit-mov-reg-mem buf 'r9 'r9 modus.mvm::+gc-off-to-start+)
+    (emit-cmp-reg-reg buf 'r8 'r9)
+    (emit-jcc buf :b not-to)
+    (emit-cmp-reg-reg buf 'r8 'r13)
+    (emit-jcc buf :b fwd-label)
+    (emit-label buf not-to)
+    (when (x64-gen-gc-p)
+      (let ((not-old (make-label)))
+        (emit-test-reg-reg buf 'r12 'r12)
+        (emit-jcc buf :e not-old)
+        (%gen-load-shr1 buf 'r9 +x64-gen-old-hi-addr+)
+        (emit-cmp-reg-reg buf 'r8 'r9)
+        (emit-jcc buf :b not-old)
+        (emit-cmp-reg-reg buf 'r8 'r12)
+        (emit-jcc buf :b fwd-label)
+        (emit-label buf not-old))
+      (emit-cmp-reg-reg buf 'r8 'rbx)
+      (emit-jcc buf :b no)
+      (emit-cmp-reg-reg buf 'r8 'rcx)
+      (emit-jcc buf :b fwd-label))
+    (emit-label buf no)))
+
+(defun emit-x64-page-fwd-test (buf fwd-label)
+  "EMIT-X64-FWD-TEST for the page-based pinning collector, whose to-space is
+   this collection's TO-RUN PAGES (descriptor 3), not one range: jump to
+   FWD-LABEL iff RAX ends in #xF and names a to-run page.  Clobbers R8, R9."
+  (let ((no (make-label)))
+    (emit-mov-reg-reg buf 'r8 'rax)
+    (emit-and-reg-imm buf 'r8 #x0F)
+    (emit-cmp-reg-imm buf 'r8 #x0F)
+    (emit-jcc buf :ne no)
+    (emit-mov-reg-reg buf 'r9 'rax)
+    (emit-and-reg-imm buf 'r9 -16)
+    (emit-mov-reg-abs buf 'r8 +mcgc-cfg-page-base-addr+)
+    (emit-cmp-reg-reg buf 'r9 'r8)
+    (emit-jcc buf :b no)
+    (emit-sub-reg-reg buf 'r9 'r8)
+    (emit-shr-reg-imm buf 'r9 +mcgc-page-shift+)
+    (emit-mov-reg-abs buf 'r8 +mcgc-cfg-page-count-addr+)
+    (emit-cmp-reg-reg buf 'r9 'r8)
+    (emit-jcc buf :ae no)
+    (emit-mov-reg-abs buf 'r8 +mcgc-cfg-descriptor-addr+)
+    (emit-bytes buf #x4F #x0F #xB6 #x04 #x08)          ; movzx r8, byte [r8+r9]
+    (emit-and-reg-imm buf 'r8 3)
+    (emit-cmp-reg-imm buf 'r8 3)
+    (emit-jcc buf :e fwd-label)
+    (emit-label buf no)))
+
 (defun emit-x64-gen-copy-object (buf copy-label)
   "copy_object for a build with generational GC: the SIZE first, then the
    destination -- the old area's bump R12 when the source lies below the
@@ -9716,10 +9815,7 @@
     (emit-mov-reg-reg buf 'rsi 'rdx)
     (emit-and-reg-imm buf 'rsi -16)                   ; rsi = raw source
     (emit-mov-reg-mem buf 'rax 'rsi 0)
-    (emit-mov-reg-reg buf 'r8 'rax)
-    (emit-and-reg-imm buf 'r8 #x0F)
-    (emit-cmp-reg-imm buf 'r8 #x0F)
-    (emit-jcc buf :e fwd)                             ; already forwarded
+    (emit-x64-fwd-test buf fwd)                       ; already forwarded
     (emit-mov-reg-reg buf 'r8 'rdx)
     (emit-and-reg-imm buf 'r8 #x0F)
     (emit-cmp-reg-imm buf 'r8 1)
@@ -9857,8 +9953,7 @@
   (emit-u32 buf +mcgc-cfg-page-base-addr+)
   (emit-shr-reg-imm buf 'rax 4)
   (emit-mov-reg-abs buf 'rsi +mcgc-cfg-bitmap-addr+)
-  (emit-bytes buf #x48 #x81 #xC6)                     ; add rsi, imm32
-  (emit-u32 buf *mcgc-kindbitmap-delta*)
+  (emit-x64-add-kind-delta buf 'rsi)                  ; add rsi, [kind delta]
   (emit-bytes buf #x48 #x0F #xA3 #x06)                ; bt [rsi], rax
   (emit-jcc buf :c cons-label))
 
@@ -10191,8 +10286,7 @@
       (emit-shr-reg-imm buf 'rax 7)
       (emit-mov-reg-abs buf 'rdi +mcgc-cfg-bitmap-addr+)
       (when kind
-        (emit-bytes buf #x48 #x81 #xC7)               ; add rdi, imm32
-        (emit-u32 buf *mcgc-kindbitmap-delta*))
+        (emit-x64-add-kind-delta buf 'rdi))           ; add rdi, [kind delta]
       (emit-add-reg-reg buf 'rdi 'rax)
       (emit-mov-reg-reg buf 'rcx 'rdx)
       (emit-bytes buf #x31 #xC0)                      ; xor eax, eax
@@ -10814,8 +10908,7 @@
       (emit-shr-reg-imm buf 'rax 7)                  ; byte offset into bitmap
       (emit-bytes buf #x48 #x8B #x3C #x25)           ; mov rdi, [bitmap_base]
       (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-      (emit-bytes buf #x48 #x81 #xC7)                ; add rdi, imm32 (kind delta)
-      (emit-u32 buf *mcgc-kindbitmap-delta*)
+      (emit-x64-add-kind-delta buf 'rdi)             ; add rdi, [kind delta]
       (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
       ;; RSI = this region's control block (loaded at the swap above)
       (emit-mov-reg-mem buf 'rcx 'rsi modus.mvm::+gc-off-space-size+)
@@ -10971,12 +11064,8 @@
       ;; RDX = tagged cons ptr. Raw addr = rdx & ~0xF (same as rdx-1 for aligned ptrs)
       (emit-mov-reg-reg buf 'rsi 'rdx)
       (emit-and-reg-imm buf 'rsi -16)            ; rsi = raw addr of cons
-      ;; Check if already forwarded: [rsi] has tag 0xF?
       (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = car word
-      (emit-mov-reg-reg buf 'r8 'rax)
-      (emit-and-reg-imm buf 'r8 #x0F)
-      (emit-cmp-reg-imm buf 'r8 #x0F)
-      (emit-jcc buf :e copy-fwd)
+      (emit-x64-fwd-test buf copy-fwd)
       ;; Not forwarded. Copy 16 bytes to free_ptr (R13)
       ;; Copy car
       (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = [rsi+0] = car
@@ -11025,10 +11114,7 @@
       (emit-and-reg-imm buf 'rsi -16)            ; rsi = raw addr of object
       ;; Check if already forwarded
       (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = header word
-      (emit-mov-reg-reg buf 'r8 'rax)
-      (emit-and-reg-imm buf 'r8 #x0F)
-      (emit-cmp-reg-imm buf 'r8 #x0F)
-      (emit-jcc buf :e copy-fwd)
+      (emit-x64-fwd-test buf copy-fwd)
       ;; Not forwarded. Read element count from header.
       ;; Header = [subtag:8][unused:7][element-count:49]
       ;; Element count = header >> 8
@@ -12022,10 +12108,7 @@
       (emit-mov-reg-reg buf 'rsi 'rdx)
       (emit-and-reg-imm buf 'rsi -16)
       (emit-mov-reg-mem buf 'rax 'rsi 0)
-      (emit-mov-reg-reg buf 'r8 'rax)
-      (emit-and-reg-imm buf 'r8 #x0F)
-      (emit-cmp-reg-imm buf 'r8 #x0F)
-      (emit-jcc buf :e copy-fwd)
+      (emit-x64-page-fwd-test buf copy-fwd)
       ;; DEST overflow?  r13+16 > to_end -> refill (pop next to-run segment).
       ;; rsi(source)/rdx(orig tagged source) survive refill; OOM -> bogus.
       (emit-mov-reg-reg buf 'rax 'r13)
@@ -12064,10 +12147,7 @@
       (emit-mov-reg-reg buf 'rsi 'rdx)
       (emit-and-reg-imm buf 'rsi -16)
       (emit-mov-reg-mem buf 'rax 'rsi 0)
-      (emit-mov-reg-reg buf 'r8 'rax)
-      (emit-and-reg-imm buf 'r8 #x0F)
-      (emit-cmp-reg-imm buf 'r8 #x0F)
-      (emit-jcc buf :e copy-fwd)
+      (emit-x64-page-fwd-test buf copy-fwd)
       (emit-mov-reg-reg buf 'r8 'rax)
       (emit-shr-reg-imm buf 'r8 8)               ; r8 = element count
       ;; Byte-packed u8 vector (subtag #x11): size = align16(16 + N).  RAX
@@ -12363,6 +12443,8 @@
          (fn-entry-labels (when call-pad (make-array n-functions)))
          ;; GC trampoline label (pre-allocated so all translate-states can use it)
          (gc-trampoline-label (when *x64-gc-enabled* (make-label)))
+         ;; the sized checks' heap-exhausted routine (hosted only: it writes to stderr)
+         (exhausted-label (when (and *x64-gc-enabled* *x64-linux-mode*) (make-label)))
          ;; MCGC stage-4 page-collector trampoline label (only when pinning on).
          ;; Stashed in *mcgc-page-gc-label* so gc-check / ensure-room sites can
          ;; reach it during instruction translation below.
@@ -12441,6 +12523,7 @@
                               :function-table fn-offset-to-label
                               :entry-table fn-offset-to-entry
                               :gc-label gc-trampoline-label
+                              :exhausted-label exhausted-label
                               :handler-push-label handler-push-lbl
                               :handler-pop-label handler-pop-lbl
                               :yield-longjmp-label yield-longjmp-lbl
@@ -12575,6 +12658,11 @@
          (setq *x64-last-gc-tramp-label* gc-trampoline-label)
          (unless *x64-jit-mode*
            (format *error-output* "~&  GC trampoline emitted, %GC-COLLECT wired~%"))))
+      ;; HEAP EXHAUSTED: the sized checks' routine (translate-state-exhausted-label).
+      (when exhausted-label
+        (emit-label buf exhausted-label)
+        (emit-fatal-message buf (format nil "~%Modus: heap exhausted -- an allocation does not fit after a full collection (raise --dynamic-space-size)~%")
+                            137))
       ;; Emit the shared cons-kind-bit setter (CALLed from cons alloc sites).
       (when cons-bit-label
         (emit-mcgc-cons-bit-subroutine buf cons-bit-label))

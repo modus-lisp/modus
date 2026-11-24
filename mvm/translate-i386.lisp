@@ -735,6 +735,13 @@
 ;;;   - a ROOT WORD at +I386-NATIVE-CONST-ROOT+ the collector forwards: the
 ;;;     vector of constants runtime code loads (a heap pointer in code would
 ;;;     go stale at the first collection).
+(defparameter *i386-raw-scratch* #x600140
+  "The raw-32-bit traps' scratch (#x0330..#x0333: MMIO read/write, port read,
+   PCI config read): the raw address at +0, the raw value at +8 -- a value a
+   30-bit fixnum cannot hold passes through memory, and MEM-REF :U32 reads it
+   back whole.  #x600140 is the mini-Lisp images' (kept: they are byte-identical);
+   the bare CL image's own layout puts paged code there, so I386-SET-CL-BARE-MODE
+   moves it to #x1B0A0, low memory pc-console's block leaves free.")
 (defparameter *i386-native-tier* nil)
 (defconstant +i386-native-const-root+ #x10000FBC
   "Hosted i386: the upper half of the 64-bit ports' JIT bump word, unused here.")
@@ -2368,6 +2375,36 @@
   (i386-emit-pop-reg buf +scratch1+)
   (i386-emit-pop-reg buf +i386-eax+))
 
+(defun i386-emit-gcnative-fwd-test (buf fwd-label)
+  "EAX = the first word of a from-space cons or object.  Jump to FWD-LABEL iff
+   it is a FORWARDING word: low nibble 15 AND the address it names lies in
+   to-space.  Clobbers EDX.
+
+   THE NIBBLE ALONE IS NOT ENOUGH.  A cons's CAR is a value slot, and the
+   interpreter's registers and operand stack (interp.lisp REG-SET) hold RAW
+   machine words as values, so an odd raw word can be a car -- measured: the
+   MVM operand stack held (#x19FFFFFF . NIL).  The nibble test took that car
+   for a forward, handed back (#x19FFFFF0 | 1), an address in neither
+   semispace, and never copied the cons; its memory was reused and the
+   interpreter's stack, and every list walk under it, read garbage (the
+   intermittent 32-bit `N is not of type LIST' / memory fault, 2026-11-23).
+   A real forward names a copy made THIS collection: [to_start, ESI), ESI
+   being the free pointer (objects and conses both copy upward from it).
+   \"Anywhere in to-space\" is not tight enough -- measured: a second raw car,
+   #x197FFFFF, named an address in to-space above the free pointer."
+  (let ((no (i386-make-label)))
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-and-reg-imm buf +scratch1+ 15)
+    (i386-emit-cmp-reg-imm buf +scratch1+ 15)
+    (i386-emit-jcc buf :ne no)
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-and-reg-imm buf +scratch1+ -16)
+    (i386-emit-cmp-reg-abs buf +scratch1+ *i386-gc-to-addr*)
+    (i386-emit-jcc buf :b no)                             ; below to_start
+    (i386-emit-cmp-reg-reg buf +scratch1+ +i386-esi+)
+    (i386-emit-jcc buf :b fwd-label)                      ; below the free ptr
+    (i386-emit-label buf no)))
+
 (defun i386-emit-gcnative-copy (buf copy-label)
   "copy_object.  In: EAX = tagged from-space pointer.  Out: EAX = tagged
    to-space pointer, ESI advanced, forwarding pointer left behind.
@@ -2386,10 +2423,7 @@
 
     ;; ---- object ----
     (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 0)   ; EAX = header
-    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
-    (i386-emit-and-reg-imm buf +scratch1+ 15)
-    (i386-emit-cmp-reg-imm buf +scratch1+ 15)
-    (i386-emit-jcc buf :e c-fwd)
+    (i386-emit-gcnative-fwd-test buf c-fwd)
     ;; size -> EDX.  u8 vectors and narrow strings (#x13, a u8 vector with its
     ;; subtag rewritten) count BYTES, everything else counts WORDS.
     (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
@@ -2452,10 +2486,7 @@
     ;; ---- cons ----
     (i386-emit-label buf c-cons)
     (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 0)   ; car word
-    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
-    (i386-emit-and-reg-imm buf +scratch1+ 15)
-    (i386-emit-cmp-reg-imm buf +scratch1+ 15)
-    (i386-emit-jcc buf :e c-fwd)
+    (i386-emit-gcnative-fwd-test buf c-fwd)               ; not an odd raw car
     (i386-emit-mov-mem-reg buf +i386-esi+ 0 +i386-eax+)   ; car
     (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 4)
     (i386-emit-mov-mem-reg buf +i386-esi+ 4 +i386-eax+)   ; cdr at +4, not +8
@@ -4002,13 +4033,13 @@ modus: heap exhausted -- this machine needs more RAM
               (i386-emit-byte buf #x50)
               ;; mov eax, [0x600140]  — load raw 32-bit address
               (i386-emit-byte buf #xA1)
-              (i386-emit-u32 buf #x600140)
+              (i386-emit-u32 buf *i386-raw-scratch*)
               ;; mov eax, [eax]  — read 32-bit value from that address
               (i386-emit-byte buf #x8B)
               (i386-emit-byte buf #x00)
               ;; mov [0x600148], eax  — store raw result
               (i386-emit-byte buf #xA3)
-              (i386-emit-u32 buf #x600148)
+              (i386-emit-u32 buf (+ *i386-raw-scratch* 8))
               ;; pop eax
               (i386-emit-byte buf #x58))
              ((= code #x0331)
@@ -4018,11 +4049,11 @@ modus: heap exhausted -- this machine needs more RAM
               (i386-emit-byte buf #x51)
               ;; mov eax, [0x600140]  — load raw 32-bit address
               (i386-emit-byte buf #xA1)
-              (i386-emit-u32 buf #x600140)
+              (i386-emit-u32 buf *i386-raw-scratch*)
               ;; mov ecx, [0x600148]  — load raw 32-bit value
               (i386-emit-byte buf #x8B)
               (i386-emit-byte buf #x0D)
-              (i386-emit-u32 buf #x600148)
+              (i386-emit-u32 buf (+ *i386-raw-scratch* 8))
               ;; mov [eax], ecx  — write value to address
               (i386-emit-byte buf #x89)
               (i386-emit-byte buf #x08)
@@ -4039,12 +4070,12 @@ modus: heap exhausted -- this machine needs more RAM
               (i386-emit-byte buf #x66)       ; operand size prefix
               (i386-emit-byte buf #x8B)       ; mov r16, [disp32]
               (i386-emit-byte buf #x15)       ; mod=00 reg=DX r/m=101 (disp32)
-              (i386-emit-u32 buf #x600140)
+              (i386-emit-u32 buf *i386-raw-scratch*)
               ;; in eax, dx  — read 32-bit value from port
               (i386-emit-byte buf #xED)
               ;; mov [0x600148], eax  — store raw result
               (i386-emit-byte buf #xA3)
-              (i386-emit-u32 buf #x600148)
+              (i386-emit-u32 buf (+ *i386-raw-scratch* 8))
               ;; pop edx; pop eax
               (i386-emit-byte buf #x5A)
               (i386-emit-byte buf #x58))
@@ -4079,7 +4110,7 @@ modus: heap exhausted -- this machine needs more RAM
               (i386-emit-byte buf #xED)
               ;; mov [0x600148], eax (store raw 32-bit result)
               (i386-emit-byte buf #xA3)
-              (i386-emit-u32 buf #x600148)
+              (i386-emit-u32 buf (+ *i386-raw-scratch* 8))
               ;; Return byte 0 tagged as fixnum in EAX
               (i386-emit-byte buf #x0F)       ; movzx eax, al
               (i386-emit-byte buf #xB6)
@@ -4674,21 +4705,34 @@ modus: heap exhausted -- this machine needs more RAM
            (i386-emit-sar-reg-imm buf +scratch0+ (if (>= amt 32) 31 amt))
            (i386-store-vreg buf vd +scratch0+)))
 
-        ((op= +op-shlv+)
-         ;; (shlv Vd Vs Vc) — shift left by register count
-         ;; Load count into ECX (CL), source into EAX, SHL EAX,CL
-         (let ((vd (first operands)) (vs (second operands)) (vc (third operands)))
+        ((or (op= +op-shlv+) (op= +op-sarv+))
+         ;; (shlv/sarv Vd Vs Vc) — shift the TAGGED word Vs by the TAGGED fixnum
+         ;; count Vc: the VALUE-level contract of the interpreter, aarch64 and
+         ;; x64 (mvm.lisp :SHLV).  This arm loaded the count into CL still
+         ;; tagged, a shift by 2k, silently: compile-ash's runtime fast path
+         ;; (%COMPILE-ASH-VAR-FAST) shifts back by the same wrong count to check
+         ;; for overflow, so it never noticed.  The bare i386 native tier runs
+         ;; that path (*JIT-TARGET-ARCH* is its :X64 default there), and every
+         ;; JIT'd (ash 1 k) came out 2^(2k): brotli-pure's dictionary offsets,
+         ;; SHA-1's rotates.
+         ;; And x86 masks a 32-bit shift count to 5 bits, while that path lets
+         ;; counts up to 61 through: shifting by 40 would shift by 8 and pass the
+         ;; shift-back check.  So the shift is done in two halves, C>>1 and
+         ;; C-(C>>1), each at most 31: a left shift by 32..61 is 0 (which the
+         ;; check rejects to BIGNUM-ASH), a right shift is the sign fill.
+         ;; EAX = source, ECX = count, EDX = the second half (scratch1).
+         (let ((vd (first operands)) (vs (second operands)) (vc (third operands))
+               (left (op= +op-shlv+)))
            (i386-load-vreg buf +i386-ecx+ vc)
            (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-shl-reg-cl buf +i386-eax+)
-           (i386-store-vreg buf vd +i386-eax+)))
-
-        ((op= +op-sarv+)
-         ;; (sarv Vd Vs Vc) — arithmetic shift right by register count
-         (let ((vd (first operands)) (vs (second operands)) (vc (third operands)))
-           (i386-load-vreg buf +i386-ecx+ vc)
-           (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-sar-reg-cl buf +i386-eax+)
+           (i386-emit-sar-reg-imm buf +i386-ecx+ 1)          ; untag the count
+           (i386-emit-mov-reg-reg buf +i386-edx+ +i386-ecx+)
+           (i386-emit-shr-reg-imm buf +i386-ecx+ 1)          ; ECX = C>>1
+           (i386-emit-byte buf #x29)                         ; SUB EDX, ECX
+           (i386-emit-byte buf (i386-modrm #b11 +i386-ecx+ +i386-edx+))
+           (if left (i386-emit-shl-reg-cl buf +i386-eax+) (i386-emit-sar-reg-cl buf +i386-eax+))
+           (i386-emit-mov-reg-reg buf +i386-ecx+ +i386-edx+)
+           (if left (i386-emit-shl-reg-cl buf +i386-eax+) (i386-emit-sar-reg-cl buf +i386-eax+))
            (i386-store-vreg buf vd +i386-eax+)))
 
         ((op= +op-ldb+)
@@ -5697,6 +5741,48 @@ modus: heap exhausted -- this machine needs more RAM
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
 
+;; ---- BULK-MOVE Vdst Vdi Vsrc Vsi Vn kind / BULK-FILL Varr Vi Vn Vval kind ----
+        ;; REPLACE and FILL's inner loops (native-bulk.lisp) as REP MOVS / STOS.  Element I of
+        ;; a word vector is at Varr - 5 + 4I, byte I of a byte vector at Varr - 5 + I (as
+        ;; U8-REF); indices, counts and the fill value arrive TAGGED.  KIND 0 words, 1 bytes;
+        ;; the copy is a memmove (backward only when the destination starts inside the source).
+        ;; Every register is saved (PUSHAL): the operands are pushed through SCRATCH0, which no
+        ;; vreg lives in, then popped into the string registers.  No write barrier: i386 has
+        ;; no generational collector and bare metal has one thread.  Source: bulk.s in the
+        ;; commit that added these, `as --32'.
+        ((op= +op-bulk-move+)
+         (let ((kind (sixth operands)))
+           (unless (member kind '(0 1))
+             (error "MVM i386: BULK-MOVE kind ~D not implemented" kind))
+           (i386-emit-byte buf #x60)                                   ; pushal
+           (dolist (v (subseq operands 0 5))
+             (i386-load-vreg buf +scratch0+ v)
+             (i386-emit-push-reg buf +scratch0+))
+           (dolist (b (if (= kind 0)
+                          '(#x59 #x58 #x5E #x5A #x5F #x8D #x74 #x46 #xFB #x8D #x7C #x57 #xFB #xD1 #xF9
+                            #x39 #xF7 #x76 #x15 #x8D #x04 #x8E #x39 #xC7 #x73 #x0E #x8D #x74 #x8E #xFC
+                            #x8D #x7C #x8F #xFC #xFD #xF3 #xA5 #xFC #xEB #x03 #xFC #xF3 #xA5 #x61)
+                          '(#x59 #x58 #x5E #x5A #x5F #xD1 #xF8 #x8D #x74 #x06 #xFB #xD1 #xFA #x8D #x7C
+                            #x17 #xFB #xD1 #xF9 #x39 #xF7 #x76 #x15 #x8D #x04 #x0E #x39 #xC7 #x73 #x0E
+                            #x8D #x74 #x0E #xFF #x8D #x7C #x0F #xFF #xFD #xF3 #xA4 #xFC #xEB #x03 #xFC
+                            #xF3 #xA4 #x61)))
+             (i386-emit-byte buf b))
+           (setf *i386-last-store* nil)))
+        ((op= +op-bulk-fill+)
+         (let ((kind (fifth operands)))
+           (unless (member kind '(0 1))
+             (error "MVM i386: BULK-FILL kind ~D not implemented" kind))
+           (i386-emit-byte buf #x60)                                   ; pushal
+           (dolist (v (subseq operands 0 4))
+             (i386-load-vreg buf +scratch0+ v)
+             (i386-emit-push-reg buf +scratch0+))
+           (dolist (b (if (= kind 0)
+                          '(#x58 #x59 #x5A #x5F #x8D #x7C #x57 #xFB #xD1 #xF9 #xFC #xF3 #xAB #x61)
+                          '(#x58 #x59 #x5A #x5F #xD1 #xFA #x8D #x7C #x17 #xFB #xD1 #xF9 #xD1 #xF8 #xFC
+                            #xF3 #xAA #x61)))
+             (i386-emit-byte buf b))
+           (setf *i386-last-store* nil)))
+
         ;; ---- U8-REF Vd, Varr, Vidx ----
         ;; Byte address = (Varr - 9) + 4 + real_idx = Varr + real_idx - 5.
         ;; Vidx is TAGGED (real_idx*2); result is TAGGED (byte << 1), matching
@@ -6483,6 +6569,7 @@ modus: heap exhausted -- this machine needs more RAM
         *i386-fn-tag-3* t
         *i386-fn-align* 16
         *i386-native-code-offset* 0
+        *i386-raw-scratch* #x1B0A0
         *i386-gc-margin-addr* margin-addr
         *i386-pit-clock* tick-addr)
   (i386-set-globals-base globals-base))

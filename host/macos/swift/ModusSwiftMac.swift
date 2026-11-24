@@ -122,6 +122,7 @@ func titlesOf(_ p: UInt, _ n: UInt) -> [String] {
 
 func plainLabel(_ s: String, _ frame: CGRect, size: CGFloat = 18) -> NSTextField {
     let label = NSTextField(wrappingLabelWithString: s)
+    label.isSelectable = false            // text to read, as a phone's label is: no I-beam, no selection
     label.frame = frame
     label.font = .systemFont(ofSize: size)
     label.textColor = .white
@@ -354,6 +355,28 @@ let buttonNew: Call = { p, n, x, y, w, h in
     let handle = adopt(button)
     wire(button, handle) { _ in send("TAP", [.int(Int(handle))]) }
     return handle
+}
+
+// symbol_button_new(name, len, x, y, w, h): a button showing the SF Symbol NAME, a toggle's look: plain when off,
+// filled with the accent colour when on (symbol_button_set).  A tap is a TAP event; Lisp says whether it is on.
+let symbolButtonNew: Call = { p, n, x, y, w, h in
+    let name = text(p, n)
+    let image = NSImage(systemSymbolName: name, accessibilityDescription: name) ?? NSImage()
+    let button = NSButton(image: image, target: nil, action: nil)
+    button.bezelStyle = .rounded
+    button.frame = rect(x, y, w, h)
+    let handle = adopt(button)
+    wire(button, handle) { _ in send("TAP", [.int(Int(handle))]) }
+    return handle
+}
+
+let symbolButtonSet: Call = { h, on, _, _, _, _ in
+    guard let button = views[h] as? NSButton else { return 0 }
+    // a rounded button shows a tint on its symbol faintly at best: on is the bezel filled, as an engaged toggle is
+    button.bezelColor = on != 0 ? .controlAccentColor : nil
+    button.contentTintColor = on != 0 ? .white : nil
+    button.state = on != 0 ? .on : .off
+    return 1
 }
 
 // switch_new(on, x, y): a switch; its frame is its own size.
@@ -942,7 +965,13 @@ let imageNew: Call = { p, n, x, y, w, h in
 // plain view's subviews.
 let addChild: Call = { parent, child, _, _, _, _ in
     guard let c = views[child] else { return 0 }
-    if let content = scrollContent[parent] {
+    if let inside = windowContent[parent] {
+        // a window's: placed from its top left; a view that fills its parent (a GPU view made to) fills the window
+        inside.addSubview(c)
+        if c.autoresizingMask.contains([.width, .height]) { c.frame = inside.bounds }
+    } else if let inside = glassContent[parent] {
+        inside.addSubview(c)                // a glass panel's: its x and y are now from the panel's top left
+    } else if let content = scrollContent[parent] {
         content.addArrangedSubview(c)
     } else if let document = scrollDocuments[parent] {
         document.addSubview(c)          // a paging scroll view's pages, each at its own x (ModusSwiftMac2.swift)
@@ -1118,10 +1147,19 @@ public func modusSwiftInstall() {
     installCamera()                                // Camera.swift: a preview, frames, photos and video
     installMicrophone()                            // Microphone.swift: its samples, for Lisp
     installNowPlaying()                            // NowPlaying.swift: Now Playing and the media keys
+    installGamepad()                               // Gamepad.swift: game controllers
+    installSpatial()                               // Spatial.swift: sound placed in three dimensions
+    installNotify()                                // Notify.swift: the system's notifications
+    installLocation()                              // Location.swift: where the device is
+    installMotion()                                // Motion.swift: how the device itself is turned
+    installLink()                                  // Link.swift: messages to and from the watch
+    installChrome()                                // MacChrome.swift: glass, menus, status items
     installNative()                                // NativeMac.swift: app-grade components (an app, not the desk)
     installWindow()                                // MacWindow.swift: the window's title, chrome and size
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
+    register("ui_symbol_button_new", symbolButtonNew)
+    register("ui_symbol_button_set", symbolButtonSet)
     register("ui_switch_new", switchNew)
     register("ui_slider_new", sliderNew)
     register("ui_text_field_new", textFieldNew)

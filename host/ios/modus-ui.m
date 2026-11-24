@@ -50,6 +50,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <QuartzCore/QuartzCore.h>
+#include <sys/stat.h>
 #include <os/lock.h>
 #include <stdint.h>
 #include <string.h>
@@ -90,6 +91,29 @@ static void push_event(long type, CGPoint p) {
     os_unfair_lock_unlock(&ev_lock);
 }
 
+// A FINGER'S OWN TOUCH (type 14), beside the 1/2/3 the desk reads: which finger (a slot 0..9, held from the touch's
+// start to its end) in bits 48-51, the phase (0 began, 1 moved, 2 ended or cancelled) in bits 52-53, x and y as a
+// pointer's.  A game's two thumbs -- a stick each -- are told apart by it; the desk ignores it.
+static __unsafe_unretained UITouch *fingers[10];
+
+static void push_finger(UITouch *t, long type, CGPoint p) {
+    long slot = -1;
+    for (long i = 0; i < 10; i++) if (fingers[i] == t) { slot = i; break; }
+    if (slot < 0 && type == 1)
+        for (long i = 0; i < 10; i++) if (!fingers[i]) { fingers[i] = t; slot = i; break; }
+    if (slot < 0) return;                          // an eleventh finger, or one never seen begin
+    long phase = type == 1 ? 0 : type == 2 ? 1 : 2;
+    if (phase == 2) fingers[slot] = nil;
+    long x = (long)(p.x * UI_SCALE), y = (long)(p.y * UI_SCALE);
+    if (x < 0) x = 0; if (y < 0) y = 0;
+    if (x >= fb_w) x = fb_w - 1; if (y >= fb_h) y = fb_h - 1;
+    os_unfair_lock_lock(&ev_lock);
+    if (ev_tail - ev_head < NEV)
+        events[ev_tail++ % NEV] = ((uint64_t)phase << 52) | ((uint64_t)slot << 48) | ((uint64_t)14 << 40)
+                                | ((uint64_t)y << 20) | (uint64_t)x;
+    os_unfair_lock_unlock(&ev_lock);
+}
+
 static void push_resize(long w, long h) {
     os_unfair_lock_lock(&ev_lock);
     if (ev_tail - ev_head < NEV)
@@ -97,19 +121,20 @@ static void push_resize(long w, long h) {
     os_unfair_lock_unlock(&ev_lock);
 }
 
-static void push_keyboard(long px) {
+static __attribute__((unused)) void push_keyboard(long px) {
     os_unfair_lock_lock(&ev_lock);
     if (ev_tail - ev_head < NEV)
         events[ev_tail++ % NEV] = ((uint64_t)7 << 40) | (uint64_t)(px < 0 ? 0 : px);
     os_unfair_lock_unlock(&ev_lock);
 }
 
-static void push_key(uint32_t keysym) {
+static void push_key_as(long type, uint32_t keysym) {   // 4 a press and release, 8 a press, 9 a release
     os_unfair_lock_lock(&ev_lock);
     if (ev_tail - ev_head < NEV)
-        events[ev_tail++ % NEV] = ((uint64_t)4 << 40) | (uint64_t)keysym;
+        events[ev_tail++ % NEV] = ((uint64_t)type << 40) | (uint64_t)keysym;
     os_unfair_lock_unlock(&ev_lock);
 }
+static void push_key(uint32_t keysym) { push_key_as(4, keysym); }
 
 static uint32_t keysym_for(uint32_t cp) {
     if (cp == '\n' || cp == '\r') return 0xff0d;
@@ -121,8 +146,12 @@ static uint32_t keysym_for(uint32_t cp) {
 // THE KEYBOARD.  The view is a UIKeyInput, so it can be first responder: the on-screen keyboard
 // types into it, and so does a hardware one while the view holds focus.  Text is the image's to
 // interpret -- no autocorrection, no auto-capitals, the keys as typed.
+#if TARGET_OS_TV
+@interface ModusView : UIView <UIKeyInput>          // a TV has no clipboard and no edit menu
+#else
 @interface ModusView : UIView <UIKeyInput, UIEditMenuInteractionDelegate>
 @property(nonatomic, strong) UIEditMenuInteraction *editMenu;   // the paste menu (two-finger press)
+#endif
 @property(nonatomic) UITextAutocorrectionType autocorrectionType;
 @property(nonatomic) UITextAutocapitalizationType autocapitalizationType;
 @property(nonatomic) UITextSpellCheckingType spellCheckingType;
@@ -144,6 +173,7 @@ static uint32_t keysym_for(uint32_t cp) {
 }
 - (void)deleteBackward { push_key(0xff08); }
 
+#if !TARGET_OS_TV
 // PASTE.  The clipboard's text goes in as keys, as typing would: keysym_for makes a newline Return
 // and a tab Tab.  Cmd-V on a hardware keyboard, a Paste in the menu that a two-finger press
 // brings up (one finger stays the pointer), and the system's own paste: all come here.
@@ -185,25 +215,139 @@ static uint32_t keysym_for(uint32_t cp) {
                                         handler:^(__kindof UIAction *a) { [self paste:nil]; }];
     return [UIMenu menuWithChildren:@[ paste ]];
 }
-// A hardware keyboard's arrows and Escape never reach insertText.
-- (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)e {
-    BOOL rest = NO;
-    for (UIPress *p in presses) {
-        uint32_t ks = 0;
-        switch (p.key.keyCode) {
-        case UIKeyboardHIDUsageKeyboardLeftArrow:  ks = 0xff51; break;
-        case UIKeyboardHIDUsageKeyboardUpArrow:    ks = 0xff52; break;
-        case UIKeyboardHIDUsageKeyboardRightArrow: ks = 0xff53; break;
-        case UIKeyboardHIDUsageKeyboardDownArrow:  ks = 0xff54; break;
-        case UIKeyboardHIDUsageKeyboardEscape:     ks = 0xff1b; break;
-        default: rest = YES;
-        }
-        if (ks) push_key(ks);
+#endif
+#if TARGET_OS_TV
+// THE REMOTE.  A TV's input is presses, not touches: its arrows (the clickpad's edges) are the arrow keys, Back
+// (Menu) is Escape and Play/Pause is Space -- what the desk does with a keyboard.  The view is focusable so the
+// presses come to it.  Back is the desk's from here on: Home (the TV button) leaves the app.
+//
+// THE POINTER.  A thumb on the touch surface moves a cursor drawn over the screen, as a laptop's trackpad does: by
+// how far it slides, not where it lands, so a short stroke repeated crosses the screen.  Select is its button -- a
+// press where it points (type 1), a drag while held (2), a release (3) -- and with nothing held its moves are a
+// hover (5), as a mouse's are.  It fades after a few still seconds and comes back where it was.
+- (BOOL)canBecomeFocused { return YES; }
+static uint32_t remote_keysym(UIPress *p) {
+    switch (p.type) {
+    case UIPressTypeLeftArrow:  return 0xff51;
+    case UIPressTypeUpArrow:    return 0xff52;
+    case UIPressTypeRightArrow: return 0xff53;
+    case UIPressTypeDownArrow:  return 0xff54;
+    case UIPressTypeMenu:       return 0xff1b;
+    case UIPressTypePlayPause:  return ' ';
+    default:                    return 0;
     }
-    if (rest) [super pressesBegan:presses withEvent:e];
+}
+#define POINTER_GAIN 1.5                              // screen points a point of the surface's slide moves
+static CGPoint cursor_at;
+static CAShapeLayer *cursor_arrow;
+static BOOL select_down;
+static NSUInteger cursor_moves;                       // which move a fade belongs to: a later one cancels it
+
+static CAShapeLayer *make_arrow(void) {
+    UIBezierPath *a = [UIBezierPath bezierPath];      // a pointer's arrow, its tip at (0,0), 32 points tall
+    [a moveToPoint:CGPointMake(0, 0)];   [a addLineToPoint:CGPointMake(0, 28)];
+    [a addLineToPoint:CGPointMake(7, 21)]; [a addLineToPoint:CGPointMake(12, 32)];
+    [a addLineToPoint:CGPointMake(17, 30)]; [a addLineToPoint:CGPointMake(12, 19)];
+    [a addLineToPoint:CGPointMake(21, 19)]; [a closePath];
+    CAShapeLayer *l = [CAShapeLayer layer];
+    l.path = a.CGPath;
+    l.fillColor = UIColor.whiteColor.CGColor;
+    l.strokeColor = UIColor.blackColor.CGColor;
+    l.lineWidth = 2;
+    l.lineJoin = kCALineJoinRound;
+    l.shadowOpacity = 0.4; l.shadowRadius = 3; l.shadowOffset = CGSizeMake(1, 2);
+    l.opacity = 0;
+    return l;
+}
+- (void)showCursor {
+    if (!cursor_arrow) {
+        cursor_arrow = make_arrow();
+        cursor_at = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+        [self.layer addSublayer:cursor_arrow];
+    }
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    cursor_arrow.position = cursor_at;
+    [CATransaction commit];
+    cursor_arrow.opacity = 1;                         // implicit: the fade back in is animated
+    NSUInteger n = ++cursor_moves;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (n == cursor_moves && !select_down) cursor_arrow.opacity = 0;
+    });
+}
+- (void)slide:(UITouch *)t {
+    CGPoint p = [t locationInView:self], q = [t previousLocationInView:self];
+    CGRect b = self.bounds;
+    cursor_at.x = fmin(fmax(cursor_at.x + (p.x - q.x) * POINTER_GAIN, 0), CGRectGetMaxX(b) - 1);
+    cursor_at.y = fmin(fmax(cursor_at.y + (p.y - q.y) * POINTER_GAIN, 0), CGRectGetMaxY(b) - 1);
+    [self showCursor];
+    push_event(select_down ? 2 : 5, cursor_at);
+}
+- (void)remoteSelect:(BOOL)down {
+    if (down == select_down) return;
+    select_down = down;
+    [self showCursor];
+    push_event(down ? 1 : 3, cursor_at);
+}
+#endif
+// HELD KEYS.  A hardware keyboard's arrows and Escape (which never reach insertText) and the remote's buttons come
+// as a press (type 8) and its release (type 9), so what is held is known -- a game turns while an arrow is down.
+// Typed text stays type 4, a press and release at once.
+static uint32_t press_keysym(UIPress *p) {
+#if TARGET_OS_TV
+    if (!p.key) return remote_keysym(p);
+#endif
+    switch (p.key.keyCode) {
+    case UIKeyboardHIDUsageKeyboardLeftArrow:  return 0xff51;
+    case UIKeyboardHIDUsageKeyboardUpArrow:    return 0xff52;
+    case UIKeyboardHIDUsageKeyboardRightArrow: return 0xff53;
+    case UIKeyboardHIDUsageKeyboardDownArrow:  return 0xff54;
+    case UIKeyboardHIDUsageKeyboardEscape:     return 0xff1b;
+    default:                                   return 0;
+    }
+}
+- (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)e {
+    NSMutableSet<UIPress *> *rest = [NSMutableSet set];
+    for (UIPress *p in presses) {
+        uint32_t ks;
+#if TARGET_OS_TV
+        if (!p.key && p.type == UIPressTypeSelect) { [self remoteSelect:YES]; continue; }
+#endif
+        if ((ks = press_keysym(p))) push_key_as(8, ks); else [rest addObject:p];
+    }
+    if (rest.count) [super pressesBegan:rest withEvent:e];
+}
+// The presses the view took are not passed on: a TV's Back that reaches the application leaves the app.
+- (NSSet<UIPress *> *)pressesLetGo:(NSSet<UIPress *> *)presses {
+    NSMutableSet<UIPress *> *rest = [NSMutableSet set];
+    for (UIPress *p in presses) {
+        uint32_t ks;
+#if TARGET_OS_TV
+        if (!p.key && p.type == UIPressTypeSelect) { [self remoteSelect:NO]; continue; }
+#endif
+        if ((ks = press_keysym(p))) push_key_as(9, ks); else [rest addObject:p];
+    }
+    return rest;
+}
+- (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)e {
+    NSSet *rest = [self pressesLetGo:presses];
+    if (rest.count) [super pressesEnded:rest withEvent:e];
+}
+- (void)pressesCancelled:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)e {
+    NSSet *rest = [self pressesLetGo:presses];
+    if (rest.count) [super pressesCancelled:rest withEvent:e];
 }
 - (void)touches:(NSSet<UITouch *> *)ts type:(long)type {
-    for (UITouch *t in ts) push_event(type, [t locationInView:self]);
+    for (UITouch *t in ts) {
+#if TARGET_OS_TV
+        if (t.type == UITouchTypeIndirect) {            // the remote's touch surface: the pointer, by how far it slides
+            if (type == 2) [self slide:t];
+            continue;
+        }
+#endif
+        CGPoint p = [t locationInView:self];
+        push_event(type, p);
+        push_finger(t, type, p);
+    }
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self touches:t type:1]; }
 - (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self touches:t type:2]; }
@@ -299,6 +443,92 @@ static long wait_frame(long ms) {
     return r ? 1 : 0;
 }
 
+#if TARGET_OS_TV
+// WHAT A TV KEEPS.  A TV app's files are all in Library/Caches (the shim moves HOME there: it may not write
+// Documents), and the system empties Caches when it wants the room -- between launches, as a rule.  What stays is
+// the app's defaults, 500 KB of them while it is installed.  So what the image keeps as state -- the dot-entries
+// at the top of HOME (.glass-seats, .glass/, .operandi/ ...) and the small files at the top of Documents (Media's
+// places) -- is copied into the defaults whenever the app goes to the background and every few minutes besides,
+// and put back at launch where Caches lost them.  Media (Documents' folders), logs and the system's own caches
+// (the rest of Caches) are not kept: they are big, and a lost one is fetched or found again.
+#define KEEP_KEY @"modus.home"
+#define KEEP_FILE_MAX (64 * 1024)
+#define KEEP_TOTAL_MAX (400 * 1024)
+static dispatch_queue_t keep_queue;
+static dispatch_source_t keep_timer;   // held for the app's life
+
+static NSString *keep_home(void) {
+    const char *h = getenv("HOME");
+    return h ? [NSString stringWithUTF8String:h] : nil;
+}
+// Before the image starts (the shim's main, once HOME is Caches): each kept file that is not there now.
+void modus_keep_restore(void) {
+    @autoreleasepool {
+        NSString *home = keep_home();
+        NSDictionary *kept = [[NSUserDefaults standardUserDefaults] dictionaryForKey:KEEP_KEY];
+        if (!home || !kept) return;
+        NSFileManager *fm = NSFileManager.defaultManager;
+        long back = 0;
+        for (NSString *rel in kept) {
+            NSData *d = kept[rel];
+            NSString *p = [home stringByAppendingPathComponent:rel];
+            if (![d isKindOfClass:NSData.class] || [rel containsString:@".."] || [fm fileExistsAtPath:p]) continue;
+            [fm createDirectoryAtPath:p.stringByDeletingLastPathComponent withIntermediateDirectories:YES
+                           attributes:nil error:NULL];
+            if ([d writeToFile:p atomically:YES]) {
+                chmod(p.fileSystemRepresentation, 0600);      // some are secrets: kept as the strictest of them
+                back++;
+            }
+        }
+        if (back) NSLog(@"modus keep: %ld file(s) put back in %@", back, home);
+    }
+}
+static void keep_save(void) {
+    @autoreleasepool {
+        NSString *home = keep_home();
+        if (!home) return;
+        NSDirectoryEnumerator *en = [NSFileManager.defaultManager enumeratorAtPath:home];
+        NSMutableDictionary *keep = [NSMutableDictionary dictionary];
+        NSUInteger total = 0, left = 0;
+        for (NSString *rel in en) {
+            NSDictionary *a = en.fileAttributes;
+            BOOL dot = [rel hasPrefix:@"."], docs = [rel hasPrefix:@"Documents/"];
+            if ([a.fileType isEqual:NSFileTypeDirectory]) {
+                if (!dot && !(en.level == 1 && [rel isEqual:@"Documents"])) [en skipDescendants];
+                continue;
+            }
+            if (![a.fileType isEqual:NSFileTypeRegular] || !(dot || (docs && en.level == 2))
+                || [rel hasSuffix:@".log"]) continue;
+            unsigned long long n = a.fileSize;
+            if (n > KEEP_FILE_MAX || total + n > KEEP_TOTAL_MAX) { left++; continue; }
+            NSData *d = [NSData dataWithContentsOfFile:[home stringByAppendingPathComponent:rel]];
+            if (!d) continue;
+            keep[rel] = d;
+            total += d.length;
+        }
+        NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+        if (![[u dictionaryForKey:KEEP_KEY] isEqual:keep]) [u setObject:keep forKey:KEEP_KEY];
+        static NSUInteger said;
+        if (left && left != said) NSLog(@"modus keep: %lu file(s) too big to keep", (unsigned long)left);
+        said = left;
+    }
+}
+static void keep_start(void) {
+    keep_queue = dispatch_queue_create("modus.keep", DISPATCH_QUEUE_SERIAL);
+    for (NSNotificationName n in @[ UISceneDidEnterBackgroundNotification, UIApplicationWillTerminateNotification ])
+        [[NSNotificationCenter defaultCenter] addObserverForName:n object:nil queue:nil
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note; dispatch_sync(keep_queue, ^{ keep_save(); });   // before the app is suspended
+        }];
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, keep_queue);
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), 180 * NSEC_PER_SEC,
+                              10 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(t, ^{ keep_save(); });
+    dispatch_resume(t);
+    keep_timer = t;
+}
+#endif
+
 // Called by the shim's scene delegate, on the main thread, when UIKit connects the
 // scene.  iOS 27 traps an app that runs on the legacy app-delegate lifecycle, so the
 // window belongs to a UIWindowScene and not to the application.
@@ -328,7 +558,9 @@ void modus_ui_start(void *scene) {
     // frame when the phone turned (measured: a landscape screen showing a 402-point-wide view).
     UIViewController *vc = [[ModusViewController alloc] init];
     ModusView *v = [[ModusView alloc] initWithFrame:b];
+#if !TARGET_OS_TV
     v.multipleTouchEnabled = YES;
+#endif
     v.backgroundColor = UIColor.blackColor;
     v.layer.magnificationFilter = kCAFilterNearest;
     if (fb_surface) v.layer.contents = (__bridge id)fb_surface;
@@ -339,6 +571,10 @@ void modus_ui_start(void *scene) {
     fb_view = v;
     show_part();
     note_safe_area(v);
+#if TARGET_OS_TV
+    keep_start();
+#endif
+#if !TARGET_OS_TV   // a TV's keyboard is a screen of its own, and a TV does not turn
     // THE KEYBOARD'S FRAME, as it comes and goes (and when it changes size: emoji, a different
     // language): how much of the view it covers, in pixels, as a type-7 event.  The image lays
     // its windows out in what is left.
@@ -373,6 +609,7 @@ void modus_ui_start(void *scene) {
             });
         }
     }
+#endif
     // THE FRAME CLOCK: a display link signals FRAME_TICK once a refresh (60 or 120 Hz), and
     // WAIT-FRAME waits on it.  At most one tick is banked, so a slow frame does not let the
     // next ones run back to back.
@@ -465,8 +702,12 @@ int64_t modus_ui_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3
         NSString *s = [[NSString alloc] initWithBytes:(const void *)a0 length:(NSUInteger)a1
                                              encoding:NSUTF8StringEncoding];
         if (!s) return -22;
+#if TARGET_OS_TV
+        return -38;                                    // a TV has no pasteboard: ENOSYS
+#else
         dispatch_async(dispatch_get_main_queue(), ^{ [UIPasteboard generalPasteboard].string = s; });
         return 0;
+#endif
     }
     case 1006:
         dispatch_async(dispatch_get_main_queue(), ^{

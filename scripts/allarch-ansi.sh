@@ -32,13 +32,13 @@ ARCHES=${*:-"aarch64 i386 arm32 riscv32 riscv64"}
 # exits 127 with "passed=0 failed=0", so it is checked before anything is built.
 QEMU_USER_DIR=${QEMU_USER_DIR:-/usr/bin}
 for a in $ARCHES; do
-  q=$QEMU_USER_DIR/qemu-$(case $a in arm32) echo arm ;; *) echo "$a" ;; esac)-static
+  q=$QEMU_USER_DIR/qemu-$(case $a in arm32) echo arm ;; 68k) echo m68k ;; *) echo "$a" ;; esac)-static
   [ -x "$q" ] || { echo "allarch-ansi: no $q (set QEMU_USER_DIR)" >&2; exit 2; }
 done
 mkdir -p "$WORKDIR" || exit 2
 WORKDIR=$(cd "$WORKDIR" && pwd)
 
-qemu_for() { case $1 in arm32) echo arm ;; *) echo "$1" ;; esac; }
+qemu_for() { case $1 in arm32) echo arm ;; 68k) echo m68k ;; *) echo "$1" ;; esac; }
 
 port() { # arch: build, wrap, sweep
   local a=$1 bin=$WORKDIR/modus-$1 wrap=$WORKDIR/run-$1

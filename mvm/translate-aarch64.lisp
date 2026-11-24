@@ -641,7 +641,10 @@
   ;; mvm.lisp ISA + interp + compiler + mvm-eval) blows past 64 MB —
   ;; a64-emit doubles the array on demand (same fix class as the
   ;; 96 MB x64 code-buffer overflow found landing WS3 on x64).
-  (code (make-array 16777216))
+  ;; (UNSIGNED-BYTE 32): 4 bytes an instruction.  A generic vector is 8 -- 128 MB
+  ;; here, 256 once doubled -- and a builder running this translator has one
+  ;; fixed 896 MB semispace to hold that and the whole compile.
+  (code (make-array 16777216 :element-type '(unsigned-byte 32)))
   (labels (make-hash-table :test 'eql))
   (fixups nil)
   (position 0))
@@ -660,7 +663,7 @@
       ;; from-space, so (replace new code) would copy abandoned memory and every
       ;; instruction emitted so far would be silently lost.  Re-read the slot
       ;; AFTER the allocation.  Harmless under SBCL (precise GC fixes locals up).
-      (let ((new (make-array (* 2 (length code)))))
+      (let ((new (make-array (* 2 (length code)) :element-type '(unsigned-byte 32))))
         (setq code (a64-buffer-code buf))
         (replace new code)
         (setf (a64-buffer-code buf) new)
@@ -958,7 +961,7 @@
    allocation the loop is allocation-free (fixnum logand/ash + aref), so one
    re-ordering closes the window.  Found while landing #210 rung 1."
   (let* ((n (a64-buffer-position buf))
-         (bytes (make-array (* n 4)))
+         (bytes (make-array (* n 4) :element-type '(unsigned-byte 8)))
          (code (a64-buffer-code buf)))
     (dotimes (i n bytes)
       (let ((w (aref code i))
@@ -2852,24 +2855,46 @@
         do (a64-movz buf +a64-x16+ (char-code ch) 0)
            (a64-exhausted-put-x16 buf)))
 
-(defun emit-aarch64-gc-exhausted (buf)
-  "Print GC: HEAP EXHAUSTED and stop: exit_group(137) hosted, WFE forever on
-   bare metal.  The message NAMES THE HEAP: the semispace size of the region
-   being collected (x25), in hex -- with threads, which region ran out is the
-   first question (a phone's 16 MB and 64 MB worker regions, region 0's young
-   space), and the process ends here with nothing else said."
-  (a64-exhausted-put-string buf (format nil "~%GC: HEAP EXHAUSTED (live data > one semispace of 0x"))
-  ;; eight hex digits of x25 (space_size): x16 = (x25 << (32+4k)) >> 60, then to ASCII
+(defun a64-exhausted-put-hex (buf reg)
+  "Eight hex digits of the low 32 bits of REG, through w16: x16 = (REG << (32+4k)) >> 60,
+   then to ASCII.  REG must not be one A64-EXHAUSTED-PUT-X16 clobbers (x0-x2, x8, x15, x16,
+   x17)."
   (dotimes (k 8)
     (let ((digit (incf *mvm-label-counter*)))
-      (a64-lsl-imm buf +a64-x16+ +a64-x25+ (+ 32 (* 4 k)))
+      (a64-lsl-imm buf +a64-x16+ reg (+ 32 (* 4 k)))
       (a64-lsr-imm buf +a64-x16+ +a64-x16+ 60)
       (a64-add-imm buf +a64-x16+ +a64-x16+ 48)                          ; '0'..
       (a64-cmp-imm buf +a64-x16+ 58)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i digit :bcond)) ; < ':' : a digit
       (a64-add-imm buf +a64-x16+ +a64-x16+ 39)                          ; 'a'..'f'
       (a64-set-label buf digit)
-      (a64-exhausted-put-x16 buf)))
+      (a64-exhausted-put-x16 buf))))
+
+(defun emit-aarch64-gc-exhausted (buf)
+  "Print GC: HEAP EXHAUSTED and stop: exit_group(137) hosted, WFE forever on
+   bare metal.  Reached from COPY_OBJECT's room check (EMIT-AARCH64-GC-ROOM-CHECK):
+   x21 is to-space's free pointer, x22 its start, x15 the size that did not fit and
+   x25 the semispace's size.  The message says all three, in hex:
+
+     GC: HEAP EXHAUSTED (0x14f2c010 bytes copied, then 0x00001010 more,
+                         > one semispace of 0x157fe000 bytes)
+
+   The semispace NAMES THE HEAP -- with threads, which region ran out is the first
+   question (a phone's 16 MB and 64 MB worker regions, region 0's young space).  The
+   copied amount is what this collection found live before it stopped, so a live set
+   the size of the whole semispace reads as one, and a single object too large for
+   a small worker heap reads as that.  The first version printed the semispace
+   alone, and its live data > one semispace, over 40 MB of a program's own arrays,
+   sent a session looking for a collector bug when ~300 MB of world was live."
+  ;; x14 = the size (the bare-metal put clobbers x15), x13 = copied = free - to_start
+  (a64-mov-reg buf +a64-x14+ +a64-x15+)
+  (a64-sub-reg buf +a64-x13+ +a64-x21+ +a64-x22+ 0 0)
+  (a64-exhausted-put-string buf (format nil "~%GC: HEAP EXHAUSTED (0x"))
+  (a64-exhausted-put-hex buf +a64-x13+)
+  (a64-exhausted-put-string buf " bytes copied, then 0x")
+  (a64-exhausted-put-hex buf +a64-x14+)
+  (a64-exhausted-put-string buf " more, > one semispace of 0x")
+  (a64-exhausted-put-hex buf +a64-x25+)
   (a64-exhausted-put-string buf (format nil " bytes)~%"))
   (if *aarch64-linux-mode*
       (progn (a64-load-imm64 buf +a64-x0+ 137)
@@ -9891,8 +9916,41 @@
           (pfail   (incf *mvm-label-counter*))
           (chosen  (incf *mvm-label-counter*))
           (notcons (incf *mvm-label-counter*)))
-      (a64-cmp-imm buf +a64-x14+ 15)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-fwd :bcond))
+      ;; A FORWARD is nibble 15 AND names a copy made THIS collection: in
+      ;; to-space [x22, x21), the old area's promotions [old_hi at entry, x8),
+      ;; or (a major's phase 2, chased at co-fwd) from-space [x19, x20).  The
+      ;; nibble alone is not enough: a cons's car is a value slot and the
+      ;; interpreter keeps RAW words as values, so an odd raw car ending in #xF
+      ;; was taken for a forward and its cons never copied
+      ;; (test/gc-raw-car.lisp; translate-x64's EMIT-X64-FWD-TEST).  x16/x17
+      ;; are free here (set before their next use).
+      (let ((notfwd (incf *mvm-label-counter*)) (not-to (incf *mvm-label-counter*))
+            (not-old (incf *mvm-label-counter*)))
+        (flet ((br (cc lbl)
+                 (let ((i (a64-current-index buf))) (a64-bcond buf cc 0) (a64-add-fixup buf i lbl :bcond))))
+          (a64-cmp-imm buf +a64-x14+ 15)
+          (br +cc-ne+ notfwd)
+          (a64-lsr-imm buf +a64-x16+ +a64-x13+ 4)
+          (a64-lsl-imm buf +a64-x16+ +a64-x16+ 4)          ; x16 = the named address
+          (a64-cmp-reg buf +a64-x16+ +a64-x22+)
+          (br +cc-cc+ not-to)
+          (a64-cmp-reg buf +a64-x16+ +a64-x21+)
+          (br +cc-cc+ co-fwd)
+          (a64-set-label buf not-to)
+          (a64-cmp-imm buf +a64-x8+ 0)
+          (br +cc-eq+ not-old)
+          (a64-load-word buf +a64-x17+ +gc-old-hi-addr+)
+          (a64-asr-imm buf +a64-x17+ +a64-x17+ 1)
+          (a64-cmp-reg buf +a64-x16+ +a64-x17+)
+          (br +cc-cc+ not-old)
+          (a64-cmp-reg buf +a64-x16+ +a64-x8+)
+          (br +cc-cc+ co-fwd)
+          (a64-set-label buf not-old)
+          (a64-cmp-reg buf +a64-x16+ +a64-x19+)
+          (br +cc-cc+ notfwd)
+          (a64-cmp-reg buf +a64-x16+ +a64-x20+)
+          (br +cc-cc+ co-fwd)
+          (a64-set-label buf notfwd)))
       (a64-mov-reg buf +a64-x14+ +a64-x12+)              ; x14 = tag, kept to the end
       (a64-cmp-imm buf +a64-x12+ 1)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-cons :bcond))

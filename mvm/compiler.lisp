@@ -15586,6 +15586,27 @@
            (setq body (cdr body)))
           (t (return nil)))))
 
+;;; BISECTING IMAGE PROMOTION.  MODUS_PROMOTE_RANGE=LO,HI promotes the image's functions numbered LO..HI-1 in
+;;; compile order (nested lambdas counted), as if each declared SPEED 3; a one-function range names it on the
+;;; build's error output.  The whole image promoted miscompiled at boot; this finds where.
+(defvar *promote-range*
+  (let ((e (sb-ext:posix-getenv "MODUS_PROMOTE_RANGE")))
+    (and e (let ((c (position #\, e)))
+             (and c (cons (parse-integer e :end c) (parse-integer e :start (+ c 1))))))))
+(defvar *promote-fn-index* 0)
+
+(defun %promote-range-hit-p (name &optional params body)
+  (and *promote-range*
+       (let ((i *promote-fn-index*))
+         (setq *promote-fn-index* (+ i 1))
+         (and (<= (car *promote-range*) i) (< i (cdr *promote-range*))
+              (progn
+                (when (= (- (cdr *promote-range*) (car *promote-range*)) 1)
+                  (format *error-output* "~&PROMOTE-ONE ~d ~a~%" i name)
+                  (let ((*print-length* 12) (*print-level* 6))
+                    (format *error-output* "~&PROMOTE-ONE-FORM ~s~%~s~%" params body)))
+                t)))))
+
 (defun %promote-locals-p ()
   "Locals may live in the dedicated local registers: in a run-time compile for aarch64 (every function), and in
    an aarch64 IMAGE compile in a function that declares (OPTIMIZE (SPEED 3)) -- the runtime's own hot loops
@@ -16781,7 +16802,13 @@
        (%compile-setq-global var dest)))))
 
 (defun %setq-direct-count-occ (var f)
+  ;; AN ATOM THAT IS NOT A SYMBOL, NUMBER, CHARACTER OR STRING MAY HIDE A REFERENCE: the build host's reader
+  ;; makes `,X' inside a backquote a COMMA STRUCTURE, so (setq result `(cons ,a ,result)) counted no RESULT
+  ;; and compiled the CONS straight into RESULT's register, overwriting it before the read -- the LIST macro's
+  ;; expander built (cons 3 3) for (list 3 t 42) once image functions kept locals in registers.  Count it as
+  ;; two: unknown, so not direct.
   (cond ((and (symbolp f) f (name-equal f var)) 1)
+        ((and (atom f) (not (or (symbolp f) (numberp f) (characterp f) (stringp f)))) 2)
         ((atom f) 0)
         ((and (symbolp (car f)) (name-eq (car f) "QUOTE")) 0)
         (t (let ((s 0) (r f))
@@ -33675,7 +33702,11 @@
             (setq new-params (cons g new-params)))
           (setq new-params (cons p new-params))))
     (setq body (%rebind-boxed-params params body))
-    (let ((promote (and (not *mvm-eval-runtime-p*) (%body-speed-3-p body))))
+    ;; every image function, as every run-time compiled one (MODUS_PROMOTE_RANGE narrows it, to bisect)
+    (let ((promote (and (not *mvm-eval-runtime-p*)
+                        (if *promote-range*
+                            (or (%body-speed-3-p body) (%promote-range-hit-p name params body))
+                            t))))
       (if renames
           (%mvm-cfi-promoting promote
            name (nreverse new-params)
@@ -35057,7 +35088,10 @@
    is opportunistic: if a form runs out of temporaries with it on, the form
    is compiled again with promotion inhibited."
   (when (%conv-form-present-p form) (setq form (%conv-subst form)))
-  (if (and (%promote-locals-p) (not *promote-inhibit*))
+  ;; AN AARCH64 IMAGE COMPILE TOO: there promotion is decided per function (%PROMOTE-LOCALS-P is false between
+  ;; them), and a function promoted out of temporaries was SKIPPED -- missing from the image, not recompiled
+  ;; without promotion.  That was the "miscompile" that kept the image from promoting every function.
+  (if (and (or (%promote-locals-p) (%image-aarch64-p)) (not *promote-inhibit*))
       ;; THE RETRY STARTS WHERE THE ATTEMPT DID.  The attempt can fail anywhere
       ;; inside FORM, and the compiler state it had changed by then stayed
       ;; changed: *%DEFUN-DEFERRED* left T by an IF branch the error unwound

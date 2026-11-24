@@ -1419,6 +1419,12 @@ Linux, from source, with no clang, ld or codesign: the same Darwin-layout image 
 builder produce the same bytes.
 
 ```
+# the image (as build-macos.sh's header says; pin MODUS_BUILD_ID and MODUS_SOURCE_COMMIT for
+# identical bytes from SBCL and a builder -- unpinned, %CORE-BUILD-ID is random per build)
+MODUS_BUILD_ID=N MODUS_SOURCE_COMMIT=SHA MODUS_DARWIN=1 MODUS_CODE_BASE=7000010000 \
+MODUS_CONV_DELTA=7040000000 MODUS_HEAP_BASE=7080000000 MODUS_JIT_ARENA_BASE=7100000000 \
+MODUS_CLI_OUT=modus-darwin.elf sbcl --dynamic-space-size 16384 --script mvm/build-aarch64-cli.lisp
+# the executable
 MODUS_MACOS_IMAGE=modus-darwin.elf MODUS_MACOS_OUT=modus \
   sbcl --dynamic-space-size 4096 --script mvm/build-macos-cli.lisp     # or BUILDER --script
 python3 -I host/macos/check-macho.py modus --modus --elf modus-darwin.elf

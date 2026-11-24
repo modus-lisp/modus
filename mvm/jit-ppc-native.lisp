@@ -430,9 +430,10 @@
 ;;; Publishing, and the seams (jit-i386-native.lisp's, with its names)
 
 (defun %runtime-has-fpd-p ()
-  "The compiler's: may runtime-compiled code use the unboxed double ops?  Not
-   yet here: translate-ppc has no FP-register class."
-  nil)
+  "The compiler's: may runtime-compiled code use the unboxed float ops?  Yes:
+   translate-ppc's FP-register class (PPC-TRANSLATE-FP, F0..F11 = f14..f25).
+   The tier runs only on a classic-FPU ppc32 (hosted, the Mac)."
+  t)
 
 (defun %nppc-install (nm fn)
   "Publish FN as runtime DEFUN NM: by name and by name hash; a generic

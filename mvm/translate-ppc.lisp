@@ -1738,6 +1738,161 @@
 ;;; MVM Opcode Translation
 ;;; ============================================================
 
+;;; ============================================================
+;;; THE FP-REGISTER CLASS (mvm.lisp: fp-* single, fpd-* double)
+;;; ============================================================
+;;;
+;;; The compiler keeps a call-free float expression tree, and a float LET's
+;;; variables, UNBOXED in FP vregs F0..F11 (compiler.lisp *FP-REG-COUNTER*,
+;;; %FPD-TREE-NEED): no box, no allocation, per operation -- on a 32-bit
+;;; target every boxed double is a five-word heap object.  F0..F11 are f14..f25
+;;; here, clear of f0..f5, the boxed float ops' scratch (FSQRT uses them all).
+;;; A single-float lives in an FPR as the double it equals; every single op
+;;; rounds (the "s" forms, FRSP).  Classic-FPU ppc32 only: SPE (e500) has no
+;;; FPRs and ppc64 does not take this path yet -- there, and for the f32x4
+;;; vector and lane ops, the op is recorded unimplemented, so a runtime module
+;;; that needs one stays interpreted (jit-ppc-native).  Semantics are
+;;; interp.lisp's reference arms.
+
+(defun ppc-fpr (f)
+  "The FPR holding FP vreg F (0..11)."
+  (+ 14 f))
+
+(defparameter *ppc-fp-class-ops*
+  (list +op-fp-unbox+ +op-fp-box+ +op-fp-add+ +op-fp-sub+ +op-fp-mul+ +op-fp-div+
+        +op-fp-mov+ +op-fpd-unbox+ +op-fpd-box+ +op-fpd-add+ +op-fpd-sub+ +op-fpd-mul+
+        +op-fpd-div+ +op-fpd-itof+ +op-fpd-lt+ +op-fpd-le+ +op-fp-op1+ +op-fp-op2+
+        +op-fp-cmp+ +op-fpd-li+ +op-fp-li+ +op-fpd-scale+ +op-fp-toi+))
+
+(defparameter *ppc-fp-unimplemented-ops*
+  (list +op-fp-lane-load+ +op-fp-lane-store+ +op-v4-lane-load+ +op-v4-lane-store+
+        +op-v4-dup+ +op-v4-dup-lane-load+ +op-v4-add+ +op-v4-sub+ +op-v4-mul+ +op-v4-div+))
+
+(defun ppc-translate-fp (buf opcode operands)
+  "Emit OPCODE when it is an FP-register-class op: T, else NIL (not one)."
+  (cond
+    ((member opcode *ppc-fp-unimplemented-ops*)
+     (pushnew opcode *ppc-unimpl-opcodes*) (ppc-emit-tw buf 31 0 0) t)
+    ((not (member opcode *ppc-fp-class-ops*)) nil)
+    ((or *ppc-64-bit* (ppc-spe-p))
+     (pushnew opcode *ppc-unimpl-opcodes*) (ppc-emit-tw buf 31 0 0) t)
+    (t (%ppc-translate-fp buf opcode operands) t)))
+
+(defun %ppc-translate-fp (buf opcode operands)
+  (labels ((word (w) (ppc-emit-word buf w))
+           (a63 (xo frt fra frb frc)
+             (word (logior (ash 63 26) (ash frt 21) (ash fra 16) (ash frb 11) (ash frc 6) (ash xo 1))))
+           (a59 (xo frt fra frb frc)
+             (word (logior (ash 59 26) (ash frt 21) (ash fra 16) (ash frb 11) (ash frc 6) (ash xo 1))))
+           (x63 (xo frt frb) (ppc-emit-fp-x buf xo frt frb))
+           (fmr (d s) (unless (= d s) (x63 72 d s)))
+           (fcmpu (fa fb) (word (logior (ash 63 26) (ash fa 16) (ash fb 11))))   ; cr0
+           (mtfsfi (imm) (word (logior (ash 63 26) (ash 7 23) (ash imm 12) (ash 134 1))))
+           (f (i) (ppc-fpr (nth i operands)))
+           (src (i scratch)
+             (let* ((v (nth i operands)) (p (ppc-vreg-phys v)))
+               (or p (progn (ppc-load-vreg buf scratch v) scratch))))
+           (dst (i) (or (ppc-vreg-phys (nth i operands)) +ppc-scratch1+))
+           (fin (i pd) (unless (ppc-vreg-phys (nth i operands)) (ppc-store-vreg buf (nth i operands) pd)))
+           (arith (single xo)
+             ;; FMUL's second operand is FRC
+             (let ((fd (f 0)) (fa (f 1)) (fb (f 2)))
+               (if (= xo 25)
+                   (if single (a59 25 fd fa 0 fb) (a63 25 fd fa 0 fb))
+                   (if single (a59 xo fd fa fb 0) (a63 xo fd fa fb 0)))))
+           (compare (le)
+             ;; fixnum 1 when Fa < Fb (or <=), ordered; an unordered pair is 0
+             (let ((pd (dst 0)) (yes (mvm-make-label)))
+               (fcmpu (f 1) (f 2))
+               (ppc-emit-li buf pd 2)
+               (ppc-emit-blt buf yes)
+               (when le (ppc-emit-beq buf yes))
+               (ppc-emit-li buf pd 0)
+               (ppc-emit-label buf yes)
+               (fin 0 pd))))
+    (case opcode
+      (#.+op-fp-unbox+ (ppc-float-unbox buf (src 1 +ppc-scratch1+) (f 0)) (x63 12 (f 0) (f 0)))   ; frsp
+      (#.+op-fpd-unbox+ (ppc-float-unbox buf (src 1 +ppc-scratch1+) (f 0)))
+      (#.+op-fp-box+ (let ((pd (dst 0))) (ppc-float-box buf (f 1) pd #x64) (fin 0 pd)))
+      (#.+op-fpd-box+ (let ((pd (dst 0))) (ppc-float-box buf (f 1) pd #x60) (fin 0 pd)))
+      (#.+op-fp-add+ (arith t 21)) (#.+op-fp-sub+ (arith t 20))
+      (#.+op-fp-mul+ (arith t 25)) (#.+op-fp-div+ (arith t 18))
+      (#.+op-fpd-add+ (arith nil 21)) (#.+op-fpd-sub+ (arith nil 20))
+      (#.+op-fpd-mul+ (arith nil 25)) (#.+op-fpd-div+ (arith nil 18))
+      (#.+op-fp-mov+ (fmr (f 0) (f 1)))
+      (#.+op-fpd-itof+
+       ;; 2^52 + 2^31 + x exactly, less 2^52 + 2^31 (as op-itof)
+       (let ((ps (src 1 +ppc-scratch1+)) (fd (f 0)))
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+         (ppc-emit-srawi buf +ppc-r0+ ps 1)
+         (ppc-emit-addis buf +ppc-scratch2+ 0 #x8000)
+         (ppc-emit-xor buf +ppc-r0+ +ppc-r0+ +ppc-scratch2+)
+         (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 4)
+         (ppc-emit-stw buf +ppc-scratch2+ +ppc-r1+ 12)
+         (ppc-emit-addis buf +ppc-scratch2+ 0 #x4330)
+         (ppc-emit-stw buf +ppc-scratch2+ +ppc-r1+ 0)
+         (ppc-emit-stw buf +ppc-scratch2+ +ppc-r1+ 8)
+         (ppc-emit-lfd buf fd +ppc-r1+ 0)
+         (ppc-emit-lfd buf 1 +ppc-r1+ 8)
+         (ppc-emit-fsub buf fd fd 1)
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)))
+      (#.+op-fpd-lt+ (compare nil))
+      (#.+op-fpd-le+ (compare t))
+      (#.+op-fp-cmp+ (compare (= (nth 3 operands) 1)))
+      (#.+op-fp-op1+
+       (let ((fd (f 0)) (fs (f 1)))
+         (case (nth 2 operands)
+           ((0 1) (x63 264 fd fs))          ; fabs
+           (2 (fmr fd fs))                  ; single -> double: already exact
+           (t (x63 12 fd fs)))))            ; double -> single: frsp
+      (#.+op-fp-op2+
+       ;; max: Fb when Fb > Fa, else Fa; min: Fb when Fb < Fa, else Fa (a NaN: Fa)
+       (let ((skip (mvm-make-label)))
+         (fmr 0 (f 1))
+         (fcmpu (f 2) (f 1))
+         (if (evenp (nth 3 operands)) (ppc-emit-ble buf skip) (ppc-emit-bge buf skip))
+         (fmr 0 (f 2))
+         (ppc-emit-label buf skip)
+         (fmr (f 0) 0)))
+      ((#.+op-fpd-li+ #.+op-fp-li+)
+       (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+       (ppc-emit-li buf +ppc-scratch2+ (logand (nth 1 operands) #xFFFFFFFF))
+       (ppc-emit-stw buf +ppc-scratch2+ +ppc-r1+ 0)
+       (ppc-emit-li buf +ppc-scratch2+ (logand (nth 2 operands) #xFFFFFFFF))
+       (ppc-emit-stw buf +ppc-scratch2+ +ppc-r1+ 4)
+       (ppc-emit-lfd buf (f 0) +ppc-r1+ 0)
+       (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
+       (when (= opcode +op-fp-li+) (x63 12 (f 0) (f 0))))
+      (#.+op-fpd-scale+
+       ;; Fd *= 2^k: the double with exponent field k + 1023 (k in [-1022, 1023])
+       (let ((pk (src 1 +ppc-scratch1+)))
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+         (ppc-emit-srawi buf +ppc-r0+ pk 1)
+         (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 1023)
+         (ppc-emit-rlwinm buf +ppc-r0+ +ppc-r0+ 20 0 11)            ; << 20
+         (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 0)
+         (ppc-emit-li buf +ppc-scratch2+ 0)
+         (ppc-emit-stw buf +ppc-scratch2+ +ppc-r1+ 4)
+         (ppc-emit-lfd buf 0 +ppc-r1+ 0)
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
+         (a63 25 (f 0) (f 0) 0 0)))                                 ; fmul Fd,Fd,f0
+      (#.+op-fp-toi+
+       ;; -> fixnum: 0 round-even (FPSCR RN 0), 1 truncate (FCTIWZ), 2 floor
+       ;; (RN 3), 3 ceiling (RN 2); the compiler only asks (%FP-TOI-PLAN) when the
+       ;; declared width is a fixnum's, so the 32-bit FCTIW result fits.
+       (let ((pd (dst 0)) (k (logand (nth 2 operands) 3)) (fs (f 1)))
+         (if (= k 1)
+             (x63 15 0 fs)                                          ; fctiwz f0
+             (progn (mtfsfi (aref #(0 0 3 2) k))
+                    (x63 14 0 fs)                                   ; fctiw f0
+                    (mtfsfi 0)))
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+         (ppc-emit-stfd buf 0 +ppc-r1+ 0)
+         (ppc-emit-lwz buf +ppc-r0+ +ppc-r1+ 4)
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
+         (ppc-emit-add buf pd +ppc-r0+ +ppc-r0+)                    ; tag
+         (fin 0 pd))))))
+
 (defun ppc-translate-insn (buf opcode operands mvm-pc label-map function-table)
   "Translate a single MVM instruction to PPC64 native code.
    LABEL-MAP maps MVM bytecode offsets to PPC label IDs.
@@ -1746,7 +1901,8 @@
   ;; Labels are emitted in the main loop at the correct PC position.
   ;; mvm-pc here is new-pc (position after this instruction), used for
   ;; branch offset computation.
-
+  (when (ppc-translate-fp buf opcode operands)
+    (return-from ppc-translate-insn nil))
   (flet ((vreg-or-scratch (vreg scratch)
            "Return the physical register for VREG, or load it into SCRATCH and return SCRATCH."
            (let ((phys (ppc-vreg-phys vreg)))

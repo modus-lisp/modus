@@ -24716,7 +24716,10 @@
        (consp form) (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
        (let ((w (ignore-errors (%decl-int-width (%resolve-declared-type (cadr form)))))
              (v (caddr form)))
-         (and w (<= w 62)
+         ;; a FIXNUM's width at most: 62 bits on a 64-bit target, 31 on a 32-bit
+         ;; one (CT-FIXNUM-BITS is the magnitude, 30 there) -- a 32-bit
+         ;; translator's conversion yields 32 bits, and the result is tagged
+         (and w (<= w (min 62 (1+ (ct-fixnum-bits))))
               (consp v) (symbolp (car v)) (consp (cdr v)) (null (cddr v))
               (let ((sub (cond ((name-eq (car v) "ROUND") 0) ((name-eq (car v) "TRUNCATE") 1)
                                ((name-eq (car v) "FLOOR") 2) ((name-eq (car v) "CEILING") 3)))

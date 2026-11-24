@@ -1442,6 +1442,10 @@
             ((eq tn 'eq)      (function %eq-fn))
             ((eq tn 'eql)     (function %eql-fn))
             ((eq tn 'equalp)  (function equalp))
+            ((eq tn 'equal)   (function %equal-fn))
+            ;; A custom test (see %HT-CANONICALIZE-TEST): the function itself.
+            ((functionp tn)   tn)
+            ((and (symbolp tn) (fboundp tn)) (symbol-function tn))
             (t                (function %equal-fn))))))
 
 (declaim (overridable %publish-fence))
@@ -1644,10 +1648,11 @@
    tests; a fixnum or character not under EQUALP, so those need the test to
    be one of the other three -- by object, and anything else funcalls.)"
   (let ((cmp (%ht-keytest ht)) (cur (car ht)))
-    (if (or (symbolp key)
-            (and (or (fixnump key) (characterp key))
-                 (or (eq cmp (function %eq-fn)) (eq cmp (function %eql-fn))
-                     (eq cmp (function %equal-fn)))))
+    (if (and (or (eq cmp (function %eq-fn)) (eq cmp (function %eql-fn))
+                 (eq cmp (function %equal-fn)) (eq cmp (function equalp)))
+             (or (symbolp key)
+                 (and (or (fixnump key) (characterp key))
+                      (not (eq cmp (function equalp))))))
         (loop
           (when (null cur) (return nil))
           (let ((pair (car cur)))
@@ -3133,12 +3138,36 @@
              ((string= n "EQL") 'eql)
              ((string= n "EQUAL") 'equal)
              ((string= n "EQUALP") 'equalp)
+             ;; A test of the program's own (SBCL's :TEST extension): kept, and
+             ;; called.  It used to become EQL, so (make-hash-table :test 'ci=)
+             ;; quietly made an EQL table and every lookup by an equal key missed.
+             ((fboundp v) v)
              (t 'eql))))
     ((eql v (function %eq-fn))    'eq)
     ((eql v (function %eql-fn))   'eql)
     ((eql v (function %equal-fn)) 'equal)
     ((eql v (function equalp))    'equalp)
+    ((functionp v) v)
     (t 'eql)))
+
+(defun %ht-standard-test-p (test)
+  "T for EQ, EQL, EQUAL and EQUALP -- the tests the bucket and address indexes
+   know how to hash for.  Any other test is the program's own: its table keeps
+   no index (the holder starts :NOHASH) and every lookup is the linear scan
+   calling the test, which is correct for any equivalence and asks nothing of
+   a :HASH-FUNCTION."
+  (or (eq test 'eq) (eq test 'eql) (eq test 'equal) (eq test 'equalp)))
+
+(defun define-hash-table-test (name hash-function)
+  "SBCL's SB-EXT:DEFINE-HASH-TABLE-TEST, as a function: let NAME, a symbol fbound
+   to an equivalence predicate, be a hash table's :TEST.  Any fbound symbol already
+   is one here (see %HT-CANONICALIZE-TEST), and HASH-FUNCTION is not needed by the
+   linear scan such a table uses, so this checks its arguments and returns NAME."
+  (unless (and (symbolp name) (fboundp name))
+    (error "define-hash-table-test: ~S is not a symbol naming a function." name))
+  (unless (or (functionp hash-function) (and (symbolp hash-function) (fboundp hash-function)))
+    (error "define-hash-table-test: ~S is not a function." hash-function))
+  name)
 
 (defun make-hash-table-args (options)
   "Internal worker: parse OPTIONS plist (`(:test eq :size 100 ...)`) and
@@ -3171,7 +3200,7 @@
     ;; by %HT-EQUALP-HASH (case-folded, = numbers alike) and buckets compare
     ;; with EQUALP.  They used to be linear for good -- cl-bench's MIXBAG,
     ;; 16k mixed keys, was 840x SBCL.
-    (let ((holder (cons nil
+    (let ((holder (cons (if (%ht-standard-test-p test) nil (%ht-nohash))
                         (cons 0 (cond ((eq test 'equal) t)
                                       ((eq test 'equalp) :equalp)
                                       (t nil))))))

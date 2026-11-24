@@ -22493,7 +22493,47 @@
                  (t nil))))
         (t nil)))
 
+(defun %dotimes-direct-count-p (var count body env)
+  "COUNT is a lexical variable (frame or register) that BODY never assigns and no
+   declaration at BODY's head names, and not VAR: the loop can test it in place."
+  (and count (symbolp count) (not (eq count var))
+       (let ((b (env-lookup env count)))
+         (and b (member (binding-location b) (list :stack :reg))))
+       (null (collect-setq-vars-in-body (cons 'progn body) (list count)))
+       (eql 0 (%setq-direct-count-occ count (%leading-declares body)))))
+
+(defun %dotimes-direct-expansion (var count rest-spec body env)
+  "The DOTIMES loop reading COUNT in place (%DOTIMES-DIRECT-COUNT-P), or NIL.  The
+   runtime macro binds its own copy of every count: once a loop's variables
+   fill the local registers that copy is a frame slot, reloaded each iteration.
+   The shape is COMPILE-DOTIMES's: VAR typed from COUNT's width, the body's
+   leading declarations on VAR's LET, an implicit TAGBODY in a BLOCK NIL."
+  (when (%dotimes-direct-count-p var count body env)
+    (let ((ty (%dotimes-counter-type count env)))
+      (list 'block nil
+            (list* 'let (list (list var 0))
+                   (append
+                    (when ty (list (list 'declare (list 'type ty var))))
+                    (%leading-declares body)
+                    (list
+                     (list 'loop
+                           (list 'if (list '< var count)
+                                 (list 'progn
+                                       (cons 'tagbody (strip-declares body))
+                                       (list 'setq var (list '1+ var)))
+                                 (list 'return (if rest-spec (car rest-spec) nil)))))))))))
+
 (defun %dotimes-typed-counter (form env)
+  "%DOTIMES-DIRECT-EXPANSION of the DOTIMES FORM when its count can be read in
+   place, else %DOTIMES-TYPED-COUNTER-1's typed form, else NIL."
+  (or (and (consp form) (symbolp (car form)) (car form)
+           (= (normalize-name (car form)) #.(compute-name-hash "DOTIMES"))
+           (consp (cdr form)) (consp (cadr form)) (consp (cdr (cadr form)))
+           (symbolp (car (cadr form))) (car (cadr form))
+           (%dotimes-direct-expansion (car (cadr form)) (cadr (cadr form)) (cddr (cadr form)) (cddr form) env))
+      (%dotimes-typed-counter-1 form env)))
+
+(defun %dotimes-typed-counter-1 (form env)
   "FORM with its counter's type declared, when FORM is a DOTIMES whose count
    has a known width and whose body does not already type the counter; else
    NIL.  The image's DOTIMES is a runtime macro (runtime-cl-macros.lisp), and a
@@ -22540,7 +22580,16 @@
          ;; lexicals (gate dotimes test: (dotimes (i (return-from done x))
          ;; (declare (special x))) returns the LEXICAL x).  It used to be
          ;; re-evaluated on every iteration, too.
-         (cnt (if (integerp count-form)
+         ;; A COUNT THAT IS A LEXICAL VARIABLE nothing in the body assigns (and
+         ;; no body declaration names) is read where it is: its copy took a
+         ;; frame slot, reloaded every iteration, once the loop's variables
+         ;; filled the local registers.
+         (cnt (if (or (integerp count-form)
+                      (and count-form (symbolp count-form) (not (eq count-form var))
+                           (let ((b (env-lookup env count-form)))
+                             (and b (member (binding-location b) (list :stack :reg))))
+                           (null (collect-setq-vars-in-body (cons 'progn body) (list count-form)))
+                           (eql 0 (%setq-direct-count-occ count-form (%leading-declares body)))))
                   nil
                   (%mvm-gensym "DTCOUNT")))
          (limit (or cnt count-form)))
@@ -30969,7 +31018,11 @@
         ((not (symbolp (car form))) nil)
         (t (let ((op (symbol-name (car form))) (args (cdr form)))
              (cond
-               ((string= op "AREF")
+               ;; THE compiles to its form alone; SVREF as the AREF below
+               ((string= op "THE")
+                (and (consp args) (consp (cdr args)) (null (cddr args))
+                     (%pure-simple-expr-p (cadr args) env)))
+               ((or (string= op "AREF") (string= op "SVREF"))
                 (and (consp args) (consp (cdr args)) (null (cddr args))
                      (symbolp (car args))
                      (or (%declared-generic-array-var-p (car args) env)

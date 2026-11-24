@@ -9713,6 +9713,11 @@
                                   #.(compute-name-hash "SHIFTF")))
                         (%symbol-macro-places-rewrite form env))
                    form))
+         ;; (an optimisation: one that cannot be made leaves the form as written)
+         ;; (a THROW passing through is not its error: see the expander's guard below)
+         (form (or (handler-case (%fp-region-rewrite form env)
+                     (error () (if *catch-active* (%hc-longjmp) nil)))
+                   form))
          (form (or (%dotimes-typed-counter form env) form))
          ;; Expanders see ENV (*%MACROEXPAND-ENV*, image only).  An ERROR from an
          ;; expander becomes the form's run-time behaviour: the same condition is
@@ -22492,6 +22497,128 @@
                  ((>= w 1) (list 'integer 0 (- (ash 1 (- w 1)) 1)))
                  (t nil))))
         (t nil)))
+
+;;; ------------------------------------------------------------
+;;; FP REGIONS: float locals in registers through a call-free loop of a scope that
+;;; has calls.  A call anywhere in a scope boxes every float local in it (FP
+;;; registers are caller-clobbered), so a function whose floats are bound at its
+;;; top and which also calls COS or SIN -- cl-bench FFT: a PROG of single-floats,
+;;; the butterfly loop inside -- allocated a float for every assignment in its
+;;; innermost loop, where nothing is called.  A loop (DO, DO*, DOTIMES, DOLIST,
+;;; LOOP) that is itself call-free and uses such boxed float variables is
+;;; compiled as
+;;;     (let ((#:v1 v1) ...) (declare (type <its type> #:v1) ...)
+;;;       (let ((#:r LOOP')) (setq v1 #:v1 ...) #:r))
+;;; LOOP' the loop with each Vi renamed: the copies are a LET of their own, whose
+;;; scope is call-free, so they live in FP registers (%LET-FP-KINDS); the ones the
+;;; loop assigns are boxed back once at its end.  The rename is only done where it
+;;; is exact: the loop binds none of those names, calls no macro that is not CL's
+;;; (whose expansion could name one), and leaves only by its own end or RETURN --
+;;; no GO or RETURN-FROM past it, which would skip the copy back.  Run-time
+;;; compiles only.
+(defvar *fp-regions* t "NIL turns the FP-region rewrite off.")
+
+(defun %fp-region-loop-p (form)
+  (and (consp form) (symbolp (car form)) (car form) (%cl-symbol-p (car form))
+       (member (symbol-name (car form)) '("DO" "DO*" "DOTIMES" "DOLIST" "LOOP") :test #'string=)))
+
+(defun %fp-region-scan (form)
+  "(SYMBOLS BOUND TAGS GOS BLOCKS FROMS OK) of FORM: every symbol it mentions
+   outside QUOTE, the names it binds, the GO tags it defines and uses, the block
+   names it establishes and returns from, and NIL in OK when it holds a form the
+   rename cannot see through (a user macro, a local function or macro, an
+   extended LOOP's variables are all counted as bound)."
+  (let ((syms nil) (bound nil) (tags nil) (gos nil) (blocks nil) (froms nil) (ok t))
+    ;; every list walked as possibly improper: a LOOP destructures (X . Y)
+    (labels ((each (fn l) (loop (unless (consp l) (return nil)) (funcall fn (car l)) (setq l (cdr l))))
+             (body-tags (body) (each (lambda (x) (when (and x (or (symbolp x) (integerp x))) (push x tags))) body))
+             (bind (spec) (cond ((and spec (symbolp spec)) (push spec bound))
+                                ((consp spec) (when (and (car spec) (symbolp (car spec))) (push (car spec) bound)))))
+             (walk (f depth)
+               (cond ((> depth 200) (setq ok nil))
+                     ((and f (symbolp f)) (push f syms))
+                     ((atom f) nil)
+                     ((not (symbolp (car f))) (each (lambda (x) (walk x (1+ depth))) f))
+                     (t
+                      (let ((n (symbol-name (car f))) (cl (%cl-symbol-p (car f))))
+                        (cond
+                          ((and cl (string= n "QUOTE")) nil)
+                          ((and cl (member n '("FLET" "LABELS" "MACROLET" "SYMBOL-MACROLET" "LAMBDA" "FUNCTION")
+                                           :test #'string=))
+                           (setq ok nil))
+                          ((not cl)
+                           ;; a macro of the program's own: its expansion could name a variable
+                           (if (not (eq (%tree-expand f) f))
+                               (setq ok nil)
+                               (each (lambda (x) (walk x (1+ depth))) (cdr f))))
+                          (t
+                           (cond ((member n '("LET" "LET*" "PROG" "PROG*" "DO" "DO*") :test #'string=)
+                                  (each (function bind) (cadr f))
+                                  (when (member n '("PROG" "PROG*") :test #'string=)
+                                    (body-tags (cddr f)) (push nil blocks))
+                                  (when (member n '("DO" "DO*") :test #'string=)
+                                    (body-tags (cdddr f)) (push nil blocks)))
+                                 ((member n '("DOTIMES" "DOLIST") :test #'string=)
+                                  (when (consp (cadr f)) (bind (car (cadr f))))
+                                  (body-tags (cddr f)) (push nil blocks))
+                                 ((member n '("MULTIPLE-VALUE-BIND" "DESTRUCTURING-BIND") :test #'string=)
+                                  (labels ((all (x) (cond ((and x (symbolp x)) (push x bound))
+                                                          ((consp x) (all (car x)) (all (cdr x))))))
+                                    (all (cadr f))))
+                                 ((string= n "TAGBODY") (body-tags (cdr f)))
+                                 ((string= n "BLOCK") (push (cadr f) blocks))
+                                 ((string= n "LOOP")
+                                  (push nil blocks)
+                                  ;; an extended LOOP binds by keyword: count every
+                                  ;; symbol in it as bound
+                                  (unless (every (function consp) (cdr f))
+                                    (labels ((all (x) (cond ((and x (symbolp x)) (push x bound))
+                                                            ((consp x) (all (car x)) (all (cdr x))))))
+                                      (all (cdr f)))))
+                                 ((string= n "GO") (push (cadr f) gos))
+                                 ((string= n "RETURN-FROM") (push (cadr f) froms)))
+                           (each (lambda (x) (walk x (1+ depth))) (cdr f)))))))))
+      (walk form 0))
+    (list syms bound tags gos blocks froms ok)))
+
+(defun %fp-region-subst (form alist)
+  "FORM with each symbol of ALIST's keys replaced by its value, QUOTE left alone."
+  (cond ((and form (symbolp form)) (let ((p (assoc form alist :test #'eq))) (if p (cdr p) form)))
+        ((atom form) form)
+        ((and (symbolp (car form)) (car form) (%cl-symbol-p (car form)) (string= (symbol-name (car form)) "QUOTE")) form)
+        (t (let ((out nil) (r form))
+             (loop (cond ((consp r) (push (%fp-region-subst (car r) alist) out) (setq r (cdr r)))
+                         (t (return (let ((res (nreverse out))) (when r (setf (cdr (last res)) (%fp-region-subst r alist))) res)))))))))
+
+(defun %fp-region-rewrite (form env)
+  "FORM's FP-region rewrite (see above), or NIL."
+  (when (and *fp-regions* *mvm-eval-runtime-p* (%fp-region-loop-p form))
+    (let* ((scan (%fp-region-scan form))
+           (syms (first scan)) (bound (second scan)) (ok (seventh scan))
+           (cands nil))
+      (when ok
+        (dolist (v syms)
+          (unless (or (member v cands :test #'eq) (member v bound :test #'eq))
+            (let ((b (env-lookup env v)))
+              (when (and b (member (binding-location b) (list :stack :reg))
+                         (member (%fp-type-kind (binding-dtype b)) '(:scalar :dscalar)))
+                (push v cands)))))
+        (when (and cands
+                   ;; no GO or RETURN-FROM past the loop
+                   (every (lambda (g) (member g (third scan) :test #'eql)) (fourth scan))
+                   (every (lambda (r) (member r (fifth scan) :test #'eq)) (sixth scan))
+                   (%fp-scope-call-free-p form env 0))
+          (let* ((alist (mapcar (lambda (v) (cons v (%mvm-gensym (symbol-name v)))) (reverse cands)))
+                 (assigned (collect-setq-vars-in-body form cands))
+                 (res (%mvm-gensym "FPRGN"))
+                 (loop2 (%fp-region-subst form alist)))
+            (list* 'let (mapcar (lambda (p) (list (cdr p) (car p))) alist)
+                   (cons 'declare (mapcar (lambda (p) (list 'type (binding-dtype (env-lookup env (car p))) (cdr p))) alist))
+                   (if assigned
+                       (list (list 'let (list (list res loop2))
+                                   (cons 'setq (mapcan (lambda (v) (list v (cdr (assoc v alist :test #'eq)))) assigned))
+                                   res))
+                       (list loop2)))))))))
 
 (defun %dotimes-direct-count-p (var count body env)
   "COUNT is a lexical variable (frame or register) that BODY never assigns and no

@@ -114,7 +114,14 @@
 (defconstant +i386-cl-v-jitsz+ #x80A8
   "The native tier's code area (mvm/jit-i386-native.lisp, MODUS_I386_JIT=1): its
    size, mapped at +I386-CL-JIT-AREA+ from RAM before the heap is sized -- a
-   sixteenth of the RAM, 256 KB to 8 MB.  0: no area (no native tier).")
+   sixteenth of the RAM, 256 KB to +I386-CL-JIT-MAX+ (all the VA below the stack).  0: no area (no native tier).")
+(defconstant +i386-cl-jit-max+ (- #x18700000 #x12000000)
+  "The code area's largest size: all the VA from +I386-CL-JIT-AREA+ up to the
+   bottom of the 1 MB stack (#x18700000), ~103 MB, reached at ~1.6 GB of RAM (a
+   sixteenth).  It was 8 MB, which a whole desk does not fit: kiln t420 compiles
+   every function before it saves the core (no first-use translation pauses), and
+   8 MB ran out at 1023 of 4416 modules.  Bigger needs VA, not RAM: a code address
+   is a fixnum below 2^30, shared with the heap (#x19000000 up) and the windows.")
 (defconstant +i386-cl-jit-area+ #x12000000
   "jit-i386-native.lisp's +N386-AREA-ADDR+: the hosted layout's code area.")
 (defconstant +i386-cl-v-jitb+ #x80B0
@@ -125,9 +132,13 @@
    a machine of 32 MB or more, for the NIC drivers' state and DMA rings -- a
    device needs the physical address of what it reads (e1000.lisp's
    E1000-DMA-ADDR seam, arch-i386-cl.lisp).")
-(defconstant +i386-cl-net-va+ #x04000000
-  "The net block's VA: where arch-i386-cl.lisp has always kept the NIC and SSH
-   state (#x04000000 .. #x04400000), mapped now rather than assumed.")
+(defconstant +i386-cl-net-va+ #x0F000000
+  "The net block's VA: the NIC and SSH state and the T420's EHCI area (vessel
+   kernel/net/arch-i386-cl.lisp, src/t420-usb.lisp), #x0F000000 .. #x0F400000,
+   between the framebuffer window and the low block.  It was #x04000000, where a
+   saved core's file is mapped too (+gap above its physical address): a 57 MB core
+   (kiln t420, every function native) reached past #x04000000, and the net block
+   took the place of its native code's tail and its code store.")
 (defconstant +i386-cl-net-size+ #x400000)
 (defconstant +i386-cl-mmio-window+ #x0D000000
   "VA of a 4 MB window for device registers (a PCI BAR is far above what a
@@ -309,7 +320,7 @@
        (cons #xBF (i386l-le32-list +i386-cl-stack-top+))
        (i386cl-abs '(#x2B #x3D) +i386-cl-v-stacksz+)          ; edi = top - size
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-stacksz+) '(#xC1 #xE9 #x0C) '(:call 0 map)
-       ;; the native tier's code area, a sixteenth of the RAM (256 KB .. 8 MB);
+       ;; the native tier's code area, a sixteenth of the RAM (256 KB .. ~103 MB);
        ;; none under 16 MB, whose heap cannot spare it (measured: 6 MB QEMU and
        ;; 8 MB Bochs ran out of young space) -- runtime code stays interpreted
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-jitsz+) (i386l-le32-list 0))
@@ -324,8 +335,8 @@
                      (cons #x3D (i386l-le32-list #x40000)) '(:j8 #x73 jit-min)
                      (cons #xB8 (i386l-le32-list #x40000))
                      '(:label jit-min)
-                     (cons #x3D (i386l-le32-list #x800000)) '(:j8 #x76 jit-max)
-                     (cons #xB8 (i386l-le32-list #x800000))
+                     (cons #x3D (i386l-le32-list +i386-cl-jit-max+)) '(:j8 #x76 jit-max)
+                     (cons #xB8 (i386l-le32-list +i386-cl-jit-max+))
                      '(:label jit-max)
                      (cons #x25 (i386l-le32-list #xFFFFF000))
                      (i386cl-abs '(#xA3) +i386-cl-v-jitsz+)
@@ -334,7 +345,7 @@
                      (i386cl-abs '(#x8B #x0D) +i386-cl-v-jitsz+)
                      '(#xC1 #xE9 #x0C) '(:call 0 map)
                      '(:label jit-none))))
-       ;; the net block: 4 MB at #x04000000 on a machine of 32 MB or more,
+       ;; the net block: 4 MB at +I386-CL-NET-VA+ on a machine of 32 MB or more,
        ;; its physical address at +I386-CL-V-NETPA+ for DMA
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-netpa+) (i386l-le32-list 0))
        (cons #x81 (cons #x3D (append (i386l-le32-list +i386-cl-v-ramend+)
@@ -809,7 +820,7 @@
        ;; 16 MB of RAM there is none) skips the copy: the heap is still restored, but its
        ;; natively translated functions point at nothing there -- such a core is for
        ;; machines with the RAM of the one that saved it (kiln t420: 1 GB under QEMU, so
-       ;; the full 8 MB area, as on any machine of 128 MB or more)
+       ;; a 64 MB area, as on any machine of 1 GB or more)
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-jitb+)
        '(#x85 #xC9) '(:jcc32 #x74 core-nojit)                 ; none
        (i386cl-abs '(#x3B #x0D) +i386-cl-v-jitsz+) '(:jcc32 #x77 core-nojit)   ; ja: too big

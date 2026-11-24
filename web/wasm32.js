@@ -80,6 +80,8 @@ const F_EXEC = 0, F_GC = 1, F_CHECKED = 2, F_FAULT = 3, F_TAIL = 4, F_TRAP = 5, 
       F_CALLREQ = 7, F_DCALL = 8, F_DCALLIND = 9, F_FINISH = 10, F_SLOTFOR = 11, F_FBYTES = 12, F_SYNCIN = 13, F_LJLABEL = 14, F_DBGENTER = 15;
 // dep: Wasm-to-Wasm call depth (native stack), not mirrored in the VM.
 // cmp / ovf: the compare and overflow flags across a jump between chunks.
+const FB_BIAS = 4096;          // see LOAD
+const DIRTYOFF = !!ENV.MVM_WASM_NODIRTY;   // bisect: spill every register every time
 const GLOBALS = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc', 'dep', 'cmp', 'ovf'];
 const G_VR = 0, G_VA = 1, G_VL = 2, G_ESP = 3, G_EBP = 4, G_PC = 5, G_DEP = 6, G_CMP = 7, G_OVF = 8;
 const WDEPTH = (ENV.MVM_WASM_DEPTH && parseInt(ENV.MVM_WASM_DEPTH, 10)) || 600;
@@ -181,6 +183,10 @@ function compile(vm, entry, osr) {
 
   // 1. control-flow graph (as compileFn)
   const starts = new Set([entry]);
+  // BRANCH targets: a label only a fallthrough (a call's return point, a
+  // conditional's not-taken side) or the dispatcher after a full LOAD can
+  // reach keeps the register state it was reached with; these reset it.
+  const jtargets = new Set();
   const seen = new Set();
   const work = [entry];
   const insns = [];
@@ -195,9 +201,9 @@ function compile(vm, entry, osr) {
       if (len === 0) { W.stats.failed++; if (ENV.MVM_WASM_DEBUG) LOG(`[wasm refuse ${vm.where(entry)}: opcode 0x${op.toString(16)} len 0]\n`); return null; }
       insns.push([pc, op, len]);
       if ((op >= 0x41 && op <= 0x46) || op === 0xC7) {
-        const t = pc + len + rd32(pc + 1); starts.add(t); work.push(t); starts.add(pc + len);
-      } else if (op === 0x40) { const t = pc + len + rd32(pc + 1); starts.add(t); work.push(t); break; }
-      else if (op === 0x47 || op === 0x48) { const t = pc + len + rd32(pc + 2); starts.add(t); work.push(t); starts.add(pc + len); }
+        const t = pc + len + rd32(pc + 1); starts.add(t); jtargets.add(t); work.push(t); starts.add(pc + len);
+      } else if (op === 0x40) { const t = pc + len + rd32(pc + 1); starts.add(t); jtargets.add(t); work.push(t); break; }
+      else if (op === 0x47 || op === 0x48) { const t = pc + len + rd32(pc + 2); starts.add(t); jtargets.add(t); work.push(t); starts.add(pc + len); }
       else if (op === 0x82 || op === 0x83) break;
       else if (op === 0x80 || op === 0x81) starts.add(pc + len);
       else if (op === 0x02 && (m8[pc + 1] | (m8[pc + 2] << 8)) === 0x0510) { hasSetjmp = true; starts.add(pc + len); sjResume.push(pc + len); }
@@ -216,6 +222,7 @@ function compile(vm, entry, osr) {
   if (hasSetjmp) { resId = W.resMaps.length; W.resMaps.push(label); }
   const insnIdx = new Map(); for (let i = 0; i < insns.length; i++) insnIdx.set(insns[i][0], i);
 
+  const tCfg = performance.now(); W.stats.cfgMs = (W.stats.cfgMs || 0) + (tCfg - t0);
   // 2. code
   const LP = 0, LR = (v) => 1 + v, LCMP = 17, LOVF = 18, LFB = 19, LT1 = 20, LT2 = 21, LT3 = 22, LDEP = 23;
   const NLOCALS = 23;           // beyond the param
@@ -233,9 +240,17 @@ function compile(vm, entry, osr) {
   const ld32 = (off = 0) => { o.push(0x28, 0x02); uleb(o, off); };
   const st32 = (off = 0) => { o.push(0x36, 0x02); uleb(o, off); };
   const op1 = (b) => o.push(b);
-  const IF = () => { o.push(0x04, 0x40); nest++; };
-  const ELSE = () => o.push(0x05);
-  const END = () => { o.push(0x0B); nest--; };
+  // DIRTY: bit v set = V<v>'s local may differ from its frame home.  A spill
+  // (STOREv) stores only dirty registers; LOAD and STOREv clean them; set()
+  // dirties.  Every label starts all-dirty (any predecessor), and a block's
+  // join takes the union of its arms, so a store skipped on one arm is never
+  // taken as done after it.  Measured: spills were 59% of every module.
+  let dirty = 0xFFFF;
+  const dstack = [];
+  const IFv = (t) => { o.push(0x04, t); nest++; dstack.push({ entry: dirty, then: -1 }); };
+  const IF = () => IFv(0x40);
+  const ELSE = () => { o.push(0x05); const d = dstack[dstack.length - 1]; d.then = dirty; dirty = d.entry; };
+  const END = () => { o.push(0x0B); nest--; const d = dstack.pop(); dirty |= d.then >= 0 ? d.then : d.entry; };
   const RET = () => o.push(0x0F);
   // value of vreg v on the stack / stack into vreg v
   const get = (v) => {
@@ -244,17 +259,23 @@ function compile(vm, entry, osr) {
       case 19: return i32c(NIL); case 20: return gget(G_ESP); case 21: return gget(G_EBP); default: return gget(G_PC); }
   };
   const set = (v) => {
-    if (v < 16) return lset(LR(v));
+    if (v < 16) { dirty |= 1 << v; return lset(LR(v)); }
     switch (v) { case 16: return gset(G_VR); case 17: return gset(G_VA); case 18: return gset(G_VL);
       case 20: return gset(G_ESP); case 21: return gset(G_EBP); default: return op1(0x1A); }
   };
   // memory at (stack top address) - VBASE
   const adr = (delta = 0) => { i32c(delta - VBASE); op1(0x6A); };
-  const LOAD = (from = 0, to = 15) => { for (let v = from; v <= to; v++) { lget(LFB); ld32_neg(IX[v] * 4); lset(LR(v)); } };
+  // LFB is the frame base minus FB_BIAS, so a home's or slot's (negative)
+  // offset becomes the load/store's own unsigned immediate: 7 bytes a spill
+  // instead of 11 (spills were 59% of every module).
+  const LOAD = (from = 0, to = 15) => { for (let v = from; v <= to; v++) { lget(LFB); ld32(IX[v] * 4 + FB_BIAS); lset(LR(v)); dirty &= ~(1 << v); } };
   function ld32_neg(off) { i32c(off); op1(0x6A); ld32(); }
-  const STOREv = (from = 0, to = 15) => { for (let v = from; v <= to; v++) { lget(LFB); i32c(IX[v] * 4); op1(0x6A); lget(LR(v)); st32(); } };
+  const STOREv = (from = 0, to = 15, all = DIRTYOFF) => {
+    for (let v = from; v <= to; v++) if (all || (dirty & (1 << v))) { lget(LFB); lget(LR(v)); st32(IX[v] * 4 + FB_BIAS); dirty &= ~(1 << v); }
+  };
+  const fbArg = () => { lget(LFB); i32c(FB_BIAS); op1(0x6A); };   // the true frame base, for an import
   const setPC = (pc) => { i32c(pc); gset(G_PC); };
-  const reloadFB = () => { gget(G_EBP); i32c(-VBASE); op1(0x6A); lset(LFB); };
+  const reloadFB = () => { gget(G_EBP); i32c(-VBASE - FB_BIAS); op1(0x6A); lset(LFB); };
   // jump to label of address t: forward = br to its block, backward = dispatch
   const chunked = N > CHL;
   const chunkOf = (j) => (j / CHL) | 0;
@@ -313,7 +334,7 @@ function compile(vm, entry, osr) {
       const gT = nglob++, gS = nglob++, gF = nglob++;
       T = () => gget(gT); S = () => gget(gS); F = () => gget(gF);
       i32c(t + 2); o.push(0x2D, 0x00, 0x00); i32c(0x83); op1(0x46);
-      o.push(0x04, I32);
+      IFv(I32);
         i32c(t + 3); o.push(0x28, 0x00, 0x00); lset(LT2);
         lget(LT2); gget(gT); op1(0x47);
         IF();
@@ -323,7 +344,7 @@ function compile(vm, entry, osr) {
           gget(gS); i32c(0); op1(0x4E); IF(); lget(LT2); gset(gT); ELSE(); i32c(-1); gset(gT); END();
         END();
         gget(gT); lget(LT2); op1(0x46);
-      ELSE(); i32c(0); o.push(0x0B);
+      ELSE(); i32c(0); END();
     }
     return { T, S, F };
   };
@@ -332,7 +353,7 @@ function compile(vm, entry, osr) {
     // and the frame here (enter()), call_indirect, reload V4-V8.
     gget(G_DEP); i32c(WDEPTH); op1(0x48); op1(0x71);
     gget(G_ESP); i32c(C.STACK_ADDR + 4096 + 8); F(); op1(0x6A); op1(0x4A); op1(0x71);
-    o.push(0x04, 0x40); nest++;
+    IF();
       // [esp-4] = RET_SENTINEL; [esp-8] = ebp; ebp = esp-8; esp = ebp - fbytes
       gget(G_ESP); i32c(-8); op1(0x6A); lset(LT3);
       lget(LT3); adr(4); i32c(-1); st32();
@@ -360,7 +381,7 @@ function compile(vm, entry, osr) {
   const startChunk = (k) => {
     o = []; lo = k * CHL; hi = Math.min(N, lo + CHL) - 1;
     // every register from its home (chunk 0 too: homes past V4 are dead at entry)
-    gget(G_EBP); i32c(-VBASE); op1(0x6A); lset(LFB);
+    gget(G_EBP); i32c(-VBASE - FB_BIAS); op1(0x6A); lset(LFB);
     LOAD(); gget(G_CMP); lset(LCMP); gget(G_OVF); lset(LOVF);
     skeleton();
   };
@@ -372,13 +393,13 @@ function compile(vm, entry, osr) {
   if (chunked) startChunk(0);
   else {
   // entry
-  gget(G_EBP); i32c(-VBASE); op1(0x6A); lset(LFB);
+  gget(G_EBP); i32c(-VBASE - FB_BIAS); op1(0x6A); lset(LFB);
   if (osr) LOAD();
   else { lget(LP); op1(0x45); IF(); LOAD(0, 4); ELSE(); LOAD(); END(); }
   // A function with setjmp landings: loop $re { try { <dispatch> } catch $lj }.
   // The catch takes a longjmp to THIS frame (ebp) at one of its landings: VM
   // state back from JS, the Wasm depth back to this frame's, re-enter there.
-  if (hasSetjmp && ENV.MVM_WASM_DEBUG) { i32c(resId); lget(LFB); lget(LP); call(F_DBGENTER); }
+  if (hasSetjmp && ENV.MVM_WASM_DEBUG) { i32c(resId); fbArg(); lget(LP); call(F_DBGENTER); }
   if (hasSetjmp) { gget(G_DEP); lset(LDEP); o.push(0x03, 0x40, 0x06, 0x40); }
   skeleton();
   }
@@ -397,6 +418,8 @@ function compile(vm, entry, osr) {
       const j = label.get(pc);
       if (chunked && j > 0 && chunkOf(j) !== chunkOf(j - 1)) { endChunk(j); startChunk(chunkOf(j)); }
       o.push(0x0B); cur = j; nest = 0;      // end of block b_cur
+      if (dstack.length) throw new Error(`wasm32: unbalanced blocks at label ${pc}`);
+      if (jtargets.has(pc) || DIRTYOFF) dirty = 0xFFFF;
     }
     const b1 = m8[pc + 1], b2 = m8[pc + 2], b3 = m8[pc + 3], b4 = m8[pc + 4];
     if (NOINL.has(op)) { delegate(pc); continue; }
@@ -457,7 +480,7 @@ function compile(vm, entry, osr) {
         // overrun goes to JS, which faults.
         if (op === 0x52) { get(b2); lset(LT1); get(b3); lset(LT2); } else { i32c(0); lset(LT1); i32c(0); lset(LT2); }
         gget(G_VA); ltee(LT3); i32c(16); op1(0x6A); i32c(vm.heapEnd); op1(0x4A);
-        o.push(0x04, I32); nest++;
+        IFv(I32);
           lget(LT1); lget(LT2); call(F_CONS);
         ELSE();
           lget(LT3); i32c(16); op1(0x6A); gset(G_VA);
@@ -519,11 +542,11 @@ function compile(vm, entry, osr) {
         lget(LT1); op1(0x1B); set(b1); break;
       }
       case 0x61:
-        if (b2 === 21) { lget(LFB); i32c(slotOff(b3)); op1(0x6A); ld32(); }
+        if (b2 === 21) { lget(LFB); ld32(slotOff(b3) + FB_BIAS); }
         else { get(b2); adr(4 * b3 - 5); ld32(); }
         set(b1); break;
       case 0x62:
-        if (b1 === 21) { lget(LFB); i32c(slotOff(b2)); op1(0x6A); get(b3); st32(); }
+        if (b1 === 21) { lget(LFB); get(b3); st32(slotOff(b2) + FB_BIAS); }
         else { get(b1); adr(4 * b2 - 5); get(b3); st32(); }
         break;
       case 0x63: get(b2); i32c(15); op1(0x71); i32c(1); op1(0x74); set(b1); break;
@@ -533,11 +556,11 @@ function compile(vm, entry, osr) {
         lget(LT1); i32c(15); op1(0x71); i32c(9); op1(0x46);
         lget(LT1); i32c(TV); op1(0x47); op1(0x71);
         lget(LT1); i32c(-9 - VBASE); op1(0x6A); i32c(vm.heapEnd - VBASE); op1(0x49); op1(0x71);
-        o.push(0x04, I32);
+        IFv(I32);
         lget(LT1); adr(-9); ld32();
         if (op === 0x64) { i32c(255); op1(0x71); } else { i32c(8); op1(0x76); }
         i32c(1); op1(0x74);
-        ELSE(); i32c(0); o.push(0x0B);
+        ELSE(); i32c(0); END();
         set(b1); break;
       }
       case 0x65:
@@ -548,7 +571,7 @@ function compile(vm, entry, osr) {
           i32c(slotOff(0)); lget(LT1); i32c(4); op1(0x6C); op1(0x6B);
           i32c(-FRAME_SIZE + 4 * 129); lget(LT1); i32c(4); op1(0x6C); op1(0x6B);
           lget(LT1); i32c(129); op1(0x48); op1(0x1B);
-          op1(0x6A); ld32();
+          op1(0x6A); ld32(FB_BIAS);
         } else { get(b2); get(b3); i32c(1); op1(0x74); op1(0x6A); adr(-5); ld32(); }
         set(b1); break;
       case 0x66: get(b1); get(b2); i32c(1); op1(0x74); op1(0x6A); adr(-5); get(b3); st32(); break;
@@ -624,12 +647,12 @@ function compile(vm, entry, osr) {
         const t = rd32(pc + 1) >>> 0;
         const setup = (T, F) => {
           gget(G_EBP); F(); op1(0x6B); gset(G_ESP);
-          for (const v of [0, 1, 2, 3, 4]) { lget(LFB); i32c(IX[v] * 4); op1(0x6A); lget(LR(v)); st32(); }
+          STOREv(0, 4, true);
           T(); gset(G_PC);
         };
         if (!NOFAST && !NOTAIL) {
           const { T, S, F } = calleeCache(t);
-          o.push(0x04, 0x40); nest++;
+          IF();
             setup(T, F);
             i32c(0); S(); o.push(0x13); uleb(o, FNTYPE); o.push(0x00);
           END();
@@ -688,7 +711,7 @@ function compile(vm, entry, osr) {
     call(F_SYNCIN);
     {
       // this frame, and any label is a landing (as drive()'s RES): ask JS
-      i32c(resId); lget(LT2); lget(LFB); call(F_LJLABEL); ltee(LT1); i32c(0); op1(0x4E);
+      i32c(resId); lget(LT2); fbArg(); call(F_LJLABEL); ltee(LT1); i32c(0); op1(0x4E);
       o.push(0x04, 0x40);
         lget(LDEP); gset(G_DEP); if (!chunked) LOAD();
         lget(LT1); lset(LP);
@@ -711,8 +734,8 @@ function compile(vm, entry, osr) {
     // the entry: loop { R = chunk[LP / CHL](LP); R < -1 ? LP = -(R+2) : return R }
     const K = bodies.length, F0 = IMPORTS.length + 1;
     o = [];
-    gget(G_EBP); i32c(-VBASE); op1(0x6A); lset(LFB);
-    if (hasSetjmp && ENV.MVM_WASM_DEBUG) { i32c(resId); lget(LFB); lget(LP); call(F_DBGENTER); }
+    gget(G_EBP); i32c(-VBASE - FB_BIAS); op1(0x6A); lset(LFB);
+    if (hasSetjmp && ENV.MVM_WASM_DEBUG) { i32c(resId); fbArg(); lget(LP); call(F_DBGENTER); }
     if (hasSetjmp) { gget(G_DEP); lset(LDEP); o.push(0x03, 0x40, 0x06, 0x40); }
     o.push(0x03, 0x40);                     // loop $d
     o.push(0x02, I32);                      // block $chk (result i32)
@@ -735,6 +758,7 @@ function compile(vm, entry, osr) {
   }
   const allBodies = [entryBody, ...bodies];
 
+  const tCode = performance.now(); W.stats.codeMs = (W.stats.codeMs || 0) + (tCode - tCfg);
   // 3. module
   const mod = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
   // types: one per distinct import signature, plus the function (i32)->i32
@@ -758,16 +782,22 @@ function compile(vm, entry, osr) {
     section(mod, 6, b);
   }
   { const b = []; uleb(b, 1); str(b, 'f'); b.push(0x00); uleb(b, IMPORTS.length); section(mod, 7, b); }
-  { const b = []; uleb(b, allBodies.length);
-    for (const ob of allBodies) {
-      const body = []; uleb(body, 1); uleb(body, NLOCALS); body.push(I32); for (let k = 0; k < ob.length; k++) body.push(ob[k]);
-      uleb(b, body.length); for (let k = 0; k < body.length; k++) b.push(body[k]);
-    }
-    section(mod, 10, b); }
+  // The code section is sized first and every body copied ONCE, straight
+  // into the module's bytes: pushing each byte through three JS arrays was
+  // most of the translator's time (7.9 of 13 s on web-mvm-calls).
+  const hdrs = allBodies.map((ob) => { const h = []; uleb(h, ob.length + 3); h.push(1); uleb(h, NLOCALS); h.push(I32); return h; });
+  let codeLen = 0; { const t = []; uleb(t, allBodies.length); codeLen = t.length; }
+  for (let k = 0; k < allBodies.length; k++) codeLen += hdrs[k].length + allBodies[k].length;
+  mod.push(10); uleb(mod, codeLen); uleb(mod, allBodies.length);
+  const bytes = new Uint8Array(mod.length + codeLen - (() => { const t = []; uleb(t, allBodies.length); return t.length; })());
+  bytes.set(mod, 0);
+  { let at = mod.length;
+    for (let k = 0; k < allBodies.length; k++) { bytes.set(hdrs[k], at); at += hdrs[k].length; bytes.set(allBodies[k], at); at += allBodies[k].length; }
+    if (at !== bytes.length) throw new Error(`wasm32: module size ${at} != ${bytes.length}`); }
 
   let inst;
   const tA = performance.now();
-  try { const mm = new WebAssembly.Module(new Uint8Array(mod)); const tB = performance.now(); W.stats.modMs = (W.stats.modMs || 0) + (tB - tA); inst = new WebAssembly.Instance(mm, W.imports); W.stats.instMs = (W.stats.instMs || 0) + (performance.now() - tB); W.stats.emitMs = (W.stats.emitMs || 0) + (tA - t0); }
+  try { const mm = new WebAssembly.Module(bytes); const tB = performance.now(); W.stats.modMs = (W.stats.modMs || 0) + (tB - tA); inst = new WebAssembly.Instance(mm, W.imports); W.stats.instMs = (W.stats.instMs || 0) + (performance.now() - tB); W.stats.emitMs = (W.stats.emitMs || 0) + (tA - t0); }
   catch (e) { W.stats.failed++; if (ENV.MVM_WASM_DEBUG && W.stats.failed < 6) LOG(`[wasm compile ${vm.where(entry)}: ${e.message}]\n`); return null; }
   if (hasSetjmp) W.stats.sj = (W.stats.sj || 0) + 1;
   const run = inst.exports.f;
@@ -804,7 +834,7 @@ function compile(vm, entry, osr) {
   if (hasSetjmp) { fn.RES = {}; for (const [pc, l] of label) fn.RES[pc] = l; }
   fn.ENTRYL = label.get(entry);
   fn.wexp = run;
-  W.stats.fns++; W.stats.bytes += mod.length;
+  W.stats.fns++; W.stats.bytes += bytes.length;
   W.stats.ms += (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
   return fn;
 }

@@ -90,6 +90,33 @@
     (mapcar (lambda (k) (+ y (float k 1d0))) '(1 2 3))))
 (check "closure over a double" (closure-float 1.5d0) '(4d0 5d0 6d0))
 
+;; = and /= of two floats: two FP compares (%FP-EQUAL-REWRITE).  Zeros of either sign are =, a NaN is = to nothing
+;; (and /= to everything), as SBCL has them.
+(defun f32-of-bits (b)
+  #+sbcl (sb-kernel:make-single-float (if (>= b #x80000000) (- b #x100000000) b))
+  #+modus (let ((a (make-array 1 :element-type 'single-float))) (modus-int::%f32-bits-set a 0 b) (aref a 0)))
+(defk eqs (a i j)
+  (declare (type (simple-array single-float (*)) a) (type fixnum i j) (optimize (speed 3) (safety 0)))
+  (let ((x (aref a i)) (y (aref a j))) (declare (type single-float x y))
+    (list (= x y) (/= x y) (if (= x y) :eq :ne) (if (/= x y) :ne :eq))))
+(defk eqd (x y)
+  (declare (type double-float x y) (optimize (speed 3) (safety 0)))
+  (list (= x y) (/= x y) (if (/= x y) :ne :eq)))
+(let ((a (make-array 7 :element-type 'single-float)))
+  (setf (aref a 0) 0.0 (aref a 1) -0.0 (aref a 2) 1.5 (aref a 3) (f32-of-bits #x7FC00000)
+        (aref a 4) (f32-of-bits #x7F800000) (aref a 5) (f32-of-bits #xFF800000) (aref a 6) 1.5)
+  (check "f32 = /="
+         (loop for i below 7 nconc
+           (loop for j below 7
+                 for want = (let ((e (if (or (= i 3) (= j 3)) nil (= (aref a i) (aref a j)))))
+                              (list e (not e) (if e :eq :ne) (if e :eq :ne)))
+                 unless (equal (eqs a i j) want) collect (list i j (eqs a i j))))
+         nil)
+  (check "f32 NaN /= itself" (eqs a 3 3) '(nil t :ne :ne)))
+(check "f64 = /=" (list (eqd 0d0 -0d0) (eqd 1d0 2d0) (eqd 2.5d0 2.5d0)) '((t nil :eq) (nil t :ne) (t nil :eq)))
+(check "f32 = no call" (calls-in 'eqs) 0)
+(check "f64 = no call" (calls-in 'eqd) 0)
+
 ;; LOG of a single: SBCL's bits
 (defun single-bits (f)
   #+sbcl (sb-kernel:single-float-bits f)

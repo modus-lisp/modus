@@ -10514,6 +10514,9 @@
       ;; prologue correctly (same path #'fn funcall uses).
       ((null op-name)
        (compile-funcall form env dest))
+      ;; = / /= of two float trees: in FP registers (%FP-EQUAL-REWRITE)
+      ((and (symbolp op) (%fp-equal-rewrite form env))
+       (compile-form (%fp-equal-rewrite form env) env dest))
       ;; (MOD X 2^k) of a fixnum: LOGAND (%MOD-POW2-REWRITE)
       ((and (symbolp op) (%mod-pow2-rewrite form env))
        (compile-form (%mod-pow2-rewrite form env) env dest))
@@ -13410,6 +13413,9 @@
     ;; every multiplier of every MatMul.
     ((%fp-sign-test test env)
      (%compile-test-branch (%fp-sign-test test env) env dest false-label))
+    ;; = / /= of two float trees: ordered both ways (%FP-EQUAL-REWRITE)
+    ((%fp-equal-rewrite test env)
+     (%compile-test-branch (%fp-equal-rewrite test env) env dest false-label))
     ;; two float trees: FP registers (COMPILE-COMPARE-2's path).  The fixnum
     ;; branches below box a double literal on every evaluation and call the
     ;; generic comparison -- (< -707d0 xd) allocated 48 bytes
@@ -16031,6 +16037,9 @@
                                  ((%declared-generic-array-var-p (cadr place) env)
                                   (%fp-scope-call-free-p val env (1+ depth)))
                                  (t nil))))))
+              ;; = / /= of two float trees compile as two FP compares
+              ((and (or (string= n "=") (string= n "/=")) (%fp-equal-rewrite form env))
+               (%fp-scope-call-free-p (%fp-equal-rewrite form env) env (1+ depth)))
               ;; (MOD X 2^k) of a fixnum compiles as LOGAND
               ((and (string= n "MOD") (%mod-pow2-rewrite form env))
                (%fp-scope-call-free-p (%mod-pow2-rewrite form env) env (1+ depth)))
@@ -27289,6 +27298,21 @@
               (cond ((name-eq (car test) "ZEROP") (list 'and (list '>= x zero) (list '<= x zero)))
                     ((name-eq (car test) "PLUSP") (list '> x zero))
                     (t (list '< x zero)))))))
+
+(defun %fp-equal-rewrite (form env)
+  "(AND (<= A B) (>= A B)) for a two-operand CL:= of two float trees that fit the FP registers, and its NOT for
+   CL:/=; else NIL.  Equal is ordered both ways: true for 0.0 and -0.0, false when either is a NaN -- as = and
+   /= are (/= of a NaN is true).  The trees are evaluated twice, which call-free trees allow (%FP-SIGN-TEST's
+   ZEROP does the same).  = and /= went through %CHECKED-EQ and the generic NUMERIC-EQUAL-P, a call in the
+   middle of the scope: mill's convolutions ask (/= weight 0f0) of every tap at a padded edge."
+  (and (consp form) (symbolp (car form)) (car form)
+       (eq (symbol-package (car form)) (find-package "COMMON-LISP"))
+       (or (string= (symbol-name (car form)) "=") (string= (symbol-name (car form)) "/="))
+       (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+       (let ((a (cadr form)) (b (caddr form)))
+         (and (%fp-compare-kind :ble a b env)
+              (let ((eqf (list 'and (list '<= a b) (list '>= a b))))
+                (if (string= (symbol-name (car form)) "=") eqf (list 'not eqf)))))))
 
 (defun %fp-compare-test-p (test env)
   "T when TEST is (< a b), (> a b), (<= a b) or (>= a b) of two float trees."

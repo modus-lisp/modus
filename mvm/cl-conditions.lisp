@@ -1456,6 +1456,15 @@
         (frame-idx 0)
         (skip *handler-bind-effective-skip*))
     (declare (ignore type-name))
+    ;; *BREAK-ON-SIGNALS* (CLHS 9.1.4.1): a condition of that type enters BREAK before any
+    ;; handler is consulted, with the variable bound to NIL so BREAK's own signals do not
+    ;; re-enter it.  Not for the restart transfers above: they are control flow, not conditions
+    ;; anybody signalled.
+    (let ((bos (if (boundp '*break-on-signals*) (symbol-value '*break-on-signals*) nil)))
+      (when (and bos (not internal) (%type-matches-condition-p bos cond-obj))
+        (let ((*break-on-signals* nil))
+          (declare (special *break-on-signals*))
+          (break "~A~%BREAK was entered because of *BREAK-ON-SIGNALS* (now NIL)." cond-obj))))
     ;; Skip the inhibited leading frames.
     (loop
       (when (or (null cur) (>= frame-idx skip)) (return nil))
@@ -2631,12 +2640,30 @@
     style-warning type-error unbound-slot unbound-variable
     undefined-function warning))
 
+;;; SB-EXT:*INVOKE-DEBUGGER-HOOK*, when the SB-EXT shim is loaded: the hook SBCL runs ahead of
+;;; *DEBUGGER-HOOK*, and the one BREAK runs, since BREAK binds *DEBUGGER-HOOK* to NIL.  Found by
+;;; name at the call because the kernel is built without the shim.
+(defun %invoke-debugger-hook ()
+  (let* ((p (find-package "SB-EXT"))
+         (s (and p (find-symbol "*INVOKE-DEBUGGER-HOOK*" p))))
+    (and s (boundp s) (symbol-value s))))
+
+(defun %call-invoke-debugger-hook (condition)
+  "Run SB-EXT:*INVOKE-DEBUGGER-HOOK* on CONDITION, bound to NIL while it runs, as SBCL does.
+   True when there was one (it returned); NIL when there is none."
+  (let ((hook (%invoke-debugger-hook)))
+    (when hook
+      (progv (list (find-symbol "*INVOKE-DEBUGGER-HOOK*" (find-package "SB-EXT"))) (list nil)
+        (funcall hook condition hook))
+      t)))
+
 ;;; invoke-debugger stub
 (defun invoke-debugger (condition)
   "Calls *DEBUGGER-HOOK* first, with it bound to NIL (CLHS; INVOKE-DEBUGGER.1);
    then, as there is no debugger, signals.  Publishes CONDITION first: the
    longjmp's landing handler-case dispatches on *CURRENT-CONDITION*, and
    leaving the previous one there reported (and matched) a stale condition."
+  (%call-invoke-debugger-hook condition)
   (let ((hook (if (boundp '*debugger-hook*) (symbol-value '*debugger-hook*) nil)))
     (when hook
       (let ((*debugger-hook* nil))

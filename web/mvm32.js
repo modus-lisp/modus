@@ -1516,9 +1516,12 @@ class MVM {
     // the collector's stack scan, a dynamic-index AREF on VFP and a re-entry
     // read it there -- and nothing has to be stored before a call.  The
     // locals are reloaded wherever the registers are (entry, after a
-    // collection, a trap or a delegated instruction).  Off: MVM_NO_SLOT_LOCALS.
+    // collection, a trap or a delegated instruction).  OFF BY DEFAULT
+    // (MVM_SLOT_LOCALS=1 turns it on): on benchmark loops it measured within
+    // noise, and loading cl-bench it cost ~5% CPU (the reloads make every
+    // translated function bigger for V8 to compile).
     const slotSet = new Set();
-    if (!DBG.MVM_NO_SLOT_LOCALS)
+    if (DBG.MVM_SLOT_LOCALS && !DBG.MVM_NO_SLOT_LOCALS)
       for (const [pc, op] of insns) {
         if (op === 0x61 && m8[pc + 2] === 21) slotSet.add(m8[pc + 3]);
         else if (op === 0x62 && m8[pc + 1] === 21) slotSet.add(m8[pc + 2]);

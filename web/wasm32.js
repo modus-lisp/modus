@@ -51,7 +51,7 @@ const I32 = 0x7f, I64 = 0x7e, F64 = 0x7c;
 // imports, in index order: [name, params, results]
 const IMPORTS = [
   ['exec', [I32], [I32]],            // 0 delegate pc -> vm.cmp
-  ['gc', [I32], []],                 // 1
+  ['gc', [I32, I32], []],            // 1: (pc, bytes the allocation after it needs)
   ['checked', [I32, I32, I32], [I32]], // 2 op a b -> result
   ['fault', [I32], []],              // 3 pc (throws)
   ['tail', [I32], []],               // 4 t
@@ -118,7 +118,7 @@ function state(vm) {
   };
   const f = {
     exec(pc) { if (W_OPS) W_OPS[vm.m8[pc]]++; syncOut(); vm.execInsn(pc); syncIn(); return vm.cmp; },
-    gc(pc) { syncOut(); vm.pc = pc; vm.gc(); syncIn(); },
+    gc(pc, need) { syncOut(); vm.pc = pc; vm.gc(need >>> 0); syncIn(); },
     checked(op, a, b) { syncOut(); const r = vm.checked(op, a, b); syncIn(); return r; },
     fault(pc) { syncOut(); vm.pc = pc; vm.memFault('car/cdr/rplac of non-cons'); },
     tail(t) { syncOut(); vm.doTailcall(t); syncIn(); },
@@ -690,15 +690,17 @@ function compile(vm, entry, osr) {
         // 64 bits so a huge count cannot wrap past the check.
         get(b1); op1(0xAC);                                 // i64.extend_i32_s
         if (b2 === 0) { o.push(0x42, 3); op1(0x86); } else { o.push(0x42, 1); op1(0x87); }
-        o.push(0x42, 32); op1(0x7C);
-        gget(G_VA); op1(0xAC); op1(0x7C); gget(G_VL); op1(0xAC); op1(0x59);   // va + n >= vl
-        IF(); STOREv(); setPC(pc); i32c(pc); call(F_GC); LOAD(); END();
+        o.push(0x42, 32); op1(0x7C); lset(LI64);
+        lget(LI64); gget(G_VA); op1(0xAC); op1(0x7C); gget(G_VL); op1(0xAC); op1(0x59);   // va + n >= vl
+        IF(); STOREv(); setPC(pc); i32c(pc);
+          lget(LI64); op1(0xA7); i32c(0x40000000); lget(LI64); o.push(0x42); sleb(o, 0x40000000); op1(0x54); o.push(0x1B);   // min(n, 2^30)
+          call(F_GC); LOAD(); END();
         break;
       }
       case 0x8C: {
         const n = rd32(pc + 1) >>> 0;
         gget(G_VA); i32c(n); op1(0x6A); gget(G_VL); op1(0x4E);
-        IF(); STOREv(); setPC(pc); i32c(pc); call(F_GC); LOAD(); END();
+        IF(); STOREv(); setPC(pc); i32c(pc); i32c(n); call(F_GC); LOAD(); END();
         break;
       }
       case 0xC9: case 0xCA: {
@@ -851,7 +853,7 @@ function compile(vm, entry, osr) {
         i32c(t * 2 + 1); RET(); break;
       }
       case 0x89:
-        gget(G_VA); gget(G_VL); op1(0x4F); IF(); STOREv(); setPC(pc); i32c(pc); call(F_GC); LOAD(); END();
+        gget(G_VA); gget(G_VL); op1(0x4F); IF(); STOREv(); setPC(pc); i32c(pc); i32c(0); call(F_GC); LOAD(); END();
         break;
       case 0xA7: { const t = rd32(pc + 2) >>> 0; i32c(t === FN_UNRESOLVED ? NIL : ((t << 4) | 3)); set(b1); break; }
       case 0xAE: case 0xAF: {

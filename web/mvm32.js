@@ -493,6 +493,11 @@ class MVM {
       ? `\n-- recovered SEGVs, oldest first --\n  ` + this.segvLog.join('\n  ') : '';
     throw new MvmFault(`${msg} at ${this.where()} (step ${this.steps})\n  ` + shown.join('\n  ') + segv);
   }
+  heapExhausted(used, live, need = 0) {
+    const mb = (x) => (x / 1048576).toFixed(1);
+    this.host.log(`modus: heap exhausted (${mb(live)} MB survived a collection of ${mb(used)} MB into a ${mb(this.ld32(A_GC_SIZE))} MB semispace${need ? `, ${need} more bytes wanted` : ''}; raise --semi)`);
+    this.fault('heap exhausted');
+  }
   memFault(what) {
     if (!this.segvLog) this.segvLog = [];
     this.segvLog.push(`${what} at ${this.where()} < ` + this.backtrace(8).slice(1).join(' < '));
@@ -553,7 +558,12 @@ class MVM {
   // -- garbage collector: Cheney copy, conservative validated roots, TYPED
   // to-space walk (a word-by-word walk would rewrite byte payloads -- bytecode
   // is one -- that happen to spell a from-space pointer). ------------------------
-  gc() {
+  // NEED: bytes the allocation after this collection takes.  Survivors that
+  // do not fit in to-space, or a NEED that still does not fit after
+  // collecting, is HEAP EXHAUSTED -- loudly: the semispaces are adjacent, so
+  // copying on would write into the from-space still being read (a 12M-cons
+  // list came back 3.4M long), and allocating on would run into it.
+  gc(need = 0) {
     if (this._ikCache) this._ikCache.clear();
     const m32 = this.m32;
     const fromStart = this.ld32(A_GC_FROM);
@@ -561,6 +571,7 @@ class MVM {
     const fromEnd = fromStart + spaceSize;
     const toStart = this.ld32(A_GC_TO);
     let free = toStart;
+    const toEnd = toStart + spaceSize;
     const self = this;
     const t0 = Date.now();
     const used = this.va - fromStart;
@@ -578,6 +589,7 @@ class MVM {
         if (size < 16 || raw + size > fromEnd) return v;
       }
       const dst = free;
+      if (dst + size > toEnd) self.heapExhausted(used, dst - toStart);
       self.m8.copyWithin(dst - VBASE, raw - VBASE, raw - VBASE + size);
       free += size;
       self.markStart(dst);
@@ -622,6 +634,7 @@ class MVM {
     this.gcCount++;
     if (this._w) this._w.g.gcn.value = this.gcCount;   // wasm32.js: reload after a call only if this moved
     this.st64(A_GC_COUNT, this.gcCount, 0);
+    if (this.va + need >= this.vl) this.heapExhausted(used, free - toStart, need);
     if (this.trace) this.host.log(`[gc #${this.gcCount}: ${used >> 10}K -> ${(free - toStart) >> 10}K, ${Date.now() - t0}ms]`);
   }
 
@@ -1154,10 +1167,10 @@ class MVM {
       }
       case 0x88: { const base = this.bump(16); this.zero(base, base + 16); this.markStart(base); this.markCons(base); this.setR(code[pc + 1], base | 1); return pc + 2; }
       case 0x89: if (this.va >= this.vl) this.gc(); return pc + 1;
-      case 0x8C: { const n = this.rd32(pc + 1) >>> 0; if (this.va + n >= this.vl) this.gc(); return pc + 5; }
+      case 0x8C: { const n = this.rd32(pc + 1) >>> 0; if (this.va + n >= this.vl) this.gc(n); return pc + 5; }
       case 0x8D: { const c = this.rv(code[pc + 1]), kind = code[pc + 2];
                    const nbytes = (kind === 0 ? c * 8 : c >> 1) + 32;    // over-estimates a 4-byte word: harmless
-                   if (this.va + nbytes >= this.vl) this.gc(); return pc + 3; }
+                   if (this.va + nbytes >= this.vl) this.gc(Math.min(nbytes, 0x40000000)); return pc + 3; }
       case 0x8A: return pc + 2;
       case 0x8B: return pc + 1;
       case 0x90: case 0x91: this.fault('save-ctx/restore-ctx not supported');

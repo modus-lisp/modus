@@ -4421,6 +4421,18 @@
                  (loop (when (>= i len) (return-from subseq r))
                    (%word-aset r i (%word-aref seq (+ start i)))
                    (setq i (+ i 1)))))))))
+;; A NARROW string where SUBSEQ makes word strings (the web image): the
+  ;; byte codes into the word string's slots.  The general path below stored
+  ;; each through %ASET-SLOW.
+  (when (and (%prim-base-string-p seq) (not (%base-subseq-p)))
+    (let* ((n (array-length seq))
+           (end (if (and end-arg (car end-arg)) (car end-arg) n)))
+      (when (and (fixnump start) (fixnump end) (<= 0 start) (<= start end) (<= end n))
+        (let* ((len (- end start)) (r (%make-string-array len)) (i 0))
+          (when (%prim-simple-string-p r)
+            (loop (when (>= i len) (return-from subseq r))
+              (%word-aset r i (%u8-ref seq (+ start i)))
+              (setq i (+ i 1))))))))
   ;; An EXPLICIT nil end (CL: (subseq s start nil)) means \"to the end\" —
   ;; same as omitting it.  Guarding on end-arg alone left end=NIL, which the
   ;; array path then fed to (- end start) → TYPE-ERROR (the list path tolerates

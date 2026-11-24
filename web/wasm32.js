@@ -558,6 +558,39 @@ function compile(vm, entry, osr) {
         END();
         break;
       }
+      case 0xB9: case 0x68: case 0xC8: {
+        // ALLOC with a count in a register: string (#x31, count = the register,
+        // not filled, as vm.allocObj), array (#x32, filled), u8 vector (#x11,
+        // count = the register >> 1, filled).  A bad count or a heap overrun
+        // goes to JS, which faults exactly as before.
+        const u8 = op === 0xC8, fill = op !== 0xB9, subtag = op === 0xB9 ? 0x31 : op === 0x68 ? 0x32 : 0x11;
+        get(b2); if (u8) { i32c(1); op1(0x75); } lset(LT1);
+        lget(LT1); i32c(0xFFFFFF); op1(0x4B);              // n < 0 or n > #xFFFFFF (unsigned)
+        IF(); delegate(pc); ELSE();
+          if (u8) { lget(LT1); i32c(4 + 15); op1(0x6A); }
+          else { lget(LT1); i32c(1); op1(0x6A); i32c(2); op1(0x74); i32c(15); op1(0x6A); }
+          i32c(-16); op1(0x71); lset(LT2);                  // total, 16-aligned
+          gget(G_VA); ltee(LT3); lget(LT2); op1(0x6A); i32c(vm.heapEnd); op1(0x4A);
+          IF(); delegate(pc); ELSE();
+            lget(LT3); lget(LT2); op1(0x6A); gset(G_VA);
+            if (fill) { lget(LT3); adr(4); i32c(0); lget(LT2); i32c(4); op1(0x6B); o.push(0xFC, 0x0B, 0x00); }
+            lget(LT3); adr(); lget(LT1); i32c(8); op1(0x74); i32c(subtag); op1(0x72); st32();
+            markBits(false);                                // clobbers LT1 / LT2
+            lget(LT3); i32c(9); op1(0x72); set(b1);
+          END();
+        END();
+        break;
+      }
+      case 0x8D: {
+        // GC check sized by a register: (kind 0 ? c*8 : c>>1) + 32 bytes, in
+        // 64 bits so a huge count cannot wrap past the check.
+        get(b1); op1(0xAC);                                 // i64.extend_i32_s
+        if (b2 === 0) { o.push(0x42, 3); op1(0x86); } else { o.push(0x42, 1); op1(0x87); }
+        o.push(0x42, 32); op1(0x7C);
+        gget(G_VA); op1(0xAC); op1(0x7C); gget(G_VL); op1(0xAC); op1(0x59);   // va + n >= vl
+        IF(); STOREv(); setPC(pc); i32c(pc); call(F_GC); LOAD(); END();
+        break;
+      }
       case 0x8C: {
         const n = rd32(pc + 1) >>> 0;
         gget(G_VA); i32c(n); op1(0x6A); gget(G_VL); op1(0x4E);

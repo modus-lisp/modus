@@ -29,9 +29,11 @@ const CODE_ADDR  = 0x10400000;
 const JIT_ADDR   = 0x12400000;
 const JIT_END    = 0x13400000;
 const STACK_ADDR = 0x13400000;
-const STACK_SIZE = 0x00800000;
+// 32 MB: cl-bench's ACKERMANN, DDERIV and WALK-LIST/MESS recurse past the 8 MB
+// this was (~12K frames); the heap moves up to make room.
+const STACK_SIZE = 0x02000000;
 const ARGV_AREA  = 0x00010000;
-const HEAP_ADDR  = 0x13C00000;
+const HEAP_ADDR  = 0x15400000;
 // Every address must stay below 2^30: a word reaches Lisp through a fixnum
 // (SHL 1 / SAR 1), and the 30-bit tower cannot carry one at or above it.
 const ADDR_LIMIT = 0x40000000;

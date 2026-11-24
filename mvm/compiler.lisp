@@ -6233,6 +6233,52 @@
             ,@body)))
       body))
 
+;; A DO COUNTER'S RANGE.  (do ((i 0 (1+ i))) ((or ... (> i 300)) ...) ...):
+;; the end test runs before every iteration, so when (> I K) is the test or one
+;; of its top-level OR disjuncts the body sees I <= K, and the step leaves at
+;; most K+1.  With a literal integer init and step (1+ I), and I assigned
+;; nowhere else, I is an (INTEGER LO HI) -- the declaration SBCL infers.
+;; Untyped, I's (1+ I) and (> I K) kept their generic slow-path calls, and a
+;; call in a scope boxes every float local in it: cl-bench MANDELBROT/DFLOAT
+;; boxed its three doubles twice an iteration.
+(defun %do-counter-range (var init step test others)
+  (and (symbolp var) var (integerp init) (not (%proclaimed-special-p var))
+       (consp step) (symbolp (car step)) (%cl-symbol-p (car step))
+       (or (and (name-eq (car step) "1+") (consp (cdr step)) (eq (cadr step) var) (null (cddr step)))
+           (and (name-eq (car step) "+") (consp (cdr step)) (consp (cddr step)) (null (cdddr step))
+                (or (and (eq (cadr step) var) (eql (caddr step) 1))
+                    (and (eql (cadr step) 1) (eq (caddr step) var)))))
+       (let ((hi nil))
+         (dolist (d (if (and (consp test) (symbolp (car test)) (name-eq (car test) "OR"))
+                        (cdr test) (list test)))
+           (when (and (consp d) (symbolp (car d)) (%cl-symbol-p (car d))
+                      (consp (cdr d)) (consp (cddr d)) (null (cdddr d)))
+             (let ((op (symbol-name (car d))) (a (cadr d)) (b (caddr d)))
+               (let ((k (cond ((and (eq a var) (integerp b) (string= op ">")) (+ b 1))
+                              ((and (eq a var) (integerp b) (string= op ">=")) b)
+                              ((and (eq b var) (integerp a) (string= op "<")) (+ a 1))
+                              ((and (eq b var) (integerp a) (string= op "<=")) a))))
+                 (when (and k (or (null hi) (< k hi))) (setq hi k))))))
+         (and hi
+              (null (collect-setq-vars-in-body others (list var)))
+              (let ((hi (max hi init)))
+                (and (< (integer-length init) 60) (< (integer-length hi) 60)
+                     (list 'type (list 'integer init hi) var)))))))
+(defun %cl-symbol-p (x) (eq (symbol-package x) (find-package "COMMON-LISP")))
+(defun %do-counter-declares (vars inits steps test results body)
+  "(DECLARE (TYPE (INTEGER LO HI) V) ...) for the DO counters %DO-COUNTER-RANGE proves, or NIL.
+   A counter the body declares itself, or one declared special, is left as written."
+  (let ((specs nil) (decls (%leading-declares body)))
+    (loop for v in vars for init in inits for s in steps
+          do (when (and (car s)
+                        (not (and decls (%setq-direct-count-occ v decls))))
+               (let ((others (list* 'progn test (append results body
+                               (loop for v2 in vars for s2 in steps
+                                     when (and (car s2) (not (eq v2 v))) collect (cadr s2))))))
+                 (let ((spec (%do-counter-range v init (cadr s) test others)))
+                   (when spec (push spec specs))))))
+    (and specs (list (cons 'declare (nreverse specs))))))
+
 (defun register-mvm-bootstrap-macros ()
   "Register standard CL macros needed to compile *runtime-functions*.
    Fast path (template already built): nothing to do, the current
@@ -8140,6 +8186,7 @@
           ;; compiled I untyped; mill's do-vectorized kernels hit this).
           `(let ,(mapcar #'list vars inits)
              ,@(%leading-declares body)
+             ,@(%do-counter-declares vars inits steps test results body)
              (loop
                (when ,test (return (progn ,@(or results '(nil)))))
                (tagbody ,@(%strip-leading-declares body))
@@ -8172,6 +8219,7 @@
               (results (cdr end-clause)))
           `(let* ,(mapcar #'list vars inits)
              ,@(%leading-declares body)
+             ,@(%do-counter-declares vars inits steps test results body)
              (loop
                (when ,test (return (progn ,@(or results '(nil)))))
                (tagbody ,@(%strip-leading-declares body))
@@ -15980,7 +16028,10 @@
               ((and (member n '("<" ">" "<=" ">=") :test #'string=)
                     (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
                     (or (and (%fp-tree-need (cadr form) env) (%fp-tree-need (caddr form) env))
-                        (and (%fpd-pure-need (cadr form) env) (%fpd-pure-need (caddr form) env))))
+                        (and (%fpd-pure-need (cadr form) env) (%fpd-pure-need (caddr form) env))
+                        ;; a single literal against a double tree (%FPD-WIDENS-P)
+                        (and (%single-literal-p (cadr form)) (%fpd-pure-need (caddr form) env))
+                        (and (%single-literal-p (caddr form)) (%fpd-pure-need (cadr form) env))))
                t)
               ((member n *fp-scope-transparent-ops* :test #'string=)
                (every (lambda (f) (%fp-scope-call-free-p f env (1+ depth))) (cdr form)))
@@ -24628,7 +24679,11 @@
 
 (defun %double-float-arith-applicable-p (args env)
   (and (consp args) (consp (cdr args))
-       (every (lambda (a) (%expr-double-float-p a env)) args)))
+       (or (every (lambda (a) (%expr-double-float-p a env)) args)
+           ;; doubles and single-float literals (%FPD-WIDENS-P), when the fpd tree takes them
+           (and (or (%runtime-fpd-p) (ct-has-fpd-p))
+                (every (lambda (a) (or (%single-literal-p a) (%expr-double-float-p a env))) args)
+                (%fpd-widens-p args env)))))
 
 ;;; Unboxed double trees: a call-free tree of double literals and lexical
 ;;; variables declared DOUBLE-FLOAT under + - * / is evaluated in the FP
@@ -24655,6 +24710,19 @@
   (let ((x (%double-conversion-arg form)))
     (and x (symbolp x) (env-lookup env x) (%expr-width x env) x)))
 
+;;; A SINGLE-FLOAT LITERAL IN A DOUBLE EXPRESSION is the double of the same value.
+;;; CL's contagion converts it so, exactly (every single is a double): (> d 4.0),
+;;; (* 2.0 d).  It made the expression no double tree -- a generic call -- and a
+;;; call in a scope boxes every double local in it: cl-bench MANDELBROT/DFLOAT's
+;;; (> (abs (+ (* z1 z1) (* z2 z2))) 4.0) was ten calls an iteration.  Only beside
+;;; a double: (+ 1.0 2.0) is single-float arithmetic and stays so.
+(defun %single-literal-p (form)
+  (let ((v (%fp-literal-value form))) (and v (typep v 'single-float))))
+(defun %fpd-widens-p (args env)
+  "ARGS (of + - * / or a comparison) hold a single-float literal and a double tree."
+  (and (some (function %single-literal-p) args)
+       (some (lambda (a) (and (not (%single-literal-p a)) (%fpd-tree-need a env))) args)))
+
 (defun %fpd-tree-need (form env)
   "FP registers needed to evaluate FORM as an unboxed double tree, or NIL."
   (cond
@@ -24670,12 +24738,15 @@
     ((and (consp form) (symbolp (car form))
           (member (symbol-name (car form)) '("+" "-" "*" "/") :test #'string=)
           (consp (cdr form)) (consp (cddr form)))
-     (let ((worst (%fpd-tree-need (cadr form) env)))
-       (and worst
-            (dolist (a (cddr form) worst)
-              (let ((n (%fpd-tree-need a env)))
-                (unless n (return nil))
-                (setq worst (max worst (1+ n))))))))
+     ;; a SINGLE-FLOAT LITERAL beside a double operand is that double (%FPD-WIDENS-P)
+     (let ((widen (%fpd-widens-p (cdr form) env)))
+       (flet ((need (a) (if (and widen (%single-literal-p a)) 1 (%fpd-tree-need a env))))
+         (let ((worst (need (cadr form))))
+           (and worst
+                (dolist (a (cddr form) worst)
+                  (let ((n (need a)))
+                    (unless n (return nil))
+                    (setq worst (max worst (1+ n))))))))))
     ((%fp-abs-p form) (%fpd-tree-need (cadr form) env))
     ((%fp-minmax-op form)
      (let ((a (%fpd-tree-need (cadr form) env)) (b (%fpd-tree-need (caddr form) env)))
@@ -24786,7 +24857,8 @@
             ;; an FP-resident double local: a register move, no unbox
             (unless (= (binding-reg b) fd) (emit-ir :fp-mov fd (binding-reg b)))
             (let ((bits (let ((v (%fp-literal-value form)))
-                          (and v (typep v 'double-float) (%fp-literal-double-bits v)))))
+                          ;; a single literal here is one %FPD-WIDENS-P let into a double tree
+                          (and v (%fp-literal-double-bits (if (typep v 'single-float) (float v 1d0) v))))))
               (if bits
                   ;; a literal: its bits straight into the register
                   (emit-ir :fpd-li fd (car bits) (cdr bits))
@@ -24800,6 +24872,9 @@
   "Left-fold ARGS with the double-float op OP-NAME (a string): :f<op> per pair,
    each result a boxed double.  Every operand double-float (caller-checked).
    A whole call-free tree goes through the FP pool unboxed instead."
+  ;; single-float literals beside the doubles are those doubles (%FPD-WIDENS-P):
+  ;; every path below, the boxed fold too, sees double operands only
+  (setq args (mapcar (lambda (a) (if (%single-literal-p a) (float (%fp-literal-value a) 1d0) a)) args))
   (let ((tree (cons (%float-op-symbol op-name) args)))
     (when (or (%runtime-fpd-p) (ct-has-fpd-p))
       ;; Conversion operands are calls, and FP registers are caller-clobbered:
@@ -27381,10 +27456,14 @@
   (when (and (or (%runtime-fpd-p) (ct-has-fpd-p))
              (member branch-op '(:blt :bgt :ble :bge)))
     (let ((kind (cond ((and (%fp-tree-need a env) (%fp-tree-need b env)) :single)
-                      ((and (%fpd-pure-need a env) (%fpd-pure-need b env)) :double))))
+                      ((and (%fpd-pure-need a env) (%fpd-pure-need b env)) :double)
+                      ;; a single literal against a double tree (%FPD-WIDENS-P)
+                      ((or (and (%single-literal-p a) (%fpd-pure-need b env))
+                           (and (%single-literal-p b) (%fpd-pure-need a env)))
+                       :double))))
       (and kind
-           (let ((na (if (eq kind :single) (%fp-tree-need a env) (%fpd-pure-need a env)))
-                 (nb (if (eq kind :single) (%fp-tree-need b env) (%fpd-pure-need b env))))
+           (let ((na (cond ((eq kind :single) (%fp-tree-need a env)) ((%single-literal-p a) 1) (t (%fpd-pure-need a env))))
+                 (nb (cond ((eq kind :single) (%fp-tree-need b env)) ((%single-literal-p b) 1) (t (%fpd-pure-need b env)))))
              (<= (+ *fp-reg-counter* (max na (1+ nb))) +fp-reg-max+))
            kind))))
 

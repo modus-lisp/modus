@@ -443,7 +443,9 @@ static lw dx_mmap_1(lw addr, lw len, lw prot, lw flags, lw fd, lw off) {
     if (flags & 0x20) f |= MAP_ANON;
     int noreplace = (flags & 0x100000) != 0;       // MAP_FIXED_NOREPLACE
     int jit = (prot & PROT_EXEC) && (flags & 0x20);
-    if (((flags & 0x10) || noreplace) && addr && in_reserved((uint64_t)addr, (uint64_t)len)) {
+    // A JIT request names its address as a HINT (Darwin refuses MAP_JIT with MAP_FIXED); inside a reservation
+    // it is ours just the same.
+    if (((flags & 0x10) || noreplace || jit) && addr && in_reserved((uint64_t)addr, (uint64_t)len)) {
         // Ours already: map over the reservation at exactly that address.
         // JIT memory cannot be MAP_FIXED on Darwin, so release the range and
         // take it back as MAP_JIT at the (now free) address; where there is
@@ -1352,6 +1354,46 @@ int main(int argc, char **argv, char **envp) {
           if (e[0] == '-') slide = -slide;
           if (slide & (int64_t)(PAGE16K - 1)) die("MODUS_SLIDE is not a 16 KB multiple", (long)slide);
       } }
+#if defined(MODUS_LAYOUT_LO) && defined(MODUS_LAYOUT_HI) && !(TARGET_OS_IPHONE)   /* iOS images run in place */
+    // THE LAYOUT MUST BE WHOLE, AND STAY OURS.  The code, the runtime-data region, the heap and the JIT arena sit
+    // at fixed distances (ADRP reaches +/-4 GB), and macOS's own reservations -- libmalloc takes a 12 GB range at a
+    // different address every launch -- landed inside the span one launch in six or so: the code could not be
+    // mapped, or the arena's hint came back gigabytes away, out of reach, and every JIT page that named a region
+    // slot read and wrote the wrong memory (memory faults while the boot files loaded, then ~300x slower).  A
+    // PC-relative image runs at any slide, so: the requested slide if the whole span is free, else the next free
+    // one a GB up; then the data part is RESERVED at once, and the boot stub's mappings go over the reservation
+    // (DX_MMAP, as an image running in place does).  The code is mapped right after, over a span just checked.
+    if (!in_place) {
+        uint64_t want = (uint64_t)slide, base_lo = ph->vaddr - PAGE16K;
+        uint64_t lo0 = MODUS_LAYOUT_LO < base_lo ? MODUS_LAYOUT_LO : base_lo;
+        uint64_t hi0 = MODUS_LAYOUT_HI > ph->vaddr + ROUND_UP(ph->memsz, PAGE16K) ? MODUS_LAYOUT_HI
+                                                                                   : ph->vaddr + ROUND_UP(ph->memsz, PAGE16K);
+        int found = 0;
+        for (int k = 0; k < 256 && !found; k++) {
+            uint64_t sl = want + (uint64_t)k * 0x40000000ull;
+            mach_vm_address_t ra = lo0 + sl; mach_vm_size_t rs = 0;
+            vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t obj = MACH_PORT_NULL;
+            kern_return_t kr = mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                              (vm_region_info_t)&info, &cnt, &obj);
+            if (kr != KERN_SUCCESS || ra >= hi0 + sl) {          // nothing at or after lo within the span
+                mach_vm_address_t r = MODUS_LAYOUT_LO + sl;
+                if (mach_vm_allocate(mach_task_self(), &r, MODUS_LAYOUT_HI - MODUS_LAYOUT_LO, VM_FLAGS_FIXED) == KERN_SUCCESS) {
+                    mach_vm_protect(mach_task_self(), r, MODUS_LAYOUT_HI - MODUS_LAYOUT_LO, FALSE, VM_PROT_NONE);
+                    if (n_reserved < MAXRES) {
+                        reserved[n_reserved].lo = r; reserved[n_reserved].hi = r + (MODUS_LAYOUT_HI - MODUS_LAYOUT_LO);
+                        n_reserved++;
+                    }
+                    if (sl != want && getenv("MODUS_SHIM_TRACE"))
+                        fprintf(stderr, "modus-shim: layout slid by %#llx, not %#llx (that span was taken)\n",
+                                (unsigned long long)sl, (unsigned long long)want);
+                    slide = (int64_t)sl; found = 1;
+                }
+            }
+        }
+        if (!found) die("no free address span for the image's layout", 0);
+    }
+#endif
     uint64_t link = ph->vaddr + (uint64_t)slide;
 
     modus_vsize_t file_span = ROUND_UP(ph->filesz, PAGE16K);

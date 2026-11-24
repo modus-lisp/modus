@@ -22,6 +22,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # executables ad hoc.
 # MODUS_IN_PLACE=1: a PC-relative image (MODUS_PCREL=1) instead gets its own
 # segments and runs where the loader put it (image-segments.sh).
+# THE LAYOUT'S SPAN, when the image names it (MODUS-LAYOUT-* symbols): the shim checks it is free at the slide
+# and reserves it before the boot stub maps it (modus-shim.c, "THE LAYOUT MUST BE WHOLE").
+LAYOUT_DEFS=""
+lsym() { xcrun nm "$IMAGE" 2>/dev/null | awk -v n="$1" '$3 == n { print $1 }'; }
+if [ -n "$(lsym MODUS-LAYOUT-REGION-LO)" ]; then
+  LAYOUT_DEFS="-DMODUS_LAYOUT_LO=0x$(lsym MODUS-LAYOUT-REGION-LO)ull -DMODUS_LAYOUT_HI=0x$(lsym MODUS-LAYOUT-ARENA-HI)ull"
+fi
 if [ "${MODUS_IN_PLACE:-0}" != 0 ]; then
   WHERE=$("$HERE/image-segments.sh" "$IMAGE" "$OUT.segs")
 else
@@ -118,7 +125,7 @@ if [ "$KIND" = gui ]; then
   OBJS=$(mktemp -d)
   for SRC in "$HERE/modus-shim.c" "$HERE/modus-audio.c" "$HERE/modus-keychain.m" $EXTRA_SRC "$HERE/syscall-stub.S"; do
     # the same minimum macOS as the Swift (and Info.plist), or ld warns that every object is "built for newer"
-    cc -O2 -Wall -fobjc-arc -mmacosx-version-min=14.0 $DEFS -c "$SRC" -o "$OBJS/$(basename "$SRC").o"
+    cc -O2 -Wall -fobjc-arc -mmacosx-version-min=14.0 $DEFS $LAYOUT_DEFS -c "$SRC" -o "$OBJS/$(basename "$SRC").o"
   done
   swiftc -target arm64-apple-macos14.0 -swift-version 5 -O -wmo -parse-as-library -module-name ModusSwift \
     -import-objc-header "$HERE/swift/bridge.h" -emit-object -o "$OBJS/swift.o" \
@@ -139,7 +146,7 @@ if [ "$KIND" = gui ]; then
   swiftc -target arm64-apple-macos14.0 -o "$BIN" "$OBJS"/*.o $FRAMEWORKS $LINKX
   rm -rf "$OBJS"
 else
-  cc -O2 -Wall -fobjc-arc $DEFS -o "$BIN" "$HERE/modus-shim.c" "$HERE/modus-audio.c" "$HERE/modus-keychain.m" $EXTRA_SRC "$HERE/syscall-stub.S" $FRAMEWORKS $WHERE
+  cc -O2 -Wall -fobjc-arc $DEFS $LAYOUT_DEFS -o "$BIN" "$HERE/modus-shim.c" "$HERE/modus-audio.c" "$HERE/modus-keychain.m" $EXTRA_SRC "$HERE/syscall-stub.S" $FRAMEWORKS $WHERE
 fi
 # THE SIGNATURE: MODUS_MAC_SIGN, a codesigning identity ("-": ad hoc); by default this Mac's Apple Development
 # identity if it has one.  Signed by a team, the app is the same app to macOS from one build to the next, and a

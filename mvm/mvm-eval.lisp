@@ -3452,8 +3452,12 @@
   "Fill in the ADRP of every PC-relative layout address in the page just
    copied to BASE (translate-aarch64.lisp *AARCH64-JIT-ADRP-FIXUPS*): the page
    delta from the ADRP's own address to its target.  The ADD after it already
-   holds the target's low 12 bits."
-  (dolist (f *aarch64-jit-adrp-fixups*)
+   holds the target's low 12 bits.  NIL when a target is out of ADRP's reach
+   (+/-4 GB): the page must not run.  An arena placed far from the layout (the
+   address hint not honoured) wrapped the delta, and the page read and wrote 4 GB
+   off -- the boot-time memory faults; the image build checks this, the JIT did not."
+  (let ((ok t))
+  (dolist (f *aarch64-jit-adrp-fixups* ok)
     (let* ((at (+ base (* 4 (car f))))
            (pages (- (ash (cdr f) -12) (ash at -12)))
            (word (logior (mem-ref at :u8) (ash (mem-ref (+ at 1) :u8) 8)
@@ -3464,7 +3468,8 @@
       (setf (mem-ref at :u8) (logand new 255))
       (setf (mem-ref (+ at 1) :u8) (logand (ash new -8) 255))
       (setf (mem-ref (+ at 2) :u8) (logand (ash new -16) 255))
-      (setf (mem-ref (+ at 3) :u8) (logand (ash new -24) 255)))))
+      (setf (mem-ref (+ at 3) :u8) (logand (ash new -24) 255))
+      (unless (and (>= pages (- (ash 1 20))) (< pages (ash 1 20))) (setq ok nil))))))
 
 (defun %jit-reclaim-page (b0 b1)
   "A REJECTED PAGE GOES BACK.  The arena is a bump allocator, so a page built
@@ -3630,7 +3635,9 @@
             (setf (mem-ref (+ base (+ o 3)) :u8) (logand (ash w -24) 255)))
           (setq k (+ k 1)))
         ;; PC-RELATIVE LAYOUT ADDRESSES (the deferred :ADRP-ABS fixups).
-        (%jit-resolve-adrp-fixups base)
+        (unless (%jit-resolve-adrp-fixups base)
+          (when (eql why 0) (setq why 4))         ; a layout address out of ADRP reach
+          (setq ok nil))
         ;; Out-of-module CALL relocations (untagged callee addr = word-3).
         ;; WS5 #206: the callee must carry the FN tag — see %jit-reloc-calls for
         ;; the full account.  A RUNTIME-defined function (a defun evaluated by an

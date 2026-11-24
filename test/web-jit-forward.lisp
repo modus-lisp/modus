@@ -3,7 +3,10 @@
 ;;; native code through %JIT-SET-FORWARDS's box.  On the web the box held an
 ;;; x64-encoded word, so calling the old object ran garbage (cl-bench DDERIV:
 ;;; "The value 0 is not of type LIST", MVM FAULT unknown opcode).
-;;;   node web/run-node.js --mvmw IMG --eval '(setq *jit-hot-calls* 0)' --load test/web-jit-forward.lisp
+;;;   node web/run-node.js --mvmw IMG --load test/web-jit-forward.lisp
+;;; Hot promotion off (read when a DEFUN is installed), so NA goes native
+;;; exactly at the %JIT-HOT-BUILD below, after *OLD* is taken.
+(setq *jit-hot-calls* 0)
 (defvar *fails* 0)
 (defmacro check (name form want)
   `(let ((got (handler-case ,form (error (e) (list :error (princ-to-string e))))))

@@ -38,6 +38,7 @@ const HEAP_ADDR  = 0x15400000;
 // (SHL 1 / SAR 1), and the 30-bit tower cannot carry one at or above it.
 const ADDR_LIMIT = 0x40000000;
 const CODE_PHYS  = CODE_ADDR - VBASE, JIT_PHYS = JIT_ADDR - VBASE;
+const A_PENDING_FAULT = 0x10000CB0;        // %PENDING-FAULT-CODE (single-threaded layout)
 const A_WEB_CONSTS = 0x10000D40, A_WEB_RELOCS = 0x10000D48, A_WEB_RELOC_STATUS = 0x10000D50;
 
 const INSN_LEN = new Uint8Array(256);
@@ -504,6 +505,12 @@ class MVM {
     if (!this.segvLog) this.segvLog = [];
     this.segvLog.push(`${what} at ${this.where()} < ` + this.backtrace(8).slice(1).join(' < '));
     if (this.segvLog.length > 8) this.segvLog.shift();
+    // The pending-fault code the handler's %INTERP-FAULT-CONDITION... reads
+    // (%PENDING-FAULT-CODE, cl-conditions.lisp): #x0B0B is STACK-EXHAUSTED,
+    // 11 MEMORY-FAULT-ERROR.  Unrecorded, the handler found no code and
+    // reported whatever condition was current: a stack overflow in cl-bench
+    // read as "The function ASDF-USER::GET-RELEASE-VERSION is undefined".
+    this.st32(A_PENDING_FAULT, what === 'stack overflow' ? 0x0B0B : 11);
     if (this.ld32(A_JMPBUF) !== 0) { if (this.trace) this.host.log(`[segv: ${what} at ${this.where()}]`); this.longjmp(); }
     this.fault(`SIGSEGV: ${what}`);
   }

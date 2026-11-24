@@ -27,6 +27,7 @@
 ;;;;   #x00010000..  the image (35 MB) -- Open Firmware loads the file at its
 ;;;;                 load-base (#x04000000 on OpenBIOS) and copies the segment,
 ;;;;                 so the file's buffer is dead once the stub runs
+;;;;   #x04800000..#x06000000  the boot payload (scripts/ppcmac-disk.lisp), up to 24 MB
 ;;;;   #x06000000..#x07000000  the stack, down from +PPCMAC-STACK-TOP+
 ;;;;   #x07000000..#x07200000  the handler-frame extension (fixed, 64K frames)
 ;;;;   #x07800000..#x07820000  NIL's 128 KB BAT block
@@ -643,7 +644,7 @@
 ;;; the loader with the image's path as its argument.
 
 (defconstant +ppcmac-loader-base+ #x07A00000
-  "Where modus-boot.elf runs: above the payload (#x07200000..) and NIL's block
+  "Where modus-boot.elf runs: above the handler-frame extension and NIL's block
    (#x07800000..), below the mutex arena (#x07D00000).  64 KB: its code, then a
    header buffer at +#x8000 and the image's path at +#x9000.")
 

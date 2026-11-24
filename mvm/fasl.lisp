@@ -64,14 +64,24 @@
 ;;; ------------------------------------------------------------------
 
 (defun %fasl-hash-string (s)
-  (let ((a 2166136261) (b 3735928559) (n (length s)) (i 0))
+  ;; Each lane as two 16-bit halves: x * 16777619 mod 2^32 = x * #x193 +
+  ;; (x << 24), and no intermediate reaches 2^26.  The same hashes as the
+  ;; plain (logand (* (logxor a c) 16777619) 4294967295) -- checked on SBCL
+  ;; against it -- but that form is BIGNUM arithmetic on a 32-bit target, per
+  ;; character: on the PowerPC Mac a key cost 14 s of a 48 s cached load.
+  (let ((ah #x811C) (al #x9DC5) (bh #xDEAD) (bl #xBEEF) (n (length s)) (i 0))
     (loop
       (when (>= i n) (return nil))
-      (let ((c (char-code (char s i))))
-        (setq a (logand (* (logxor a c) 16777619) 4294967295))
-        (setq b (logand (* (logxor b (logand (+ c 41) 65535)) 16777619) 4294967295)))
+      (let* ((c (char-code (char s i)))
+             (xl (logxor al (logand c 65535))) (xh (logxor ah (ash c -16)))
+             (tl (* xl 403)))
+        (setq al (logand tl 65535))
+        (setq ah (logand (+ (* xh 403) (ash tl -16) (ash (logand xl 255) 8)) 65535))
+        (let* ((yl (logxor bl (logand (+ c 41) 65535))) (tl2 (* yl 403)))
+          (setq bl (logand tl2 65535))
+          (setq bh (logand (+ (* bh 403) (ash tl2 -16) (ash (logand yl 255) 8)) 65535))))
       (setq i (+ i 1)))
-    (format nil "~8,'0x~8,'0x~x" a b n)))
+    (format nil "~4,'0x~4,'0x~4,'0x~4,'0x~x" ah al bh bl n)))
 
 ;;; ------------------------------------------------------------------
 ;;; A growable byte buffer: (vector . fill).
@@ -516,13 +526,30 @@
         (let ((h (ignore-errors (%cli-getenv "HOME"))))
           (and h (> (length h) 0) (concatenate 'string h "/.cache/modus/fasl/"))))))
 
+(defvar *fasl-record-mem* nil
+  "Non-NIL: record into *FASL-MEM* where there is no directory -- a bare
+   machine making the fasls a later boot of the SAME image replays (the
+   PowerPC Mac's disk build, scripts/ppcmac/fasl-record.py).  The keys
+   recorded, newest first, in *FASL-RECORDED*.")
+(defvar *fasl-recorded* nil)
+(defun %fasl-record-mem-p ()
+  ;; BOUNDP: a DEFVAR initform does not run in-image
+  (and (boundp (quote *fasl-record-mem*)) (symbol-value (quote *fasl-record-mem*))))
+
 (defun fasl-mem-put (key bytes)
   "Make BYTES the fasl for KEY in this image (bare metal: kiln pushes them)."
   (setq *fasl-mem* (cons (cons key bytes) (remove key *fasl-mem* :key (function car) :test (function string=))))
   key)
 
 (defun %fasl-get (key)
-  (or (cdr (assoc key *fasl-mem* :test (function string=)))
+  (or (let ((v (cdr (assoc key *fasl-mem* :test (function string=)))))
+        ;; (ADDRESS . LENGTH): bytes in memory outside the heap (a boot
+        ;; payload), copied out only when their file is loaded -- a machine
+        ;; whose fasls would fill its heap keeps none of them there
+        (if (and (consp v) (integerp (car v)) (integerp (cdr v)))
+            (let ((b (make-array (cdr v) :element-type '(unsigned-byte 8))))
+              (dotimes (i (cdr v) b) (setf (aref b i) (mem-ref (+ (car v) i) :u8))))
+            v))
       (let ((d (%fasl-dir)))
         (and d
              (ignore-errors
@@ -541,6 +568,9 @@
    loading the same file concurrently -- 32 sweep shards share one cache --
    replay another's half-written record: one of four concurrent loads of the
    ANSI suite came back 53 tests short."
+  (when (%fasl-record-mem-p)
+    (fasl-mem-put key bytes)
+    (setq *fasl-recorded* (cons key (if (boundp (quote *fasl-recorded*)) *fasl-recorded* nil))))
   (let ((d (%fasl-dir)))
     (when d
       (ignore-errors
@@ -684,7 +714,7 @@
                 (progn (%fasl-stat 0) (list :replay key text 0 nil (cadddr rec) t)))
             ;; Nowhere to keep a record (bare metal, no $HOME): do not pay for
             ;; one -- the board spent 3 s of boot recording its shims
-            (when (%fasl-dir)
+            (when (or (%fasl-dir) (%fasl-record-mem-p))
               (%fasl-stat 1) (list :record key text 0 nil nil t)))))))
 
 (defun %fasl-read (fx eof)

@@ -19,10 +19,15 @@
 ;;;; real Mac finds it by itself.  Under QEMU (OpenBIOS) give the path:
 ;;;;   -prom-env 'boot-device=hd:,\modus.elf'
 ;;;;
-;;;; --payload LIST adds a second segment to the ELF, loaded at #x07200000: the
+;;;; --payload LIST adds a second segment to the ELF, loaded at #x04800000: the
 ;;;; boot payload the image reads before its REPL (build-cl-repl-common.lisp,
 ;;;; %PPCMAC-BOOT-PAYLOAD).  LIST has a line per entry, NAME<tab>PATH, in order;
 ;;;; a .lisp entry is evaluated at boot, any other kept as bytes by NAME.
+;;;;
+;;;; --fasl-record makes a disk whose boot records the payload's fasls and sends
+;;;; them on the serial port; --fasls DIR puts DIR's KEY.mfasl files in the
+;;;; payload, ahead of the sources, so a boot replays them instead of compiling
+;;;; (scripts/ppcmac/fasl-record.py does both, around one QEMU boot).
 ;;;;
 ;;;; The disk layout is fs-apple's (the partition map, lib/apm.lisp; the volume,
 ;;;; lib/hfs.lisp); scripts/mac68k-tools.lisp finds fs-apple.
@@ -49,16 +54,22 @@
           #\Return #\Return #\Return #\Return #\Return #\Return #\Return #\Return
           elf-name #\Return #\Return #\Return)))
 
-(defconstant +payload-addr+ #x07200000)
+(defconstant +payload-addr+ #x04800000)
+(defconstant +payload-max+ #x01800000 "To #x06000000, the stack's floor.")
 
 (defun be32 (v n) (dotimes (i 4) (vector-push-extend (ldb (byte 8 (- 24 (* 8 i))) n) v)))
 
-(defun payload-bytes (list-file)
+(defun payload-bytes (list-file &key fasl-record fasls)
   "The payload container: MDPL, a count, then per entry its name and data."
-  (let ((entries (with-open-file (in list-file)
-                   (loop for l = (read-line in nil) while l
-                         for tab = (position #\Tab l)
-                         when tab collect (cons (subseq l 0 tab) (subseq l (1+ tab))))))
+  (let ((entries (append
+                  (when fasl-record (list (cons "fasl-record" nil)))
+                  (when fasls
+                    (loop for f in (directory (merge-pathnames "*.mfasl" (concatenate 'string (string-right-trim "/" fasls) "/")))
+                          collect (cons (concatenate 'string "fasl:" (pathname-name f)) (namestring f))))
+                  (with-open-file (in list-file)
+                    (loop for l = (read-line in nil) while l
+                          for tab = (position #\Tab l)
+                          when tab collect (cons (subseq l 0 tab) (subseq l (1+ tab)))))))
         (v (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
     (loop for c across "MDPL" do (vector-push-extend (char-code c) v))
     (be32 v (length entries))
@@ -68,9 +79,9 @@
              (loop until (zerop (mod (length v) 4)) do (vector-push-extend 0 v))))
       (dolist (e entries)
         (blob (ascii-bytes (car e)))
-        (blob (read-bytes (cdr e)))))
-    ;; it ends below NIL's block (#x07800000; boot/boot-ppcmac.lisp's map)
-    (assert (<= (length v) #x600000) () "the payload (~D bytes) is over 6 MB" (length v))
+        (blob (if (cdr e) (read-bytes (cdr e)) #()))))
+    ;; it ends below the stack (#x06000000; boot/boot-ppcmac.lisp's map)
+    (assert (<= (length v) +payload-max+) () "the payload (~D bytes) is over 24 MB" (length v))
     (format t "ppcmac-disk: payload: ~D entries, ~D bytes at #x~X~%" (length entries) (length v) +payload-addr+)
     (coerce v '(simple-array (unsigned-byte 8) (*)))))
 
@@ -101,10 +112,10 @@
 (defun ascii-bytes (s)
   (map '(vector (unsigned-byte 8)) #'char-code s))
 
-(defun main (image out &key (size-mb nil) payload loader)
+(defun main (image out &key (size-mb nil) payload loader fasl-record fasls)
   (let* ((loader (or loader (let ((b (concatenate 'string image ".boot"))) (and (probe-file b) b))))
          (boot (and loader (read-bytes loader)))
-         (elf (if payload (elf-with-payload (read-bytes image) (payload-bytes payload)) (read-bytes image)))
+         (elf (if payload (elf-with-payload (read-bytes image) (payload-bytes payload :fasl-record fasl-record :fasls fasls)) (read-bytes image)))
          (vol-bytes (* 512 (ceiling (max (* 4 1024 1024)
                                          (+ (* 2 (length elf)) (* 1024 1024)))
                                     512)))
@@ -163,5 +174,8 @@
         (payload (let ((p (position "--payload" args :test #'string=)))
                    (and p (nth (1+ p) args))))
         (loader (let ((p (position "--loader" args :test #'string=)))
-                  (and p (nth (1+ p) args)))))
-    (main (first args) (second args) :size-mb size :payload payload :loader loader)))
+                  (and p (nth (1+ p) args))))
+        (fasls (let ((p (position "--fasls" args :test #'string=)))
+                 (and p (nth (1+ p) args)))))
+    (main (first args) (second args) :size-mb size :payload payload :loader loader
+          :fasl-record (and (member "--fasl-record" args :test #'string=) t) :fasls fasls)))

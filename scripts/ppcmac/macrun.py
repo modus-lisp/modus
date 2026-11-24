@@ -29,15 +29,15 @@ def main():
                           '-serial', f'unix:{ser},server=on,wait=on',
                           '-monitor', f'unix:{mon},server=on,wait=off'],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(100):
+    for _ in range(300):                 # 30 s: a loaded host starts QEMU slowly
         if os.path.exists(ser): break
         time.sleep(0.1)
     s = socket.socket(socket.AF_UNIX); s.connect(ser); s.settimeout(0.5)
-    for _ in range(100):
+    for _ in range(300):
         if os.path.exists(mon): break
         time.sleep(0.1)
     m = socket.socket(socket.AF_UNIX); m.connect(mon); m.settimeout(0.5)
-    buf = b''
+    buf = bytearray()
     t0 = time.time()
     # MACRUN_STAMPS=FILE: every chunk from the serial port, with its time since start
     stamps = open(os.environ['MACRUN_STAMPS'], 'w') if os.environ.get('MACRUN_STAMPS') else None
@@ -45,11 +45,13 @@ def main():
     def read_until(pat, timeout):
         nonlocal buf
         end = time.time() + timeout
+        start = 0                     # search only what is new (a boot can send megabytes)
         while time.time() < end:
-            i = buf.find(pat)
+            i = buf.find(pat, start)
             if i >= 0:
                 out, buf = buf[:i + len(pat)], buf[i + len(pat):]
                 return out
+            start = max(0, len(buf) - len(pat) + 1)
             try:
                 c = s.recv(65536)
                 if not c: break
@@ -58,7 +60,7 @@ def main():
                     stamps.write(f'{time.time() - t0:8.1f} {c.decode("latin-1")!r}\n'); stamps.flush()
             except socket.timeout:
                 pass
-        out, buf = buf, b''
+        out, buf = buf, bytearray()
         return out + b'[TIMEOUT]'
 
     def emit(b):

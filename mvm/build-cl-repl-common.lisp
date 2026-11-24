@@ -508,13 +508,22 @@
 (defun %bare-sync-arena () (values #x07D00000 #x07D10000))
 
 ;;; THE BOOT PAYLOAD (scripts/ppcmac-disk.lisp --payload): a second ELF segment
-;;; Open Firmware loads at #x07200000, between the handler-frame extension and
-;;; NIL's page.  \"MDPL\", a count, then per entry a name (u32 length, bytes)
-;;; and its data (u32 length, bytes, padded to 4).  A .lisp entry is evaluated
-;;; as LOAD would (%IT-EVAL-SOURCE), in order -- under the native tier its
-;;; DEFUNs become native code; any other entry is kept, as an octet vector, in
-;;; *PPCMAC-FILES* by name.  Run before the REPL; a failing entry is reported
-;;; and the rest go on.
+;;; Open Firmware loads at #x04800000 (up to 24 MB, below the stack), memory no
+;;; layout uses (boot/boot-ppcmac.lisp's map).  \"MDPL\", a count, then per
+;;; entry a name (u32 length, bytes) and its data (u32 length, bytes, padded to
+;;; 4).  A .lisp entry is evaluated as LOAD would (%IT-EVAL-SOURCE), in order --
+;;; under the native tier its DEFUNs become native code; any other entry is
+;;; kept, as an octet vector, in *PPCMAC-FILES* by name.  Run before the REPL;
+;;; a failing entry is reported and the rest go on.
+;;;
+;;; THE FASL CACHE (mvm/fasl.lisp) makes the second boot of an image fast:
+;;;   \"fasl-record\"  (an empty entry) -- record each source's fasl in memory,
+;;;                   and send it on the serial port as it closes:
+;;;                   FASL <key> <length> NL <hex> NL (scripts/ppcmac/fasl-record.py
+;;;                   collects them);
+;;;   \"fasl:KEY\"     -- a fasl that boot recorded: in the cache before the
+;;;                   sources, which then replay instead of compiling.
+;;; A fasl replays only in the image that recorded it (its key holds the build).
 ;;; PCI DEVICE REGISTERS: one 32-bit access, in the bus's (little-endian) byte
 ;;; order.  (setf (mem-ref a :u32) v) cannot be one: on a 32-bit target a u32
 ;;; may be a bignum, so it is two 16-bit stores -- right for memory, wrong for a
@@ -540,10 +549,33 @@
     (dotimes (i n v) (setf (aref v i) (mem-ref (+ a i) :u8)))))
 (defun ppcmac-file (name)
   (cdr (assoc name *ppcmac-files* :test (function string=))))
+(defun %ppcmac-hex-out (data)
+  (let ((digits \"0123456789abcdef\") (col 0))
+    (dotimes (i (length data))
+      (let ((b (aref data i)))
+        (write-char-serial (char-code (char digits (ash b -4))))
+        (write-char-serial (char-code (char digits (logand b 15))))
+        (setq col (+ col 1))
+        (when (= col 64) (write-char-serial 10) (setq col 0))))
+    (write-char-serial 10)))
+(defun %ppcmac-fasl-dump ()
+  \"Send each fasl recorded since the last call (FASL key length, hex).\"
+  (let ((keys (reverse *fasl-recorded*)))
+    (setq *fasl-recorded* nil)
+    (dolist (k keys)
+      (let ((b (cdr (assoc k *fasl-mem* :test (function string=)))))
+        (when b
+          (write-string-serial \"FASL \") (write-string-serial k) (write-string-serial \" \")
+          (print-dec (length b)) (write-char-serial 10)
+          (%ppcmac-hex-out b)
+          (write-string-serial \"FASL-END\") (write-char-serial 10)))
+      ;; sent: out of the heap (a whole payload's fasls would fill it)
+      (setq *fasl-mem* (remove k *fasl-mem* :key (function car) :test (function string=))))))
 (defun %ppcmac-boot-payload ()
-  (let ((a #x07200000))
+  (let ((a #x04800000))
+    (unless (boundp (quote *fasl-mem*)) (setq *fasl-mem* nil))
     (when (and (= (mem-ref a :u16) #x4D44) (= (mem-ref (+ a 2) :u16) #x504C))
-      (let ((n (%ppcmac-u32 (+ a 4))) (p (+ a 8)))
+      (let ((n (%ppcmac-u32 (+ a 4))) (p (+ a 8)) (nfasl 0))
         (write-string-serial \"payload: \") (print-dec n) (write-string-serial \" entries\")
         (write-char-serial 10)
         (dotimes (i n)
@@ -551,15 +583,32 @@
                  (name (map (quote string) (function code-char) (%ppcmac-octets (+ p 4) nl)))
                  (q (+ p 4 (* 4 (ceiling nl 4))))
                  (dl (%ppcmac-u32 q))
-                 (data (%ppcmac-octets (+ q 4) dl)))
+                 (fasl (and (> (length name) 5) (string= \"fasl:\" name :end2 5)))
+                 ;; a fasl stays where the firmware put it: (address . length)
+                 (data (if fasl (cons (+ q 4) dl) (%ppcmac-octets (+ q 4) dl))))
             (setq p (+ q 4 (* 4 (ceiling dl 4))))
-            (write-string-serial \"  \") (write-string-serial name) (write-char-serial 10)
-            (if (and (> (length name) 5) (string= \".lisp\" name :start2 (- (length name) 5)))
-                (handler-case (%it-eval-source (%it-utf8-bytes-to-string data) name)
-                  (t (c) (write-string-serial \"  payload error: \")
-                         (handler-case (write-object c) (t (c2) c2 nil))
-                         (write-char-serial 10)))
-                (setq *ppcmac-files* (cons (cons name data) *ppcmac-files*)))))))))
+            (cond
+              (fasl
+               (fasl-mem-put (subseq name 5) data)
+               (setq nfasl (+ nfasl 1)))
+              ((string= name \"fasl-record\")
+               (setq *fasl-recorded* nil)
+               (setq *fasl-record-mem* t)
+               (write-string-serial \"  fasl: recording\") (write-char-serial 10))
+              (t
+               (when (> nfasl 0)
+                 (write-string-serial \"  fasl: \") (print-dec nfasl) (write-string-serial \" cached\")
+                 (write-char-serial 10)
+                 (setq nfasl 0))
+               (write-string-serial \"  \") (write-string-serial name) (write-char-serial 10)
+               (if (and (> (length name) 5) (string= \".lisp\" name :start2 (- (length name) 5)))
+                   (progn
+                     (handler-case (%it-eval-source (%it-utf8-bytes-to-string data) name)
+                       (t (c) (write-string-serial \"  payload error: \")
+                              (handler-case (write-object c) (t (c2) c2 nil))
+                              (write-char-serial 10)))
+                     (when (%fasl-record-mem-p) (%ppcmac-fasl-dump)))
+                   (setq *ppcmac-files* (cons (cons name data) *ppcmac-files*)))))))))))
 "
         "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the

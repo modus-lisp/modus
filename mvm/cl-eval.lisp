@@ -6312,9 +6312,21 @@
   "Return T if X is a compiled function."
   (functionp x))
 
-(defun break (&optional message &rest args)
-  "Enter debugger (stub - no-op)."
-  nil)
+(defun break (&optional (format-control "Break") &rest format-arguments)
+  "CLHS BREAK: the debugger, with a CONTINUE restart that returns NIL from here.
+   *DEBUGGER-HOOK* is not run (CLHS: BREAK binds it to NIL); SB-EXT:*INVOKE-DEBUGGER-HOOK* is,
+   when set, as on SBCL.  modus has no interactive debugger, so with no hook the message is
+   written to *ERROR-OUTPUT* and BREAK returns, as continuing would."
+  (let ((c (make-condition 'simple-condition :format-control format-control
+                                             :format-arguments format-arguments)))
+    ;; CONTINUE as CERROR makes it (%WITH-RESTARTS, :case style): invoking it lands here.
+    (%with-restarts
+     (list (list 'continue (lambda () nil) "Return from BREAK."))
+     (lambda ()
+       (unless (%call-invoke-debugger-hook c)
+         (format *error-output* "~&BREAK: ~A~%" c)
+         (finish-output *error-output*))))
+    nil))
 
 ;;; ============================================================
 ;;; SPECIAL-OPERATOR-P, MACRO-FUNCTION, FBOUNDP extensions

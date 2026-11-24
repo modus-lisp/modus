@@ -16,6 +16,12 @@
 ;;;; what runs on Unix is the cross-checked image, not something derived from it.  The PE
 ;;;; header moves from 0x80 to 0x280 to make room; nothing else in the PE changes.
 ;;;;
+;;;; MODUS_APE_MACHO adds the macOS/arm64 CLI (mvm/build-macos-cli.lisp) after the Linux
+;;;; image; the script picks by `uname -sm' ("Linux x86_64", "Darwin arm64").  With
+;;;; MODUS_APE_CRAM both go in gzip-compressed, and with MODUS_APE_STUB too the PE is the
+;;;; Windows launcher (mvm/ape-stub-win64.lisp) and the Windows CLI a compressed segment.
+;;;; The script must fit in the DOS stub (0x40..0x280), which is why it is terse.
+;;;;
 ;;;; Not the single-image APE Cosmopolitan builds: the two images differ (syscalls go
 ;;;; through a shim on Windows; per-thread storage is TEB slots there, FS/GS on Linux),
 ;;;; so the file carries both.  The script is POSIX sh (bash, dash, zsh, busybox ash).
@@ -93,9 +99,14 @@
     #+modus (funcall (find-symbol "JIT-EAGER" "MODUS"))   ; one long call: native first
     (funcall (find-symbol "GZIP-COMPRESS" "CRAM") octets :mtime 0)))
 
-(defun make-ape (pe elf &optional elf-z)
-  "ELF-Z, when given, is ELF gzip-compressed: the file carries that, and the script
-   decompresses it (gzip -dc) into the cache, where it is ELF's exact bytes again."
+(defun make-ape (pe images)
+  "IMAGES: one plist per Unix platform, in file order --
+     :UNAME  what `uname -sm' prints there (\"Linux x86_64\", \"Darwin arm64\")
+     :RAW    the executable's bytes (what the cache holds, and what is checked)
+     :STORED what the file carries: RAW, or RAW gzip-compressed (the script then runs
+             it through gzip -dc)
+   Each is stored 4 KB aligned after the PE.  Returns the file, the cache names, and each
+   image's offset."
   (let* ((lfanew (ape-u32 pe #x3C))
          (nsec (ape-u16 pe (+ lfanew 6)))
          (optsz (ape-u16 pe (+ lfanew 20)))
@@ -105,25 +116,39 @@
          (first-raw (loop for i below nsec
                           for raw = (ape-u32 pe (+ lfanew 24 optsz (* 40 i) 20))
                           when (plusp raw) minimize raw))
-         (elf-at (* 4096 (ceiling (length pe) 4096)))
-         (stored (or elf-z elf))
-         (elf-blocks (ceiling (length stored) 4096))
-         (name (concatenate 'string "modus-" (ape-fnv64 elf)))
+         (at (* 4096 (ceiling (length pe) 4096)))
+         (offsets (loop for im in images
+                        collect at
+                        do (incf at (* 4096 (ceiling (length (getf im :stored)) 4096)))))
+         (names (loop for im in images
+                      collect (concatenate 'string "modus-" (ape-fnv64 (getf im :raw)))))
+         ;; one arm per platform sets s (first 4 KB block), c (blocks), l (stored
+         ;; length) and n (the cache name); one line then copies the image to the cache
+         ;; once and runs it.  The script must fit in the DOS stub, so when every image
+         ;; is gzip'd its check is gzip's own (CRC-32 and length: a short or damaged copy
+         ;; exits non-zero, which stops the && chain); otherwise u (the length) and z
+         ;; (gzip -dc or cat) are set too and the copy's length is checked.
+         (gz (every (lambda (im) (not (eq (getf im :stored) (getf im :raw)))) images))
+         (arms (with-output-to-string (o)
+                 (loop for im in images for off in offsets for n in names
+                       for stored = (getf im :stored)
+                       do (format o "\"~A\")s=~D c=~D l=~D n=~A~@[ u=~D z=~A~];;"
+                                  (getf im :uname) (/ off 4096)
+                                  (ceiling (length stored) 4096) (length stored) n
+                                  (and (not gz) (length (getf im :raw)))
+                                  (if (eq stored (getf im :raw)) "cat" "'gzip -dc'")))))
          (script (format nil "~C'~%~
-case $(uname -sm) in \"Linux x86_64\") ;; *) echo \"modus.com: no image for $(uname -sm) in this file\" >&2; exit 1;; esac~%~
-o=$0; case $o in */*) ;; *) o=$(command -v \"$o\");; esac; case $o in /*) ;; *) o=$PWD/$o;; esac~%~
-d=${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/modus; e=$d/~A~%~
-[ -x \"$e\" ] || { mkdir -p \"$d\" && dd if=\"$o\" bs=4096 skip=~D count=~D 2>/dev/null | head -c ~D~A > \"$e.$$\" ~
-&& [ $(wc -c < \"$e.$$\") -eq ~D ] && chmod 755 \"$e.$$\" && mv -f \"$e.$$\" \"$e\"; } || exit 1~%~
+case $(uname -sm) in ~A*)echo \"modus.com: no image for $(uname -sm)\" >&2;exit 1;;esac~%~
+o=$0;case $o in */*);; *)o=$(command -v \"$o\");;esac;case $o in /*);; *)o=$PWD/$o;;esac~%~
+d=${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/modus;e=$d/$n~%~
+[ -x \"$e\" ]||{ mkdir -p \"$d\"&&dd if=\"$o\" bs=4096 skip=$s count=$c 2>/dev/null|head -c $l|~A>\"$e.$$\"~
+~A&&chmod +x \"$e.$$\"&&mv -f \"$e.$$\" \"$e\";}||{ rm -f \"$e.$$\";exit 1;}~%~
 MODUS_APE=$o exec \"$e\" \"$@\"~%exit 1~%"
-                         #\Newline name (/ elf-at 4096) elf-blocks (length stored)
-                         (if elf-z " | gzip -dc" "") (length elf)))
-         (out (make-array (+ elf-at (* 4096 elf-blocks))
-                          :element-type '(unsigned-byte 8) :initial-element 0)))
+                         #\Newline arms (if gz "gzip -dc" "$z")
+                         (if gz "" "&&[ $(wc -c<\"$e.$$\") -eq $u ]")))
+         (out (make-array at :element-type '(unsigned-byte 8) :initial-element 0)))
     (unless (and (= (aref pe 0) 77) (= (aref pe 1) 90) (= (ape-u32 pe lfanew) #x4550))
       (error "make-ape: ~A is not a PE image" "MODUS_APE_PE"))
-    (unless (and (= (aref elf 0) #x7F) (= (aref elf 1) 69) (= (aref elf 2) 76) (= (aref elf 3) 70))
-      (error "make-ape: MODUS_APE_ELF is not an ELF image"))
     (when (> (+ +ape-pe-at+ hdr-len) size-of-headers)
       (error "make-ape: the PE header does not fit below SizeOfHeaders (#x~X)" size-of-headers))
     (when (> (+ #x40 (length script)) +ape-pe-at+)
@@ -142,8 +167,9 @@ MODUS_APE=$o exec \"$e\" \"$@\"~%exit 1~%"
     (dotimes (i (length script))
       (setf (aref out (+ #x40 i)) (char-code (char script i))))
     (assert (<= size-of-headers first-raw))
-    (replace out stored :start1 elf-at)
-    (values out name elf-at)))
+    (loop for im in images for off in offsets
+          do (replace out (getf im :stored) :start1 off))
+    (values out names offsets (length script))))
 
 (defun ape-opt (name)
   (let ((v (funcall (find-symbol "POSIX-GETENV" "SB-EXT") name))) (and v (plusp (length v)) v)))
@@ -159,13 +185,28 @@ MODUS_APE=$o exec \"$e\" \"$@\"~%exit 1~%"
        (stub (and (ape-opt "MODUS_APE_STUB") (ape-read (ape-opt "MODUS_APE_STUB"))))
        (pe-z (and stub (or elf-z (error "make-ape: MODUS_APE_STUB needs MODUS_APE_CRAM"))
                   (ape-gzip pe))))
-  (multiple-value-bind (out0 name elf-at) (make-ape (or stub pe) elf elf-z)
-    (let ((out (ape-trailer out0 (append (and pe-z (list (cons "windows-x64.exe.gz" pe-z)))
-                                         (ape-segments-from-env))
-                            (list (list (if elf-z "linux-x64.elf.gz" "linux-x64.elf")
-                                        elf-at (length (or elf-z elf)))))))
-      (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
-                              :if-exists :supersede)
-        (write-sequence out s))
-      (format t "~&make-ape: ~A, ~D bytes (Linux image cached as ~~/.cache/modus/~A)~%"
-              path (length out) name))))
+  (unless (and (= (aref elf 0) #x7F) (= (aref elf 1) 69) (= (aref elf 2) 76) (= (aref elf 3) 70))
+    (error "make-ape: MODUS_APE_ELF is not an ELF image"))
+  ;; MODUS_APE_MACHO (mvm/build-macos-cli.lisp's executable): the macOS/arm64 CLI, stored
+  ;; after the Linux image (gzip-compressed with MODUS_APE_CRAM); Darwin's sh runs it the
+  ;; same way
+  (let* ((macho (and (ape-opt "MODUS_APE_MACHO") (ape-read (ape-opt "MODUS_APE_MACHO"))))
+         (macho-z (and macho elf-z (ape-gzip macho)))
+         (images (append (list (list :uname "Linux x86_64" :raw elf :stored (or elf-z elf)
+                                     :dir (if elf-z "linux-x64.elf.gz" "linux-x64.elf")))
+                         (and macho
+                              (list (list :uname "Darwin arm64" :raw macho
+                                          :stored (or macho-z macho)
+                                          :dir (if macho-z "darwin-arm64.gz" "darwin-arm64")))))))
+    (when (and macho (not (= (ape-u32 macho 0) #xFEEDFACF)))
+      (error "make-ape: MODUS_APE_MACHO is not a 64-bit Mach-O"))
+    (multiple-value-bind (out0 names offsets script-len) (make-ape (or stub pe) images)
+      (let ((out (ape-trailer out0 (append (and pe-z (list (cons "windows-x64.exe.gz" pe-z)))
+                                           (ape-segments-from-env))
+                              (loop for im in images for off in offsets
+                                    collect (list (getf im :dir) off (length (getf im :stored)))))))
+        (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                                :if-exists :supersede)
+          (write-sequence out s))
+        (format t "~&make-ape: ~A, ~D bytes, a ~D-byte script; cached in ~~/.cache/modus/ as ~{~A~^, ~}~%"
+                path (length out) script-len names)))))

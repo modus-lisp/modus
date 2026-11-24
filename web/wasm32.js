@@ -81,7 +81,8 @@ const F_EXEC = 0, F_GC = 1, F_CHECKED = 2, F_FAULT = 3, F_TAIL = 4, F_TRAP = 5, 
 // dep: Wasm-to-Wasm call depth (native stack), not mirrored in the VM.
 // cmp / ovf: the compare and overflow flags across a jump between chunks.
 const FB_BIAS = 4096;          // see LOAD
-const DIRTYOFF = !!ENV.MVM_WASM_NODIRTY;   // bisect: spill every register every time
+const DIRTYOFF = !!ENV.MVM_WASM_NODIRTY;
+const NOINLSJ = !!ENV.MVM_WASM_NOINLSJ;      // bisect: setjmp / handler-pop through JS   // bisect: spill every register every time
 const GLOBALS = ['vr', 'va', 'vl', 'esp', 'ebp', 'pc', 'dep', 'cmp', 'ovf'];
 const G_VR = 0, G_VA = 1, G_VL = 2, G_ESP = 3, G_EBP = 4, G_PC = 5, G_DEP = 6, G_CMP = 7, G_OVF = 8;
 const WDEPTH = (ENV.MVM_WASM_DEPTH && parseInt(ENV.MVM_WASM_DEPTH, 10)) || 600;
@@ -367,6 +368,42 @@ function compile(vm, entry, osr) {
       lget(LT1); i32c(-1); op1(0x47); IF(); T(); lget(LT1); call(F_FINISH); END();
       LOAD(4, 15);
   };
+  // absolute address A as a memory operand base (adr's form, from a constant)
+  const absA = (a) => i32c(a - VBASE);
+  const st64lo = (a, val) => { absA(a); val(); st32(); absA(a + 4); i32c(0); st32(); };
+  const inlineHandlerPop = () => {
+    const { A_JMPBUF, A_HDEPTH, A_HSTACK, A_HOVF, JMPBUF_WORDS } = C;
+    absA(A_HOVF); ld32(); ltee(LT1);
+    IF();                                   // overflowed pushes are popped first
+      absA(A_HOVF); lget(LT1); i32c(1); op1(0x6B); st32();
+    ELSE();
+      absA(A_HDEPTH); ld32(); ltee(LT1); op1(0x45);
+      IF();
+        for (let i = 0; i < JMPBUF_WORDS; i++) st64lo(A_JMPBUF + 8 * i, () => i32c(0));
+      ELSE();
+        lget(LT1); i32c(1); op1(0x6B); lset(LT1);
+        st64lo(A_HDEPTH, () => lget(LT1));
+        lget(LT1); i32c(5); op1(0x74); i32c(A_HSTACK - VBASE); op1(0x6A); lset(LT2);   // frame
+        for (let i = 0; i < JMPBUF_WORDS; i++) st64lo(A_JMPBUF + 8 * i, () => { lget(LT2); ld32(8 * i); });
+      END();
+    END();
+  };
+  const inlineSetjmp = (resumePc) => {
+    const { A_JMPBUF, A_HDEPTH, A_HSTACK, HMAX, A_HOVF, JMPBUF_WORDS } = C;
+    absA(A_HDEPTH); ld32(); ltee(LT1); i32c(HMAX); op1(0x4E);           // depth >= HMAX
+    IF();
+      absA(A_HOVF); absA(A_HOVF); ld32(); i32c(1); op1(0x6A); st32();
+    ELSE();
+      lget(LT1); i32c(5); op1(0x74); i32c(A_HSTACK - VBASE); op1(0x6A); lset(LT2);   // push the armed frame
+      for (let i = 0; i < JMPBUF_WORDS; i++) { lget(LT2); absA(A_JMPBUF + 8 * i); ld32(); st32(8 * i); lget(LT2); i32c(0); st32(8 * i + 4); }
+      st64lo(A_HDEPTH, () => { lget(LT1); i32c(1); op1(0x6A); });
+      st64lo(A_JMPBUF, () => gget(G_ESP));
+      st64lo(A_JMPBUF + 8, () => gget(G_EBP));
+      st64lo(A_JMPBUF + 16, () => i32c(resumePc));
+      st64lo(A_JMPBUF + 24, () => lget(LR(4)));                       // V4 (the home, which the JS read)
+    END();
+    i32c(NIL); gset(G_VR);
+  };
   const delegate = (pc) => { STOREv(); i32c(pc); call(F_EXEC); lset(LCMP); LOAD(); };
 
   const bodies = [];
@@ -427,8 +464,18 @@ function compile(vm, entry, osr) {
       case 0x00: case 0x72: case 0x8A: case 0x8B: case 0x92: break;
       case 0x02: {
         const c = b1 | (b2 << 8);
-        if ((c < 0x100 || c >= 0x8000) && frameEnterParams(c) <= 4) break;
+        if (c < 0x100 || c >= 0x8000) {
+          // FRAME-ENTER: parameters 5.. are copied from the caller's pushed
+          // arguments into their frame slots (vm.trap's first arm), inline.
+          const n = frameEnterParams(c);
+          for (let i = 4; i < n; i++) { lget(LFB); lget(LFB); ld32(8 + 4 * (i - 4) + FB_BIAS); st32(slotOff(i) + FB_BIAS); }
+          break;
+        }
         if (c >= 0x100 && c < 0x300) break;
+        // SETJMP and HANDLER-POP are memory shuffles (vm.setjmp / vm.handlerPop):
+        // inline, not a trip through JS -- a million each loading cl-bench.
+        if (c === 0x510 && !NOINLSJ) { inlineSetjmp(pc + len); break; }
+        if (c === 0x512 && !NOINLSJ) { inlineHandlerPop(); break; }
         STOREv(); setPC(pc); i32c(c); i32c(pc + len); i32c(pc); call(F_TRAP); reloadFB(); LOAD();
         break;
       }

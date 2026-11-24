@@ -1841,7 +1841,8 @@ if (ENV.MVM_WASM) {
 if (WASM) {
   WASM.init({ VBASE, NIL, TV, IX, slotOff, FRAME_SIZE, INSN_LEN, JIT_PHYS, A_WEB_CONSTS, POOL_ADDR,
               A_MVCOUNT, A_CENV, A_NARGS, RET_SENTINEL, FN_UNRESOLVED, frameEnterParams, ldbMask,
-              JD_MAX, LongJmp, BACK_BRANCH, frameBytes, STACK_ADDR, LJ_TAG });
+              JD_MAX, LongJmp, BACK_BRANCH, frameBytes, STACK_ADDR, LJ_TAG,
+              A_JMPBUF, A_HDEPTH, A_HSTACK, HMAX, A_HOVF, JMPBUF_WORDS });
 }
 if (typeof module !== 'undefined' && module.exports) module.exports = MVM_EXPORTS;
 else if (typeof self !== 'undefined') self.MVM_EXPORTS = MVM_EXPORTS;

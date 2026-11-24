@@ -586,8 +586,13 @@ class MVM {
     this.va = free;
     this.vl = toStart + spaceSize;
     const g0 = (fromStart - this.pageBase) >> 4, g1 = (fromEnd - this.pageBase) >> 4;
-    this.startBmp.fill(0, g0 >> 3, (g1 >> 3) + 1);
-    this.consBmp.fill(0, g0 >> 3, (g1 >> 3) + 1);
+    // EXCLUSIVE end: the semispaces are adjacent and granule-aligned to 8, so
+    // byte g1>>3 is the first of the OTHER semispace -- the to-space this
+    // collection just copied its first survivors into.  Clearing it (as a +1
+    // here did) erased their start/cons bits, so a later root pointing at one
+    // was not forwarded: TYPE-ERRORs / `#<?F..>' after enough collections.
+    this.startBmp.fill(0, g0 >> 3, g1 >> 3);
+    this.consBmp.fill(0, g0 >> 3, g1 >> 3);
     this.gcCount++;
     this.st64(A_GC_COUNT, this.gcCount, 0);
     if (this.trace) this.host.log(`[gc #${this.gcCount}: ${used >> 10}K -> ${(free - toStart) >> 10}K, ${Date.now() - t0}ms]`);

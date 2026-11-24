@@ -85,7 +85,17 @@
         (dotimes (k 8) (setf (aref new (+ tr 16 k)) (ldb (byte 8 (* 8 k)) (length text)))))
       new)))
 
-(defun make-ape (pe elf)
+(defun ape-gzip (octets)
+  "OCTETS gzip-compressed by cram (MODUS_APE_CRAM: its source in one file -- the cram.lisp
+   segment), with mtime 0: the same bytes on every host."
+  (let ((cram (ape-env "MODUS_APE_CRAM")))
+    (unless (find-package "CRAM") (load cram))
+    #+modus (funcall (find-symbol "JIT-EAGER" "MODUS"))   ; one long call: native first
+    (funcall (find-symbol "GZIP-COMPRESS" "CRAM") octets :mtime 0)))
+
+(defun make-ape (pe elf &optional elf-z)
+  "ELF-Z, when given, is ELF gzip-compressed: the file carries that, and the script
+   decompresses it (gzip -dc) into the cache, where it is ELF's exact bytes again."
   (let* ((lfanew (ape-u32 pe #x3C))
          (nsec (ape-u16 pe (+ lfanew 6)))
          (optsz (ape-u16 pe (+ lfanew 20)))
@@ -96,16 +106,18 @@
                           for raw = (ape-u32 pe (+ lfanew 24 optsz (* 40 i) 20))
                           when (plusp raw) minimize raw))
          (elf-at (* 4096 (ceiling (length pe) 4096)))
-         (elf-blocks (ceiling (length elf) 4096))
+         (stored (or elf-z elf))
+         (elf-blocks (ceiling (length stored) 4096))
          (name (concatenate 'string "modus-" (ape-fnv64 elf)))
          (script (format nil "~C'~%~
 case $(uname -sm) in \"Linux x86_64\") ;; *) echo \"modus.com: no image for $(uname -sm) in this file\" >&2; exit 1;; esac~%~
 o=$0; case $o in */*) ;; *) o=$(command -v \"$o\");; esac; case $o in /*) ;; *) o=$PWD/$o;; esac~%~
 d=${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/modus; e=$d/~A~%~
-[ -x \"$e\" ] || { mkdir -p \"$d\" && dd if=\"$o\" bs=4096 skip=~D count=~D 2>/dev/null | head -c ~D > \"$e.$$\" ~
-&& chmod 755 \"$e.$$\" && mv -f \"$e.$$\" \"$e\"; } || exit 1~%~
+[ -x \"$e\" ] || { mkdir -p \"$d\" && dd if=\"$o\" bs=4096 skip=~D count=~D 2>/dev/null | head -c ~D~A > \"$e.$$\" ~
+&& [ $(wc -c < \"$e.$$\") -eq ~D ] && chmod 755 \"$e.$$\" && mv -f \"$e.$$\" \"$e\"; } || exit 1~%~
 MODUS_APE=$o exec \"$e\" \"$@\"~%exit 1~%"
-                         #\Newline name (/ elf-at 4096) elf-blocks (length elf)))
+                         #\Newline name (/ elf-at 4096) elf-blocks (length stored)
+                         (if elf-z " | gzip -dc" "") (length elf)))
          (out (make-array (+ elf-at (* 4096 elf-blocks))
                           :element-type '(unsigned-byte 8) :initial-element 0)))
     (unless (and (= (aref pe 0) 77) (= (aref pe 1) 90) (= (ape-u32 pe lfanew) #x4550))
@@ -130,15 +142,28 @@ MODUS_APE=$o exec \"$e\" \"$@\"~%exit 1~%"
     (dotimes (i (length script))
       (setf (aref out (+ #x40 i)) (char-code (char script i))))
     (assert (<= size-of-headers first-raw))
-    (replace out elf :start1 elf-at)
+    (replace out stored :start1 elf-at)
     (values out name elf-at)))
 
-(let ((pe (ape-read (ape-env "MODUS_APE_PE")))
-      (elf (ape-read (ape-env "MODUS_APE_ELF")))
-      (path (ape-env "MODUS_APE_OUT" "modus.com")))
-  (multiple-value-bind (out0 name elf-at) (make-ape pe elf)
-    (let ((out (ape-trailer out0 (ape-segments-from-env)
-                            (list (list "linux-x64.elf" elf-at (length elf))))))
+(defun ape-opt (name)
+  (let ((v (funcall (find-symbol "POSIX-GETENV" "SB-EXT") name))) (and v (plusp (length v)) v)))
+
+(let* ((pe (ape-read (ape-env "MODUS_APE_PE")))
+       (elf (ape-read (ape-env "MODUS_APE_ELF")))
+       (path (ape-env "MODUS_APE_OUT" "modus.com"))
+       ;; MODUS_APE_CRAM (cram's source): the Linux image goes in gzip-compressed
+       (elf-z (and (ape-opt "MODUS_APE_CRAM") (ape-gzip elf)))
+       ;; MODUS_APE_STUB (mvm/build-ape-stub.lisp's launcher), with MODUS_APE_CRAM: the file's
+       ;; PE is the launcher, and the Windows CLI goes in gzip-compressed as the segment
+       ;; windows-x64.exe.gz, which the launcher inflates, caches and runs
+       (stub (and (ape-opt "MODUS_APE_STUB") (ape-read (ape-opt "MODUS_APE_STUB"))))
+       (pe-z (and stub (or elf-z (error "make-ape: MODUS_APE_STUB needs MODUS_APE_CRAM"))
+                  (ape-gzip pe))))
+  (multiple-value-bind (out0 name elf-at) (make-ape (or stub pe) elf elf-z)
+    (let ((out (ape-trailer out0 (append (and pe-z (list (cons "windows-x64.exe.gz" pe-z)))
+                                         (ape-segments-from-env))
+                            (list (list (if elf-z "linux-x64.elf.gz" "linux-x64.elf")
+                                        elf-at (length (or elf-z elf)))))))
       (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
                               :if-exists :supersede)
         (write-sequence out s))

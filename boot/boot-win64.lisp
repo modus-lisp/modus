@@ -1132,6 +1132,15 @@
 ;;; The prologue and the stub.
 ;;; ============================================================
 
+;;; The heap and JIT arena this stub maps -- the CLI's defaults, which Windows COMMITS up
+;;; front.  A small program (mvm/build-ape-stub.lisp: the modus.com launcher) asks for less.
+(defvar *win64-midpoint* nil "Semispace size (midpoint) to map, or NIL: +LINUX-X64-GC-MIDPOINT+.")
+(defvar *win64-jit-arena-size* nil "JIT arena bytes, or NIL: +LINUX-X64-JIT-ARENA-SIZE+.")
+(defun win64-midpoint () (or *win64-midpoint* +linux-x64-gc-midpoint+))
+(defun win64-heap-map-size ()
+  (if *win64-midpoint* (getf (x64-heap-layout *win64-midpoint*) :map) +linux-x64-heap-size+))
+(defun win64-jit-arena-size () (or *win64-jit-arena-size* +linux-x64-jit-arena-size+))
+
 (defun win64-heap-tail-bytes ()
   "The shared heap tail (argc/argv, GC metadata, registers) as bytes.  It is
    position independent: absolute addresses and rel8 jumps inside it only."
@@ -1165,7 +1174,7 @@
     (:bytes #x48 #xB8 ,@(w64-le64 +win64-win32-stack-top+)) ; mov rax,Win32 stack top
     ,(w64-gs-store +win64-tls-stack+ 0)                  ; mov gs:[stack],rax
     (:bytes #x48 #xB9 ,@(w64-le64 +linux-x64-fixed-heap-base+)) ; mov rcx,heap base
-    (:bytes #xBA ,@(w64-le32 +linux-x64-heap-size+))     ; mov edx,heap size
+    (:bytes #xBA ,@(w64-le32 (win64-heap-map-size)))     ; mov edx,heap size
     (:bytes #x41 #xB8 #x00 #x30 #x00 #x00)               ; mov r8d,MEM_RESERVE|MEM_COMMIT
     (:bytes #x41 #xB9 #x04 #x00 #x00 #x00)               ; mov r9d,PAGE_READWRITE
     (:call-iat "VirtualAlloc")
@@ -1186,7 +1195,7 @@
     (:call-iat "WSAStartup")
     (:bytes #x48 #x81 #xC4 #xC0 #x01 0 0)                ; add rsp,0x1C0
     (:bytes #x48 #xB9 ,@(w64-le64 +linux-x64-jit-arena-base+)) ; mov rcx,arena base
-    (:bytes #xBA ,@(w64-le32 +linux-x64-jit-arena-size+))  ; mov edx,arena size
+    (:bytes #xBA ,@(w64-le32 (win64-jit-arena-size)))  ; mov edx,arena size
     (:bytes #x41 #xB8 #x00 #x30 #x00 #x00)               ; mov r8d,MEM_RESERVE|MEM_COMMIT
     (:bytes #x41 #xB9 #x40 #x00 #x00 #x00)               ; mov r9d,PAGE_EXECUTE_READWRITE
     (:call-iat "VirtualAlloc")
@@ -1274,8 +1283,8 @@
     ;; The heap's geometry, which the Linux stub chooses at startup
     ;; (EMIT-LINUX-X64-CHOOSE-HEAP) and the tail reads: here the default layout,
     ;; the one +LINUX-X64-HEAP-SIZE+ committed above.
-    ,@(let ((l (x64-heap-layout +linux-x64-gc-midpoint+)))
-        (loop for (slot v) in `((#x10000F88 ,+linux-x64-gc-midpoint+)
+    ,@(let ((l (x64-heap-layout (win64-midpoint))))
+        (loop for (slot v) in `((#x10000F88 ,(win64-midpoint))
                                 (#x10000F90 ,(getf l :data))
                                 (#x10000F98 ,(getf l :kind-delta)))
               collect `(:bytes #x48 #xB9 ,@(w64-le64 v)             ; mov rcx, v

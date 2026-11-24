@@ -1539,6 +1539,10 @@
       (%fs-set-pos stream (+ (%fs-pos stream) (- end start)))
       (return-from %fs-write-bytes t))
     (when (and (%fs-bulk-ok-p stream seq) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
+      ;; WRITE-BYTE's bytes still in the stream's buffer go first: this writes straight to the descriptor, so without
+      ;; it (write-byte 1) (write-sequence #(2)) wrote 2 1 -- every byte that went one at a time came out after every
+      ;; sequence, at the close.
+      (%fs-flush stream)
       ;; a socket goes out through the per-CPU socket buffer when there is one (64 KB, not 4 KB:
       ;; each write(2) is a wakeup for the reader, and a 98 KB ZRLE frame was 25 of them)
       (let* ((sock (%fs-obuf-p stream fd))

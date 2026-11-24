@@ -476,12 +476,14 @@
 ;; looks the name up (FUNCALL, the REPL, translated pages); the image's own direct
 ;; callers keep the original, as on a read-only native image.
 (defun %kernel-redirect-hook (name) nil)
+(defun %jit-native-fn-at (addr)
+  (%word->val (logior (* (- addr #x10000000) 16) 3)))
 (defun %jit-install-native-fns (base fnoffs names)
   (let ((n 0))
     (dolist (e fnoffs)
       (let ((nm (car e)))
         (when (member nm names :test (function string=))
-          (let ((fn (%word->val (logior (* (- (+ base (cdr e)) #x10000000) 16) 3))))
+          (let ((fn (%jit-native-fn-at (+ base (cdr e)))))
             (when (boundp (quote *symbol-function-table*))
               (puthash nm *symbol-function-table* fn))
             (when (boundp (quote *native-sym-function-table*))

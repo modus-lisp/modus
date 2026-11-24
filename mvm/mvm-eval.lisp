@@ -2425,6 +2425,17 @@
     (setq *jit-trampoline-forwards* (make-hash-table :test (function equal))))
   (puthash name *jit-trampoline-forwards* (cons bc box)))
 
+(declaim (overridable %jit-native-fn-at))
+(defun %jit-native-fn-at (addr)
+  "The function object for native code entered at ADDR, or NIL when ADDR cannot
+   be one.  A native function's word is its 16-aligned address tagged 3.  The
+   web image overrides it: its JIT pages hold bytecode its VM runs, and a
+   function word there is the code's offset from #x10000000 times 16, tagged 3
+   (build-web.lisp's %JIT-INSTALL-NATIVE-FNS).  Spelling x64's encoding into
+   %JIT-SET-FORWARDS sent every promoted DEFUN's old function object -- in a
+   plist, a closure, a table -- to a garbage address on the web (DDERIV)."
+  (when (eql (logand addr 15) 0) (%word->val (logior addr 3))))
+
 (defun %jit-set-forwards (bc base fnoffs names)
   "Point the forwarding box of each NAMES function this module (bytecode BC)
    defines at its native code (BASE + offset); see *JIT-TRAMPOLINE-FORWARDS*."
@@ -2433,9 +2444,9 @@
       (let ((nm (car e)))
         (when (member nm names :test (function string=))
           (let ((f (gethash nm *jit-trampoline-forwards*))
-                (addr (+ base (cdr e))))
-            (when (and f (eq (car f) bc) (eql (logand addr 15) 0))
-              (setf (car (cdr f)) (%word->val (logior addr 3))))))))))
+                (fn (%jit-native-fn-at (+ base (cdr e)))))
+            (when (and f (eq (car f) bc) fn)
+              (setf (car (cdr f)) fn))))))))
 
 (defun %jit-own-definition-p (name current)
   "True when CURRENT -- NAME's definition now -- is NAME's runtime DEFUN: the

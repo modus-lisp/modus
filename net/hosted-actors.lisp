@@ -137,6 +137,16 @@
 (defvar *ha-nregions* 0)  ; how many per-thread regions the carve produced
 (defvar *ha-rbase-from* 0) ; region i's from-space = *ha-rbase-from* + i * *ha-rsize*
 (defvar *ha-rbase-to* 0)   ; region i's to-space   = *ha-rbase-to*   + i * *ha-rsize*
+;; VARIABLE-SIZED REGIONS (*THREAD-HEAP-SIZES*, MODUS_THREAD_HEAPS).  With a layout, region I's
+;; semispace size and its offset from *HA-RBASE-FROM* / *HA-RBASE-TO* are in these two vectors
+;; (fixnums, one per region index, made before the carve -- the carve itself must not allocate),
+;; and *HA-RSIZE* is region 0's.  NIL (no layout): every region is *HA-RSIZE*, at I * *HA-RSIZE*,
+;; exactly as before.  Read them through %HA-RSIZE and %HA-ROFF.
+(defvar *ha-rsizes* nil)
+(defvar *ha-roffs* nil)
+(defvar *ha-layout-n* 0)      ; how many regions the layout fits (the carve's N)
+(defvar *ha-layout-total* 0)  ; their semispace sizes, summed
+(defvar *ha-default-rsize* 0) ; the size a thread asks for when it names none (%THR-FREE-SLOT)
 ;; REGIONS 0 AND 1 UNDER THEIR OLD NAMES.  Every test and every selftest written
 ;; before the carve went to N spells the first two regions this way, and they are
 ;; still literally the first two slices — so these are aliases, not a parallel
@@ -249,6 +259,95 @@
    a worker that owns a loaded page holds its DOM, styles, layout, scripts and canvas, which 16 MB
    does not.")
 
+;;; VARIABLE-SIZED THREAD HEAPS.  One size for every region made the world choose between its
+;;; workers: a phone's web-page worker needs 64 MB (a loaded page's DOM, styles, layout and canvas),
+;;; and every region that big left region 0 so little room over the world's live data that a video
+;;; decoder -- a worker that allocates and collects constantly -- hung at its first collection
+;;; (measured: 16 MB plays, 32 and 64 hang at their first collection).  So a program may lay the
+;;; regions out by size, and a thread may ask for one:
+;;;
+;;;   *THREAD-HEAP-SIZES*   a list of sizes in bytes, one per thread slot from 1, before the first
+;;;                         thread starts.  Slots past the list are *THREAD-HEAP-BYTES* (16 MB).
+;;;   MODUS_THREAD_HEAPS    the same in megabytes, overriding it: "64x3,16x8" or "64,64,16".
+;;;   (sb-thread:make-thread fn :heap-bytes N)
+;;;                         the smallest free slot of at least N bytes (%THR-FREE-SLOT); without it,
+;;;                         the size a thread asks for is *THREAD-HEAP-BYTES*'s.
+;;;
+;;; Region 0 of the carve is never a thread's (see %HA-NREGIONS below) and is 16 MB in a layout.
+;;; The regions are laid out in slot order, as many as leave region 0 at least half of its
+;;; semispace -- %HA-FIT-REGIONS' rule -- and never fewer than two.  Every size is a whole
+;;; megabyte, so every base keeps the 1024-byte congruence the carve aligns the first one to.
+(defvar *thread-heap-sizes* nil
+  "Per-slot thread heap sizes in bytes (slot 1 first), or NIL for one size (*THREAD-HEAP-BYTES*).
+   Read once, when the regions are carved; MODUS_THREAD_HEAPS (megabytes) overrides it.")
+
+(defun %ha-parse-heaps (env)
+  "MODUS_THREAD_HEAPS: comma-separated megabyte counts, each optionally xN (repeated N times).
+   A list of megabytes, or NIL when it holds none."
+  (let ((out nil) (i 0) (n (length env)) (num 0) (rep 0) (in-rep nil) (any nil))
+    (loop
+      (let ((c (if (< i n) (char env i) #\,)))
+        (cond ((digit-char-p c)
+               (if in-rep
+                   (setq rep (+ (* rep 10) (digit-char-p c)))
+                   (setq num (+ (* num 10) (digit-char-p c))))
+               (setq any t))
+              ((or (char= c #\x) (char= c #\X) (char= c #\*)) (setq in-rep t))
+              ((char= c #\,)
+               (when (and any (> num 0))
+                 (let ((k (if (and in-rep (> rep 0)) rep 1)))
+                   (loop (when (<= k 0) (return nil)) (setq out (cons num out)) (setq k (- k 1)))))
+               (setq num 0 rep 0 in-rep nil any nil))
+              (t nil)))
+      (setq i (+ i 1))
+      (when (> i n) (return nil)))
+    (nreverse out)))
+
+(defun %ha-heap-request ()
+  "The layout asked for: per-slot sizes in bytes, slot 1 first, or NIL for one size."
+  (let* ((env (ignore-errors (%cli-getenv "MODUS_THREAD_HEAPS")))
+         (mbs (and env (> (length env) 0) (ignore-errors (%ha-parse-heaps env)))))
+    (if mbs
+        (let ((out nil)) (dolist (m mbs) (setq out (cons (* m #x100000) out))) (nreverse out))
+        (and (boundp '*thread-heap-sizes*) (consp *thread-heap-sizes*) *thread-heap-sizes*))))
+
+(defun %ha-plan-layout (size0 g)
+  "Lay the regions out for a region-0 semispace of SIZE0 and a G-byte band: fill *HA-RSIZES* and
+   *HA-ROFFS*, *HA-LAYOUT-N* and *HA-LAYOUT-TOTAL* -- or, with no layout asked for, clear them, and
+   the carve is the uniform one it always was.  Runs BEFORE the carve, which must not allocate."
+  (let ((want (%ha-heap-request))
+        (dflt (%ha-region-size size0)))
+    (setq *ha-default-rsize* dflt)
+    (if (null want)
+        (progn (setq *ha-rsizes* nil) (setq *ha-roffs* nil)
+               (setq *ha-layout-n* 0) (setq *ha-layout-total* 0)
+               nil)
+        (let* ((maxn (%ha-max-regions))
+               (sizes (make-array maxn :initial-element 0))
+               (offs (make-array maxn :initial-element 0))
+               (room (- size0 (ash size0 -1)))
+               (used (+ g 4096))
+               (rest want)
+               (i 0))
+          (loop
+            (when (>= i maxn) (return nil))
+            (let ((sz (if (= i 0)
+                          #x1000000
+                          (let ((w (if rest (car rest) dflt)))
+                            (when rest (setq rest (cdr rest)))
+                            (max #x1000000 (logand w (- 0 #x100000)))))))
+              ;; at least two regions, whatever they cost: %HA-FIT-REGIONS' floor
+              (when (and (>= i 2) (> (+ used sz) room)) (return nil))
+              (setf (svref offs i) (- used (+ g 4096)))
+              (setf (svref sizes i) sz)
+              (setq used (+ used sz))
+              (setq i (+ i 1))))
+          (setq *ha-rsizes* sizes)
+          (setq *ha-roffs* offs)
+          (setq *ha-layout-n* i)
+          (setq *ha-layout-total* (- used (+ g 4096)))
+          t))))
+
 (defun %ha-region-size (size0)
   "Each region's semispace size for a region-0 semispace of SIZE0: *THREAD-HEAP-BYTES* (or
    MODUS_THREAD_HEAP, in MB), at least 16 MB, cut so at least two regions fit."
@@ -267,11 +366,14 @@
 (defun %ha-carve-new0 (size0)
   "The byte offset into a semispace of SIZE0 at which the carve begins — the
    band base, and the new size of region 0.  Split out of %HA-CARVE because
-   %HA-CARVE-ROOM has to know the answer BEFORE the carve commits to it."
-  (let* ((s (%ha-region-size size0))
-         (g #x1000000)
-         (n (%ha-fit-regions size0 g s (%ha-max-regions))))
-    (logand (- size0 (+ g (+ (* n s) 4096))) (- 0 4096))))
+   %HA-CARVE-ROOM has to know the answer BEFORE the carve commits to it.  With
+   a layout (%HA-PLAN-LAYOUT, run first) the regions are its sizes, summed."
+  (let ((g #x1000000))
+    (if (%ha-layout-p)
+        (logand (- size0 (+ g (+ *ha-layout-total* 4096))) (- 0 4096))
+        (let* ((s (%ha-region-size size0))
+               (n (%ha-fit-regions size0 g s (%ha-max-regions))))
+          (logand (- size0 (+ g (+ (* n s) 4096))) (- 0 4096))))))
 
 (defun %ha-carve-room (from0 size0)
   "MAKE ROOM FOR THE CARVE, OR SAY THERE IS NONE.  Returns 1 if region 0's live
@@ -349,6 +451,9 @@
       *ha-band*
       (let ((k (%gc-meta-scale))
             (r0 (%gc-region)))
+        ;; THE LAYOUT FIRST (%HA-PLAN-LAYOUT allocates; nothing after it may).  The
+        ;; semispace size does not change in a collection, so it holds across ROOM's.
+        (%ha-plan-layout (%gc-meta-read (+ r0 #x10) k) #x1000000)
         ;; ROOM FIRST — it may COLLECT, which flips the semispaces, so every
         ;; field below must be read after it and not before.
         (let ((room (%ha-carve-room (%gc-meta-read r0 k)
@@ -373,9 +478,10 @@
               ;; this arithmetic: %HA-CARVE-ROOM checked the frontier against
               ;; that function's answer, and two spellings that could drift
               ;; would make the check guard an address the carve does not use.
-              (let* ((s (%ha-region-size size0))
+              (let* ((layout (%ha-layout-p))
+                     (s (if layout (svref *ha-rsizes* 0) (%ha-region-size size0)))
                      (g #x1000000)
-                     (n (%ha-fit-regions size0 g s (%ha-max-regions)))
+                     (n (if layout *ha-layout-n* (%ha-fit-regions size0 g s (%ha-max-regions))))
                      (new0 (%ha-carve-new0 size0)))
                 ;; R0 was read before %HA-CARVE-ROOM; a collection there does
                 ;; not move the CONTROL BLOCK (only the semispaces flip), but
@@ -414,8 +520,8 @@
                 (setq *ha-rbase-to*   (%ha-align-up-to-page-base (+ to0   (+ new0 g))))
                 (setq *ha-r1-from* *ha-rbase-from*)
                 (setq *ha-r1-to*   *ha-rbase-to*)
-                (setq *ha-r2-from* (+ *ha-rbase-from* s))
-                (setq *ha-r2-to*   (+ *ha-rbase-to* s))
+                (setq *ha-r2-from* (+ *ha-rbase-from* (%ha-roff 1)))
+                (setq *ha-r2-to*   (+ *ha-rbase-to* (%ha-roff 1)))
                 ;; Zero the control head, the per-CPU block and the actor
                 ;; table.  Everything else in the band is stacks and pools that
                 ;; their own initialisers fill; zeroing 16 MB would cost more
@@ -811,8 +917,19 @@
   "How many per-thread regions this image carved.  0 before the carve."
   *ha-nregions*)
 
-(defun %ha-region-from (i) (+ *ha-rbase-from* (* i *ha-rsize*)))
-(defun %ha-region-to (i)   (+ *ha-rbase-to*   (* i *ha-rsize*)))
+(defun %ha-layout-p ()
+  (and (boundp '*ha-rsizes*) (simple-vector-p *ha-rsizes*)))
+
+(defun %ha-rsize (i)
+  "Region I's semispace size: its own with a layout (*THREAD-HEAP-SIZES*), else *HA-RSIZE*."
+  (if (%ha-layout-p) (svref *ha-rsizes* i) *ha-rsize*))
+
+(defun %ha-roff (i)
+  "Region I's byte offset from the first region's base, in either semispace."
+  (if (%ha-layout-p) (svref *ha-roffs* i) (* i *ha-rsize*)))
+
+(defun %ha-region-from (i) (+ *ha-rbase-from* (%ha-roff i)))
+(defun %ha-region-to (i)   (+ *ha-rbase-to*   (%ha-roff i)))
 
 (defun %ha-rcb (i)
   "Raw byte address of thread slot I's 64-byte region control block."

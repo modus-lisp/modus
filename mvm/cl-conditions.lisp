@@ -3104,6 +3104,10 @@
     (dolist (n (quote ("SYS-EXIT" "SAVE-AND-DIE" "INSTALL-TARBALL"
                        "ACTORS-SPAWN" "ACTORS-SEND" "ACTORS-RECEIVE" "ACTORS-RECEIVE-IF"
                        "ACTORS-SELF" "ACTORS-YIELD" "ACTORS-START" "ACTORS-STOP"
+                       "COROUTINES-START" "COROUTINE-CREATE" "COROUTINE-TRANSFER"
+                       "COROUTINE-CURRENT" "COROUTINE-DONE-P"
+                       "COROUTINE-STACK-BYTES" "SET-COROUTINE-STACK-BYTES"
+                       "DEFINE-HASH-TABLE-TEST"
                        "SPAWN-LINK" "LINK"
                        "SOCKET-CONNECT" "SOCKET-LISTEN" "SOCKET-LISTEN-ON"
                        "SOCKET-LISTEN-PORT" "SOCKET-ACCEPT" "SOCKET-SEND"
@@ -3124,6 +3128,8 @@
                        ;; what this image is (lib/configuration.lisp), and the bare-metal
                        ;; message log (lib/bare-log.lisp)
                        "IMAGE-CONFIGURATION"
+                       ;; the modus.com this process came from (lib/cli-toplevel.lisp)
+                       "APE-FILE" "APE-SEGMENTS" "APE-SEGMENT"
                        "KMSG" "KMSG-EVENT" "KMSG-DUMP" "KMSG-RECORDS" "KMSG-STATUS"
                        "KMSG-ECHO-LEVEL" "KMSG-SHIP-TO" "KMSG-SHIP-STATUS")))
       (let ((sym (intern n int)))

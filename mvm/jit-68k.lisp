@@ -469,8 +469,8 @@
              (fn (and name (%mvm-resolve-runtime-fn name)))
              (w (and fn (%val->word fn))))
         (if (and w (= (logand w 15) 3))
-            (- w 3)
-            (progn (setq *t68-why* (list :not-native name)) nil)))
+            (progn (%t68-note-dep name) (- w 3))
+            (progn (%t68-note-wait name) (setq *t68-why* (list :not-native name)) nil)))
       (let ((pc (if (< operand (length fn-table)) (aref fn-table operand) operand)))
         (or (gethash pc stubs)
             (progn (setq *t68-why* (list :no-callee operand)) nil)))))
@@ -613,10 +613,85 @@
           (setq *n68-refused* (cons (cons (car names) *n68-why*) *n68-refused*)))
       r)))
 
+;;; REDEFINITION.  Both tiers bind a call to another runtime function DIRECTLY, to
+;;; its native entry as it is when the caller is translated (%T68-CALL-TARGET), so
+;;; a later definition of the callee -- a DEFUN, (SETF FDEFINITION) -- was never
+;;; seen by native callers (test/redefine-native-callers.lisp).  So each binding is
+;;; recorded, callee -> caller module; a redefinition puts those callers back to
+;;; their interpreted definitions (which call by name, and see it), transitively --
+;;; their own native callers are bound to THEM -- and translates them again against
+;;; the new definition.  A module refused because a callee was not native yet is
+;;; recorded too and tried again when that callee goes native.
+(defvar *t68-binding* nil "The DEFUN names of the module being translated.")
+(defvar *t68-deps* nil "Callee name -> the name lists of modules bound directly to it.")
+(defvar *t68-waiting* nil "Callee name -> the name lists of modules waiting for it to go native.")
+(defvar *t68-interp* nil "DEFUN name -> its interpreted definition, while a native one is installed.")
+
+(defun %t68-table (sym)
+  (or (and (boundp sym) (symbol-value sym))
+      (set sym (make-hash-table :test (function equal)))))
+
+(defun %t68-note-dep (callee)
+  (when (and (boundp (quote *t68-binding*)) *t68-binding*)
+    (let ((tbl (%t68-table (quote *t68-deps*))))
+      (unless (member *t68-binding* (gethash callee tbl) :test (function equal))
+        (puthash callee tbl (cons *t68-binding* (gethash callee tbl)))))))
+
+(defun %t68-note-wait (callee)
+  (when (and (boundp (quote *t68-binding*)) *t68-binding*)
+    (let ((tbl (%t68-table (quote *t68-waiting*))))
+      (unless (member *t68-binding* (gethash callee tbl) :test (function equal))
+        (puthash callee tbl (cons *t68-binding* (gethash callee tbl)))))))
+
+(defun %t68-revert (nm)
+  "Put DEFUN NM back to its interpreted definition, if a native one is installed."
+  (let* ((tbl (%t68-table (quote *t68-interp*)))
+         (fn (gethash nm tbl)))
+    (when fn
+      (remhash nm tbl)
+      (when (boundp (quote *symbol-function-table*))
+        (puthash nm *symbol-function-table* fn))
+      (when (boundp (quote *native-sym-function-table*))
+        (puthash (compute-name-hash nm) *native-sym-function-table* fn))
+      t)))
+
+(defun %t68-relink (names)
+  "NAMES were (re)defined: native code bound to their old definitions goes back
+   to interpreted, transitively, and is translated again; modules waiting for one
+   of them to go native are tried again."
+  (let ((work (copy-list names)) (seen nil) (redo nil)
+        (deps (%t68-table (quote *t68-deps*))) (wait (%t68-table (quote *t68-waiting*))))
+    (loop while work do
+      (let* ((n (car work)) (callers (gethash n deps)) (waiters (gethash n wait)))
+        (setq work (cdr work))
+        (when callers (remhash n deps))
+        (when waiters (remhash n wait))
+        (dolist (c (append callers waiters))
+          (unless (member c seen :test (function equal))
+            (setq seen (cons c seen))
+            (dolist (nm c)
+              (when (%t68-revert nm) (setq work (cons nm work))))
+            (let ((m (and *jit-module-registry* (gethash (car c) *jit-module-registry*))))
+              (when m
+                (when (boundp (quote *t68-done*))
+                  (setq *t68-done* (remove (first m) *t68-done* :test (function eq))))
+                (setq redo (cons c redo))))))))
+    (dolist (c (nreverse redo)) (%t68-on-defun c))))
+
+(defun %fn-binding-changed (name)
+  "(SETF FDEFINITION) of NAME (mvm/cl-eval.lisp): native callers bound to its old
+   definition are relinked, as after a DEFUN of it."
+  (when (and (boundp (quote *t68-deps*)) (hash-table-p *t68-deps*))
+    ;; NAME's new definition is what SET-SYMBOL-FUNCTION just stored: it has no
+    ;; interpreted one to go back to any more, only its callers are relinked
+    (remhash name (%t68-table (quote *t68-interp*)))
+    (%t68-relink (list name))))
+
 (defun %t68-on-defun (names)
   "*RUNTIME-DEFUN-HOOK*: translate the module mvm-eval just installed for
    NAMES and publish its DEFUNs; on any failure they stay interpreted."
-  (let ((m (and names *jit-module-registry* (gethash (car names) *jit-module-registry*))))
+  (let ((m (and names *jit-module-registry* (gethash (car names) *jit-module-registry*)))
+        (*t68-binding* names))
     (when m
       (let ((fns (or (%t68-native m names)
                      (if (eq *t68-table* :native-only)
@@ -632,6 +707,10 @@
               (%t68-note-done (first m))
               (dolist (f fns)
                 (when (member (car f) names :test (function string=))
+                  ;; the interpreted definition, for a redefinition of a callee
+                  (let ((cur (and (boundp (quote *symbol-function-table*))
+                                  (gethash (car f) *symbol-function-table*))))
+                    (when cur (puthash (car f) (%t68-table (quote *t68-interp*)) cur)))
                   (%t68-install (car f) (cdr f))))
               t)
             (progn
@@ -680,7 +759,11 @@
   (when (and names (%t68-allowed-p) (%t68-on-defun-p)
              (not (and (boundp (quote *t68-off*)) *t68-off*))
              (%t68-ready))
-    (%t68-on-defun names)))
+    ;; a native definition of an earlier one is not the definition any more
+    (dolist (nm names)
+      (let ((tbl (%t68-table (quote *t68-interp*)))) (remhash nm tbl)))
+    (%t68-on-defun names)
+    (%t68-relink names)))
 
 (defun %native-thunk-run (forms bc entry ft-list fn-table rt-table lam-offsets)
   "mvm-eval's seam: a toplevel form that LOOPS (%MVM-FORMS-LOOP-P: not a

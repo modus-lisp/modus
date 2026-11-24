@@ -1442,6 +1442,10 @@
             ((eq tn 'eq)      (function %eq-fn))
             ((eq tn 'eql)     (function %eql-fn))
             ((eq tn 'equalp)  (function equalp))
+            ((eq tn 'equal)   (function %equal-fn))
+            ;; A custom test (see %HT-CANONICALIZE-TEST): the function itself.
+            ((functionp tn)   tn)
+            ((and (symbolp tn) (fboundp tn)) (symbol-function tn))
             (t                (function %equal-fn))))))
 
 (declaim (overridable %publish-fence))
@@ -1644,10 +1648,11 @@
    tests; a fixnum or character not under EQUALP, so those need the test to
    be one of the other three -- by object, and anything else funcalls.)"
   (let ((cmp (%ht-keytest ht)) (cur (car ht)))
-    (if (or (symbolp key)
-            (and (or (fixnump key) (characterp key))
-                 (or (eq cmp (function %eq-fn)) (eq cmp (function %eql-fn))
-                     (eq cmp (function %equal-fn)))))
+    (if (and (or (eq cmp (function %eq-fn)) (eq cmp (function %eql-fn))
+                 (eq cmp (function %equal-fn)) (eq cmp (function equalp)))
+             (or (symbolp key)
+                 (and (or (fixnump key) (characterp key))
+                      (not (eq cmp (function equalp))))))
         (loop
           (when (null cur) (return nil))
           (let ((pair (car cur)))
@@ -1684,16 +1689,44 @@
       (setq *%ht-pair-sides* (cons (cons ht side) *%ht-pair-sides*))
       side)))
 
+;;; A WORKER MAKES A SHARED TABLE'S PAIR UNDER THE RUNTIME LOCK, as
+;;; %HT-READ-BUILD-INDEX builds a shared table's index.  The pair, the side
+;;; table and the *%HT-PAIR-SIDES* entry all end up reachable from a table every
+;;; thread reads; made on a worker outside the lock they were the worker's own
+;;; objects.  On x86-64 the shared-store guard refused the side PUTHASH, so every
+;;; SB-THREAD:MAKE-THREAD body died before its first form -- its first call
+;;; through the symbol-function table asked for a pair (it came in with the dict
+;;; pairs, daa29493, and no test started a thread on x86-64 after it).  Inside
+;;; the lock the allocations come from the lock arena;
+;;; look again there, since another thread may have made the pair meanwhile.
+;;; Main, a process with no threads, and a worker's own table are unchanged.
+(defun %ht-dict-pair-1 (key ht v)
+  (let ((side (%ht-pair-side ht t)))
+    (or (gethash key side)
+        (let ((p (cons key v)))
+          (puthash key side p)
+          p))))
+
+(defun %ht-dict-pair-shared-key (key)
+  "KEY, or under the runtime lock a copy of it when it is a string of THIS
+   worker's own: the JIT bridge looks a package-qualified callee up again by
+   its bare name, a SUBSEQ the worker just made, and that key goes into the
+   pair and the side -- shared objects.  Measured: the first thread's first
+   such call refused the side's index build (%HTD-FROM-ALIST)."
+  (if (and (stringp key) (%own-region-object-p key)) (copy-seq key) key))
+
 (defun %ht-dict-pair (key ht)
   "KEY's pair in dict table HT, made and entered in its side on first use; NIL
    when KEY is absent."
   (multiple-value-bind (v present) (gethash key ht)
     (when present
-      (let ((side (%ht-pair-side ht t)))
-        (or (gethash key side)
-            (let ((p (cons key v)))
-              (puthash key side p)
-              p))))))
+      (if (or (eql (mem-ref #x10000DB8 :u32) 0) (eql (%dynb-block) 0)
+              (%own-region-object-p ht))
+          (%ht-dict-pair-1 key ht v)
+          (progn
+            (%rt-enter)
+            (unwind-protect (%ht-dict-pair-1 (%ht-dict-pair-shared-key key) ht v)
+              (%rt-leave)))))))
 
 (defun %ht-pair-set (ht key value)
   "PUTHASH's step: KEY's handed-out pair, if any, now holds VALUE."
@@ -3105,12 +3138,36 @@
              ((string= n "EQL") 'eql)
              ((string= n "EQUAL") 'equal)
              ((string= n "EQUALP") 'equalp)
+             ;; A test of the program's own (SBCL's :TEST extension): kept, and
+             ;; called.  It used to become EQL, so (make-hash-table :test 'ci=)
+             ;; quietly made an EQL table and every lookup by an equal key missed.
+             ((fboundp v) v)
              (t 'eql))))
     ((eql v (function %eq-fn))    'eq)
     ((eql v (function %eql-fn))   'eql)
     ((eql v (function %equal-fn)) 'equal)
     ((eql v (function equalp))    'equalp)
+    ((functionp v) v)
     (t 'eql)))
+
+(defun %ht-standard-test-p (test)
+  "T for EQ, EQL, EQUAL and EQUALP -- the tests the bucket and address indexes
+   know how to hash for.  Any other test is the program's own: its table keeps
+   no index (the holder starts :NOHASH) and every lookup is the linear scan
+   calling the test, which is correct for any equivalence and asks nothing of
+   a :HASH-FUNCTION."
+  (or (eq test 'eq) (eq test 'eql) (eq test 'equal) (eq test 'equalp)))
+
+(defun define-hash-table-test (name hash-function)
+  "SBCL's SB-EXT:DEFINE-HASH-TABLE-TEST, as a function: let NAME, a symbol fbound
+   to an equivalence predicate, be a hash table's :TEST.  Any fbound symbol already
+   is one here (see %HT-CANONICALIZE-TEST), and HASH-FUNCTION is not needed by the
+   linear scan such a table uses, so this checks its arguments and returns NAME."
+  (unless (and (symbolp name) (fboundp name))
+    (error "define-hash-table-test: ~S is not a symbol naming a function." name))
+  (unless (or (functionp hash-function) (and (symbolp hash-function) (fboundp hash-function)))
+    (error "define-hash-table-test: ~S is not a function." hash-function))
+  name)
 
 (defun make-hash-table-args (options)
   "Internal worker: parse OPTIONS plist (`(:test eq :size 100 ...)`) and
@@ -3143,7 +3200,7 @@
     ;; by %HT-EQUALP-HASH (case-folded, = numbers alike) and buckets compare
     ;; with EQUALP.  They used to be linear for good -- cl-bench's MIXBAG,
     ;; 16k mixed keys, was 840x SBCL.
-    (let ((holder (cons nil
+    (let ((holder (cons (if (%ht-standard-test-p test) nil (%ht-nohash))
                         (cons 0 (cond ((eq test 'equal) t)
                                       ((eq test 'equalp) :equalp)
                                       (t nil))))))
@@ -3445,39 +3502,88 @@
    worker starts with its per-computation bindings and nothing else -- used to
    walk the whole binding stack before falling through to the global: 0.76 us
    against main's 3 ns, which made elliptic-curve code 6x slower on a thread.
-   The filter is 256 16-bit counters, one per (KEY mod 256): %DYNBIND counts a
-   key in, %DYNB-UNWIND counts every truncated entry out, and a zero counter
-   answers \"not bound here\" without the walk.  Anything that desynchronises
-   it can only leave a counter too HIGH (a thread that died with bindings live,
-   a wrap), which costs a walk and never a wrong answer.
+   The filter counts each bound key in a slot chosen by its low bits: %DYNBIND
+   counts a key in, %DYNB-UNWIND counts every truncated entry out, and a zero
+   counter answers \"not bound here\" without the walk.  Anything that
+   desynchronises it can only leave a counter too HIGH (a thread that died with
+   bindings live, a saturated counter), which costs a walk and never a wrong
+   answer.
 
-   It lives in the in-window fallback area, blk+0xC80..0xE7F, which is unused
-   exactly when the thread has an extension stack (blk+0xC60 non-zero).  A
-   thread without one keeps its entries there and has no filter."
-  (if (eql (mem-ref (+ blk #xC60) :u64) 0) 0 (+ blk #xC80)))
+   TWO SHAPES.  The WIDE filter -- 4096 one-byte counters, saturating at 255
+   and sticky there -- is a hosted thread's, in the thread page, its address in
+   the window block's +0xC70 (%TLS-PREPARE-BLOCK writes it).  The NARROW one
+   -- 256 16-bit counters in the in-window fallback area, blk+0xC80..0xE7F --
+   is what a stack with no wide filter (an actor's) uses.  256 slots were too
+   few: a page worker binds some 300 specials for its whole life (weft, shuttle,
+   scribe, loom's WITH-THREAD-STATE), which leaves a third of the slots zero,
+   so two reads in three of a special it never bound walked all 300 entries --
+   LENGTH 5x slower there, Hacker News laid out 2.7x slower than on main.
+   With 4096 slots 93% stay zero.
+
+   Both areas are unused exactly when the thread has an extension stack
+   (blk+0xC60 non-zero); a thread without one keeps its entries there and has
+   no filter."
+  (if (eql (mem-ref (+ blk #xC60) :u64) 0)
+      0
+      (let ((w (mem-ref (+ blk #xC70) :u64)))
+        (if (eql w 0) (+ blk #xC80) w))))
+
+(defun %dynb-filter-wide-p (blk)
+  (not (eql (mem-ref (+ blk #xC70) :u64) 0)))
 
 (defun %dynb-filter-slot (f key)
+  "The narrow filter's 16-bit counter for KEY."
   (+ f (ash (logand key 255) 1)))
 
+(defun %dynb-filter-count (blk f key)
+  "Count KEY in: one more live binding of it on this thread."
+  (if (%dynb-filter-wide-p blk)
+      (let* ((slot (+ f (logand key 4095))) (v (mem-ref slot :u8)))
+        (when (< v 255) (setf (mem-ref slot :u8) (+ v 1))))
+      (let ((slot (%dynb-filter-slot f key)))
+        (setf (mem-ref slot :u16) (logand (+ (mem-ref slot :u16) 1) #xFFFF))))
+  0)
+
+(defun %dynb-filter-unbound-p (blk f key)
+  "T when the filter proves this thread has no binding of KEY."
+  (if (%dynb-filter-wide-p blk)
+      (eql (mem-ref (+ f (logand key 4095)) :u8) 0)
+      (eql (mem-ref (%dynb-filter-slot f key) :u16) 0)))
+
 (defun %dynb-filter-clear (blk)
-  "Zero BLK's filter.  Called wherever the stack is emptied."
+  "Zero BLK's filters.  Called wherever the stack is emptied."
   (let ((a (+ blk #xC80)))
     (loop
       (when (>= a (+ blk #xE80)) (return 0))
       (setf (mem-ref a :u32) 0)
-      (setq a (+ a 4)))))
+      (setq a (+ a 4))))
+  (when (%dynb-filter-wide-p blk)
+    (let* ((w (mem-ref (+ blk #xC70) :u64)) (a w))
+      (loop
+        (when (>= a (+ w 4096)) (return 0))
+        (setf (mem-ref a :u32) 0)
+        (setq a (+ a 4)))))
+  0)
 
-(defun %dynb-filter-drop (f a top)
+(defun %dynb-filter-drop (blk f a top)
   "Count out every entry from the KEY word at A up to TOP."
-  (loop
-    (when (>= a top) (return 0))
-    (let ((slot (%dynb-filter-slot f (mem-ref a :u64))))
-      (setf (mem-ref slot :u16) (logand (- (mem-ref slot :u16) 1) #xFFFF)))
-    (setq a (+ a 16))))
+  (let ((wide (%dynb-filter-wide-p blk)))
+    (loop
+      (when (>= a top) (return 0))
+      (let ((key (mem-ref a :u64)))
+        (if wide
+            (let* ((slot (+ f (logand key 4095))) (v (mem-ref slot :u8)))
+              ;; 255 is sticky: once saturated the true count is lost, so the
+              ;; slot stays \"maybe bound\" (a walk, never a wrong answer).
+              (when (and (> v 0) (< v 255)) (setf (mem-ref slot :u8) (- v 1))))
+            (let ((slot (%dynb-filter-slot f key)))
+              (setf (mem-ref slot :u16) (logand (- (mem-ref slot :u16) 1) #xFFFF)))))
+      (setq a (+ a 16)))))
 
 (defun %dynb-lookup (blk key)
   "Address of the VALUE word of this thread's innermost binding of KEY, or 0:
-   the index cache, then %DYNB-FIND behind the filter.  Same no-global-read
+   the index cache, then %DYNB-FIND behind the filter (wide or narrow:
+   %DYNB-FILTER-UNBOUND-P).  Same no-global-read
    rule as %DYNB-FIND.
 
    THE INDEX CACHE.  The filter answers a read of a special this thread has
@@ -3506,7 +3612,7 @@
           (if (and (> ix 0) (<= ix d)
                    (eq (mem-ref (+ ext (ash (- ix 1) 4)) :u64) key))
               (+ ext (- (ash ix 4) 8))
-              (if (eql (mem-ref (+ blk (+ #xC80 (ash (logand key 255) 1))) :u16) 0)
+              (if (%dynb-filter-unbound-p blk (%dynb-filter blk) key)
                   0
                   (let ((a (%dynb-find key (- (%dynb-next blk) 16) (- d 1) ext)))
                     (if (eql a 0)
@@ -3536,7 +3642,7 @@
   (declare (ignore i))
   (if (and (>= a (%dynb-base blk)) (eql (mem-ref a :u64) key))
       (let ((f (%dynb-filter blk)))
-        (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
+        (unless (eql f 0) (%dynb-filter-drop blk f a (%dynb-next blk)))
         (%dynb-set-top blk a (- (%dynb-depth blk) 1))
         1)
       0))
@@ -3639,9 +3745,7 @@
                     (%dynb-set-top blk (+ a 16) (+ d 1))
                     (let ((f (%dynb-filter blk)))
                       (unless (eql f 0)
-                        (let ((slot (%dynb-filter-slot f key)))
-                          (setf (mem-ref slot :u16)
-                                (logand (+ (mem-ref slot :u16) 1) #xFFFF)))
+                        (%dynb-filter-count blk f key)
                         ;; The index cache (see %DYNB-LOOKUP): this push is
                         ;; now KEY's innermost binding, entry D, 1-based D+1.
                         ;; F is non-zero exactly when the extension is.
@@ -3762,26 +3866,38 @@
    special in compiled code actually becomes) were not.  The gate is the
    word %RT-ENTER and %DYNBIND already test, so an unarmed image pays one
    32-bit load and a branch."
-  ;; THE INDEX CACHE'S HIT IS WRITTEN OUT HERE rather than reached through
-  ;; %DYNB-LOOKUP: this is every armed special read, and on a worker the read
-  ;; of a special bound by an enclosing LET is the common case.  A miss (or a
-  ;; thread with no extension stack) takes %DYNB-LOOKUP, which repeats the
-  ;; probe and walks.  EQ, not EQL: every word compared here is a fixnum, and
-  ;; EQL compiles to a type dispatch.
+  ;; THE COMMON CASES ARE FUSED, with no call: this thread's block
+  ;; (%DYNB-BLOCK's arithmetic, inline); then, with an extension stack, the
+  ;; wide filter's counter for KEY (zero: not bound here -- a worker's read of
+  ;; a special it never bound, its commonest read) and the INDEX CACHE's hit
+  ;; (KEY bound by an enclosing LET, the next commonest; see %DYNB-LOOKUP).
+  ;; Anything else -- no extension, the narrow filter, a cache miss -- takes
+  ;; %DYNB-LOOKUP, which repeats both and walks.  EQ, not EQL: every word
+  ;; compared here is a fixnum, and EQL compiles to a type dispatch.
   (if (eq (mem-ref #x10000DB8 :u32) 0)
       0
-      (let ((blk (%dynb-block)))
-        (if (eq blk 0)
+      (let ((lo (mem-ref #x10000C30 :u32))
+            (hi (mem-ref #x10000C34 :u32)))
+        (if (and (eq hi 0) (eq lo 0))
             0
-            (let ((ext (mem-ref (+ blk #xC60) :u64)))
+            (let* ((blk (if (eq hi 0)
+                            (+ (%conv-addr #x10000000) lo)
+                            (if (>= hi #x80000000)
+                                (+ (%conv-addr #x10000000) (+ (* (* (- hi 4294967296) 65536) 65536) lo))
+                                (+ (%conv-addr #x10000000) (+ (* (* hi 65536) 65536) lo)))))
+                   (ext (mem-ref (+ blk #xC60) :u64)))
               (if (eq ext 0)
                   (%dynb-lookup blk key)
-                  (let ((ix (mem-ref (+ ext (+ #x3C00 (ash (logand key 511) 1))) :u16)))
-                    (if (and (> ix 0)
-                             (<= ix (mem-ref (+ blk #xC58) :u64))
-                             (eq (mem-ref (+ ext (- (ash ix 4) 16)) :u64) key))
-                        (+ ext (- (ash ix 4) 8))
-                        (%dynb-lookup blk key)))))))))
+                  (let ((w (mem-ref (+ blk #xC70) :u64)))
+                    (if (and (not (eq w 0))
+                             (eq (mem-ref (+ w (logand key 4095)) :u8) 0))
+                        0
+                        (let ((ix (mem-ref (+ ext (+ #x3C00 (ash (logand key 511) 1))) :u16)))
+                          (if (and (> ix 0)
+                                   (<= ix (mem-ref (+ blk #xC58) :u64))
+                                   (eq (mem-ref (+ ext (- (ash ix 4) 16)) :u64) key))
+                              (+ ext (- (ash ix 4) 8))
+                              (%dynb-lookup blk key)))))))))))
 
 (defun %gv-ref (%gv-key)
   "Compiled special-variable READ: value of global KEY, NIL if absent

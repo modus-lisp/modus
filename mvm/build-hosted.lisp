@@ -49,10 +49,10 @@
      "INSTALL-68K-TRANSLATOR"     "M68K-SET-LINUX-MODE"  :linux-68k
      "MODUS_68K_LINUX_OUT"     "/tmp/modus-68k-linux"     "qemu-m68k-static")
     ;; Not hosted: the bare 68k Mac (boot/boot-mac68k.lisp), a flat image for
-    ;; scripts/mac68k-disk.py; the same single-source build.
+    ;; scripts/mac68k-disk.lisp; the same single-source build.
     ("mac68k"  ("boot/boot-linux-68k.lisp" "boot/boot-mac68k.lisp")
      "INSTALL-68K-TRANSLATOR"     "MAC68K-CONFIGURE"     :mac68k
-     "MODUS_MAC68K_OUT"        "/tmp/modus-mac68k.bin"    "scripts/mac68k-disk.py")))
+     "MODUS_MAC68K_OUT"        "/tmp/modus-mac68k.bin"    "sbcl --script scripts/mac68k-disk.lisp")))
 
 (defparameter *hosted-port*
   (let ((arch (second sb-ext:*posix-argv*)))
@@ -71,17 +71,16 @@
   ;; MODUS_68K_TAGS3=1: 68k's 3-bit tags and 8-byte granule (target.lisp).
   (when (and (member arch '("68k" "mac68k") :test #'string=)
              (equal (sb-ext:posix-getenv "MODUS_68K_TAGS3") "1"))
-    (setf (symbol-value (find-symbol "*68K-TAGS3*" :modus.mvm)) t))
+    (setf (symbol-value (cl-user::host-symbol "*68K-TAGS3*" :modus.mvm)) t))
   ;; MODUS_MAC68K_LOAD_ADDR=#xNNNNNNNN: link a mac68k image there (the boot
   ;; disk's loader, which unpacks the real image at the usual address).
   (let ((la (sb-ext:posix-getenv "MODUS_MAC68K_LOAD_ADDR")))
     (when (and la (string= arch "mac68k"))
-      (setf (symbol-value (find-symbol "*MAC68K-LOAD-ADDR*" :modus.mvm))
+      (setf (symbol-value (cl-user::host-symbol "*MAC68K-LOAD-ADDR*" :modus.mvm))
             (let ((*read-base* 10)) (read-from-string la)))))
   (let* ((srcs (cddr sb-ext:*posix-argv*))
          (out (or (sb-ext:posix-getenv out-env) out-default))
-         ;; several source files are one text, in the order given (a floppy
-         ;; loader is its head, then mvm/unlzma-core.lisp)
+         ;; several source files are one text, in the order given
          (text (if srcs
                    (if (cdr srcs)
                        (format nil "~{~A~%~}" (mapcar #'read-file-text srcs))

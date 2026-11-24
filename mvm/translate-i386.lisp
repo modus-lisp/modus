@@ -2375,6 +2375,36 @@
   (i386-emit-pop-reg buf +scratch1+)
   (i386-emit-pop-reg buf +i386-eax+))
 
+(defun i386-emit-gcnative-fwd-test (buf fwd-label)
+  "EAX = the first word of a from-space cons or object.  Jump to FWD-LABEL iff
+   it is a FORWARDING word: low nibble 15 AND the address it names lies in
+   to-space.  Clobbers EDX.
+
+   THE NIBBLE ALONE IS NOT ENOUGH.  A cons's CAR is a value slot, and the
+   interpreter's registers and operand stack (interp.lisp REG-SET) hold RAW
+   machine words as values, so an odd raw word can be a car -- measured: the
+   MVM operand stack held (#x19FFFFFF . NIL).  The nibble test took that car
+   for a forward, handed back (#x19FFFFF0 | 1), an address in neither
+   semispace, and never copied the cons; its memory was reused and the
+   interpreter's stack, and every list walk under it, read garbage (the
+   intermittent 32-bit `N is not of type LIST' / memory fault, 2026-11-23).
+   A real forward names a copy made THIS collection: [to_start, ESI), ESI
+   being the free pointer (objects and conses both copy upward from it).
+   \"Anywhere in to-space\" is not tight enough -- measured: a second raw car,
+   #x197FFFFF, named an address in to-space above the free pointer."
+  (let ((no (i386-make-label)))
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-and-reg-imm buf +scratch1+ 15)
+    (i386-emit-cmp-reg-imm buf +scratch1+ 15)
+    (i386-emit-jcc buf :ne no)
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-and-reg-imm buf +scratch1+ -16)
+    (i386-emit-cmp-reg-abs buf +scratch1+ *i386-gc-to-addr*)
+    (i386-emit-jcc buf :b no)                             ; below to_start
+    (i386-emit-cmp-reg-reg buf +scratch1+ +i386-esi+)
+    (i386-emit-jcc buf :b fwd-label)                      ; below the free ptr
+    (i386-emit-label buf no)))
+
 (defun i386-emit-gcnative-copy (buf copy-label)
   "copy_object.  In: EAX = tagged from-space pointer.  Out: EAX = tagged
    to-space pointer, ESI advanced, forwarding pointer left behind.
@@ -2393,10 +2423,7 @@
 
     ;; ---- object ----
     (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 0)   ; EAX = header
-    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
-    (i386-emit-and-reg-imm buf +scratch1+ 15)
-    (i386-emit-cmp-reg-imm buf +scratch1+ 15)
-    (i386-emit-jcc buf :e c-fwd)
+    (i386-emit-gcnative-fwd-test buf c-fwd)
     ;; size -> EDX.  u8 vectors and narrow strings (#x13, a u8 vector with its
     ;; subtag rewritten) count BYTES, everything else counts WORDS.
     (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
@@ -2459,10 +2486,7 @@
     ;; ---- cons ----
     (i386-emit-label buf c-cons)
     (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 0)   ; car word
-    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
-    (i386-emit-and-reg-imm buf +scratch1+ 15)
-    (i386-emit-cmp-reg-imm buf +scratch1+ 15)
-    (i386-emit-jcc buf :e c-fwd)
+    (i386-emit-gcnative-fwd-test buf c-fwd)               ; not an odd raw car
     (i386-emit-mov-mem-reg buf +i386-esi+ 0 +i386-eax+)   ; car
     (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 4)
     (i386-emit-mov-mem-reg buf +i386-esi+ 4 +i386-eax+)   ; cdr at +4, not +8

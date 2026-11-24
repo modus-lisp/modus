@@ -1675,25 +1675,14 @@
   (if *ssh-build-p*
       (concatenate 'string
         (%rpi-net-text "crypto.lisp")        (string #\Newline)
-        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline)
-        ;; :I386 -- crypto-fast's field arithmetic reaches a field element's
-        ;; limbs through a RAW address computed once per call, and on 30-bit
-        ;; fixnums its 26x26-bit limb products are BIGNUMS: an allocation, so a
-        ;; collection can move the arrays under the cached address.  Measured:
-        ;; ed25519-public-key correct in every run with no collection, wrong in
-        ;; exactly the run where %GC-EPOCH moved.  crypto-32-fast.lisp is the
-        ;; cons-free 32-bit field layer (MUL26LO/MUL26HI, intermediates in fixed
-        ;; scratch at FE-SCRATCH-BASE): nothing in a field operation allocates,
-        ;; so nothing moves.  Its limb offset is rewritten from the mini-Lisp's
-        ;; header (+4) to crypto-fast's (+8), so every field function in the
-        ;; image agrees on where limb 0 is (inside the 40-slot array either way).
-        (if *cl-repl-i386-p*
-            (concatenate 'string
-              (%replace-all (%rpi-net-text "crypto-32-fast.lisp")
-                            "(- 0 4)) 1) 4)" "(- 0 4)) 1) 8)")
-              (string #\Newline))
-            ""))
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
       ""))
+;; (:I386 used to splice net/crypto-32-fast.lisp here, with its limb offset
+;; rewritten by %REPLACE-ALL: crypto-fast cached raw limb addresses across its
+;; bignum products, which a 30-bit tower makes an allocation.  crypto-fast
+;; now keeps its limbs as fixnums in the vector's slots and takes no raw
+;; address at all (docs/w32.md, M4), so every image runs the one field source
+;; and crypto-32-fast.lisp is deleted.)
 
 ;; Actor/SSH address map for the CL host image's memory layout.  The legacy
 ;; block (arch-raspi3b) sits at 0x0200_0000/0x0600_0000, which lands INSIDE this
@@ -1803,6 +1792,33 @@
               (*cl-repl-rpi-p* (%rpi-net-text "hwrng-bcm2835.lisp"))
               (t "")) (string #\Newline)
         "(defun native-eval (form) (eval form))"  (string #\Newline)
+        ;; :I386: SSH's waits on the PIT clock (GET-INTERNAL-REAL-TIME), not
+        ;; poll counts alone -- ssh-x64-cl.lisp's policy, with the PIT for the
+        ;; TSC.  The default version wait is 50 polls of one packet each; after
+        ;; a connection, the NE2000 ring still holds its tail (the client's last
+        ;; segments, slirp's retransmits), and the 50 polls went on those: the
+        ;; next client's version arrived 6 ms after the banner and the server
+        ;; had already given up ("#VX 51 0 0": 51 polls, buffer empty, peer
+        ;; open).  Every connection after the first failed that way once the
+        ;; key exchange stopped taking long enough for the ring to drain.
+        (if *cl-repl-i386-p*
+            "(defun %i386-ssh-clock () (get-internal-real-time))
+(defun %i386-ssh-wait-expired-p (count limit since)
+  (or (modus.ssh:ssh-peer-closed-p)
+      (and (> count limit)
+           (> (- (get-internal-real-time) since) (* 15 internal-time-units-per-second)))))
+(defun %i386-ssh-version-wait-expired-p (count since)
+  (or (modus.ssh:ssh-peer-closed-p)
+      (and (> count 50)
+           (> (- (get-internal-real-time) since) (* 2 internal-time-units-per-second)))))
+(defun %bind-i386-ssh-seams ()
+  (setf (fdefinition 'modus.ssh:ssh-preauth-clock) (function %i386-ssh-clock))
+  (setf (fdefinition 'modus.ssh:ssh-wait-expired-p) (function %i386-ssh-wait-expired-p))
+  (setf (fdefinition 'modus.ssh:ssh-version-wait-expired-p)
+        (function %i386-ssh-version-wait-expired-p)))
+"
+            "")
+        (string #\Newline)
         ;; ssh-handle-connection fix + trace live in net/ssh.lisp.
         ;; FIX: single-threaded server handles ONE connection at a time.  Guard
         ;; against RE-ENTRANT net-accept-connection: while inside a connection
@@ -1989,6 +2005,15 @@
 ;;; block and arch-aarch64's 0x41000000 block both land INSIDE this ~57 MB
 ;;; kernel image, so the NIC would DMA over native code.  See each -cl file's
 ;;; header.
+;; :ARM32 has no NIC adapter: arch-arm32 went with the mini-Lisp (d4ae00fe),
+;; and the fall-through below is the Raspberry Pi board stack -- DWC2, R8152,
+;; the VideoCore mailbox at #x3F00B880 -- which on QEMU virt data-aborts at the
+;; first mailbox read (HDMI-RD) and, with no abort handler, loops at the vector
+;; right after "DTB ptr".  Refuse rather than build that image.
+(when (and *net-build-p* *cl-repl-arm32-p*)
+  (error "MODUS_NET_BUILD=1 on :ARM32: there is no arm32 NIC adapter (the Pi's ~
+          board stack is the only fall-through, and it cannot run on QEMU virt). ~
+          For the crypto layer alone: MODUS_CRYPTO_BUILD=1."))
 (defvar *net-nic-source*
   (if (not *net-build-p*)
       ""
@@ -2171,9 +2196,11 @@
                      ;; the SSH interface (net/ssh.lisp): its defaults, then
                      ;; what this image's adapters replace
                      (if *ssh-build-p*
-                         (format nil "  (modus.ssh::%bind-ssh-seams)~%~A~A"
+                         (format nil "  (modus.ssh::%bind-ssh-seams)~%~A~A~A"
                                  (if (or *cl-repl-x64-p* *cl-repl-rpi-p*)
                                      (format nil "  (modus.board::%bind-board-ssh-seams)~%") "")
+                                 (if *cl-repl-i386-p*
+                                     (format nil "  (%bind-i386-ssh-seams)~%") "")
                                  (if *ssh-isolated-p*
                                      (format nil "  (%bind-isolated-ssh-seams)~%") ""))
                          ""))))
@@ -3034,12 +3061,55 @@
           (%rpi-net-text "snp-ghcb.lisp") (string #\Newline))
         "")))
 
+;;; MODUS_CRYPTO_BUILD=1 -- the crypto layer (crypto.lisp + crypto-fast.lisp)
+;;; WITHOUT a NIC, for a platform that has no network adapter: today :ARM32,
+;;; whose net adapter went with the mini-Lisp (d4ae00fe).  The one thing crypto
+;;; needs from an adapter is its fixed state block: the SHA-256 K table at
+;;; (e1000-state-base)+0x100, the Ed25519 constants, and FE-SCRATCH-BASE.  On
+;;; arm32 that is VA #x0F900000 -- mapped DRAM between the L1 table
+;;; (#x0F800000, 16 KB) and the I/O scratch pages (#x0FE00000), below 2^29, and
+;;; not heap memory, so nothing moves it.  test/w32-x25519-bare.py uses it
+;;; (W32_X25519_ARCH=arm32) for the 30-bit collector check of crypto-fast.
+(defvar *crypto-only-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_CRYPTO_BUILD")))
+    (and v (string= v "1"))))
+(when (and *crypto-only-p* *net-build-p*)
+  (error "MODUS_CRYPTO_BUILD=1 is crypto WITHOUT the net stack; MODUS_NET_BUILD=1 ~
+          MODUS_SSH_BUILD=1 already includes it."))
+(when (and *crypto-only-p* (not *cl-repl-arm32-p*))
+  (error "MODUS_CRYPTO_BUILD=1: only :ARM32 has a state block defined for it; ~
+          this platform has a NIC adapter -- MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 ~
+          MODUS_NET_NOAUTO=1 builds crypto in without starting the NIC."))
+(defvar *crypto-only-source*
+  (if *crypto-only-p*
+      (concatenate 'string
+        (format nil "~%(defun e1000-state-base () #x0F900000)~%~
+                     (defun fe-scratch-base () #x0F900900)~%~
+                     (defun usb-keepalive () 0)~%")
+        ;; The two byte-buffer helpers crypto.lisp takes from net/ip.lisp (not
+        ;; in this image: it is the IP stack).  Copies of ip.lisp's, same names
+        ;; and results, as net/hosted-ssh.lisp carries for the same reason; the
+        ;; SHA-256/512 vectors on the arm32 crypto image are their check.
+        "(defun buf-read-u32 (buf off)
+  (logior (ash (aref buf off) 24) (ash (aref buf (+ off 1)) 16)
+          (ash (aref buf (+ off 2)) 8) (aref buf (+ off 3))))
+(defun buf-write-u32 (buf off val)
+  (aset buf off (logand (ash val -24) #xFF))
+  (aset buf (+ off 1) (logand (ash val -16) #xFF))
+  (aset buf (+ off 2) (logand (ash val -8) #xFF))
+  (aset buf (+ off 3) (logand val #xFF)))
+"
+        (%rpi-net-text "crypto.lisp")        (string #\Newline)
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
+      ""))
+
 (defvar *cli-bare-metal-net-source*
   ;; *cl-repl-jit-region-source* LAST: its %jit-exec-* defuns must come after
   ;; translate-aarch64.lisp's defaults so last-defun-wins picks the :virt DRAM
   ;; window.  Empty string on :rpi, which keeps the translator's own values.
   (concatenate 'string *snp-ghcb-source*
-               *net-source* *net-url-source* *net-driver-source*
+               *net-source* *crypto-only-source*
+               *net-url-source* *net-driver-source*
                *rpi-jit-coinit-override* *cl-repl-jit-region-source*
                *snp-attest-source* *ssh-key-override-source*))
 
@@ -3282,7 +3352,7 @@
 ;;; follows MODUS_SMALL_IMAGE as on the hosted 68k CLI).  After boot the heap is
 ;;; frozen (mvm/68k-gc-static.lisp, as mvm/build-68k-cli.lisp does).  On the
 ;;; Classic layout a boot whose stub found the SAVE flag (the build's core run,
-;;; scripts/mac68k-core.py) then sends its core over serial port A -- "MCOR",
+;;; scripts/mac68k-core.lisp) then sends its core over serial port A -- "MCOR",
 ;;; the low block's address and the static ranges, the low block, the static
 ;;; objects and conses -- and stops; a boot whose stub found a CORE (the low
 ;;; block's #x10006014 set, as the core was saved) skips boot init and goes
@@ -3292,7 +3362,7 @@
   (let ((s (sb-ext:posix-getenv "MODUS_SMALL_IMAGE")))
     (and s (plusp (length s)) (not (string= s "0")))))
 ;;; :MAC68K: COLD NAMES (mvm/mac68k-cold.lisp): with the saved core, the names
-;;; *SYM-NAME-TABLE* holds are also written to IMAGE.cold, which mac68k-core.py
+;;; *SYM-NAME-TABLE* holds are also written to IMAGE.cold, which mac68k-core.lisp
 ;;; puts on the core's disk, and the core run drops the table (430 KB of a
 ;;; Classic's static heap).  Follows the static heap; MODUS_MAC68K_COLD_NAMES=0
 ;;; keeps the table.
@@ -3308,7 +3378,7 @@
 
 ;;; :MAC68K: INIT-ONLY TEXT (cross.lisp *POOL-INIT-ONLY*), with the saved core:
 ;;; the boot tables' packed text (symbol, function and global names) goes last
-;;; in the resident image, where mac68k-core.py starts the static heap over it.
+;;; in the resident image, where mac68k-core.lisp starts the static heap over it.
 ;;; MODUS_MAC68K_INIT_ONLY=0 keeps it in the pool.
 (defvar *mac-init-only*
   (and *mac-cold-names-out*
@@ -3619,7 +3689,7 @@
     ;; emulator that is the host's timing -- measured, two core runs of one
     ;; build (Basilisk II) saved different heaps (a closure where the other had
     ;; garbage), so the shift pair a relocatable image is made from
-    ;; (mac68k-reloc-disk.py) no longer differed by relocations alone.
+    ;; (mac68k-reloc-disk.lisp) no longer differed by relocations alone.
     (setq text (concatenate 'string text "
 (defun %jit-hot-ns ()
   (if (eql (mem-ref #x1000602C :u32) 1) 1099511627776 10000000))
@@ -3627,7 +3697,7 @@
     (setq *cli-arch-override-source*
           (concatenate 'string *cli-arch-override-source* (string #\Newline) text
                        "
-;; THE MAC'S SAVED CORE (boot/boot-mac68k.lisp, scripts/mac68k-core.py).
+;; THE MAC'S SAVED CORE (boot/boot-mac68k.lisp, scripts/mac68k-core.lisp).
 (defun %core-requested-p () (eql (mem-ref #x10006014 :u32) 1))
 (defun %core-pre-restore () t)
 (defun %restore-image () nil)
@@ -3918,6 +3988,11 @@
 ;; Narrow AOT string literals (compiler.lisp *NARROW-LITERALS-P*) wherever
 ;; *CL-REPL-RPI-CORE-SOURCE* turns %NARROW-STRINGS-P on.
 (when cl-user::*cl-repl-rpi-p* (setq *narrow-literals-p* t))
+
+;; MODUS_W32_UNSAFE_LIVE=1: the collector rung's NEGATIVE CONTROL -- raw W32
+;; variables are not split around GC points (compiler.lisp *W32-UNSAFE-LIVE*,
+;; test/w32-gc-live.lisp).  Never for a real image.
+(setq modus.mvm::*w32-unsafe-live* (equal (sb-ext:posix-getenv "MODUS_W32_UNSAFE_LIVE") "1"))
 ;; i386: AOT string literals POOLED (compiler.lisp *NARROW-LITERALS-P*), each
 ;; evaluation a %FRESH-STRING copy of the pooled one -- wide here, i386 has no
 ;; narrow strings -- instead of one LI and one OBJ-SET per character: 919 KB of
@@ -4053,7 +4128,7 @@
   ;; (%CONV-ADDR K), or a number that only looks like one.  Listed after the build.
   (when (let ((v (sb-ext:posix-getenv "MODUS_CONV_VALUE_AUDIT"))) (and v (string/= v "0")))
     (defparameter cl-user::*conv-value-hits* (make-hash-table :test 'equal))
-    (sb-int:encapsulate (intern "COMPILE-INTEGER" "MODUS.MVM") 'conv-value-audit
+    (modus.mvm::%gck-encapsulate (intern "COMPILE-INTEGER" "MODUS.MVM") 'conv-value-audit
       (lambda (f value dest)
         (when (and (integerp value) (<= #x10000000 value #x1001FFFF))
           (push value (gethash (symbol-value (intern "*CURRENT-FUNCTION-NAME*" "MODUS.MVM"))
@@ -4147,6 +4222,9 @@
           (format t "~&;; 68k cold native code: ~D functions kept resident (~A)~%"
                   (hash-table-count h) f)
           (setf (symbol-value (sym "*COLD-KEEP*")) h))))
+    ;; No threads on a 68k: the special-variable thread gate always falls
+    ;; through, so emit none (compiler.lisp *SHALLOW-THREAD-GATE*)
+    (setf (symbol-value (sym "*SHALLOW-THREAD-GATE*")) nil)
     ;; MODUS_68K_CALL_ISLANDS=0: no call islands (translate-68k *68K-CALL-ISLANDS*)
     (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_ISLANDS")))
       (setf (symbol-value (sym "*68K-CALL-ISLANDS*"))
@@ -4936,7 +5014,7 @@
     (format t "~%Run: ~A~%"
             (cond
               (cl-user::*cl-repl-mac68k-p*
-                (format nil "scripts/mac68k-disk.py ~A DISK, then Basilisk II with it (serial port A is the console)" path))
+                (format nil "sbcl --script scripts/mac68k-disk.lisp ~A DISK, then Basilisk II with it (serial port A is the console)" path))
               (cl-user::*cl-repl-arm32-p*
                 (format nil "qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 -kernel ~A -display none -serial stdio -no-reboot" path))
               (cl-user::*cl-repl-x64-p*

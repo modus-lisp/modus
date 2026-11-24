@@ -316,6 +316,16 @@
         (m68k-emit-long buf 0)                            ; flag
         (m68k-emit-long buf 0)                            ; Y
         (m68k-emit-label buf over)))
+    ;; FPCR: round to DOUBLE precision, nearest.  A process starts at 0 --
+    ;; EXTENDED precision -- so every double result was rounded twice (to 64
+    ;; bits, then to 53 on FMOVE.D): (+ 1d0 double-float-epsilon) came out 1d0
+    ;; (ansi-test EPSILONS.*).  The x87 boot's #x027F, for the same reason.
+    ;; Residual: the exponent range stays extended, so a result in double's
+    ;; DENORMAL range can still round twice (x87 scales * and / for that).
+    ;; Not in a soft-float image: it is an FPU instruction.
+    (unless (eql +target-soft-float+ 1)
+      (m68k-emit-word buf #xF23C) (m68k-emit-word buf #x9000)   ; FMOVE.L #imm,FPCR
+      (m68k-emit-long buf #x00000080))                          ; PREC=double, RND=nearest
     (emit-linux-68k-choose-heap-size buf)
     (when *68k-gc-static*
       (m68k-emit-word buf #x41FA)                         ; LEA (d16,PC),A0

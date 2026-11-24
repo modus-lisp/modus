@@ -53,6 +53,17 @@ for (const [ops, n] of [[[0x00,0x01,0x72,0x82,0x89,0x8B,0x92,0xA2,0xA3,0xA4],1],
 for (const [ops, n] of [[[0x8D,0xCB,0xD0,0xD1,0xD2,0xDB,0xE1,0xF4],3],
   [[0xCC,0xCD,0xCE,0xCF,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,0xDC,0xDD,0xDE,0xDF,0xE0,0xE4,0xE5,0xE8],4],
   [[0x8C,0xE2,0xE3,0xE6,0xE7,0xE9],5],[[0xEA],6]]) for (const o of ops) INSN_LEN[o] = n;
+// The scalar FP register class (single + double) and its literal / compare /
+// convert ops, implemented below.
+for (const [ops, n] of [[[0xEB,0xEC,0xF1,0xF9],3],[[0xED,0xEE,0xEF,0xF0,0xF2,0xF3,0xF5,0xF8],4],
+  [[0xF6,0xF7],5],[[0xFA,0xFB],10]]) for (const o of ops) INSN_LEN[o] = n;
+// Ops this file can WALK but not EXECUTE (f32x4 / integer-lane SIMD).  The
+// image has none (the module would fault the first time one ran); a runtime
+// page that uses one is refused by relocate(), so it stays on the Lisp
+// interpreter -- slower, but it runs.  Before this list such a page relocated
+// and then stopped the VM with `unknown opcode'.
+const NO_EXEC = new Uint8Array(256);
+for (const o of [0x8C,0x8D,0xD9,0xDA,0xDB,0xDC,0xDD,0xDE,0xDF,0xE0,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA]) NO_EXEC[o] = 1;
 const ALLOC_START_OFF = 0x400;            // boot-linux-x64: +linux-x64-heap-alloc-start+
 const GUARD      = 0x01000000;            // 16 MB overshoot guard
 
@@ -75,7 +86,8 @@ const A_MCGC_PAGEBASE = 0x10000E00;
 // slots too: the reserved callee-save words and a 48-byte extension.
 const FRAME_SIZE = 1168;
 // A sized frame-enter (trap #x8000 | units<<8 | nparams, mvm.lisp) may name
-// more than the 128 slots FRAME_SIZE holds; grow the frame for those only.
+// more than the 128 slots FRAME_SIZE holds; grow the frame for those only (slotOff
+// puts the extra slots below the register homes).
 function frameEnterParams(c) { return c >= 0x8000 ? c & 0xFF : c; }
 function frameBytes(code, target) {
   if (code[target] !== 0x02) return FRAME_SIZE;
@@ -85,6 +97,13 @@ function frameBytes(code, target) {
   return slots > 128 ? FRAME_SIZE + 8 * (slots - 128) : FRAME_SIZE;
 }
 const SLOT_BASE  = -96;
+// Frame slot I's byte offset from ebp.  Slots 0..128 run down from SLOT_BASE to
+// ebp-1120; the homes of V3 and V5-V8 sit just below, at ebp-1128..-1160.  A
+// frame of more than 129 slots (FRAME-ENTER's hint allows 255) continues BELOW
+// the homes, in the space frameBytes adds -- it used to run through them, so
+// slot 129 was V3 and 130..133 were V5..V8.
+const SLOT_SPLIT = 129;
+function slotOff(i) { return i < SLOT_SPLIT ? SLOT_BASE - 8 * i : -FRAME_SIZE - 8 * (i - SLOT_SPLIT); }
 const ROFF = new Int32Array(16);
 ROFF[4] = -8; ROFF[0] = -16; ROFF[1] = -24; ROFF[2] = -32;
 ROFF[3] = -1128; ROFF[5] = -1136; ROFF[6] = -1144; ROFF[7] = -1152; ROFF[8] = -1160;
@@ -219,6 +238,11 @@ class MVM {
     this.dv = new DataView(this.buf);
     this.f64 = new Float64Array(1);
     this.f64u16 = new Uint16Array(this.f64.buffer);
+    this.f64u32 = new Uint32Array(this.f64.buffer);
+    // FP vregs F0..F11 (+fp-reg-max+): one IEEE double each; a single-float
+    // value is kept rounded (Math.fround).  Live only inside a call-free tree,
+    // so one file serves every activation, as in the reference interpreter.
+    this.fr = new Float64Array(16);
     const granules = (this.heapEnd - this.heapBase) >> 4;
     this.startBmp = new Uint8Array(granules >> 3);
     this.consBmp = new Uint8Array(granules >> 3);
@@ -357,6 +381,7 @@ class MVM {
     while (p < end) {
       const op = m8[p], n = INSN_LEN[op];
       if (n === 0) { this.host.log(`[relocate: unknown opcode 0x${op.toString(16)} at phys 0x${p.toString(16)}]`); return false; }
+      if (synthetic && NO_EXEC[op]) return false;   // stays on the Lisp interpreter (NO_EXEC)
       if (op === 0x80 || op === 0x83 || op === 0xA7) {
         const at = p + (op === 0xA7 ? 2 : 1);
         const imm = (m8[at] | (m8[at + 1] << 8) | (m8[at + 2] << 16) | (m8[at + 3] << 24)) >>> 0;
@@ -573,6 +598,12 @@ class MVM {
     this.markStart(base);
     return base | 9;
   }
+  // the byte offset (from VBASE, for this.dv) of lane Vidx of packed f32 vector Varr
+  f32Lane(arr, x) {
+    const a = this.rlo(arr) + 7 + 4 * (this.rlo(x) >> 1);
+    if (this.rhi(arr) !== 0 || (this.rlo(arr) & 0xF) !== 9 || a < this.heapBase) this.memFault('f32 lane');
+    return a - VBASE;
+  }
   floatVal(v) {
     if ((v & 0xF) !== 9 || v < this.heapBase) this.memFault('float op on non-object');
     for (let i = 0; i < 4; i++) this.f64u16[3 - i] = (this.ldlo(v - 9 + 16 + 8 * i) >> 1) & 0xFFFF;
@@ -760,7 +791,7 @@ class MVM {
     if (codeNum < 0x100 || codeNum >= 0x8000) {
       const n = frameEnterParams(codeNum);
       for (let i = 4; i < n; i++) {
-        const s = this.ebp + 16 + 8 * (i - 4), d = this.ebp + SLOT_BASE - 8 * i;
+        const s = this.ebp + 16 + 8 * (i - 4), d = this.ebp + slotOff(i);
         this.st64(d, this.ldlo(s), this.ldhi(s));
       }
       return;
@@ -795,7 +826,7 @@ class MVM {
         if (n < 5) return;
         if (n > 121) n = 121;              // +apply-spread-max+ + the tail word of nargs 254
         for (let i = 4; i < n; i++) {
-          const s = this.ebp + 16 + 8 * (i - 4), d = this.ebp + SLOT_BASE - 8 * i;
+          const s = this.ebp + 16 + 8 * (i - 4), d = this.ebp + slotOff(i);
           this.st64(d, this.ldlo(s), this.ldhi(s));
         }
         return;
@@ -1034,8 +1065,12 @@ class MVM {
         case 0x2B: { const s = code[pc + 2]; shl64(this.rlo(s), this.rhi(s), code[pc + 3]); this.setRegR(code[pc + 1]); pc += 4; break; }
         case 0x2C: { const s = code[pc + 2]; shr64(this.rlo(s), this.rhi(s), code[pc + 3]); this.setRegR(code[pc + 1]); pc += 4; break; }
         case 0x2D: { const s = code[pc + 2]; sar64(this.rlo(s), this.rhi(s), code[pc + 3]); this.setRegR(code[pc + 1]); pc += 4; break; }
-        case 0x2F: { const s = code[pc + 2]; shl64(this.rlo(s), this.rhi(s), this.rlo(code[pc + 3]) & 63); this.setRegR(code[pc + 1]); pc += 4; break; }
-        case 0x32: { const s = code[pc + 2]; sar64(this.rlo(s), this.rhi(s), this.rlo(code[pc + 3]) & 63); this.setRegR(code[pc + 1]); pc += 4; break; }
+        // shlv / sarv Vd Vs Vc: the count Vc is a TAGGED fixnum, untagged here as in
+        // every native arm (translate-x64.lisp).  Shifting by the raw word shifted
+        // by 2k: compile-ash's variable-count fast path (06d2bd84) made every
+        // runtime (ash x n) wrong, e.g. sha1's ROTATE-WORD.
+        case 0x2F: { const s = code[pc + 2]; shl64(this.rlo(s), this.rhi(s), (this.rlo(code[pc + 3]) >> 1) & 63); this.setRegR(code[pc + 1]); pc += 4; break; }
+        case 0x32: { const s = code[pc + 2]; sar64(this.rlo(s), this.rhi(s), (this.rlo(code[pc + 3]) >> 1) & 63); this.setRegR(code[pc + 1]); pc += 4; break; }
         case 0x2E: {                                                                                     // ldb pos size
           const s = code[pc + 2], pos = code[pc + 3], size = code[pc + 4];
           shr64(this.rlo(s), this.rhi(s), pos);
@@ -1084,7 +1119,7 @@ class MVM {
         case 0x61: {                                                                                     // obj-ref Vd Vobj idx
           const vobj = code[pc + 2], idx = code[pc + 3];
           let a;
-          if (vobj === 21) a = this.ebp + SLOT_BASE - 8 * idx;
+          if (vobj === 21) a = this.ebp + slotOff(idx);
           else { const lo = this.rlo(vobj); a = lo + 7 + 8 * idx; if (this.rhi(vobj) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`obj-ref on 0x${(lo >>> 0).toString(16)}`); }
           const i = (a - VBASE) >> 2;
           this.setReg(code[pc + 1], m32[i], m32[i + 1]); pc += 4; break;
@@ -1092,7 +1127,7 @@ class MVM {
         case 0x62: {                                                                                     // obj-set Vobj idx Vs
           const vobj = code[pc + 1], idx = code[pc + 2], s = code[pc + 3];
           let a;
-          if (vobj === 21) a = this.ebp + SLOT_BASE - 8 * idx;
+          if (vobj === 21) a = this.ebp + slotOff(idx);
           else { const lo = this.rlo(vobj); a = lo + 7 + 8 * idx; if (this.rhi(vobj) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`obj-set on 0x${(lo >>> 0).toString(16)}`); }
           const i = (a - VBASE) >> 2;
           m32[i] = this.rlo(s); m32[i + 1] = this.rhi(s); pc += 4; break;
@@ -1106,6 +1141,12 @@ class MVM {
         }
         case 0x65: {                                                                                     // aref Vd Vobj Vidx
           const o = code[pc + 2], x = code[pc + 3];
+          // Vobj = VFP: frame slot Vidx (tagged), as in the x64 translator.
+          // The &rest prologue's loop walks frame slots this way.
+          if (o === 21) {
+            const i = (this.ebp + slotOff(this.rlo(x) >> 1) - VBASE) >> 2;
+            this.setReg(code[pc + 1], m32[i], m32[i + 1]); pc += 4; break;
+          }
           const a = this.rlo(o) + this.rlo(x) * 4 + 7;
           if (this.rhi(o) !== 0 || a < VBASE || a >= heapEnd) this.memFault('aref');
           const i = (a - VBASE) >> 2;
@@ -1312,6 +1353,69 @@ class MVM {
         case 0xCA: { const arr = code[pc + 1], x = code[pc + 2]; const a = this.rlo(arr) + (this.rlo(x) >> 1) + 7;
                      if (this.rhi(arr) !== 0 || a < VBASE || a >= heapEnd) this.memFault('u8-set');
                      m8[a - VBASE] = (this.rlo(code[pc + 3]) >> 1) & 0xFF; pc += 4; break; }
+        // ---- packed single-float vectors (subtag #x12): header (N<<8)|#x12, the
+        // lanes at raw+16 (= tagged + 7), size align16(16 + 4N); translate-x64.lisp
+        case 0xCB: {                                                                                     // alloc-f32 Vd Vcount
+          const c = code[pc + 2]; sar64(this.rlo(c), this.rhi(c), 1); const n = toNum(RL, RH), total = align16(16 + 4 * n);
+          const base = this.bump(total); this.zero(base + 8, base + total);
+          this.st64(base, ((n << 8) | 0x12) | 0, Math.floor(n / 16777216) | 0); this.markStart(base);
+          this.setReg(code[pc + 1], base | 9, 0); pc += 3; break;
+        }
+        case 0xCC: case 0xCE: case 0xD3: {                                                               // f32-ref / f32-load Vd, fp-lane-load Fd; Varr Vidx
+          const a = this.f32Lane(code[pc + 2], code[pc + 3]);
+          if (op === 0xCC) { const b = this.dv.getUint32(a, true); this.setReg(code[pc + 1], (b << 1) | 0, b >>> 31); }
+          else if (op === 0xCE) this.setReg(code[pc + 1], this.allocFloat(this.dv.getFloat32(a, true), 0x64), 0);
+          else this.fr[code[pc + 1]] = this.dv.getFloat32(a, true);
+          pc += 4; break;
+        }
+        case 0xCD: case 0xCF: case 0xD4: {                                                               // f32-set / f32-store / fp-lane-store Varr Vidx Vs|Fs
+          const a = this.f32Lane(code[pc + 1], code[pc + 2]), s = code[pc + 3];
+          if (op === 0xCD) this.dv.setUint32(a, ((this.rlo(s) >>> 1) | (this.rhi(s) << 31)) >>> 0, true);
+          else this.dv.setFloat32(a, op === 0xCF ? this.floatVal(this.rlo(s)) : this.fr[s], true);
+          pc += 4; break;
+        }
+        // ---- scalar FP registers (mvm.lisp; reference arms in interp.lisp)
+        case 0xD1: this.fr[code[pc + 1]] = Math.fround(this.floatVal(this.rlo(code[pc + 2]))); pc += 3; break;   // fp-unbox
+        case 0xEB: this.fr[code[pc + 1]] = this.floatVal(this.rlo(code[pc + 2])); pc += 3; break;                // fpd-unbox
+        case 0xD2: this.setReg(code[pc + 1], this.allocFloat(this.fr[code[pc + 2]], 0x64), 0); pc += 3; break;  // fp-box
+        case 0xEC: this.setReg(code[pc + 1], this.allocFloat(this.fr[code[pc + 2]], 0x60), 0); pc += 3; break;  // fpd-box
+        case 0xE1: this.fr[code[pc + 1]] = this.fr[code[pc + 2]]; pc += 3; break;                                  // fp-mov
+        case 0xD5: case 0xD6: case 0xD7: case 0xD8: case 0xED: case 0xEE: case 0xEF: case 0xF0: {               // fp-/fpd- add sub mul div
+          const fr = this.fr, x = fr[code[pc + 2]], y = fr[code[pc + 3]], k = op <= 0xD8 ? op - 0xD5 : op - 0xED;
+          const r = k === 0 ? x + y : k === 1 ? x - y : k === 2 ? x * y : x / y;
+          fr[code[pc + 1]] = op <= 0xD8 ? Math.fround(r) : r; pc += 4; break;
+        }
+        case 0xF1: { const c = code[pc + 2]; sar64(this.rlo(c), this.rhi(c), 1); this.fr[code[pc + 1]] = toNum(RL, RH); pc += 3; break; }   // fpd-itof
+        case 0xF2: case 0xF3: {                                                                          // fpd-lt / fpd-le Vd Fa Fb
+          const x = this.fr[code[pc + 2]], y = this.fr[code[pc + 3]];
+          this.setReg(code[pc + 1], (op === 0xF2 ? x < y : x <= y) ? 2 : 0, 0); pc += 4; break;
+        }
+        case 0xF7: {                                                                                     // fp-cmp Vd Fa Fb sub (0 <, 1 <=)
+          const x = this.fr[code[pc + 2]], y = this.fr[code[pc + 3]];
+          this.setReg(code[pc + 1], (code[pc + 4] === 0 ? x < y : x <= y) ? 2 : 0, 0); pc += 5; break;
+        }
+        case 0xF5: {                                                                                     // fp-op1 Fd Fs sub
+          const x = this.fr[code[pc + 2]], sub = code[pc + 3];
+          this.fr[code[pc + 1]] = sub < 2 ? Math.abs(x) : sub === 2 ? x : Math.fround(x); pc += 4; break;
+        }
+        case 0xF6: {                                                                                     // fp-op2 Fd Fa Fb sub (even max, odd min)
+          const x = this.fr[code[pc + 2]], y = this.fr[code[pc + 3]];
+          this.fr[code[pc + 1]] = (code[pc + 4] & 1) === 0 ? (y > x ? y : x) : (y < x ? y : x); pc += 5; break;
+        }
+        case 0xF8: {                                                                                     // fp-toi Vd Fs sub
+          const x = this.fr[code[pc + 2]], k = code[pc + 3] & 3;
+          let r;
+          if (k === 0) { const f = Math.floor(x), d = x - f; r = d < 0.5 ? f : d > 0.5 ? f + 1 : (f % 2 === 0 ? f : f + 1); }
+          else r = k === 1 ? Math.trunc(x) : k === 2 ? Math.floor(x) : Math.ceil(x);
+          fromNum(r * 2); this.setReg(code[pc + 1], RL, RH); pc += 4; break;
+        }
+        case 0xF9: { const c = code[pc + 2]; this.fr[code[pc + 1]] *= Math.pow(2, this.rlo(c) >> 1); pc += 3; break; }   // fpd-scale Fd Vk
+        case 0xFA: case 0xFB: {                                                                          // fpd-li / fp-li Fd hi lo
+          const hi = (code[pc + 2] | (code[pc + 3] << 8) | (code[pc + 4] << 16) | (code[pc + 5] << 24)) >>> 0;
+          const lo = (code[pc + 6] | (code[pc + 7] << 8) | (code[pc + 8] << 16) | (code[pc + 9] << 24)) >>> 0;
+          this.f64u32[0] = lo; this.f64u32[1] = hi;
+          this.fr[code[pc + 1]] = op === 0xFB ? Math.fround(this.f64[0]) : this.f64[0]; pc += 10; break;
+        }
         default: this.fault(`unknown opcode 0x${op.toString(16)}`);
       }
     }
@@ -1383,7 +1487,27 @@ class MVM {
         if (g) { this.contDepth = d; f = g; L = 0; ebp = this.ebp; }   // keep contDepth live: a JS stand-in (e.g. the intern memo) may run() a nested activation
         else {
           this.contDepth = d;
-          this.run();                           // interpreted callee, pops its frame
+          // Interpreted callee, pops its frame.  A longjmp out of it that its
+          // own run() does not take lands in a translated frame of THIS
+          // driver's segment (a THROW from an interpreted function to a CATCH
+          // in a translated caller), so it is recovered here exactly as one
+          // out of f(this, L) is.  Left to propagate, the enclosing run() --
+          // the interpreted caller of this whole segment -- took it: it ran
+          // the translated function's frame on interpreted from the resume
+          // pc, and that frame's return then ended the CALLER's loop, its
+          // remaining work skipped and its registers whatever the callee
+          // left.
+          try { this.run(); }
+          catch (e) {
+            if (!(e instanceof LongJmp)) throw e;
+            let found = false;
+            while (!found && d > base) {
+              d--;
+              if (ce[d] === this.ebp && cf[d].RES && cf[d].RES[e.ip] !== undefined) { f = cf[d]; L = cf[d].RES[e.ip]; ebp = ce[d]; found = true; }
+            }
+            if (!found) throw e;
+            continue;
+          }
           if (d === base) return;
           d--; f = cf[d]; L = cl[d]; ebp = ce[d];
         }
@@ -1574,18 +1698,19 @@ class MVM {
         case 0x56: out += `{const l=${lo(b2)};${W(b1, `(!(l===${NIL}&&${hi(b2)}===0)&&(l&15)===1)?${NIL}:${TV}`, '0')}}`; break;
         case 0x60: out += `${P}${W(b1, `vm.allocObj(${b2 | (b3 << 8)},${b4},true)`, '0')}`; break;
         case 0x61: {
-          if (b2 === 21) out += `{const i=fb+(${(SLOT_BASE >> 2) - 2 * b3});${W(b1, 'm32[i]', 'm32[i+1]')}}`;
+          if (b2 === 21) out += `{const i=fb+(${slotOff(b3) >> 2});${W(b1, 'm32[i]', 'm32[i+1]')}}`;
           else out += `${P}{const a=${lo(b2)}+${7 + 8 * b3};${chk(lo(b2), hi(b2), 'a', 'obj-ref')}const i=(a-${VBASE})>>2;${W(b1, 'm32[i]', 'm32[i+1]')}}`;
           break;
         }
         case 0x62: {
-          if (b1 === 21) out += `{const i=fb+(${(SLOT_BASE >> 2) - 2 * b2});m32[i]=${lo(b3)};m32[i+1]=${hi(b3)};}`;
+          if (b1 === 21) out += `{const i=fb+(${slotOff(b2) >> 2});m32[i]=${lo(b3)};m32[i+1]=${hi(b3)};}`;
           else out += `${P}{const a=${lo(b1)}+${7 + 8 * b2};${chk(lo(b1), hi(b1), 'a', 'obj-set')}const i=(a-${VBASE})>>2;m32[i]=${lo(b3)};m32[i+1]=${hi(b3)};}`;
           break;
         }
         case 0x63: out += W(b1, `(${lo(b2)}&15)<<1`, '0'); break;
         case 0x64: out += `{const l=${lo(b2)};let r=0;if((l&15)===9&&${hi(b2)}===0&&l!==${TV}&&l-9>=${VBASE}&&l-9<HE)r=(m32[(l-9-${VBASE})>>2]&255)<<1;${W(b1, 'r', '0')}}`; break;
-        case 0x65: out += `${P}{const a=${lo(b2)}+${lo(b3)}*4+7;${chk(lo(b2), hi(b2), 'a', 'aref')}const i=(a-${VBASE})>>2;${W(b1, 'm32[i]', 'm32[i+1]')}}`; break;
+        case 0x65: if (b2 === 21) { out += `{const k=${lo(b3)};const i=fb+(k<${2 * SLOT_SPLIT}?${SLOT_BASE >> 2}-k:${-FRAME_SIZE >> 2}-(k-${2 * SLOT_SPLIT}));${W(b1, 'm32[i]', 'm32[i+1]')}}`; break; }   // VFP: frame slot Vidx
+                   out += `${P}{const a=${lo(b2)}+${lo(b3)}*4+7;${chk(lo(b2), hi(b2), 'a', 'aref')}const i=(a-${VBASE})>>2;${W(b1, 'm32[i]', 'm32[i+1]')}}`; break;
         case 0x66: out += `${P}{const a=${lo(b1)}+${lo(b2)}*4+7;${chk(lo(b1), hi(b1), 'a', 'aset')}const i=(a-${VBASE})>>2;m32[i]=${lo(b3)};m32[i+1]=${hi(b3)};}`; break;
         case 0x67: out += `{const l=${lo(b2)};if((l&15)===9&&${hi(b2)}===0&&l!==${TV}&&l-9>=${VBASE}&&l-9<HE){const i=(l-9-${VBASE})>>2,cl=m32[i]>>>8,ch=m32[i+1];shl64(cl|(ch<<24),ch>>>8,1);${WR(b1)}}else{${W(b1, '0', '0')}}}`; break;
         case 0x70: {

@@ -88,6 +88,14 @@
   "The process argc, stored by the boot stub at 0x10000200."
   (mem-ref #x10000200 :u32))
 
+(defvar *cli-argv-base* nil
+  "argv[0]'s slot, recorded by a runtime that moves region 0's stack base
+   (COROUTINES-START, before its first transfer), or NIL: then
+   %CLI-ARGV-BASE computes it from that base.  A transfer points region 0's
+   stack base at the stack it enters, so a coroutine computing it walks its
+   own stack as argv and envp: GETENV answered NIL, or faulted on whatever
+   the walk read as a pointer.")
+
 (declaim (overridable %cli-argv-base))
 (defun %cli-argv-base ()
   "Real byte address of argv[0]'s slot = initial-RSP + 8 (RSP holds argc).
@@ -98,7 +106,7 @@
    address operand wants (mem-ref SHRs the tagged machine word back).
    Region 0's base, not the active region's: in an actor the active region
    is the actor's, and getenv from an actor walked its stack as envp."
-  (+ (* 2 (%gc-stack-base-0)) 8))
+  (or *cli-argv-base* (+ (* 2 (%gc-stack-base-0)) 8)))
 
 (declaim (overridable %cli-collect-argv))
 (defun %cli-collect-argv ()
@@ -143,6 +151,85 @@
       (setq i (+ i 1)))))
 
 ;;; *POSIX-ARGV* — the SBCL-equivalent global, readable from user code.
+;;; ---------------------------------------------------------------------------
+;;; THE FILE THIS PROCESS CAME FROM: Actually Portable Executable segments
+;;; (scripts/make-ape.lisp).  modus.com ends in a trailer naming segments -- the
+;;; Linux image, a main.lisp, the sources -- and, run with no arguments, loads its
+;;; main.lisp instead of starting the REPL.  A plain binary has no trailer and
+;;; behaves exactly as before.
+;;;
+;;; Trailer: the file's last 32 bytes are "MODUSAPE", the directory's offset and
+;;; length (each 8 bytes, little-endian) and 8 zero bytes.  The directory is the
+;;; text of a list ((NAME OFFSET LENGTH) ...).
+;;; ---------------------------------------------------------------------------
+
+(declaim (overridable %ape-self-path))
+(defun %ape-self-path ()
+  "The file this process was started from when that is a modus.com, else NIL.  On Unix
+   the file's shell header runs a cached copy of the Linux image and names the file in
+   MODUS_APE.  Windows runs the file itself, and overrides this (net/win32-self.lisp)."
+  (let ((v (%cli-getenv "MODUS_APE")))
+    (and v (plusp (length v)) v)))
+
+(defun %ape-u64 (b i)
+  (let ((v 0))
+    (dotimes (k 8 v) (setq v (+ v (ash (aref b (+ i k)) (* 8 k)))))))
+
+(defun %ape-read-directory (path)
+  (with-open-file (s path :element-type '(unsigned-byte 8))
+    (let ((len (file-length s))
+          (tail (make-array 32 :element-type '(unsigned-byte 8))))
+      (when (>= len 32)
+        (file-position s (- len 32))
+        (read-sequence tail s)
+        (when (every (lambda (c i) (= (char-code c) (aref tail i)))
+                     "MODUSAPE" '(0 1 2 3 4 5 6 7))
+          (let* ((off (%ape-u64 tail 8)) (n (%ape-u64 tail 16))
+                 (text (make-array n :element-type '(unsigned-byte 8))))
+            (file-position s off)
+            (read-sequence text s)
+            (let ((*read-eval* nil))
+              (read-from-string (map 'string #'code-char text)))))))))
+
+(defvar *%ape-directory* :unread)
+
+(defun ape-file ()
+  "The modus.com this process was started from, or NIL."
+  (%ape-self-path))
+
+(defun ape-segments ()
+  "The segments of the modus.com this process came from, ((NAME OFFSET LENGTH) ...),
+   or NIL."
+  (when (eq *%ape-directory* :unread)
+    (setq *%ape-directory*
+          (let ((path (%ape-self-path)))
+            (and path (handler-case (%ape-read-directory path) (error () nil))))))
+  *%ape-directory*)
+
+(defun ape-segment (name)
+  "The bytes of the segment NAME of this process's modus.com, as an octet vector, or NIL."
+  (let ((e (assoc name (ape-segments) :test #'string=)))
+    (when e
+      (with-open-file (s (ape-file) :element-type '(unsigned-byte 8))
+        (let ((b (make-array (third e) :element-type '(unsigned-byte 8))))
+          (file-position s (second e))
+          (read-sequence b s)
+          b)))))
+
+(defun %ape-main ()
+  "Load the main.lisp segment, if this process came from a modus.com that has one; T if
+   it did.  CLI-TOPLEVEL calls this when its first argument is not an option."
+  (let ((m (ape-segment "main.lisp")))
+    (when m
+      (load (make-string-input-stream (map 'string #'code-char m)))
+      t)))
+
+(defvar *cli-command-line* nil
+  "The whole command line, as %CLI-COLLECT-ARGV read it at startup: unlike
+   *POSIX-ARGV* it keeps the toplevel options (--script FILE).  The image
+   configuration record reads the build script from it where there is no
+   /proc/self/cmdline (Windows; lib/image-config.lisp %IMAGE-BUILD-SCRIPT).")
+
 (defvar *posix-argv* nil
   "List of the process's command-line arguments, element 0 = program name.
    Populated by CLI-TOPLEVEL at startup.  Mirrors SB-EXT:*POSIX-ARGV*.")
@@ -324,6 +411,7 @@
   (setq *%no-cons-array-wrappers* t)
   ;; Expose the full argv as *posix-argv* (element 0 = program name).
   (setq *posix-argv* (%cli-collect-argv))
+  (setq *cli-command-line* *posix-argv*)
   (let* ((all *posix-argv*)
          (args (cdr all))                 ; drop program name
          (actions nil)                    ; reversed list of (:eval/:load . x)
@@ -451,6 +539,17 @@
     ;; SBCL's *posix-argv* keeps program name + the args AFTER the toplevel
     ;; options.  Rebuild it as (program-name . rest-args).
     (setq *posix-argv* (cons (car all) rest-args))
+    ;; ---- a modus.com with no arguments, or a command word, runs its main.lisp
+    ;; (which reads the words from *CLI-COMMAND-LINE*); options still go to the
+    ;; toplevel, so modus.com --eval ... is modus --eval ...
+    (when (or (null (cdr all))
+              (let ((a (cadr all))) (and (plusp (length a)) (char/= (char a 0) #\-))))
+      (handler-case (when (%ape-main) (%cli-exit 0))
+        (t (c)
+          (%cli-msg "modus.com: ")
+          (handler-case (write-object c) (t (c2) (%cli-msg "<condition>")))
+          (%cli-nl)
+          (%cli-exit 1))))
     ;; ---- dispatch ---------------------------------------------------------
     (cond
       ;; --script: honour any preceding --eval/--load (left-to-right), then

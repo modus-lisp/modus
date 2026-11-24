@@ -182,6 +182,11 @@
       (let ((slot (gethash nm *n386-name-slots*)))
         (when slot (setf (svref *n386-consts* slot) (%n386-current-fn nm)))))))
 
+(defun %fn-binding-changed (name)
+  "(SETF FDEFINITION) of NAME (mvm/cl-eval.lisp): its cell, if any, holds what a
+   call reaches now -- as a DEFUN of it refreshes it (%RUNTIME-DEFUN-HOOK)."
+  (%n386-refresh (list name)))
+
 (defun %n386-init ()
   (unless *n386-ready*
     (%n386-coinit)

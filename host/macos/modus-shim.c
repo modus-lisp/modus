@@ -80,10 +80,11 @@ extern void modus_syscall_stub(void);
 extern int64_t modus_keychain_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2);   // host/macos/modus-keychain.m
 
 extern void modus_enter(uint64_t sp, uint64_t entry) __attribute__((noreturn));
-// sigaltstack is prohibited on watchOS: there the fault handler runs on the
+// sigaltstack is prohibited on watchOS and tvOS: there the fault handler runs on the
 // faulting thread's own stack.
+#define MODUS_NO_ALTSTACK (TARGET_OS_WATCH || TARGET_OS_TV)
 static inline void modus_altstack(stack_t *ss) {
-#if TARGET_OS_WATCH
+#if MODUS_NO_ALTSTACK
     (void)ss;
 #else
     sigaltstack(ss, NULL);
@@ -184,6 +185,40 @@ static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t 
     UIApplicationMain(argc, argv, NULL, CFSTR("ModusAppDelegate"));
     _exit(0);   // UIApplicationMain does not return; the image's exit() ends the app
 #endif
+}
+#endif
+
+#if defined(MODUS_MAC_GUI)
+// THE MACOS WINDOW (build-macos.sh --gui).  AppKit owns the main thread: its run loop must be there.
+// The image runs on a thread of its own, exactly as on iOS, and reaches the window through the
+// pseudo-syscalls 1001-1008, which modus-ui-mac.m answers.  host/macos/modus-ui-mac.m.
+extern void modus_mac_init(void);
+extern void modus_mac_main(void) __attribute__((noreturn));
+extern int64_t modus_mac_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3);
+extern int64_t modus_objc_call(int64_t frame);   // host/ios/modus-objc.m: built into the Mac window too
+extern int64_t modus_swift_call(int64_t frame);  // host/ios/modus-swift.m: the registry; host/macos/swift/ fills it
+extern void modus_mac_wait_ready(void);          // host/macos/modus-ui-mac.m: until the window is up
+struct mac_image_start { uint64_t sp, entry; };
+static void *mac_image_thread(void *arg) {
+    struct mac_image_start st = *(struct mac_image_start *)arg;
+    stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0 };
+    modus_altstack(&ss);
+    image_leader = 1;
+    modus_enter(st.sp, st.entry);
+}
+static void run_image_beside_appkit(uint64_t sp, uint64_t entry) __attribute__((noreturn));
+static void run_image_beside_appkit(uint64_t sp, uint64_t entry) {
+    static struct mac_image_start st;
+    st.sp = sp; st.entry = entry;
+    modus_mac_init();
+    pthread_attr_t at; pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    if (pthread_create(&th, &at, mac_image_thread, &st) != 0) {
+        fprintf(stderr, "modus-shim: could not start the image thread\n");
+        _exit(1);
+    }
+    modus_mac_main();
 }
 #endif
 
@@ -480,8 +515,14 @@ struct lx_sigaction { uint64_t handler, flags, restorer, mask; };
 
 // SIGSEGV and SIGBUS stay the shim's own (the JIT mode flip must see them
 // first); what the image registers for them is kept here and chained to.
-static struct lx_sigaction image_fault_handler[2];      // [0] SEGV, [1] BUS
-static int fault_slot(int sig) { return sig == SIGSEGV ? 0 : sig == SIGBUS ? 1 : -1; }
+// SIGFPE and SIGILL too: the image's stub READS its siginfo and ucontext (translate-aarch64
+// A64-EMIT-FAULT-RECORD: si_addr, the interrupted SP and PC), in Linux's layouts, so every
+// signal it handles must reach it through ON_FAULT, which builds those (LX_FAULT_FRAMES).
+static struct lx_sigaction image_fault_handler[4];      // [0] SEGV, [1] BUS, [2] FPE, [3] ILL
+static int fault_slot(int sig) {
+    return sig == SIGSEGV ? 0 : sig == SIGBUS ? 1 : sig == SIGFPE ? 2 : sig == SIGILL ? 3 : -1;
+}
+static const int fault_slot_lx_sig[4] = { 11, 7, 8, 4 };
 
 static lw dx_rt_sigaction(lw lsig, struct lx_sigaction *nw, struct lx_sigaction *old) {
     int sig = dx_sig(lsig);
@@ -518,6 +559,30 @@ static lw dx_rt_sigaction(lw lsig, struct lx_sigaction *nw, struct lx_sigaction 
         old->restorer = 0; old->mask = lx_sigset(dold.sa_mask);
     }
     return 0;
+}
+
+// sigaltstack(2): Linux's stack_t is { ss_sp, int ss_flags, ss_size }, Darwin's { ss_sp, ss_size,
+// int ss_flags }; SS_ONSTACK is 1 in both, SS_DISABLE 2 on Linux and 4 here.  The image arms one per
+// thread (trap #x0520 for main, net/hosted-sync %THR-SIGALTSTACK for a worker) for SA_ONSTACK.
+struct lx_stack { uint64_t sp; int32_t flags, pad; uint64_t size; };
+static lw dx_sigaltstack(const struct lx_stack *nw, struct lx_stack *old) {
+#if MODUS_NO_ALTSTACK
+    if (old) memset(old, 0, sizeof *old);
+    (void)nw; return 0;                     // none here: a fault is handled on the faulting stack
+#else
+    stack_t dn, dold;
+    if (nw) {
+        memset(&dn, 0, sizeof dn);
+        dn.ss_sp = (void *)(uintptr_t)nw->sp; dn.ss_size = (size_t)nw->size;
+        dn.ss_flags = (nw->flags & 2) ? SS_DISABLE : 0;
+    }
+    if (sigaltstack(nw ? &dn : NULL, &dold) < 0) return -lx_errno(errno);
+    if (old) {
+        old->sp = (uint64_t)(uintptr_t)dold.ss_sp; old->size = dold.ss_size; old->pad = 0;
+        old->flags = ((dold.ss_flags & SS_ONSTACK) ? 1 : 0) | ((dold.ss_flags & SS_DISABLE) ? 2 : 0);
+    }
+    return 0;
+#endif
 }
 
 static lw dx_rt_sigprocmask(lw how, const uint64_t *set, uint64_t *old) {
@@ -861,6 +926,7 @@ static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
     case 222: return dx_mmap(a0, a1, a2, a3, a4, a5);
     case 215: RET(munmap((void *)(uintptr_t)a0, (size_t)a1));
     case 226: RET(mprotect((void *)(uintptr_t)a0, (size_t)a1, (int)a2));
+    case 132: return dx_sigaltstack((const struct lx_stack *)(uintptr_t)a0, (struct lx_stack *)(uintptr_t)a1);
     case 93: if (is_clone) thread_exit(); report_resident(); _exit((int)a0);   // exit: the THREAD
     case 94: report_resident(); prof_write(); _exit((int)a0);             // exit_group
     case 220: return dx_clone(a0, a1, (uint32_t *)(uintptr_t)a2, (uint32_t *)(uintptr_t)a4, frame);
@@ -975,15 +1041,25 @@ static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
     case 103: return 0;                            // setitimer
     case 1030: case 1031: case 1032:                                    // the keychain, random bytes (modus-keychain.m)
         return modus_keychain_call(nr, a0, a1, a2);
-#if TARGET_OS_IPHONE
-    case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007:   // screen, input, copy (host/ios/modus-ui.m)
+#if defined(MODUS_MAC_GUI)
+    case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007: case 1008:   // the window (host/macos/modus-ui-mac.m)
+        return modus_mac_call(nr, a0, a1, a2, a3);
+    // the bridges wait for the window, as the window's own calls do: an app's first call can come before it is up
+    case 1040:   // the Objective-C runtime: a frame in the image's memory (host/ios/modus-objc.m, the same bridge)
+        modus_mac_wait_ready();
+        return modus_objc_call(a0);
+    case 1060:   // Lisp calls a Swift function by name (host/ios/modus-swift.m; the Mac's are host/macos/swift/)
+        modus_mac_wait_ready();
+        return modus_swift_call(a0);
+#elif TARGET_OS_IPHONE
+    case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007: case 1008:   // screen, input, copy, frame clock (host/ios/modus-ui.m)
         return modus_ui_call(nr, a0, a1, a2, a3);
     case 1040:   // the Objective-C runtime: a frame in the image's memory (host/ios/modus-objc.m)
         return modus_objc_call(a0);
     case 1060:   // Lisp calls a Swift function by name (host/ios/modus-swift.m)
         return modus_swift_call(a0);
 #endif
-    case 1010: case 1011: case 1012:                          // the speaker (host/macos/modus-audio.c)
+    case 1010: case 1011: case 1012: case 1013:               // the speaker (host/macos/modus-audio.c)
         return modus_audio_call(nr, a0, a1);
     default:
         if (nr >= 0 && nr < 512 && !unknown_seen[nr]) {
@@ -1072,6 +1148,32 @@ static void start_profiler(void) {
 }
 static __thread uint64_t last_flip_pc; static __thread int same_pc_flips;   // per thread: W^X is
 
+// Linux aarch64's siginfo and ucontext, as far as an image's fault stub reads them:
+// si_addr at +16; uc_mcontext (struct sigcontext) at +176 = fault_address, regs[31], sp (+432),
+// pc (+440), pstate.  The kernel's ucontext: uc_flags, uc_link, uc_stack (24), a 128-byte
+// sigmask, then the sigcontext aligned to 16.
+struct lx_siginfo { int32_t signo, errno_, code, pad; uint64_t addr; uint8_t rest[104]; };
+struct lx_sigcontext { uint64_t fault_address, regs[31], sp, pc, pstate; };
+struct lx_ucontext { uint64_t flags, link; uint64_t ss_sp; int32_t ss_flags, pad0; uint64_t ss_size;
+                     uint8_t sigmask[128]; uint64_t pad1; struct lx_sigcontext mc; };
+_Static_assert(__builtin_offsetof(struct lx_siginfo, addr) == 16, "Linux si_addr");
+_Static_assert(__builtin_offsetof(struct lx_ucontext, mc) == 176, "Linux uc_mcontext");
+_Static_assert(__builtin_offsetof(struct lx_ucontext, mc.sp) == 432, "Linux uc_mcontext.sp");
+_Static_assert(__builtin_offsetof(struct lx_ucontext, mc.pc) == 440, "Linux uc_mcontext.pc");
+static void lx_fault_frames(int lsig, siginfo_t *si, ucontext_t *uc,
+                            struct lx_siginfo *lsi, struct lx_ucontext *luc) {
+    memset(lsi, 0, sizeof *lsi); memset(luc, 0, sizeof *luc);
+    lsi->signo = lsig; lsi->code = si->si_code; lsi->addr = (uint64_t)(uintptr_t)si->si_addr;
+    __typeof__(uc->uc_mcontext->__ss) *ts = &uc->uc_mcontext->__ss;
+    luc->mc.fault_address = lsi->addr;
+    for (int i = 0; i < 29; i++) luc->mc.regs[i] = ts->__x[i];
+    luc->mc.regs[29] = __darwin_arm_thread_state64_get_fp(*ts);
+    luc->mc.regs[30] = __darwin_arm_thread_state64_get_lr(*ts);
+    luc->mc.sp = __darwin_arm_thread_state64_get_sp(*ts);
+    luc->mc.pc = __darwin_arm_thread_state64_get_pc(*ts);
+    luc->mc.pstate = ts->__cpsr;
+}
+
 static void on_fault(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     uint64_t pc = __darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
@@ -1126,8 +1228,14 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
     if (slot >= 0 && image_fault_handler[slot].handler > 1) {
         // The image's handler: a stub that ignores its arguments and branches
         // into the armed handler-case frame, never returning.
-        ((void (*)(int, siginfo_t *, void *))(uintptr_t)image_fault_handler[slot].handler)
-            (sig == SIGBUS ? 7 : 11, si, uc_);
+        // In LINUX's layouts, which is what the stub reads (it used to ignore its
+        // arguments, and Darwin's were passed through: si_addr read as si_uid and
+        // the SP as zero, so every recoverable fault looked like a stack overflow).
+        // On this stack: the handler never returns, and the stub has read them by then.
+        struct lx_siginfo lsi; struct lx_ucontext luc;
+        lx_fault_frames(fault_slot_lx_sig[slot], si, uc, &lsi, &luc);
+        ((void (*)(int, void *, void *))(uintptr_t)image_fault_handler[slot].handler)
+            (fault_slot_lx_sig[slot], &lsi, &luc);
     }
     report_fault(sig, si, uc_);
 }
@@ -1191,7 +1299,28 @@ static void log_to_documents(void) {
 }
 #endif
 
+#if TARGET_OS_TV
+// A TV GIVES AN APP NO DOCUMENTS: its container's Documents cannot be written, and only Caches (which the system
+// may clear when space runs low) and tmp can.  So HOME is moved to Library/Caches, with a Documents folder of its
+// own, before anything reads it: the image's HOME/Documents and Files.swift's files_documents both land there.
+extern void modus_keep_restore(void);
+static void home_in_caches(void) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char caches[1024], docs[1100];
+    snprintf(caches, sizeof caches, "%s/Library/Caches", home);
+    snprintf(docs, sizeof docs, "%s/Documents", caches);
+    mkdir(caches, 0755);
+    mkdir(docs, 0755);
+    setenv("HOME", caches, 1);
+    modus_keep_restore();                    // what the defaults kept of it, if Caches was emptied (modus-ui.m)
+}
+#endif
+
 int main(int argc, char **argv, char **envp) {
+#if TARGET_OS_TV
+    home_in_caches();
+#endif
 #if TARGET_OS_IPHONE && !TARGET_OS_WATCH
     log_to_documents();
 #endif
@@ -1284,9 +1413,15 @@ int main(int argc, char **argv, char **envp) {
     char exedir0[4096] = "";
     { char exe[4096]; uint32_t n = sizeof exe;
       if (_NSGetExecutablePath(exe, &n) == 0) strncpy(exedir0, dirname(exe), sizeof exedir0 - 1); }
+    // A Mac app's are in its Resources (Contents/MacOS holds only code, as codesign wants): `kiln mac' writes
+    // them there, so the app opens from the Finder, the Dock or `open' as well as from `kiln mac run'.
     if (argc == 1 && exedir0[0]) {
         char path[4200]; snprintf(path, sizeof path, "%s/modus.args", exedir0);
         FILE *af = fopen(path, "r");
+        if (!af) {
+            snprintf(path, sizeof path, "%s/../Resources/modus.args", exedir0);
+            af = fopen(path, "r");
+        }
         if (af) {
             char **nv = calloc(64, sizeof *nv); int nc = 0; char line[4096];
             nv[nc++] = argv[0];
@@ -1358,7 +1493,9 @@ int main(int argc, char **argv, char **envp) {
     reserve_delta_key();
     install_fault_report();
     start_profiler();
-#if TARGET_OS_IPHONE
+#if defined(MODUS_MAC_GUI)
+    run_image_beside_appkit((uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
+#elif TARGET_OS_IPHONE
     run_image_beside_uikit(argc, argv, (uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
 #else
     image_leader = 1;

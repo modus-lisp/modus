@@ -1,3 +1,4 @@
+#if !os(tvOS)   // app-grade components are the phone's and iPad's (tvOS has few of these controls)
 // Native.swift — app-grade native components: what a modus app needs to look like an ordinary iPhone app
 // rather than a window over glass's desk.  The navigation controller is the window's ROOT; screens are pushed
 // onto it and say when they are popped; tables are the system's inset-grouped ones in the system's colours,
@@ -22,7 +23,9 @@
 
 import CoreImage
 import ImageIO
+#if canImport(QuickLook)
 import QuickLook
+#endif
 import UIKit
 import UniformTypeIdentifiers
 
@@ -1107,7 +1110,7 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         infoLabel.font = .preferredFont(forTextStyle: .footnote)
         infoLabel.textColor = .secondaryLabel
         infoLabel.numberOfLines = 0
-        // a tap on it is an INFO event (ferry: the folder's usage)
+        // a tap on it is an INFO event (an app shows more about it: a folder's usage, say)
         infoLabel.isUserInteractionEnabled = true
         infoLabel.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(infoTapped)))
         header.addSubview(infoLabel)
@@ -2145,7 +2148,13 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         vc.view.addSubview(pagesView)
         buildPane()
         vc.onLayout = { [weak self] in self?.layout() }
+        // A TAP ON THE TITLE (the path): a TITLE event, for the app's menu of what to do with where it is -- copy
+        // the path, go somewhere by typing it.  The title's parts are labels, so nothing in it takes the tap.
+        title.isUserInteractionEnabled = true
+        title.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(titleTapped)))
     }
+
+    @objc func titleTapped() { send("TITLE", [.int(Int(handle)), .int(0)]) }
 
     var width: CGFloat { pagesView.bounds.width }
     var landscape: Bool { vc.view.bounds.width > vc.view.bounds.height }
@@ -3585,6 +3594,25 @@ final class NativeStatus {
     var clearing: DispatchWorkItem?              // taking it away, shortly: a status that follows at once stays
     private var spinning = false
     private var lastFill: CGFloat = 0
+    private var finishing: Timer?                // the last stretch of the ring, filling before the checkmark
+
+    /// How much of the ring a measured progress fills: all the work is 95% of it, so a nearly finished one does
+    /// not look done; the last 5% fills when it is (FINISH).
+    static let measured: CGFloat = 0.95
+    /// How long work goes before its ring shows (quicker work shows none), how long a shown ring stays at least,
+    /// and how long it stays after its work ends (for a next status that follows at once).
+    static let grace = 0.5, held = 1.0, linger = 0.25
+    weak var panel: StatusPanel?                 // its panel, while open
+    var panelAction = false                      // the item's tap opens the panel (not a result's alert)
+    var pending: DispatchWorkItem?               // work begun, its ring not shown yet (within the grace)
+    var shownSince: CFTimeInterval = 0
+
+    /// Shown now, on the bar of the screen on top.
+    func appear(in nav: UINavigationController) {
+        shown = true
+        shownSince = CACurrentMediaTime()
+        place(on: nav.topViewController, in: nav)
+    }
 
     init() {
         item.accessibilityLabel = "Status"
@@ -3593,12 +3621,14 @@ final class NativeStatus {
 
     /// PROGRESS 0-1, or nil: no measure (turning arrows); DONE: a checkmark.  The ring fills forward only.
     func show(progress: Double?, done: Bool) {
+        finishing?.invalidate()
+        finishing = nil
         if done {
             stopSpinning()
-            item.image = UIImage(systemName: "checkmark.circle")
+            if lastFill > 0 { finish() } else { item.image = UIImage(systemName: "checkmark.circle") }
         } else if let p = progress {
             stopSpinning()
-            let v = max(lastFill, CGFloat(max(0, min(1, p))))
+            let v = max(lastFill, CGFloat(max(0, min(1, p))) * NativeStatus.measured)
             lastFill = v
             item.image = StatusRingImage.make(v)
         } else {
@@ -3610,7 +3640,24 @@ final class NativeStatus {
             }
         }
     }
-    func reset() { lastFill = 0; stopSpinning() }
+    /// A ring that was filling: its rest filled in a quarter of a second, then the checkmark.
+    private func finish() {
+        let from = lastFill, start = CACurrentMediaTime(), length = 0.25
+        lastFill = 0
+        finishing = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            let k = min(1, (CACurrentMediaTime() - start) / length)
+            if k < 1 {
+                self.item.image = StatusRingImage.make(from + (1 - from) * CGFloat(k))
+            } else {
+                t.invalidate()
+                self.finishing = nil
+                self.item.image = UIImage(systemName: "checkmark.circle")
+            }
+            self.refresh()
+        }
+    }
+    func reset() { lastFill = 0; finishing?.invalidate(); finishing = nil; stopSpinning() }
     /// Its island button, if it is in one, given what the item now is.
     func refresh() { refreshIsland(item) }
     private func stopSpinning() {
@@ -3669,6 +3716,88 @@ func statusDetail(_ text: String) -> String {
         .joined(separator: "\u{00A0}\u{00A0}·  ")
 }
 
+/// A working status, opened from its ring: a popover of the app's own (a menu cannot be changed while it is open),
+/// so its lines follow the status as it goes -- what it is, how far it has got -- with Cancel under them.
+final class StatusPanel: UIViewController, UIPopoverPresentationControllerDelegate {
+    private let icon = UIImageView(image: UIImage(systemName: "arrow.down.circle"))
+    private let titleLabel = UILabel()
+    private let detailLabel = UILabel()
+    private let button = UIButton(type: .system)
+    private let width: CGFloat = 300
+    private let all = UIStackView()
+    var onCancel: (() -> Void)?
+
+    init(item: UIBarButtonItem) {
+        super.init(nibName: nil, bundle: nil)
+        modalPresentationStyle = .popover
+        popoverPresentationController?.sourceItem = item
+        popoverPresentationController?.delegate = self
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    // a popover on a phone too, not a sheet
+    func adaptivePresentationStyle(for controller: UIPresentationController,
+                                   traitCollection: UITraitCollection) -> UIModalPresentationStyle { .none }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        icon.tintColor = .label
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(textStyle: .body)
+        titleLabel.font = .preferredFont(forTextStyle: .body)
+        titleLabel.numberOfLines = 0
+        detailLabel.font = .preferredFont(forTextStyle: .subheadline)
+        detailLabel.textColor = .secondaryLabel
+        detailLabel.numberOfLines = 0
+        let words = UIStackView(arrangedSubviews: [titleLabel, detailLabel])
+        words.axis = .vertical
+        words.spacing = 2
+        let top = UIStackView(arrangedSubviews: [icon, words])
+        top.spacing = 12
+        top.alignment = .firstBaseline
+        let rule = UIView()
+        rule.backgroundColor = .separator
+        rule.heightAnchor.constraint(equalToConstant: 1 / UIScreen.main.scale).isActive = true
+        var c = UIButton.Configuration.plain()
+        c.image = UIImage(systemName: "xmark")
+        c.imagePadding = 12
+        c.title = "Cancel"
+        c.baseForegroundColor = .systemRed
+        c.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0)
+        button.configuration = c
+        button.contentHorizontalAlignment = .leading
+        button.addAction(UIAction { [weak self] _ in
+            self?.onCancel?()
+            self?.dismiss(animated: true)
+        }, for: .primaryActionTriggered)
+        [top, rule, button].forEach(all.addArrangedSubview)
+        all.axis = .vertical
+        all.spacing = 10
+        all.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(all)
+        NSLayoutConstraint.activate([
+            all.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
+            all.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
+            all.topAnchor.constraint(equalTo: view.topAnchor, constant: 16),
+            all.widthAnchor.constraint(equalToConstant: width - 36)])
+    }
+
+    /// Its lines from MESSAGE ("Doing x — how far"), and its size to fit them.
+    func show(_ message: String) {
+        loadViewIfNeeded()
+        let parts = message.components(separatedBy: " — ")
+        titleLabel.text = parts[0]
+        detailLabel.text = parts.count > 1 ? statusDetail(parts.dropFirst().joined(separator: " — ")) : nil
+        detailLabel.isHidden = parts.count < 2
+        // the stack's own height (the view's is the popover's, not yet known), and the margins around it
+        let fit = all.systemLayoutSizeFitting(CGSize(width: width - 36, height: UIView.layoutFittingCompressedSize.height),
+                                              withHorizontalFittingPriority: .required,
+                                              verticalFittingPriority: .fittingSizeLevel)
+        let size = CGSize(width: width, height: ceil(fit.height) + 16 + 12)
+        if preferredContentSize != size { preferredContentSize = size }
+    }
+}
+
 /// app_status(nav, text, permille, cancellable): what NAV's app is doing, as a ring in the bar of the screen on
 /// top: filling to PERMILLE (0-1000; above, no measure: it spins), its menu TEXT ("Doing x — how far") and Cancel
 /// when CANCELLABLE (a STATUSCANCEL).  Not CANCELLABLE: a result -- a checkmark, its menu the TEXT.  An empty TEXT
@@ -3680,9 +3809,15 @@ let appStatus: Call = { h, p, n, permille, cancellable, _ in
     let message = text(p, n)
     s.clearing?.cancel()
     s.clearing = nil
+    // When the ring comes and goes (each time, the bar's buttons move):
+    //   hidden  -- work begins: pending; it shows only if the work is still going a moment later
+    //   pending -- the work ends first: hidden again, never shown; a result: shown at once
+    //   shown   -- held at least a little while, then taken away a moment after the work ends (an app often
+    //              ends one status and begins the next straight after: the ring stays rather than blink)
     if message.isEmpty {
-        // not at once: an app often clears one status and gives the next (its result) straight after, and the
-        // ring should stay rather than go and come back
+        s.panel?.dismiss(animated: true)
+        s.panelAction = false
+        if let p = s.pending { p.cancel(); s.pending = nil; s.reset(); s.item.menu = nil; return 1 }
         guard s.shown else { return 1 }
         let clear = DispatchWorkItem { [weak s, weak nav] in
             guard let s, let nav else { return }
@@ -3693,7 +3828,9 @@ let appStatus: Call = { h, p, n, permille, cancellable, _ in
             s.place(on: nil, in: nav)
         }
         s.clearing = clear
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: clear)
+        let held = CACurrentMediaTime() - s.shownSince
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(NativeStatus.linger, NativeStatus.held - held),
+                                      execute: clear)
         return 1
     }
     let working = cancellable != 0
@@ -3703,22 +3840,24 @@ let appStatus: Call = { h, p, n, permille, cancellable, _ in
     s.message = message
     s.cancel = { send("STATUSCANCEL", [.int(Int(h))]) }
     if working {
-        // made when opened, from the status as it is then -- not replaced at each step under the finger
-        if s.item.menu == nil || s.item.primaryAction != nil {
-            s.item.primaryAction = nil
-            s.item.menu = UIMenu(title: "", children: [UIDeferredMenuElement.uncached { [weak s] done in   // once an opening
-                guard let s else { done([]); return }
-                let parts = s.message.components(separatedBy: " — ")
-                let about = UIAction(title: parts[0], image: UIImage(systemName: "arrow.down.circle")) { _ in }
-                if parts.count > 1 { about.subtitle = statusDetail(parts.dropFirst().joined(separator: " — ")) }
-                done([about, UIMenu(title: "", options: .displayInline, children: [
-                    UIAction(title: "Cancel", image: UIImage(systemName: "xmark"), attributes: .destructive) { _ in
-                        s.cancel?()
-                    }])])
-            }])
+        // a tap opens its panel, which follows the status while it is open
+        s.item.menu = nil
+        if !s.panelAction {
+            s.panelAction = true
+            s.item.primaryAction = UIAction(image: s.item.image) { [weak s] _ in
+                guard let s, s.panel == nil, let host = presenter() else { return }
+                let panel = StatusPanel(item: s.item)
+                panel.onCancel = { [weak s] in s?.cancel?() }
+                panel.show(s.message)
+                s.panel = panel
+                host.present(panel, animated: true)
+            }
         }
+        s.panel?.show(message)
     } else {
         // a result: a tap pops it up in full, and OK clears the checkmark
+        s.panel?.dismiss(animated: true)
+        s.panelAction = false
         s.item.menu = nil
         s.item.primaryAction = UIAction(image: s.item.image) { [weak nav] _ in
             guard let nav, let host = presenter() else { return }
@@ -3734,8 +3873,23 @@ let appStatus: Call = { h, p, n, permille, cancellable, _ in
     }
     s.item.accessibilityValue = message
     s.refresh()
-    s.shown = true
-    s.place(on: nav.topViewController, in: nav)
+    if s.shown { return 1 }
+    if working {
+        // not yet: shown if the work is still going after the grace (PENDING still set)
+        if s.pending == nil {
+            let show = DispatchWorkItem { [weak s, weak nav] in
+                guard let s, let nav, s.pending != nil else { return }
+                s.pending = nil
+                s.appear(in: nav)
+            }
+            s.pending = show
+            DispatchQueue.main.asyncAfter(deadline: .now() + NativeStatus.grace, execute: show)
+        }
+        return 1
+    }
+    s.pending?.cancel()
+    s.pending = nil
+    s.appear(in: nav)
     return 1
 }
 
@@ -3923,3 +4077,4 @@ func installNative() {
     register("app_resolve", appResolve)
     register("app_documents", appDocuments)
 }
+#endif

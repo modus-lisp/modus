@@ -1384,7 +1384,9 @@
 
 (in-package :modus.mvm)
 
-(install-aarch64-translator)
+;; a modus host (the builder CLI) has the translator baked; %BUILDER-PREPARE-TARGET
+;; configures it for :LINUX-AARCH64 (mvm/builder.lisp)
+#-modus (install-aarch64-translator)
 
 (setf *aarch64-stack-align-16* t)
 (setf *aarch64-linux-mode* t)
@@ -1402,7 +1404,7 @@
 ;; :arch :aarch64); the boot publishes from/to/space_size/stack_base metadata.
 (setf *linux-aarch64-gc-metadata-shl* t)
 (setf *linux-aarch64-gc-midpoint*
-      (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_GC_MIDPOINT")))
+      (let ((v (sb-ext:posix-getenv "MODUS_GC_MIDPOINT")))
         (cond ((and v (> (length v) 0)) (parse-integer v :radix 16))
               ;; WITH THREADS, x86-64's 896 MB semispaces in a 1808 MB
               ;; mapping (the :HEAP-SIZE hosted-layout-env gives a threaded
@@ -1440,8 +1442,8 @@
   (when (and sm (plusp (length sm)))
     (setf modus.mvm::*write-symmap-path* sm)))
 
-(let ((image (build-image :target :linux-aarch64 :source-text cl-user::*full-source*)))
-  (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CLI_OUT")
+(let ((image (cl-user::host-build-image :target :linux-aarch64 :source-text cl-user::*full-source*)))
+  (let ((path (or (sb-ext:posix-getenv "MODUS_CLI_OUT")
                   "/home/claude/modus-aa64-cli")))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
@@ -1454,7 +1456,8 @@
         (write-sequence (kernel-image-native-code image) o))
       (format t "  native code: ~D bytes -> ~A.native~%"
               (length (kernel-image-native-code image)) path))
-    #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
+    #-modus (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
+    #+modus (ignore-errors (funcall (find-symbol "CHMOD" "SB-POSIX") path #o755))
     (when (string= path "/home/claude/modus-aa64-cli")
       (format t "~%NOTE: wrote the SHARED default path.  Set MODUS_CLI_OUT for any~%      gate or comparison build — the default is outside the worktree, so~%      two agents building at once overwrite each other.~%"))
     (when (consp *conv-audit*)

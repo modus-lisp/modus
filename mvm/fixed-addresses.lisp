@@ -231,15 +231,10 @@
 ;;; ------------------------------------------------------------------
 
 (defun %fa-getenv (name)
-  "getenv(3) DIRECTLY, not SB-EXT:POSIX-GETENV.  lib/image-config.lisp wraps
-   POSIX-GETENV to record every MODUS_* knob a build reads INTO the image, so
-   merely reading these two would add two entries to every image's
-   configuration record.  They cannot change a byte of an image -- the check
-   passes a build or stops it -- so, like output paths, they stay out of the
-   record, and a build with this file is byte-identical to one without it."
-  (sb-alien:alien-funcall
-   (sb-alien:extern-alien "getenv" (function sb-alien:c-string sb-alien:c-string))
-   name))
+  "MODUS_FIXED_ADDR_* without a knob-record entry: they cannot change a byte of an
+   image (the check passes a build or stops it), so, like output paths, they stay
+   out of the record (lib/image-config.lisp GETENV-UNRECORDED)."
+  (modus.image-config:getenv-unrecorded name))
 
 (defun %fa-mode ()
   (let ((v (%fa-getenv "MODUS_FIXED_ADDR_CHECK")))
@@ -1098,6 +1093,15 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
   (:a64-handler-pop-va  #x10000F98 8 :constants ("MODUS-INT::+A64-HANDLER-POP-VA-SLOT+")
    :doc "VA of the POP helper."))
 
+(define-fixed-words (:images (:x64) :owner "boot/boot-linux-x64.lisp, boot/boot-x64.lisp, mvm/translate-x64.lisp")
+  (:x64-heap-midpoint #x10000F88 8
+   :doc "Bytes from the heap base to the second semispace: chosen at startup
+   (--dynamic-space-size) by the hosted stub, read by its heap tail.")
+  (:x64-heap-data-size #x10000F90 8
+   :doc "Bytes of the heap's data region (two semispaces and the guard).")
+  (:x64-kind-delta #x10000F98 8 :constants ("MODUS.MVM.X64::+MCGC-KIND-DELTA-ADDR+")
+   :doc "Cons-kind bitmap base minus object-start bitmap base (EMIT-X64-ADD-KIND-DELTA)."))
+
 (define-fixed-words (:images (:all) :owner "mvm/compiler.lisp")
   ;; :ALL, not :LOW-BLOCK: the compiler emits these two for EVERY target (the
   ;; inline global-cell read; COMPILE-QUOTE's static literals), including the
@@ -1433,6 +1437,10 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
 
 (define-fixed-word :web-scratch #x10010000 #x5000 :kind :region :images (:web)
   :owner "mvm/build-web.lisp" :doc "*CSTR-SCRATCH* #x10010000, *IO-BUF-ADDR* #x10014000.")
+
+(define-fixed-word :web-gl-float-scratch #x10015000 #x1000 :kind :region :images (:web)
+  :owner "web/samples/opengl.lisp, web/host-browser.js"
+  :doc "+FBUF+: matrices as raw IEEE-754 doubles; guiSend snapshots it with each command batch.")
 
 ;;; ==================================================================
 ;;; Run H1-H3 now: every build loads this file, so an overlap introduced in

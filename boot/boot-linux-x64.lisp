@@ -46,8 +46,8 @@
   ;; makes a hosted library load collect several times with a large live set,
   ;; the way the 104 MB bare-x64 heap does -- the shape the default below was
   ;; chosen to avoid.  Must be a multiple of 1024 (see +linux-x64-heap-alloc-start+).
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_X64_MIDPOINT")))
-    (if (and v (plusp (length v))) (parse-integer v) #x38000000)))  ; 896MB semispace (2x orig): self-compile ~580MB total alloc fits WITHOUT a collection (avoids the large-working-set-collection corruption). Total mmap 2x896MB+guard ~1.8GB < 2GB imm32 cap.
+  (let ((v (sb-ext:posix-getenv "MODUS_X64_MIDPOINT")))
+    (if (and v (plusp (length v))) (parse-integer v) #x38000000)))  ; 896MB semispace (2x orig): self-compile ~580MB total alloc fits WITHOUT a collection (avoids the large-working-set-collection corruption). Past 2 GB the stub loads sizes with MOVABS (EMIT-X64-STUB-ADD).
 (defconstant +linux-x64-heap-data-size+ (+ (* 2 +linux-x64-gc-midpoint+) +linux-x64-gc-guard+))  ; 2 semispaces + 16MB guard
 ;; #x400 AND NOT #x200, WHICH IS A GC CONCURRENCY FIX, NOT A COSMETIC ONE.
 ;; page_base is heap_base + this offset, from_start is the same address, and
@@ -78,43 +78,56 @@
 ;;; still runs UNCHANGED over the two semispaces; the metadata is built
 ;;; but unused (stage 1) / write-only (stage 2).
 ;;; ------------------------------------------------------------
+;;; The layout is a function of the semispace size, chosen at startup: a hosted
+;;; image's stub computes it from --dynamic-space-size with exactly the arithmetic
+;;; X64-HEAP-LAYOUT does (EMIT-LINUX-X64-CHOOSE-HEAP), and stores what the
+;;; translator and the heap tail need in three words (fixed-addresses.lisp:
+;;; :X64-HEAP-MIDPOINT / -DATA-SIZE / :X64-KIND-DELTA).  The constants below are
+;;; the DEFAULT layout (no flag; the Windows stub's).
 (defconstant +mcgc-page-size+ #x1000)           ; 4 KiB pages
-(defconstant +mcgc-page-count+ (truncate +linux-x64-heap-data-size+ +mcgc-page-size+)) ; pages over the data region
-(defconstant +mcgc-descriptor-size+ +mcgc-page-count+)  ; 1 byte/page
-;; Object-start bitmap: 1 bit / 16-byte granule = data_size/16/8 bytes.
-(defconstant +mcgc-bitmap-size+ (truncate +linux-x64-heap-data-size+ (* 16 8)))
-(defconstant +mcgc-freelist-size+ (* +mcgc-page-count+ 4))  ; u32 per page index
-(defconstant +mcgc-meta-size+ #x4000000)        ; 64 MiB metadata region (enlarged for 2x heap: 2x~14.5MB bitmaps + descriptor + freelist ~32MB; was 24 MiB;
-                                                ; holds descriptor + object-start
-                                                ; bitmap + freelist + cons-kind bitmap)
-;; Offsets (from mmap base) of the metadata arrays, each 64-byte aligned.
+
+(defun x64-heap-layout (mid)
+  "The heap mapping for semispaces MID bytes apart (MID = the second semispace's
+   offset from the base), as a plist: :DATA (two semispaces and the guard), then
+   the metadata arrays after it, each 64-byte aligned -- descriptors (1 byte a
+   4 KB page), the object-start bitmap (1 bit / 16 bytes), the free list (4 bytes a
+   page), the cons-kind bitmap -- :KIND-DELTA (kind bitmap minus start bitmap) and
+   :MAP (the whole mapping, page-rounded)."
+  (let* ((data (+ (* 2 mid) +linux-x64-gc-guard+))
+         (pages (ash data -12))
+         (bmo (logand (+ data pages 63) (lognot 63)))
+         (bms (ash data -7))
+         (flo (logand (+ bmo bms 63) (lognot 63)))
+         (kdo (logand (+ flo (* 4 pages) 63) (lognot 63))))
+    (list :data data :pages pages :bitmap-offset bmo :freelist-offset flo
+          :kind-delta (- kdo bmo) :map (logand (+ kdo bms #xFFF) (lognot #xFFF)))))
+
+;; The DEFAULT layout, X64-HEAP-LAYOUT's arithmetic written out: a constant's
+;; initform must fold when the image's own compiler reads this file, where no
+;; function of it can be called (a SKIPPED form, and the two hosts diverge).
+(defconstant +mcgc-page-count+ (ash +linux-x64-heap-data-size+ -12))
 (defconstant +mcgc-meta-offset+ +linux-x64-heap-data-size+) ; metadata starts right after data
 (defconstant +mcgc-descriptor-offset+ +mcgc-meta-offset+)
 (defconstant +mcgc-bitmap-offset+
-  (logand (+ +mcgc-descriptor-offset+ +mcgc-descriptor-size+ 63) (lognot 63)))
+  (logand (+ +linux-x64-heap-data-size+ +mcgc-page-count+ 63) (lognot 63)))
+(defconstant +mcgc-bitmap-size+ (ash +linux-x64-heap-data-size+ -7))
 (defconstant +mcgc-freelist-offset+
   (logand (+ +mcgc-bitmap-offset+ +mcgc-bitmap-size+ 63) (lognot 63)))
-;; Cons-kind bitmap: a SECOND object-start-sized bitmap (1 bit / 16-byte
-;; granule) marking which starts are CONSES (vs objects).  scan_word
-;; cross-checks a candidate's TAG against it so a conservative scratch word
-;; aliasing a live object's BASE with the wrong tag can't be copied as the
-;; wrong type.  Its runtime base is derived as [+mcgc-cfg-bitmap-addr+] +
-;; modus.mvm.x64::*mcgc-kindbitmap-delta* (no extra boot config word, so no
-;; boot-preamble growth / *x64-native-code-offset* bump).  The two asserts
-;; below pin that delta to the real layout.
 (defconstant +mcgc-kindbitmap-offset+
-  (logand (+ +mcgc-freelist-offset+ +mcgc-freelist-size+ 63) (lognot 63)))
+  (logand (+ +mcgc-freelist-offset+ (* 4 +mcgc-page-count+) 63) (lognot 63)))
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; The translator reads the delta from this layout (it was a constant that
-  ;; this form ASSERTED equal; now the layout is the one source of truth, and
-  ;; the default layout still yields #xFE4000 byte-for-byte).
+  ;; the default layout's: bare x64 stores this one (boot-x64.lisp), a hosted stub
+  ;; the one it computes
   (setf modus.mvm.x64::*mcgc-kindbitmap-delta*
-        (- +mcgc-kindbitmap-offset+ +mcgc-bitmap-offset+))
-  (assert (<= (+ +mcgc-kindbitmap-offset+ +mcgc-bitmap-size+)
-              (+ +mcgc-meta-offset+ +mcgc-meta-size+))
-          () "cons-kind bitmap overruns the metadata region"))
-;; Full mmap = data region + metadata region.
-(defconstant +linux-x64-heap-size+ (+ +linux-x64-heap-data-size+ +mcgc-meta-size+))
+        (- +mcgc-kindbitmap-offset+ +mcgc-bitmap-offset+)))
+;; Full mmap = data region + metadata region (the default layout's).
+(defconstant +linux-x64-heap-size+
+  (logand (+ +mcgc-kindbitmap-offset+ +mcgc-bitmap-size+ #xFFF) (lognot #xFFF)))
+;; --dynamic-space-size N: semispaces N/2, rounded down to 1 MB, within these.
+;; The heap is mapped at +LINUX-X64-FIXED-HEAP-BASE+ (0x2000000000) and the JIT
+;; arena at 0x3000000000, so the whole mapping stays under 64 GB.
+(defconstant +linux-x64-min-midpoint+ #x2000000)       ; 32 MB
+(defconstant +linux-x64-max-midpoint+ #x600000000)     ; 24 GB
 
 ;;; MCGC config-word slots in the fixed BSS block (zero-init by the ELF
 ;;; loader; the boot stub overwrites with mmap-relative raw addresses).
@@ -416,11 +429,11 @@
   ;; reserved, not committed, so a machine with less RAM than that can run
   ;; (pages are backed as they are touched).  Without it the kernel's default
   ;; overcommit heuristic refuses the mapping on a 1 GB VM.
+  (emit-linux-x64-choose-heap buf)
   (let ((hbase (modus.mvm::hosted-layout :heap-base +linux-x64-fixed-heap-base+))
         (abase (modus.mvm::hosted-layout :jit-arena-base +linux-x64-jit-arena-base+)))
     (emit-bytes buf #x48 #xBF) (emit-le64 buf hbase)      ; movabs rdi, fixed heap base
-    (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
-    (emit-le32 buf +linux-x64-heap-size+)
+    (emit-bytes buf #x4C #x89 #xE6)                ; mov rsi, r12 (EMIT-LINUX-X64-CHOOSE-HEAP's size)
     (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_RW)
     (emit-bytes buf #x49 #xC7 #xC2 #x22 #x40 #x10 #x00) ; mov r10, 0x104022 (PRIV|ANON|NORESERVE|FIXED_NOREPLACE)
     (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
@@ -429,17 +442,16 @@
     (emit-bytes buf #x0F #x05)                      ; syscall
     (emit-bytes buf #x48 #xB9) (emit-le64 buf hbase)      ; movabs rcx, fixed heap base
     (emit-bytes buf #x48 #x39 #xC8)                ; cmp rax, rcx
-    (emit-bytes buf #x74 #x33)                     ; je +51: got it, skip the fallback
+    (emit-bytes buf #x74 #x2F)                     ; je +47: got it, skip the fallback
     ;; Fallback: the historical hint mmap (kernel picks the address; --core will refuse).
     (emit-bytes buf #x48 #xC7 #xC7 #x00 #x00 #x00 #x10) ; mov rdi, 0x10000000
-    (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
-    (emit-le32 buf +linux-x64-heap-size+)
+    (emit-bytes buf #x4C #x89 #xE6)                ; mov rsi, r12 (47 bytes from the je)
     (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_RW)
     (emit-bytes buf #x49 #xC7 #xC2 #x22 #x40 #x00 #x00) ; mov r10, 0x4022 (MAP_PRIV|MAP_ANON|NORESERVE)
     (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
     (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
     (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
-    (emit-bytes buf #x0F #x05)                      ; syscall  (51 bytes from the je)
+    (emit-bytes buf #x0F #x05)                      ; syscall
     ;; Both paths land here with the heap mapping's result in RAX.  An error is
     ;; -errno, i.e. unsigned >= -4095: say so and exit_group(1) rather than use
     ;; it as the heap base (which segfaulted with no message at all).
@@ -480,6 +492,149 @@
     (emit-le32 buf +linux-x64-jit-bump-slot+)
     (emit-bytes buf #x48 #x89 #xE8))               ; mov rax, rbp  (heap base back)
 
+  (emit-linux-x64-heap-tail buf))
+
+  ;; Fall through to JMP kernel-main
+
+;;; ------------------------------------------------------------
+;;; --dynamic-space-size: the heap is sized at startup
+;;; ------------------------------------------------------------
+
+(defun x64-stub-assemble (items)
+  "Bytes for ITEMS: lists of bytes, (:LABEL K), (:JCC CC K) and (:JMP K), both
+   rel32 -- CC the condition nibble (#x4 E, #x5 NE, #x6 BE, #x7 A, #x3 AE, #xD GE).
+   For the hand-written stub code below, so no jump distance is counted by hand."
+  (let ((labels (make-hash-table)) (pos 0))
+    (dolist (it items)
+      (case (car it)
+        (:label (setf (gethash (second it) labels) pos))
+        (:jcc (incf pos 6)) (:jmp (incf pos 5))
+        (t (incf pos (length it)))))
+    (setq pos 0)
+    (let ((out nil))
+      (flet ((rel32 (k end)
+               (let ((d (- (or (gethash k labels) (error "stub label ~S" k)) end)))
+                 (dotimes (i 4) (push (ldb (byte 8 (* 8 i)) d) out)))))
+        (dolist (it items)
+          (case (car it)
+            (:label nil)
+            (:jcc (push #x0F out) (push (+ #x80 (second it)) out) (incf pos 6) (rel32 (third it) pos))
+            (:jmp (push #xE9 out) (incf pos 5) (rel32 (second it) pos))
+            (t (dolist (b it) (push b out)) (incf pos (length it))))))
+      (nreverse out))))
+
+(defun %x64-stub-le32 (v) (loop for i below 4 collect (ldb (byte 8 (* 8 i)) v)))
+(defun %x64-stub-le64 (v) (loop for i below 8 collect (ldb (byte 8 (* 8 i)) v)))
+
+(defun emit-linux-x64-choose-heap (buf)
+  "Choose the heap's size and lay it out, before it is mapped.  RSP is the
+   kernel's argv block; RBX argc; RBX, R13-R15 are preserved.  The first
+   --dynamic-space-size N (N in MB, or with a KB / MB / GB suffix, as SBCL takes
+   it) sets the semispaces to N/2, rounded down to 1 MB and kept within
+   +LINUX-X64-MIN/MAX-MIDPOINT+; with none, +LINUX-X64-GC-MIDPOINT+.  Stores the
+   midpoint, data size and cons-kind delta (X64-HEAP-LAYOUT's arithmetic) in
+   their words and leaves the mapping's size in R12."
+  (let ((flag "--dynamic-space-size"))
+    (dolist (b (x64-stub-assemble
+                `((#x31 #xD2)                                 ; xor edx, edx   (no size yet)
+                  (#xB9 1 0 0 0)                              ; mov ecx, 1
+                  (:label :top)
+                  (#x48 #x39 #xD9)                            ; cmp rcx, rbx
+                  (:jcc #xD :done)                            ; jge
+                  (#x48 #x8B #x74 #xCC #x08)                  ; mov rsi, [rsp+rcx*8+8]
+                  ,@(loop for c across flag for k from 0
+                          append `((#x80 #x7E ,k ,(char-code c)) (:jcc #x5 :next)))
+                  (#x80 #x7E ,(length flag) 0) (:jcc #x5 :next)
+                  (#x48 #x8D #x41 #x01)                       ; lea rax, [rcx+1]
+                  (#x48 #x39 #xD8)                            ; cmp rax, rbx
+                  (:jcc #xD :done)
+                  (#x48 #x8B #x74 #xC4 #x08)                  ; mov rsi, [rsp+rax*8+8]
+                  (#x45 #x31 #xC0)                            ; xor r8d, r8d
+                  (:label :digits)
+                  (#x0F #xB6 #x06)                            ; movzx eax, byte [rsi]
+                  (#x48 #xFF #xC6)                            ; inc rsi
+                  (#x8D #x78 #xD0)                            ; lea edi, [rax-48]
+                  (#x83 #xFF #x09)                            ; cmp edi, 9
+                  (:jcc #x7 :suffix)                          ; ja
+                  (#x4D #x6B #xC0 #x0A)                       ; imul r8, r8, 10
+                  (#x49 #x01 #xF8)                            ; add r8, rdi
+                  (#x49 #x81 #xF8 ,@(%x64-stub-le32 #x100000))         ; cmp r8, 2^20 units
+                  (:jcc #x6 :digits)                          ; jbe
+                  (#x41 #xB8 ,@(%x64-stub-le32 #x100000))              ; mov r8d, 2^20 (saturate)
+                  (:jmp :digits)
+                  (:label :suffix)
+                  (#x25 #xDF 0 0 0)                           ; and eax, 0xDF  (upper case)
+                  (#x83 #xF8 #x4B) (:jcc #x5 :not-k)          ; cmp eax, 'K'
+                  (#x49 #xC1 #xE0 10) (:jmp :have)            ; shl r8, 10
+                  (:label :not-k)
+                  (#x83 #xF8 #x47) (:jcc #x5 :mb)             ; cmp eax, 'G'
+                  (#x49 #xC1 #xE0 30) (:jmp :have)            ; shl r8, 30
+                  (:label :mb)
+                  (#x49 #xC1 #xE0 20)                         ; shl r8, 20   (MB, the default unit)
+                  (:label :have)
+                  (#x4C #x89 #xC2)                            ; mov rdx, r8
+                  (:jmp :done)
+                  (:label :next)
+                  (#x48 #xFF #xC1)                            ; inc rcx
+                  (:jmp :top)
+                  (:label :done)
+                  (#x48 #x85 #xD2) (:jcc #x5 :sized)          ; test rdx, rdx ; jnz
+                  (#x48 #xBA ,@(%x64-stub-le64 +linux-x64-gc-midpoint+)) ; movabs rdx, default midpoint
+                  (:jmp :mid)
+                  (:label :sized)
+                  (#x48 #xD1 #xEA)                            ; shr rdx, 1   (two semispaces)
+                  (#x48 #xB8 ,@(%x64-stub-le64 +linux-x64-min-midpoint+))
+                  (#x48 #x39 #xC2) (:jcc #x3 :ge-min)         ; cmp rdx, rax ; jae
+                  (#x48 #x89 #xC2)                            ; mov rdx, rax
+                  (:label :ge-min)
+                  (#x48 #xB8 ,@(%x64-stub-le64 +linux-x64-max-midpoint+))
+                  (#x48 #x39 #xC2) (:jcc #x6 :le-max)         ; cmp rdx, rax ; jbe
+                  (#x48 #x89 #xC2)                            ; mov rdx, rax
+                  (:label :le-max)
+                  (#x48 #x81 #xE2 ,@(%x64-stub-le32 #xFFF00000))       ; and rdx, -1 MB
+                  (:label :mid)
+                  ;; X64-HEAP-LAYOUT, instruction for instruction
+                  (#x48 #x89 #x14 #x25 ,@(%x64-stub-le32 #x10000F88))  ; mov [midpoint], rdx
+                  (#x48 #x8D #x3C #x12)                       ; lea rdi, [rdx+rdx]
+                  (#x48 #x81 #xC7 ,@(%x64-stub-le32 +linux-x64-gc-guard+)) ; add rdi, guard    = data
+                  (#x48 #x89 #x3C #x25 ,@(%x64-stub-le32 #x10000F90))  ; mov [data size], rdi
+                  (#x49 #x89 #xF8) (#x49 #xC1 #xE8 12)        ; r8 = data >> 12   = pages
+                  (#x4E #x8D #x4C #x07 #x3F)                  ; lea r9, [rdi+r8+63]
+                  (#x49 #x83 #xE1 #xC0)                       ; and r9, -64       = bitmap offset
+                  (#x49 #x89 #xFA) (#x49 #xC1 #xEA 7)         ; r10 = data >> 7   = bitmap bytes
+                  (#x4F #x8D #x5C #x11 #x3F)                  ; lea r11, [r9+r10+63]
+                  (#x49 #x83 #xE3 #xC0)                       ; and r11, -64      = free list
+                  (#x4B #x8D #x44 #x83 #x3F)                  ; lea rax, [r11+r8*4+63]
+                  (#x48 #x83 #xE0 #xC0)                       ; and rax, -64      = kind bitmap
+                  (#x48 #x89 #xC1) (#x4C #x29 #xC9)           ; rcx = rax - r9
+                  (#x48 #x89 #x0C #x25 ,@(%x64-stub-le32 #x10000F98))  ; mov [kind delta], rcx
+                  (#x4E #x8D #xA4 #x10 ,@(%x64-stub-le32 #xFFF))       ; lea r12, [rax+r10+0xFFF]
+                  (#x49 #x81 #xE4 ,@(%x64-stub-le32 #xFFFFF000)))))   ; and r12, -4096   = map size
+      (emit-bytes buf b))))
+
+;;; A heap-geometry value that does not fit a sign-extended imm32 (a MODUS_X64_MIDPOINT
+;;; heap past 2 GB) is loaded with MOVABS through R11, which the stub does not otherwise
+;;; use (a syscall clobbers it anyway).  A value that fits keeps the imm32 form, so the
+;;; default layout's bytes are unchanged.
+(defun %x64-simm32-p (v) (<= (- (ash 1 31)) v (1- (ash 1 31))))
+
+(defun emit-x64-stub-add (buf reg v)
+  "add REG, V for REG one of :rcx :r12 :r14."
+  (if (%x64-simm32-p v)
+      (progn (emit-bytes buf (if (eq reg :rcx) #x48 #x49) #x81
+                         (ecase reg (:rcx #xC1) (:r12 #xC4) (:r14 #xC6)))
+             (emit-le32 buf v))
+      (progn (emit-bytes buf #x49 #xBB) (emit-le64 buf v)          ; movabs r11, v
+             (emit-bytes buf (if (eq reg :rcx) #x4C #x4D) #x01
+                         (ecase reg (:rcx #xD9) (:r12 #xDC) (:r14 #xDE))))))
+
+(defun emit-linux-x64-heap-tail (buf)
+  "The part of the Linux x64 entry that follows the heap mapping, with RAX =
+   the heap base: argc/argv into the low block, the GC metadata, the MCGC
+   config words and the MVM registers (R12, R14, R15, RBP).  Shared with the
+   Windows stub (boot-win64.lisp), which maps the heap with VirtualAlloc but
+   otherwise enters the same state.  Position independent: absolute addresses
+   and rel8 jumps inside it only."
   ;; Store argc/argv to globals area at heap base (mmap result in RAX)
   ;; argc at [rax+0], argv[0] at [rax+0x10], argv[1] at [rax+0x18], argv[2] at [rax+0x20]
   (emit-bytes buf #x48 #x89 #x18)                ; mov [rax], rbx     (argc)
@@ -499,16 +654,29 @@
   ;; R14 = alloc limit
   ;; With GC: midpoint (GC fires when from-space fills)
   ;; Without GC: full heap end (no GC trigger)
-  (emit-bytes buf #x49 #x89 #xC6)                ; mov r14, rax
-  (emit-bytes buf #x49 #x81 #xC6)                ; add r14, imm32
   ;; The FIRST semispace needs the same headroom the trampoline leaves after
   ;; every flip (translate-x64 X64-GC-LIMIT-MARGIN): it ends exactly where the
   ;; second begins, so a limit AT the midpoint lets an allocation straddle into
   ;; the to-space the first collection copies into.  Only the normal midpoint
   ;; limit moves; a MODUS_GC_R14 stress value is taken as given.
-  (emit-le32 buf (if (= *linux-x64-r14-offset* +linux-x64-gc-midpoint+)
-                     (- *linux-x64-r14-offset* +linux-x64-gc-guard+)
-                     *linux-x64-r14-offset*))
+  ;; The midpoint is the one the stub chose ([0x10000F88]); a MODUS_GC_R14
+  ;; stress value is a fixed offset.
+  (if (= *linux-x64-r14-offset* +linux-x64-gc-midpoint+)
+      (progn
+        (emit-bytes buf #x4C #x8B #x34 #x25) (emit-le32 buf #x10000F88) ; mov r14, [midpoint]
+        (emit-bytes buf #x49 #x81 #xEE) (emit-le32 buf +linux-x64-gc-guard+) ; sub r14, guard
+        (emit-bytes buf #x49 #x01 #xC6))                                ; add r14, rax
+      ;; THE SAME LENGTH AS THE BRANCH ABOVE (18 bytes): the native code offset
+      ;; is measured from this stub when the build script loads, BEFORE it sets
+      ;; *LINUX-X64-R14-OFFSET* to the midpoint, so a branch of another length
+      ;; moves every function entry (by 8 once: words ending #xB, not #x3, and
+      ;; the runtime JIT's tag-3 test took half the kernel for not native).
+      (let ((off *linux-x64-r14-offset*))
+        (unless (%x64-simm32-p off)
+          (error "MODUS_GC_R14 offset ~X does not fit an imm32" off))
+        (emit-bytes buf #x49 #xC7 #xC6) (emit-le32 buf off)          ; mov r14, off
+        (emit-bytes buf #x0F #x1F #x84 #x00 #x00 #x00 #x00 #x00)     ; 8-byte NOP
+        (emit-bytes buf #x49 #x01 #xC6)))                            ; add r14, rax
 
   ;; Initialize GC metadata at ABSOLUTE addresses 0x10000040..0x10000060
   ;; These are in the ELF BSS region (zero-initialized by the kernel loader).
@@ -524,15 +692,14 @@
   (emit-le32 buf +gc-from-start-addr+)
 
   ;; [0x10000048] = to_start = mmap_base + midpoint
-  (emit-bytes buf #x48 #x89 #xC1)                ; mov rcx, rax
-  (emit-bytes buf #x48 #x81 #xC1)                ; add rcx, imm32
-  (emit-le32 buf +linux-x64-gc-midpoint+)
+  (emit-bytes buf #x48 #x8B #x0C #x25) (emit-le32 buf #x10000F88) ; mov rcx, [midpoint]
+  (emit-bytes buf #x48 #x01 #xC1)                ; add rcx, rax
   (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
   (emit-le32 buf +gc-to-start-addr+)
 
   ;; [0x10000050] = space_size = midpoint - alloc_offset
-  (emit-bytes buf #x48 #xC7 #xC1)                ; mov rcx, imm32
-  (emit-le32 buf (- +linux-x64-gc-midpoint+ +linux-x64-heap-alloc-start+))
+  (emit-bytes buf #x48 #x8B #x0C #x25) (emit-le32 buf #x10000F88) ; mov rcx, [midpoint]
+  (emit-bytes buf #x48 #x81 #xE9) (emit-le32 buf +linux-x64-heap-alloc-start+) ; sub rcx, alloc start
   (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
   (emit-le32 buf +gc-space-size-addr+)
 
@@ -554,8 +721,7 @@
   (flet ((store-base+off (slot off)
            ;; mov rcx, rax ; add rcx, off ; mov [slot], rcx
            (emit-bytes buf #x48 #x89 #xC1)          ; mov rcx, rax
-           (emit-bytes buf #x48 #x81 #xC1)          ; add rcx, imm32
-           (emit-le32 buf off)
+           (emit-x64-stub-add buf :rcx off)
            (emit-bytes buf #x48 #x89 #x0C #x25)     ; mov [abs32], rcx
            (emit-le32 buf slot))
          (store-imm (slot val)
@@ -567,14 +733,24 @@
            (emit-le32 buf slot)))
     ;; page_base = mmap_base + alloc_start (first allocatable data byte)
     (store-base+off +mcgc-cfg-page-base+ +linux-x64-heap-alloc-start+)
-    ;; data_end = mmap_base + data_size
-    (store-base+off +mcgc-cfg-data-end+  +linux-x64-heap-data-size+)
-    ;; descriptor / bitmap / freelist array bases
-    (store-base+off +mcgc-cfg-descriptor+ +mcgc-descriptor-offset+)
-    (store-base+off +mcgc-cfg-bitmap+     +mcgc-bitmap-offset+)
-    (store-base+off +mcgc-cfg-freelist+   +mcgc-freelist-offset+)
-    ;; page_count, freelist_count (0 until stage-3 builds the list), alloc_page (0)
-    (store-imm +mcgc-cfg-page-count+      +mcgc-page-count+)
+    ;; The rest from the data size the stub chose: X64-HEAP-LAYOUT's offsets.
+    ;; rcx = data, rdx = pages, rsi = bitmap offset, rdi = free-list offset.
+    (emit-bytes buf #x48 #x8B #x0C #x25) (emit-le32 buf #x10000F90) ; mov rcx, [data size]
+    (emit-bytes buf #x48 #x89 #xCA #x48 #xC1 #xEA 12)  ; rdx = rcx >> 12
+    (emit-bytes buf #x48 #x8D #x74 #x11 #x3F)          ; lea rsi, [rcx+rdx+63]
+    (emit-bytes buf #x48 #x83 #xE6 #xC0)               ; and rsi, -64
+    (emit-bytes buf #x48 #x89 #xCF #x48 #xC1 #xEF 7)   ; rdi = rcx >> 7
+    (emit-bytes buf #x48 #x8D #x7C #x3E #x3F)          ; lea rdi, [rsi+rdi+63]
+    (emit-bytes buf #x48 #x83 #xE7 #xC0)               ; and rdi, -64
+    (flet ((store-rax+ (reg-sib slot)
+             ;; lea r8, [rax+REG] ; mov [slot], r8
+             (emit-bytes buf #x4C #x8D #x04 reg-sib)
+             (emit-bytes buf #x4C #x89 #x04 #x25) (emit-le32 buf slot)))
+      (store-rax+ #x08 +mcgc-cfg-data-end+)     ; data_end   = base + data   (SIB rax+rcx)
+      (store-rax+ #x08 +mcgc-cfg-descriptor+)   ; descriptors follow the data
+      (store-rax+ #x30 +mcgc-cfg-bitmap+)       ; SIB rax+rsi
+      (store-rax+ #x38 +mcgc-cfg-freelist+))    ; SIB rax+rdi
+    (emit-bytes buf #x48 #x89 #x14 #x25) (emit-le32 buf +mcgc-cfg-page-count+) ; mov [page count], rdx
     (store-imm +mcgc-cfg-freelist-count+  0)
     (store-imm +mcgc-cfg-alloc-page+      0))
 
@@ -583,8 +759,6 @@
   (emit-le64 buf #xDEAD0001)
   ;; Frame pointer
   (emit-bytes buf #x48 #x89 #xE5))               ; mov rbp, rsp
-
-  ;; Fall through to JMP kernel-main
 
 ;;; ============================================================
 ;;; Helper: emit raw bytes

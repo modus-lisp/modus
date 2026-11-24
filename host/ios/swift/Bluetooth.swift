@@ -1,3 +1,4 @@
+#if !os(tvOS)   // a TV cannot advertise as a peripheral
 // Bluetooth.swift — Bluetooth LE links for a mesh: this phone both a central (it finds and connects to others
 // offering a service) and a peripheral (it offers the service, for others to connect to), each link a number,
 // its bytes handed to Lisp as they come.  What the bytes mean is Lisp's (chirp: bitchat's protocol).
@@ -236,3 +237,4 @@ func installBluetooth() {
     register("ble_send", bleSendCall)
     register("ble_stop", bleStop)
 }
+#endif

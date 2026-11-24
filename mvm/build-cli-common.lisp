@@ -104,11 +104,41 @@
 ;;; block (%init-x64-translator + x64-asm.lisp) on an AARCH64 image, dead only
 ;;; because its *jit-on* was nil — see #266.
 (defvar *cli-bare-metal* nil)
+;; T for the Windows hosted image (mvm/build-win64-cli.lisp), which builds with
+;; the per-thread FS window, the per-CPU GS block and stop-the-world OFF (on
+;; Windows GS is the TEB, and FS is not ours to set).  The runtime JIT must emit
+;; the same shape, so its co-init (%INIT-X64-TRANSLATOR) turns them off too.
+(defvar *cli-win64* nil)
 (defvar *cli-bare-metal-tarball* nil)
 (defvar *cli-bare-metal-net-source* "")
 ;;; SAVE-AND-DIE on bare metal: what a restored process runs INSTEAD of boot
 ;;; init (its toplevel: serial REPL + halt).  "" = no bare-metal core support.
 (defvar *cli-arch-core-resume* "")
+
+;; The build's helpers and the knob recorder (lib/image-config.lisp) before the first
+;; MODUS_* read: a knob read earlier is missing from the image's record.  A wrapper that
+;; loaded them already is not loaded twice.
+(unless (fboundp (find-symbol "MVM-TEXT" "COMMON-LISP-USER"))
+  (load (merge-pathnames "../lib/load-mvm.lisp"
+                         (directory-namestring (truename *load-truename*)))))
+
+;;; THE RUNTIME NATIVE TIERS on the CLIs that have one: i386 (mvm/jit-i386-native.lisp)
+;;; and 68k (mvm/jit-68k.lisp, jit-68k-native.lisp).  OPT-IN: MODUS_I386_JIT=1 /
+;;; MODUS_68K_JIT=1.  Not default-safe yet (CLAUDE.md: the i386 sweep with it on is
+;;; 21653/21681), and a default here also reached the bare i386 images, which build
+;;; through this file with *CLI-ARCH* :I386.  The bare Mac keeps its own rule.
+(defun %cli-tier-knob (name)
+  (let ((v (sb-ext:posix-getenv name)))
+    (and v (string= v "1"))))
+(defvar *cli-68k-jit*
+  (and (boundp '*cli-arch*) (eq *cli-arch* :68k) (%cli-tier-knob "MODUS_68K_JIT")))
+(defvar *cli-i386-jit*
+  (and (boundp '*cli-arch*) (eq *cli-arch* :i386) (%cli-tier-knob "MODUS_I386_JIT")))
+;; translate-68k.lisp decided *68K-JIT-SHAPES* from MODUS_68K_JIT when it loaded
+;; (it serves the bare Mac too); the CLI's default is decided here.
+(when *cli-68k-jit*
+  (setf (symbol-value (cl-user::host-symbol "*68K-JIT-SHAPES*" "MODUS.MVM"))
+        (not (equal (sb-ext:posix-getenv "MODUS_68K_JIT_SHAPES") "0"))))
 
 ;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-test-aux.lisp
 ;;; (the ANSI-test helpers; the CL runtime it once shared a file with is in
@@ -127,6 +157,20 @@
 (when *small-image*
   (format t "~&;; MODUS_SMALL_IMAGE: boot tables from packed text, no ansi-test-aux~%"))
 (defvar *cli-omit-ansi-test-aux* *small-image*)
+;;; MODUS_PACKED_TABLES=1/0 (default: on for the x64 CLI and MODUS_SMALL_IMAGE): the small image's boot TABLES on
+;;; any image -- the symbol names, the function table and the opcode table from packed
+;;; text, and the DEFVAR init thunks run in batches -- with none of its other trade-offs.
+;;; Same tables, same order; measured on the x64 CLI, the per-entry code was 57% of the
+;;; native image (the symbol names alone 26 MB, ~1.6 KB of code a name).
+(defvar *packed-boot-tables*
+  (let ((v (sb-ext:posix-getenv "MODUS_PACKED_TABLES")))
+    (if (and v (plusp (length v)))
+        (string/= v "0")
+        ;; DEFAULT ON for the x64 CLI (2026-11-22): 65.5 MB -> 32.0 MB, boot time
+        ;; unchanged (~1.46 s both), upstream ANSI 21681/21681 on both with identical
+        ;; pass sets.  Other CLIs keep the small-image rule until the secondary suite
+        ;; (scripts/allarch-ansi.sh) has run them packed.
+        (or *small-image* (and (boundp (quote *cli-arch*)) (eq *cli-arch* :x64))))))
 ;;; MODUS_NO_SURFACES=1: the Genera, SBCL (SB-THREAD, SB-BSD-SOCKETS, gray
 ;;; streams, SB-MOP) and ASDF surfaces are left out at BUILD time -- their
 ;;; baked source text (~440 KB of literals) and the cooperative atomics with
@@ -165,9 +209,10 @@
 ;;; second time is ~20s of pure waste and doubles every build warning.  Hosted
 ;;; wrappers do not pre-load, so the package does not exist and this loads
 ;;; exactly as it always did.
-(unless (find-package "MODUS.MVM")
-  (load (merge-pathnames "../lib/load-mvm.lisp"
-                         (directory-namestring (truename *load-truename*)))))
+;; Asked as "are the build's helpers loaded", not "does MODUS.MVM exist": in a modus
+;; image MODUS.MVM is always there (the kernel's own package's nickname), and a build on
+;; a modus host still needs load-mvm.lisp's helpers (MVM-TEXT ...), if not its compiler.
+;; (load-mvm.lisp is loaded at the top of this file: the knob recorder must see every read)
 
 (format t "~%=== Building generic Modus image ===~%")
 
@@ -702,6 +747,16 @@
   (setq *park-safepoints* nil)
 "
        "")
+   (if *cli-win64*
+       ;; WIN64-SHIM-VA-PLACEHOLDER is replaced by build-win64-cli with the
+       ;; shim's address (it needs boot-win64, which loads after this file).
+       ;; Set here, not at top level: init-all-globals resets a top-level setq.
+       ;; The window, per-CPU storage and stop-the-world are on, as on Linux;
+       ;; *X64-WIN-TLS* turns their FS/GS prefixes into TEB TLS-slot accesses.
+       "  (setq modus.mvm.x64::*x64-win-shim-va* WIN64-SHIM-VA-PLACEHOLDER)
+  (setq modus.mvm.x64::*x64-win-tls* t)
+"
+       "")
    "  t)
 (in-package :modus.mvm)
 ")))
@@ -722,8 +777,8 @@
       ;; Shrink the a64-buffer code array default (16M general slots ~ 128MB
       ;; tagged) to 64K — a64-emit grows it on demand, and a 128MB alloc per
       ;; make-a64-buffer would exhaust the image semispace on every JIT page.
-      (let ((needle "(code (make-array 16777216))")
-            (repl   "(code (make-array 65536))"))
+      (let ((needle "(code (make-array 16777216 :element-type '(unsigned-byte 32)))")
+            (repl   "(code (make-array 65536 :element-type '(unsigned-byte 32)))"))
         (let ((p (search needle src)))
           (unless p (error "CLI-JIT: could not find a64-buffer 16M code default to shrink"))
           (setq src (concatenate 'string (subseq src 0 p) repl
@@ -860,7 +915,7 @@
 ;;; stand-in; the emitter's settings are filled in when BUILD-IMAGE compiles,
 ;;; after the target is configured (cross.lisp LATE-SOURCE-FILL).
 (defun %68k-native-tier-p ()
-  (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+  (and *cli-68k-jit*
        (not (equal (sb-ext:posix-getenv "MODUS_68K_NATIVE") "0"))))
 
 (defun %68k-native-tier-source ()
@@ -882,7 +937,7 @@
 ;;; compiles (I386-NATIVE-COINIT-TEXT).  build-i386-cli.lisp sets
 ;;; *I386-NATIVE-TIER* so the image carries the export table and the root.
 (defun %i386-native-tier-p ()
-  (and (eq *cli-arch* :i386) (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1")))
+  *cli-i386-jit*)
 
 (defun %i386-native-tier-source ()
   (pushnew (cons "'(:n386-coinit :pending)" 'modus.mvm.i386::i386-native-coinit-text)
@@ -922,6 +977,24 @@
                (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32 or :68k)"
               *cli-arch*))))
 
+;;; THE BUILDER CLI (MODUS_BUILDER=1, x64 with the JIT): the same CLI plus the
+;;; cross tooling modus-sh carries -- targets, cross.lisp's BUILD-IMAGE, the boot
+;;; descriptors, the AArch64 and RV32 translators (mvm/selfhost-tooling.lisp) --
+;;; and mvm/builder.lisp's %BUILDER-BUILD-IMAGE, which a build script calls in
+;;; place of BUILD-IMAGE on a modus host.  So this image runs the build scripts
+;;; that SBCL runs, with a JIT for the scripts' own code, and builds modus.
+;;; Spliced into the translator slot: after the x64 translator it needs, and
+;;; inside the text the defun scanner registers.
+(defvar *cli-builder-p*
+  (and *jit-on* (eq *cli-arch* :x64)
+       (equal (sb-ext:posix-getenv "MODUS_BUILDER") "1")))
+(when *cli-builder-p*
+  (load (merge-pathnames "selfhost-tooling.lisp" (merge-pathnames "mvm/" *modus-base*)))
+  (setf *cli-arch-jit-translator-source*
+        (concatenate 'string *cli-arch-jit-translator-source*
+                     *selfhost-cross-tooling-source*
+                     (mvm-text "mvm/builder.lisp") (string #\Newline))))
+
 ;;; ARCH SLOT — boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins
 ;;; over mvm-eval.lisp's base version (last-defun-wins).  When JIT is OFF both
 ;;; defuns are inert; the two tiny defuns are ALWAYS baked (an empty string here
@@ -950,6 +1023,13 @@
     ((not *jit-on*)
      "
 (defun %jit-boot-init () nil)
+")
+    ((and (eq *cli-arch* :x64) *cli-builder-p*)
+     ;; the builder CLI also configures its foreign translators at boot, as
+     ;; modus-sh does (their globals' DEFVAR inits never run in-image)
+     "
+(defun %jit-boot-init () (%init-x64-translator) (%builder-boot-init) (setq *use-jit* t) t)
+(defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))
 ")
     ((eq *cli-arch* :x64)
      "
@@ -1270,23 +1350,23 @@
 ;; host table and trigger it via a defparameter init-thunk (those DO run).
 (defvar *opcode-table-init-source*
   (with-output-to-string (s)
-   (if cl-user::*small-image*
+   (if cl-user::*packed-boot-tables*
     ;; MODUS_SMALL_IMAGE: the table as one text literal (a pooled constant), a
     ;; line an opcode -- "CODE NAME OPERAND... <tab>", no description -- parsed at
     ;; boot, instead of a SETF and a MAKE-OPCODE-INFO with its description built
     ;; a character at a time for each.  Names and operands are keywords: INTERN
     ;; returns the static keyword objects, seeded before the globals' thunks run.
     (let ((lines nil))
-      (maphash (lambda (code info)
-                 (progn
-                   ;; no description: nothing in an image reads one, and their
-                   ;; em dashes kept this whole literal wide (4 bytes a char)
-                   (push (format nil "~D ~A~{ ~A~}~C" code
-                                 (symbol-name (modus.mvm::opcode-info-name info))
-                                 (mapcar #'symbol-name (modus.mvm::opcode-info-operands info))
-                                 #\Tab)
-                         lines)))
-               modus.mvm::*opcode-table*)
+      (dolist (e (cl-user::%opcode-entries))
+        (destructuring-bind (code name operands description) e
+          (declare (ignore description))
+          ;; no description: nothing in an image reads one, and their
+          ;; em dashes kept this whole literal wide (4 bytes a char)
+          (push (format nil "~D ~A~{ ~A~}~C" code
+                        (symbol-name name)
+                        (mapcar #'symbol-name operands)
+                        #\Tab)
+                lines)))
       (format s "(defun %populate-opcode-table ()
   (let ((text ~S) (i 0))
     (let ((n (length text)))
@@ -1312,13 +1392,13 @@
       (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%"))
    (progn
     (format s "(defun %~A-opcode-table ()~%" "populate")
-    (maphash (lambda (code info)
-               (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
-                       code code
-                       (modus.mvm::opcode-info-name info)
-                       (modus.mvm::opcode-info-operands info)
-                       (modus.mvm::opcode-info-description info)))
-             modus.mvm::*opcode-table*)
+    ;; Not pretty-printed: SBCL's pretty printer breaks long lines at its right
+    ;; margin and a modus host's does not, so the text would depend on the host.
+    (let ((*print-pretty* nil))
+      (dolist (e (cl-user::%opcode-entries))
+        (destructuring-bind (code name operands description) e
+          (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
+                  code code name operands description))))
     (format s "  t)~%")
     ;; defparameter init-thunk runs %populate-opcode-table at boot, AFTER the
     ;; *opcode-table* defparameter (earlier in source order) creates the table.
@@ -1490,6 +1570,21 @@
 ;;; a reader error that names anything else.  (modus:image-configuration) does not list it;
 ;;; (modus.runtime::%ucn-present-p) answers.
 (load (merge-pathnames "lib/unicode-names-gen.lisp" *modus-base*))
+;;; The data is checked in (a modus host cannot generate it); SBCL regenerates it and
+;;; compares, so a different SBCL or a generator change is reported, not silently baked.
+#+sbcl
+(defun %check-unicode-names-data ()
+  (let* ((path (modus-source "mvm/cl-unicode-names-data.lisp"))
+         (fresh (modus.unicode-names-gen::unicode-names-source :stream *standard-output*))
+         (have (and (probe-file path) (read-file-text path))))
+    (cond ((equal fresh have))
+          ((equal (sb-ext:posix-getenv "MODUS_UNICODE_NAMES_REGEN") "1")
+           (with-open-file (o path :direction :output :if-exists :supersede :external-format :utf-8)
+             (write-string fresh o))
+           (format t "~&;; unicode names: rewrote ~A~%" path))
+          (t (format t "~&;; WARNING unicode names: this SBCL's CHAR-NAME table differs from ~
+                        mvm/cl-unicode-names-data.lisp; the image bakes the checked-in one ~
+                        (MODUS_UNICODE_NAMES_REGEN=1 rewrites it)~%")))))
 (defvar *cli-unicode-names*
   (modus.unicode-names-gen::unicode-names-wanted-p (not *cli-bare-metal*)))
 (defvar *unicode-names-source*
@@ -1497,9 +1592,8 @@
       (concatenate 'string
                    (mvm-text "mvm/cl-unicode-names.lisp")
                    (string #\Newline)
-                   (modus.mvm::%build-package-scoped-source
-                    (modus.unicode-names-gen::unicode-names-source :stream *standard-output*)
-                    "mvm/cl-unicode-names-data.lisp"))
+                   (progn #+sbcl (%check-unicode-names-data)
+                          (mvm-text "mvm/cl-unicode-names-data.lisp")))
       (progn
         (format t "~&;; unicode names: no table (MODUS_UNICODE_NAMES / bare metal)~%")
         (mvm-text "mvm/cl-unicode-names-absent.lisp"))))
@@ -1648,7 +1742,9 @@
                    (string #\Newline)
                    ;; SAVE-AND-DIE on hosted x64: the arena bump word's address
                    ;; (lib/save-image-x64.lisp; the stub and the trap arm agree).
-                   (format nil "(defun %core-kindbitmap-delta () ~D)~%" modus.mvm.x64::*mcgc-kindbitmap-delta*)
+                   ;; The cons-kind bitmap's offset follows the heap chosen at
+                   ;; startup (--dynamic-space-size): the word the stub wrote.
+                   (format nil "(defun %core-kindbitmap-delta () (%gc-read64 (%conv-addr #x10000F98)))~%")
                    (mvm-text "lib/save-image-x64.lisp")
                    (string #\Newline)
                    ;; THE SSH-2 SERVER OVER A LINUX STREAM (docs/nitro-enclaves.md,
@@ -1674,6 +1770,12 @@
                    ;; %WITH-COMPUTATION-STATE macro) and net/actors.lisp,
                    ;; neither of which resolves as a forward reference.
                    (mvm-text "net/hosted-actor-runtime.lisp")
+                   (string #\Newline)
+                   ;; COROUTINES (docs/coroutines.md): the actor runtime's
+                   ;; window, stack and parked-scan machinery in region 0 on
+                   ;; the main thread.  After it: it calls %WITH-COMPUTATION-
+                   ;; STATE, %HA-CARVE and %RT-THREADS-ON, none forward.
+                   (mvm-text "net/hosted-coroutines.lisp")
                    (string #\Newline)
                    ;; THE AOT HALF OF AN A/B.  test/hosted-intern-layers.lisp's
                    ;; `low' arm — a worker interning fresh symbols through
@@ -2116,7 +2218,7 @@
 ;; kernel-main: single-form resolution for the spin-point bisect, without a
 ;; named point per line.  The line must exist (else the build stops); unset,
 ;; *DRIVER-SOURCE* is untouched.
-(let ((v #+sbcl (sb-ext:posix-getenv "MODUS_LISP_SPIN_AFTER") #-sbcl nil))
+(let ((v (sb-ext:posix-getenv "MODUS_LISP_SPIN_AFTER")))
   (when (and v (plusp (length v)))
     (let* ((needle (format nil "  ~A~%" v))
            (km (search "(defun kernel-main ()" *driver-source*))
@@ -2419,7 +2521,14 @@
                      (cons \"ACTORS-RECEIVE-IF\" (function actors-receive-if))
                      (cons \"ACTORS-YIELD\" (function actors-yield))
                      (cons \"ACTORS-SELF\" (function actors-self))
-                     (cons \"ACTORS-LINK\" (function actors-link))))
+                     (cons \"ACTORS-LINK\" (function actors-link))
+                     (cons \"COROUTINES-START\" (function coroutines-start))
+                     (cons \"COROUTINE-CREATE\" (function coroutine-create))
+                     (cons \"COROUTINE-TRANSFER\" (function coroutine-transfer))
+                     (cons \"COROUTINE-CURRENT\" (function coroutine-current))
+                     (cons \"COROUTINE-DONE-P\" (function coroutine-done-p))
+                     (cons \"COROUTINE-STACK-BYTES\" (function coroutine-stack-bytes))
+                     (cons \"SET-COROUTINE-STACK-BYTES\" (function set-coroutine-stack-bytes))))
       ;; 0: not linked into this image (the aarch64 CLI has no hosted actors)
       (unless (eql (cdr e) 0)
         (set-symbol-function (intern (car e) pk) (cdr e))
@@ -2847,7 +2956,7 @@
               before (reduce #'+ vars :key (lambda (v) (length (symbol-value v))))))))
 
 (defvar *cli-arch-late-source*
-  (if (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+  (if (and *cli-68k-jit*
            (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
       (mvm-text "mvm/jit-68k.lisp")
       (if (%i386-native-tier-p) (mvm-text "mvm/jit-i386-native.lisp") ""))
@@ -2922,6 +3031,13 @@
           (with-open-file (o f :direction :output :if-exists :supersede)
             (dolist (n removed) (write-line n o))))))))
 
+;;; Text a build adds to *ALL-RUNTIME-SOURCE* for its NAMES only (that variable is
+;;; scanned, never compiled), because the build appends the code itself to
+;;; *FULL-SOURCE* later -- the Windows image's net/win32-window.lisp, whose functions
+;;; must be callable by name (glass's native presenter finds them with FIND-SYMBOL).
+;;; "" everywhere else, so every other build's scanner input is unchanged.
+(defvar *cli-scan-extra-source* "")
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
                        *configuration-source* (string #\Newline)
@@ -2974,6 +3090,7 @@
                        ;; SYM-NAME-AUTO — is byte-identical.
                        *cli-bare-metal-net-source*
                        (%extra-source-text)
+                       *cli-scan-extra-source*
                        *driver-source*))
 
 ;;; NOTE: *genera-source* is deliberately NOT part of *all-runtime-source*.
@@ -3001,6 +3118,94 @@
                                      (find c "+-*/<=>?!@$%^&_:|.~")))
                                s)))
                  (scan-defuns *all-runtime-source*)))
+
+;;; THE BUILDER'S STRUCT FUNCTIONS.  The symbol-function table is how evaluated
+;;; code reaches a kernel function, and it is generated from the source's DEFUN
+;;; TEXT, so a DEFSTRUCT's accessors, predicate and copier -- real
+;;; functions in the image, but written nowhere as "(defun" -- are not in it:
+;;; (modus-int::make-mvm-buffer) from a script is UNDEFINED-FUNCTION.  The
+;;; builder CLI runs build scripts that call the cross tooling's structs
+;;; (KERNEL-IMAGE-IMAGE-BYTES, MAKE-MVM-BUFFER ...), so in builder mode every
+;;; DEFSTRUCT in the ISA and the cross tooling is READ and its functions named by
+;;; the CLHS rules.  On a host that loaded these files (any CL but modus), every
+;;; name must be FBOUNDP, so a wrong rule fails the build here.
+(defun %scan-defstruct-fn-names (text)
+  (let ((names nil) (slots-of (make-hash-table :test 'equal))
+        (pos 0) (pkgs (%scan-in-packages text)) (pkg "MODUS.MVM")
+        (code (%code-mask text)))
+    (labels ((nm (x) (if (stringp x) x (symbol-name x)))
+             (opt (options key)
+               (remove-if-not (lambda (o) (or (eq o key) (and (consp o) (eq (car o) key))))
+                              options))
+             (qualify (s)
+               (if (or (string= pkg "MODUS.MVM") (not (find-package pkg)))
+                   s
+                   (let ((q (concatenate 'string pkg "::" s)))
+                     (setf (gethash q *scan-defuns-qualified*) s)
+                     q))))
+      (loop
+        (let ((p (loop (let ((q (search "(defstruct " text :start2 pos)))
+                         (when (or (null q) (= 1 (sbit code q))) (return q))
+                         (setq pos (1+ q))))))
+          (unless p (return))
+          (loop while (and pkgs (< (car (first pkgs)) p))
+                do (setq pkg (cdr (pop pkgs))))
+          (setq pos (1+ p))
+          (let ((form (ignore-errors
+                       (let ((*package* (or (find-package pkg) (find-package "MODUS.MVM")))
+                             (*read-eval* nil))
+                         (read-from-string text t nil :start p)))))
+            (when (and (consp form) (consp (cdr form)))
+              (let* ((head (cadr form))
+                     (sname (nm (if (consp head) (car head) head)))
+                     (options (if (consp head) (cdr head) nil))
+                     (body (if (stringp (caddr form)) (cdddr form) (cddr form)))
+                     (own (mapcar (lambda (s) (nm (if (consp s) (car s) s))) body))
+                     (inc (car (opt options :include)))
+                     (all (append (and (consp inc) (gethash (nm (cadr inc)) slots-of)) own))
+                     (cn (car (opt options :conc-name)))
+                     (conc (cond ((null cn) (concatenate 'string sname "-"))
+                                 ((or (keywordp cn) (null (cadr cn))) "")
+                                 (t (nm (cadr cn)))))
+                     (typed (opt options :type))
+                     (named (opt options :named))
+                     (out nil))
+                (setf (gethash sname slots-of) all)
+                ;; NOT the constructors: in an image (MAKE-X ...) is expanded by the
+                ;; compiler into a call of the internal %%STRUCT-CTOR-X, and no
+                ;; function is named MAKE-X -- registering #'MAKE-X baked a NIL
+                ;; sentinel for each (check-compiler-warns: unresolved-function)
+                (let ((pr (car (opt options :predicate))))
+                  (cond ((and typed (not named)))
+                        ((or (null pr) (keywordp pr) (null (cdr pr)))
+                         (push (concatenate 'string sname "-P") out))
+                        ((cadr pr) (push (nm (cadr pr)) out))))
+                (let ((cp (car (opt options :copier))))
+                  (cond ((or (null cp) (keywordp cp) (null (cdr cp)))
+                         (push (concatenate 'string "COPY-" sname) out))
+                        ((cadr cp) (push (nm (cadr cp)) out))))
+                (dolist (s all) (push (concatenate 'string conc s) out))
+                (dolist (n (nreverse out))
+                  #-modus
+                  (let ((sym (find-symbol n (or (find-package pkg) "MODUS.MVM"))))
+                    (unless (and sym (fboundp sym))
+                      (error "builder struct scan: ~A::~A is not a function -- the ~
+                              DEFSTRUCT rules here are wrong for ~A" pkg n sname)))
+                  (push (qualify n) names)))))))
+      (nreverse names))))
+
+(when *cli-builder-p*
+  (let* ((have (make-hash-table :test 'equal))
+         (new (remove-if (lambda (n) (gethash n have))
+                         (remove-duplicates
+                          (%scan-defstruct-fn-names
+                           (concatenate 'string *isa-source* (string #\Newline)
+                                        *selfhost-cross-tooling-source*))
+                          :test #'equal :from-end t))))
+    (dolist (n *all-defun-names*) (setf (gethash n have) t))
+    (setq new (remove-if (lambda (n) (gethash n have)) new))
+    (format t "  builder: ~D struct functions registered~%" (length new))
+    (setq *all-defun-names* (append *all-defun-names* new))))
 
 (format t "  defuns found: ~D~%" (length *all-defun-names*))
 
@@ -3066,7 +3271,12 @@
 
 ;; MODUS_SMALL_IMAGE: the globals' init thunks run in batches through one
 ;; guarded loop, not a HANDLER-CASE's code each (compiler.lisp *INIT-GLOBALS-BATCHED*).
-(when cl-user::*small-image* (setq modus.mvm::*init-globals-batched* t))
+(when cl-user::*packed-boot-tables* (setq modus.mvm::*init-globals-batched* t))
+
+;; MODUS_W32_UNSAFE_LIVE=1: the collector rung's NEGATIVE CONTROL -- raw W32
+;; variables are not split around GC points (compiler.lisp *W32-UNSAFE-LIVE*,
+;; test/w32-gc-live.lisp).  Never for a real image.
+(setq modus.mvm::*w32-unsafe-live* (equal (sb-ext:posix-getenv "MODUS_W32_UNSAFE_LIVE") "1"))
 ;; MODUS_SMALL_ACCESS (default: MODUS_SMALL_IMAGE): a quoted symbol's site is
 ;; one call (compiler.lisp *STATIC-SYMBOL-ONE-CALL*) and a global read or write
 ;; is one call (*GV-CACHE-MODE* :CALL), not the inline loads.  Measured on the
@@ -3127,7 +3337,7 @@
               (%init-only (format nil "~{~A~^ ~}" *all-global-names*))))))
 
 (defvar *sft-auto-source*
-  (if cl-user::*small-image*
+  (if cl-user::*packed-boot-tables*
       (emit-sft-auto-packed *all-defun-names* 200)
       (emit-sft-auto *all-defun-names* 200)))
 (format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))
@@ -3291,14 +3501,14 @@
             (member "" names :test #'string=))))
 
 (defvar *sym-name-auto-source*
-  (if cl-user::*small-image*
+  (if cl-user::*packed-boot-tables*
       (emit-sym-name-auto-packed *all-symbol-names*)
       (emit-sym-name-auto *all-symbol-names* 200)))
 
 ;;; COLD NAMES (the bare Mac, CL-USER::*MAC-COLD-NAMES-OUT*): the same names,
 ;;; also written to a file of 512-byte pages, sorted by name hash -- each entry
 ;;; the hash (4 bytes, big-endian), the name's length (1) and its bytes; a page
-;;; ends at a zero hash -- which scripts/mac68k-core.py puts on the disk after
+;;; ends at a zero hash -- which scripts/mac68k-core.lisp puts on the disk after
 ;;; the code streams.  The image gets each page's first hash (%COLD-NAMES-INDEX,
 ;;; 8 hex digits a page) and the hash of "CAR" as the build computed it
 ;;; (%COLD-NAMES-CHECK), so SYMBOL-NAME can read a name from disk once the core
@@ -3312,7 +3522,7 @@
                  ;; NOT NUMBERS: the harvest also yields literals (#x1300000 as
                  ;; "X1300000", "-246415360"), and those are addresses -- the
                  ;; table's page breaks, so its index string's length, then
-                 ;; moved with the memory map (mac68k-reloc.py found it)
+                 ;; moved with the memory map (mac68k-reloc.lisp found it)
                  (not (every (lambda (c) (or (digit-char-p c) (char= c #\-))) nm))
                  (not (and (> (length nm) 1) (char-equal (char nm 0) #\X)
                            (every (lambda (c) (digit-char-p c 16)) (subseq nm 1)))))
@@ -3528,7 +3738,6 @@
 ;;; takes ~20s instead of a ~10min image build.  Placed AFTER assembly and
 ;;; BEFORE build-image so it cannot perturb what it measures -- and before the
 ;;; blob read check, so a blob that does not read can still be dumped and read.
-#+sbcl
 (let ((p (sb-ext:posix-getenv "MODUS_DUMP_FULL_SOURCE")))
   (when (and p (plusp (length p)))
     (with-open-file (o p :direction :output :if-exists :supersede

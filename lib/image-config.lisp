@@ -27,7 +27,8 @@
 
 (defpackage :modus.image-config
   (:use :common-lisp)
-  (:export #:image-configuration-text #:finalize-image-configuration #:*knob-reads*))
+  (:export #:image-configuration-text #:finalize-image-configuration #:*knob-reads*
+           #:getenv-unrecorded))
 (in-package :modus.image-config)
 
 (defvar *tree* (namestring (truename (merge-pathnames "../" (directory-namestring *load-truename*))))
@@ -42,9 +43,32 @@
       (setf (gethash name *knob-reads*) v))
     v))
 
+#+sbcl
 (unless (sb-int:encapsulated-p 'sb-ext:posix-getenv 'modus-knob-recorder)
   (sb-ext:without-package-locks
     (sb-int:encapsulate 'sb-ext:posix-getenv 'modus-knob-recorder #'%record-knob-read)))
+;; ON MODUS (a build that runs on modus itself): SB-EXT:POSIX-GETENV is the shim's
+;; ordinary function, so it is wrapped by replacing its definition -- once, the
+;; wrapper remembering the original.
+#-sbcl
+(defvar *getenv-unwrapped* nil)
+#-sbcl
+(unless *getenv-unwrapped*
+  (let ((orig (fdefinition 'sb-ext:posix-getenv)))
+    (setq *getenv-unwrapped* orig)
+    (setf (fdefinition 'sb-ext:posix-getenv)
+          (lambda (name) (%record-knob-read orig name)))))
+
+;; A knob that cannot change a byte of an image -- a build check's mode, a diagnostic
+;; dump's path -- is read with this, and stays out of the record, which holds the
+;; inputs of the image only.  (mvm/build-checks.lisp, mvm/fixed-addresses.lisp)
+(defun getenv-unrecorded (name)
+  #+sbcl
+  (sb-alien:alien-funcall
+   (sb-alien:extern-alien "getenv" (function sb-alien:c-string sb-alien:c-string))
+   name)
+  #-sbcl
+  (funcall (or *getenv-unwrapped* (function sb-ext:posix-getenv)) name))
 
 (defparameter *image-configuration-flags*
   '((:aarch64 "MODUS-INT" "*AARCH64-GC-NATIVE-MCGC*")
@@ -88,7 +112,43 @@
     (or (let ((n (length name))) (and (> n 4) (string= "_OUT" name :start2 (- n 4))))
         (has "DUMP") (has "SYMMAP") (has "INVENTORY") (has "_LOG") (has "WORK"))))
 
+(defun %file-first-line (path)
+  (with-open-file (f path :if-does-not-exist nil)
+    (and f (let ((l (read-line f nil nil))) (and l (string-trim '(#\Space #\Tab #\Return) l))))))
+
+(defun %git-dir ()
+  "The tree's git directory: .git, or the directory a worktree's .git FILE names."
+  (let* ((dot (concatenate 'string *tree* ".git"))
+         (l (ignore-errors (%file-first-line dot))))
+    (cond ((and l (> (length l) 8) (string= "gitdir: " l :end2 8))
+           (let ((d (subseq l 8))) (if (char= (char d (1- (length d))) #\/) d (concatenate 'string d "/"))))
+          (t (concatenate 'string dot "/")))))
+
+(defun %git-head-from-files ()
+  "HEAD's commit read from the git directory's own files -- HEAD, the loose ref, then
+   packed-refs (a worktree's refs live in its common directory) -- for a build with no
+   git to run: a modus image, or a browser.  \"\" when it cannot be found."
+  (or (ignore-errors
+       (let* ((gd (%git-dir))
+              (head (%file-first-line (concatenate 'string gd "HEAD"))))
+         (if (and head (> (length head) 5) (string= "ref: " head :end2 5))
+             (let* ((ref (subseq head 5))
+                    (common (let ((c (%file-first-line (concatenate 'string gd "commondir"))))
+                              (if c (if (char= (char c 0) #\/) (concatenate 'string c "/")
+                                        (concatenate 'string gd c "/"))
+                                  gd))))
+               (or (%file-first-line (concatenate 'string gd ref))
+                   (%file-first-line (concatenate 'string common ref))
+                   (with-open-file (f (concatenate 'string common "packed-refs") :if-does-not-exist nil)
+                     (and f (loop for l = (read-line f nil nil) while l
+                                  when (and (> (length l) 41) (string= ref l :start2 41))
+                                    return (subseq l 0 40))))))
+             head)))
+      ""))
+
 (defun %git-line (&rest args)
+  #-sbcl (if (equal args '("rev-parse" "HEAD")) (%git-head-from-files) "")
+  #+sbcl
   (handler-case
       (let* ((s (with-output-to-string (o)
                   (sb-ext:run-program "git" (list* "-C" *tree* args)
@@ -106,24 +166,66 @@
 
 (defun %image-build-script ()
   "The build script, relative to the tree: the first argument naming a .lisp file
-   under mvm/, from /proc/self/cmdline (SBCL's *POSIX-ARGV* drops --script's file)."
-  (let ((args (handler-case
-                  (with-open-file (f "/proc/self/cmdline")
-                    (let ((acc nil) (cur (make-string-output-stream)))
-                      (loop for c = (read-char f nil nil)
-                            while c
-                            do (if (char= c (code-char 0))
-                                   (push (get-output-stream-string cur) acc)
-                                   (write-char c cur)))
-                      (nreverse acc)))
-                (error () sb-ext:*posix-argv*))))
-    (or (dolist (a args)
-          (let ((p (search "mvm/" a)))
+   under mvm/, from /proc/self/cmdline (SBCL's *POSIX-ARGV* drops --script's file).
+   A host driver that LOADs the script itself (scripts/build-ccl.sh, build-abcl-driver)
+   names it in CL-USER::*IMAGE-BUILD-SCRIPT*, so every host records the same script."
+  (let ((v (find-symbol "*IMAGE-BUILD-SCRIPT*" "COMMON-LISP-USER")))
+    (when (and v (boundp v) (stringp (symbol-value v)))
+      (return-from %image-build-script (symbol-value v))))
+  (let ((args
+          ;; a modus host's own record of its command line first: under Wine
+          ;; /proc/self/cmdline is readable and is WINE's
+          (let ((v (or (find-symbol "*CLI-COMMAND-LINE*" "MODUS-INT")
+                       (find-symbol "*CLI-COMMAND-LINE*" "MODUS.RUNTIME"))))
+            (if (and v (boundp v) (symbol-value v))
+                (symbol-value v)
+                (handler-case
+                    (with-open-file (f "/proc/self/cmdline")
+                      (let ((acc nil) (cur (make-string-output-stream)))
+                        (loop for c = (read-char f nil nil)
+                              while c
+                              do (if (char= c (code-char 0))
+                                     (push (get-output-stream-string cur) acc)
+                                     (write-char c cur)))
+                        (nreverse acc)))
+                  (error () sb-ext:*posix-argv*))))))
+    (or (dolist (a0 args)
+          (let* ((a (substitute #\/ #\\ a0))   ; mvm\build-....lisp on Windows
+                 (p (search "mvm/" a)))
             (when (and p (> (length a) 5) (string= ".lisp" a :start2 (- (length a) 5)))
               (return (subseq a p)))))
         "unknown")))
 
-(defun %image-configuration-record (target)
+(defun %source-hash (text start end)
+  "Two 32-bit FNV-1a lanes over TEXT outside [START, END), as one hex string:
+   the image's whole source, so two builds with one configuration but different
+   code differ here.  The FASL cache keys on it (mvm/fasl.lisp %FASL-BUILD-KEY):
+   a module's function-table indices are this image's, not the next build's."
+  (let ((a 2166136261) (b 3735928559))
+    (declare (type (unsigned-byte 32) a b))
+    (flet ((run (from to)
+             (loop for i from from below to
+                   for k = (char-code (char text i))
+                   do (setf a (logand (* (logxor a k) 16777619) #xFFFFFFFF))
+                      (setf b (logand (* (logxor b (logand (+ k 41) #xFFFF)) 16777619) #xFFFFFFFF)))))
+      ;; and outside the build id: %CORE-BUILD-ID is drawn fresh per build
+      ;; (build-cli-common; MODUS_BUILD_ID pins it), and the cache should be
+      ;; shared by two builds of one source.  It names the binary for a saved
+      ;; core, which must restore under the binary that wrote it; a FASL is
+      ;; portable across them.
+      (let* ((tag "(defun %core-build-id () ")
+             (q (search tag text))
+             (q-end (and q (position #\) text :start (+ q (length tag))))))
+        (if (and q q-end (or (< q-end start) (>= q end)))
+            (let ((cuts (sort (list (cons start end) (cons q (+ q-end 1))) #'< :key #'car)))
+              (run 0 (car (first cuts)))
+              (run (cdr (first cuts)) (car (second cuts)))
+              (run (cdr (second cuts)) (length text)))
+            (progn (run 0 start)
+                   (run end (length text))))))
+    (format nil "~8,'0x~8,'0x" a b)))
+
+(defun %image-configuration-record (target &optional source-hash)
   (let* ((arch (%target-arch target))
          (commit (%image-source-commit))
          (knobs (let ((acc nil))
@@ -148,7 +250,7 @@
                   (nreverse acc))))
     (list :script (%image-build-script) :target (string-upcase (string target))
           :commit (first commit) :uncommitted-changes (second commit)
-          :knobs knobs :flags flags)))
+          :knobs knobs :flags flags :source-hash source-hash)))
 
 ;;; THE PLACEHOLDER.  The assembly appends IMAGE-CONFIGURATION-TEXT before the build
 ;;; script has finished setting knobs and flags; FINALIZE-IMAGE-CONFIGURATION, run by
@@ -168,5 +270,7 @@
         (concatenate 'string (subseq text 0 p) "'"
                      (with-standard-io-syntax
                        (let ((*package* (find-package "COMMON-LISP-USER")) (*print-readably* nil))
-                         (prin1-to-string (%image-configuration-record target))))
+                         (prin1-to-string
+                          (%image-configuration-record
+                           target (%source-hash text p (+ p (length *placeholder*)))))))
                      (subseq text (+ p (length *placeholder*)))))))

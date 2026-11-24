@@ -174,7 +174,7 @@ Quadra, 2026-11-18: front end ~45%, translation ~33%):
 6. **Function and macro lookup by symbol, not by name string** (`STRING=`,
    `GETHASH`, `%HT-*`, `MEMBER`: ~30% self).  The structural one.
 
-Measuring: `scripts/period-lisps/lisp.lua` `PROF=T0:T1` samples PC and the A6
-chain every `PROF_US` emulated microseconds; `scripts/mac68k-prof/native.py` and
-`tree.native.py` map them through `cl.map`.  MAME types a long form in tens of
+Measuring: vessel's `tools/mac68k/period-lisps/lisp.lua` `PROF=T0:T1` samples PC and the A6
+chain every `PROF_US` emulated microseconds; its `tools/mac68k/prof/native.lisp` and
+`tree-native.lisp` map them through `cl.map`.  MAME types a long form in tens of
 emulated seconds: the profile window starts where the REPL's reader stops.

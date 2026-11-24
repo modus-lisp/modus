@@ -29,6 +29,7 @@ trap 'rm -f "$launcher"' EXIT
 cat > "$launcher" <<EOF
 (load "lib/ccl-host-compat.lisp")
 (setf ccl:*default-file-character-encoding* :utf-8)
+(defvar cl-user::*image-build-script* "$BUILD_SCRIPT")
 (handler-case (load "$BUILD_SCRIPT")
   (error (e) (format t "~&BUILD ERROR: ~A~%" e)
     (ignore-errors (ccl:print-call-history :count 25))

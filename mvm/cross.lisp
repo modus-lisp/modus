@@ -209,6 +209,12 @@
                   do (handler-case (return (funcall translator bytecode table))
                        (error (e)
                          (format t "  WARN: translator error #~D: ~A~%" attempt e)
+                         ;; in modus, a fault's condition carries the stack it happened
+                         ;; at: say where, since the translator is about to give up
+                         (let* ((p (find-package "MODUS-INT"))
+                                (f (and p (find-symbol "%PRINT-FAULT-BACKTRACE" p))))
+                           (when (and f (fboundp f))
+                             (ignore-errors (funcall f *standard-output* e))))
                          (when (>= attempt max-retries)
                            ;; Give up — return empty buffer
                            (format t "  WARN: giving up on translator, using partial result~%")
@@ -349,7 +355,7 @@
 ;;; only boot reads -- the boot tables' packed text.  BUILD-CONSTANT-POOL lays
 ;;; them out LAST, after an 8-byte "modusINI" marker at *POOL-INIT-START*
 ;;; (pool-relative), and the image assembly moves that tail past the NFN table
-;;; and the footer, to the very end of the resident image; mac68k-core.py then
+;;; and the footer, to the very end of the resident image; mac68k-core.lisp then
 ;;; starts the static heap at the marker, over text a core boot never reads.
 ;;; NIL: one pool, as always.
 (defvar *pool-init-only* nil)
@@ -366,7 +372,7 @@
   "NIL: the pool's init-only tail is linked where it lies, last in the resident
    image.  An address: it is LINKED there (16-aligned), though the file still
    carries it last -- the bare Mac's 1 MB map, whose runtime-data region sits
-   where the tail would; scripts/mac68k-core.py puts the bytes at this address
+   where the tail would; scripts/mac68k-core.lisp puts the bytes at this address
    for the core run, and a core boot never reads them.")
 
 (defun build-constant-pool (module target)
@@ -783,6 +789,8 @@
     ((null boot-descriptor) 0)
     ;; Linux x64 ELF64: ELF header (64) + 1 program header (56) = 120
     ((eq (getf boot-descriptor :elf-format) :linux-x64) 120)
+    ;; Windows PE32+: the PE headers and padding (boot/boot-win64.lisp).
+    ((eq (getf boot-descriptor :elf-format) :win64) #x1000)
     ;; Linux AArch64 ELF64: same 64+56 layout as x64.
     ((eq (getf boot-descriptor :elf-format) :linux-aarch64) 120)
     ;; Linux i386 ELF32: ELF header (52) + 1 program header (32) = 84.
@@ -1481,17 +1489,26 @@
                ;; 16-byte boundary (the translator 16-aligns every function
                ;; entry relative to it; see translate-mvm-to-arm32).  The
                ;; payload loads at the ELF32 header size past a page boundary.
+               ;; B reaches +-32 MB; past that (a 34 MB arm32 CLI) it wrapped
+               ;; and the image jumped to #xFE012950 at startup.  Then:
+               ;;   LDR ip,[pc,#0] ; ADD pc,pc,ip ; .word OFF
+               ;; ADD reads pc = its own address + 8 = the code start, so OFF
+               ;; is PAD + entry offset.  Images that fit keep the 4-byte B.
                (let* ((hdr (if (eq (getf boot-descriptor :elf-format) :linux-arm32) 84 0))
-                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) 4) 16)) 16))
+                      (long-p (>= (+ entry-native-offset 32) (ash 1 25)))
+                      (jlen (if long-p 12 4))
+                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) jlen) 16)) 16))
                       (byte-offset (+ entry-native-offset pad))
                       (arm-offset (ash (- byte-offset 4) -2))  ; instruction units, adjusted for PC+8
-                      (insn (logior #xEA000000 (logand arm-offset #xFFFFFF))))
-                 (dolist (w (cons insn (make-list (floor pad 4) :initial-element #xE1A00000)))
+                      (words (if long-p
+                                 (list #xE59FC000 #xE08FF00C byte-offset)
+                                 (list (logior #xEA000000 (logand arm-offset #xFFFFFF))))))
+                 (dolist (w (append words (make-list (floor pad 4) :initial-element #xE1A00000)))
                    (mvm-emit-byte final-buf (logand w #xFF))
                    (mvm-emit-byte final-buf (logand (ash w -8) #xFF))
                    (mvm-emit-byte final-buf (logand (ash w -16) #xFF))
                    (mvm-emit-byte final-buf (logand (ash w -24) #xFF)))
-                 (setq jmp-size (+ 4 pad))))
+                 (setq jmp-size (+ jlen pad))))
               ((and (member arch '(:aarch64 :rpi))
                     (not aarch64-unified-p))
                ;; AArch64 B (unconditional branch, 4 bytes)
@@ -1889,6 +1906,8 @@
                   (cond
                     ((getf boot-descriptor :uefi)
                      (wrap-in-pe32plus raw-bytes))
+                    ((eq (getf boot-descriptor :elf-format) :win64)
+                     (wrap-in-pe64-win raw-bytes))
                     ((eq (getf boot-descriptor :elf-format) :linux-x64)
                      (wrap-in-elf64-le raw-bytes
                                        (or (getf boot-descriptor :load-addr) #x400000)
@@ -2020,6 +2039,7 @@
     (:uefi-x64 :x86-64)
     (:uefi-x64-cl :x86-64)
     (:linux-x64 :x86-64)
+    (:win64 :x86-64)
     (:linux-aarch64 :aarch64)
     (:linux-riscv :riscv64)
     (:linux-riscv32 :riscv32)
@@ -2135,6 +2155,7 @@
     (:uefi-x64 (uefi-x64-boot-descriptor))
     (:uefi-x64-cl (uefi-x64-cl-boot-descriptor))
     (:linux-x64 (linux-x64-boot-descriptor))
+    (:win64 (win64-boot-descriptor))
     (:linux-aarch64 (linux-aarch64-boot-descriptor))
     (:linux-riscv (linux-riscv-boot-descriptor))
     (:linux-riscv32 (linux-riscv32-boot-descriptor))
@@ -2184,10 +2205,12 @@
 (defun read-all-forms (source-text)
   "Read all Lisp forms from SOURCE-TEXT string.
    Returns a list of forms."
-  (with-input-from-string (stream source-text)
-    (loop for form = (read stream nil :eof)
-          until (eq form :eof)
-          collect form)))
+  (let ((*readtable* (or (%image-source-readtable) *readtable*))
+        (*features* (%image-source-features)))
+    (with-input-from-string (stream source-text)
+      (loop for form = (read stream nil :eof)
+            until (eq form :eof)
+            collect form))))
 
 (defun %skip-blank-and-comments (text pos)
   "The index of the first character at or after POS in TEXT that is not
@@ -2205,6 +2228,50 @@
              (let ((end (search "|#" text :start2 (+ pos 2))))
                (setq pos (if end (+ end 2) n))))
             (t (return pos))))))
+
+;;; THE IMAGE SOURCE'S BACKQUOTE, ON EVERY HOST.  The compiler expands backquote
+;;; itself, from either of two shapes: SBCL's (SB-INT:QUASIQUOTE x) with comma
+;;; structs, or modus's own reader's (BACKQUOTE x) with (COMMA x) / (COMMA-AT x) /
+;;; (COMMA-DOT x) -- and the self-hosted DDCs prove the two compile alike.  Other
+;;; hosts' readers EXPAND backquote at read time instead (CCL into LIST* / APPEND,
+;;; ABCL into its own BACKQ- operators), so the compiler would see different code
+;;; for the same text.  So a host that is neither reads image source with modus's
+;;; shape: this readtable, bound only where the image source is read.  SBCL and
+;;; modus keep their own readers (NIL here).
+(defun %image-source-readtable ()
+  #+(or sbcl modus) nil
+  #-(or sbcl modus)
+  (let ((rt (copy-readtable nil)))
+    (set-macro-character
+     #\` (lambda (stream char)
+           (declare (ignore char))
+           (list 'backquote (read stream t nil t)))
+     nil rt)
+    (set-macro-character
+     #\, (lambda (stream char)
+           (declare (ignore char))
+           (let ((next (peek-char nil stream t nil t)))
+             (cond ((char= next #\@) (read-char stream t nil t)
+                    (list 'comma-at (read stream t nil t)))
+                   ((char= next #\.) (read-char stream t nil t)
+                    (list 'comma-dot (read stream t nil t)))
+                   (t (list 'comma (read stream t nil t))))))
+     nil rt)
+    rt))
+
+;;; THE IMAGE SOURCE'S FEATURES, ON EVERY HOST.  #+/#- in image source is decided by
+;;; the READER, so it would answer for the HOST: translate-x64's
+;;; (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_FAULT_DUMP") #-sbcl nil)) ...) compiled
+;;; a call to an SB-EXT function the image does not have when SBCL built it, and NIL
+;;; when CCL did.  Image source is read as what it is -- modus -- with this list.
+(defun %image-source-features () (list :modus :common-lisp :ansi-cl))
+
+;;; ... and those forms are not only compiled: the build also EVALUATES some of them
+;;; on the host (an image macro expands on the host while compiling the image), so
+;;; the host must read (BACKQUOTE x) as the backquote it is -- through the compiler's
+;;; own EXPAND-BACKQUOTE, which is the expansion the image gets.
+#-(or sbcl modus)
+(defmacro backquote (template) (expand-backquote template 1))
 
 (defun read-all-forms-with-locations (source-text)
   "Read all Lisp forms from SOURCE-TEXT, tracking line numbers.
@@ -2254,7 +2321,9 @@
         ;; (#.+op-nop+ ...) case keys) resolves in the package where load-mvm
         ;; bound them.  Symbols are name-hashed by the compiler (package-
         ;; independent), so this doesn't change how the cl-* runtime compiles.
-        (*package* (or (find-package :modus.mvm) *package*)))
+        (*package* (or (find-package :modus.mvm) *package*))
+        (*readtable* (or (%image-source-readtable) *readtable*))
+        (*features* (%image-source-features)))
     (with-input-from-string (stream source-text)
       (loop
         (let ((pos (%skip-blank-and-comments source-text (file-position stream))))

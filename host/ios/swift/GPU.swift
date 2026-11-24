@@ -13,9 +13,43 @@
 //   gpu_draw(pass, primitive, start, count)  primitive 0 triangles, 1 triangle strip, 2 lines, 3 points
 //   gpu_pass_end(pass)                       encode, present, commit: the GPU runs it while Lisp goes on
 //
+// For 3D: every view has a DEPTH buffer (32-bit float, cleared to 1 each pass, sized with the drawable), every
+// pipeline writes it, and a pass starts with the depth test on (less-or-equal, so 2D drawn at one depth still
+// layers in order) and no face culled.
+//   gpu_view_new(0, 0, 0, 0)                 a view filling the window, following it as it resizes
+//   gpu_view_size(view)                      its drawable's size in pixels: width * 65536 + height
+//   gpu_set_depth(pass, mode)                0 no test and no write, 1 test and write, 2 test only (see-through)
+//   gpu_set_cull(pass, mode)                 0 none, 1 back faces, 2 front faces (counter-clockwise is the front)
+//   gpu_set_bytes(pass, data, len, index, stage)   up to 4 KB of constants for this draw -- a model matrix --
+//                                            copied now, so the next draw's do not race the GPU
+//   gpu_texture_new(rgba, width, height)     an RGBA8 texture from WIDTH x HEIGHT pixels, mipmapped
+//   gpu_set_texture(pass, texture, index, stage)   and a sampler at the same index: linear, mipmapped, repeating
+//   gpu_view_print(view)                     its next frame, copied out of the GPU, to the system's print panel
+//   gpu_draw_indexed(pass, primitive, indices, count, first, wide)   COUNT indices from FIRST in the buffer
+//                                            INDICES: 16-bit, or 32-bit when WIDE is 1
+//
+// HIGH DYNAMIC RANGE, as WebGPU's canvas.configure({format: 'rgba16float', toneMapping: {mode: 'extended'}}):
+//   gpu_view_hdr(view, on)                   1: the view draws half floats in extended sRGB -- what a shader wrote
+//                                            before looks the same, and a value past 1.0 is brighter than white, up
+//                                            to the screen's headroom.  0 back to 8 bits.  On a TV it also asks
+//                                            for an HDR10 mode (AVDisplayManager), which the TV takes when its
+//                                            Match Content > Dynamic Range is on.  1 if the view is HDR now.
+//   gpu_headroom()                           how many times SDR white the screen can show now, in thousandths
+//                                            (1000: none -- an SDR screen); a TV that can show HDR says 4000,
+//                                            as tvOS's own figure is no use (below)
+// A pipeline follows its view: it is built for each pixel format it is used with (8-bit or float).
+//
 // Data is bytes in the image's memory, read in place: a single-float vector's payload is IEEE singles already.
 
+#if os(macOS)
+import AppKit          // the macOS window host builds this file too (host/macos/build-macos.sh gui)
+#else
 import UIKit
+#endif
+#if os(tvOS)
+import AVKit           // AVDisplayManager: the TV's mode
+import CoreMedia
+#endif
 import Metal
 import QuartzCore
 
@@ -36,15 +70,47 @@ private func bytes(_ p: UInt, _ n: UInt) -> UnsafeRawPointer? {
 }
 
 /// A view the GPU draws: its layer is a CAMetalLayer, sized in pixels to the view.
+#if os(macOS)
+final class GPUView: NSView {
+    var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
+    var depth: MTLTexture?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        wantsLayer = true                    // the layer comes from makeBackingLayer
+    }
+    required init?(coder: NSCoder) { fatalError("no coder") }
+
+    override func makeBackingLayer() -> CALayer {
+        let layer = CAMetalLayer()
+        layer.device = device
+        layer.pixelFormat = .bgra8Unorm
+        layer.framebufferOnly = false            // a frame can be copied out (gpu_view_print)
+        return layer
+    }
+
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }   // the phone's isUserInteractionEnabled = false
+
+    private func fit() {
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        metalLayer.contentsScale = scale
+        metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+    }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); fit() }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); fit() }
+}
+#else
 final class GPUView: UIView {
     override class var layerClass: AnyClass { CAMetalLayer.self }
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
+    var depth: MTLTexture?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         metalLayer.device = device
         metalLayer.pixelFormat = .bgra8Unorm
-        metalLayer.framebufferOnly = true
+        metalLayer.framebufferOnly = false       // a frame can be copied out (gpu_view_print)
         isUserInteractionEnabled = false
     }
     required init?(coder: NSCoder) { fatalError("no coder") }
@@ -56,12 +122,55 @@ final class GPUView: UIView {
         metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
     }
 }
+#endif
+
+/// The depth states a pass can use, by mode: 0 none, 1 test and write, 2 test only.
+private func depthState(_ compare: MTLCompareFunction, _ write: Bool) -> MTLDepthStencilState? {
+    let d = MTLDepthStencilDescriptor()
+    d.depthCompareFunction = compare
+    d.isDepthWriteEnabled = write
+    return device?.makeDepthStencilState(descriptor: d)
+}
+private let depthStates: [MTLDepthStencilState?] = [depthState(.always, false), depthState(.lessEqual, true),
+                                                    depthState(.lessEqual, false)]
+
+/// The one sampler textures are read with: linear, mipmapped, repeating, anisotropic.
+private let sampler: MTLSamplerState? = {
+    let d = MTLSamplerDescriptor()
+    d.minFilter = .linear
+    d.magFilter = .linear
+    d.mipFilter = .linear
+    d.sAddressMode = .repeat
+    d.tAddressMode = .repeat
+    d.maxAnisotropy = 8
+    return device?.makeSamplerState(descriptor: d)
+}()
 
 /// A frame in progress: its drawable, command buffer and encoder.
+/// A render pipeline as Lisp made it, and its state for each colour format it has been drawn into.
+private final class Pipeline {
+    let descriptor: MTLRenderPipelineDescriptor
+    var states: [MTLPixelFormat: MTLRenderPipelineState] = [:]
+    init(_ d: MTLRenderPipelineDescriptor) { descriptor = d }
+    func state(for format: MTLPixelFormat) -> MTLRenderPipelineState? {
+        if let s = states[format] { return s }
+        descriptor.colorAttachments[0].pixelFormat = format
+        do {
+            let s = try device!.makeRenderPipelineState(descriptor: descriptor)
+            states[format] = s
+            return s
+        } catch {
+            NSLog("modus gpu: the pipeline does not build: \(error)")
+            return nil
+        }
+    }
+}
+
 private final class Pass {
     let drawable: CAMetalDrawable
     let commands: MTLCommandBuffer
     let encoder: MTLRenderCommandEncoder
+    var view: UInt = 0
     init(_ drawable: CAMetalDrawable, _ commands: MTLCommandBuffer, _ encoder: MTLRenderCommandEncoder) {
         self.drawable = drawable
         self.commands = commands
@@ -69,13 +178,76 @@ private final class Pass {
     }
 }
 
+/// Views whose next frame is to be printed.
+private var printNext: Set<UInt> = []
+
+/// The frame in TEXTURE (BGRA), copied into BUFFER by the GPU, as an image.
+private func frameImage(_ buffer: MTLBuffer, _ w: Int, _ h: Int) -> CGImage? {
+    let bytes = Data(bytes: buffer.contents(), count: w * h * 4)
+    guard let provider = CGDataProvider(data: bytes as CFData) else { return nil }
+    return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                   space: CGColorSpaceCreateDeviceRGB(),
+                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue
+                                            | CGBitmapInfo.byteOrder32Little.rawValue),
+                   provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+}
+
+/// IMAGE to the system's print panel, fitted to the page.
+func printImage(_ image: CGImage, title: String) {
+    #if os(macOS)
+    let size = NSSize(width: image.width, height: image.height)
+    let view = NSImageView(frame: NSRect(origin: .zero, size: size))
+    view.image = NSImage(cgImage: image, size: size)
+    view.imageScaling = .scaleProportionallyUpOrDown
+    let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+    info.horizontalPagination = .fit
+    info.verticalPagination = .fit
+    info.orientation = image.width > image.height ? .landscape : .portrait
+    info.isHorizontallyCentered = true
+    info.isVerticallyCentered = true
+    let op = NSPrintOperation(view: view, printInfo: info)
+    op.jobTitle = title
+    if let window = rootView()?.window { op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil) }
+    else { op.run() }
+    #elseif os(iOS)   // a TV does not print
+    let controller = UIPrintInteractionController.shared
+    let info = UIPrintInfo(dictionary: nil)
+    info.jobName = title
+    info.outputType = .photo
+    controller.printInfo = info
+    controller.printingItem = UIImage(cgImage: image)
+    controller.present(animated: true)
+    #endif
+}
+
 private var gpuViews: [UInt: GPUView] = [:]
 
 let gpuViewNew: Call = { x, y, w, h, _, _ in
-    let view = GPUView(frame: rect(x, y, w, h))
+    let fill = w == 0 && h == 0
+    let view = GPUView(frame: rect(x, y, max(w, 1), max(h, 1)))
     let handle = adopt(view)
+    if fill, let parent = view.superview {        // the whole window, and following it
+        view.frame = parent.bounds
+        #if os(macOS)
+        view.autoresizingMask = [.width, .height]
+        #else
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        #endif
+    }
     gpuViews[handle] = view
     return handle
+}
+
+let gpuViewPrint: Call = { v, _, _, _, _, _ in
+    guard gpuViews[v] != nil else { return 0 }
+    printNext.insert(v)
+    return 1
+}
+
+let gpuViewSize: Call = { v, _, _, _, _, _ in
+    guard let view = gpuViews[v] else { return 0 }
+    let size = view.metalLayer.drawableSize
+    return UInt(max(0, size.width)) * 65536 + UInt(max(0, size.height))
 }
 
 let gpuShaderNew: Call = { p, n, _, _, _, _ in
@@ -102,12 +274,64 @@ let gpuPipelineNew: Call = { shader, vp, vn, fp, fn, _ in
     colour.destinationRGBBlendFactor = .oneMinusSourceAlpha
     colour.sourceAlphaBlendFactor = .one
     colour.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-    do {
-        return keep(try device.makeRenderPipelineState(descriptor: d))
-    } catch {
-        NSLog("modus gpu: the pipeline does not build: \(error)")
-        return 0
+    d.depthAttachmentPixelFormat = .depth32Float               // every view has one (gpu_pass_begin)
+    let pipeline = Pipeline(d)
+    guard pipeline.state(for: .bgra8Unorm) != nil else { return 0 }   // built now, so an error is said now
+    return keep(pipeline)
+}
+
+// THE TV'S MODE for HDR: a 4K HEVC HDR10 picture (PQ, BT.2020) at the screen's rate, as a video player asks.  The
+// TV switches only when the person's Match Content > Dynamic Range is on; otherwise it stays as it is set.
+#if os(tvOS)
+private func hdrCriteria() -> AVDisplayCriteria? {
+    let ext: [CFString: Any] = [
+        kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+        kCMFormatDescriptionExtension_TransferFunction: kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ,
+        kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+    ]
+    var format: CMVideoFormatDescription?
+    guard CMVideoFormatDescriptionCreate(allocator: nil, codecType: kCMVideoCodecType_HEVC, width: 3840,
+                                         height: 2160, extensions: ext as CFDictionary,
+                                         formatDescriptionOut: &format) == noErr, let format else { return nil }
+    return AVDisplayCriteria(refreshRate: Float(UIScreen.main.maximumFramesPerSecond), formatDescription: format)
+}
+#endif
+
+let gpuViewHDR: Call = { v, on, _, _, _, _ in
+    guard let view = gpuViews[v] else { return 0 }
+    let layer = view.metalLayer
+    layer.pixelFormat = on != 0 ? .rgba16Float : .bgra8Unorm
+    layer.colorspace = on != 0 ? CGColorSpace(name: CGColorSpace.extendedSRGB) : nil
+    // extended range, untone-mapped: preferredDynamicRange where there is one (the only way on a TV), else the
+    // older switch (a phone or Mac before 26)
+    if #available(macOS 26.0, iOS 26.0, tvOS 26.0, *) {
+        layer.preferredDynamicRange = on != 0 ? .high : .standard
+    } else {
+        #if !os(tvOS)
+        layer.wantsExtendedDynamicRangeContent = on != 0
+        #endif
     }
+    #if os(tvOS)
+    if let manager = view.window?.avDisplayManager {           // the view is in the window (adopt)
+        manager.preferredDisplayCriteria = on != 0 ? hdrCriteria() : nil
+    }
+    #endif
+    return on != 0 ? 1 : 0
+}
+
+let gpuHeadroom: Call = { _, _, _, _, _, _ in
+    #if os(macOS)
+    let headroom = NSScreen.main?.maximumExtendedDynamicRangeColorComponentValue ?? 1
+    #else
+    var headroom = UIScreen.main.currentEDRHeadroom
+    #if os(tvOS)
+    // A TV SAYS NEXT TO NOTHING: measured on an Apple TV 4K in an HDR10 mode, current 1.2 and potential 1.0, while
+    // 4x white showed plainly brighter than white.  So where the TV can show HDR at all, 4x: HDR10 puts SDR white
+    // near 200 nits, and a TV's highlights reach several times that.  (A TV left in SDR clips it to white.)
+    if AVPlayer.eligibleForHDRPlayback { headroom = max(headroom, 4) }
+    #endif
+    #endif
+    return UInt(max(1, headroom) * 1000)
 }
 
 let gpuBufferNew: Call = { p, n, _, _, _, _ in
@@ -134,13 +358,32 @@ let gpuPassBegin: Call = { v, rgb, _, _, _, _ in
     colour.storeAction = .store
     colour.clearColor = MTLClearColor(red: Double((rgb >> 16) & 255) / 255, green: Double((rgb >> 8) & 255) / 255,
                                       blue: Double(rgb & 255) / 255, alpha: 1)
+    // THE DEPTH BUFFER, made again when the drawable's size changes (the window resized)
+    let w = drawable.texture.width, h = drawable.texture.height
+    if view.depth == nil || view.depth!.width != w || view.depth!.height != h {
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: w, height: h, mipmapped: false)
+        td.usage = .renderTarget
+        td.storageMode = .private
+        view.depth = device?.makeTexture(descriptor: td)
+    }
+    d.depthAttachment.texture = view.depth
+    d.depthAttachment.loadAction = .clear
+    d.depthAttachment.clearDepth = 1
+    d.depthAttachment.storeAction = .dontCare
     guard let encoder = commands.makeRenderCommandEncoder(descriptor: d) else { return 0 }
-    return keep(Pass(drawable, commands, encoder))
+    if let state = depthStates[1] { encoder.setDepthStencilState(state) }
+    // COUNTER-CLOCKWISE IS THE FRONT, as Lisp's geometry is wound (OpenGL's way)
+    encoder.setFrontFacing(.counterClockwise)
+    encoder.setCullMode(.none)
+    let pass = Pass(drawable, commands, encoder)
+    pass.view = v
+    return keep(pass)
 }
 
 let gpuSetPipeline: Call = { p, pipe, _, _, _, _ in
-    guard let pass = objects[p] as? Pass, let pipeline = objects[pipe] as? MTLRenderPipelineState else { return 0 }
-    pass.encoder.setRenderPipelineState(pipeline)
+    guard let pass = objects[p] as? Pass, let pipeline = objects[pipe] as? Pipeline,
+          let state = pipeline.state(for: pass.drawable.texture.pixelFormat) else { return 0 }
+    pass.encoder.setRenderPipelineState(state)
     return 1
 }
 
@@ -158,9 +401,87 @@ let gpuDraw: Call = { p, primitive, start, count, _, _ in
     return 1
 }
 
+let gpuSetDepth: Call = { p, mode, _, _, _, _ in
+    guard let pass = objects[p] as? Pass, mode < 3, let state = depthStates[Int(mode)] else { return 0 }
+    pass.encoder.setDepthStencilState(state)
+    return 1
+}
+
+let gpuSetCull: Call = { p, mode, _, _, _, _ in
+    guard let pass = objects[p] as? Pass else { return 0 }
+    pass.encoder.setCullMode([.none, .back, .front][Int(min(mode, 2))])
+    return 1
+}
+
+let gpuSetBytes: Call = { p, data, n, index, stage, _ in
+    guard let pass = objects[p] as? Pass, let src = bytes(data, n), n <= 4096 else { return 0 }
+    if stage != 1 { pass.encoder.setVertexBytes(src, length: Int(n), index: Int(index)) }
+    if stage != 0 { pass.encoder.setFragmentBytes(src, length: Int(n), index: Int(index)) }
+    return 1
+}
+
+let gpuTextureNew: Call = { p, w, h, _, _, _ in
+    guard let device, let src = bytes(p, w * h * 4), w > 0, h > 0 else { return 0 }
+    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: Int(w), height: Int(h),
+                                                     mipmapped: true)
+    d.usage = .shaderRead
+    guard let texture = device.makeTexture(descriptor: d) else { return 0 }
+    texture.replace(region: MTLRegionMake2D(0, 0, Int(w), Int(h)), mipmapLevel: 0, withBytes: src,
+                    bytesPerRow: Int(w) * 4)
+    // the smaller levels, made by the GPU: a textured floor seen at a slant does not shimmer
+    if let commands = queue?.makeCommandBuffer(), let blit = commands.makeBlitCommandEncoder() {
+        blit.generateMipmaps(for: texture)
+        blit.endEncoding()
+        commands.commit()
+    }
+    return keep(texture)
+}
+
+let gpuSetTexture: Call = { p, t, index, stage, _, _ in
+    guard let pass = objects[p] as? Pass, let texture = objects[t] as? MTLTexture else { return 0 }
+    if stage != 1 {
+        pass.encoder.setVertexTexture(texture, index: Int(index))
+        pass.encoder.setVertexSamplerState(sampler, index: Int(index))
+    }
+    if stage != 0 {
+        pass.encoder.setFragmentTexture(texture, index: Int(index))
+        pass.encoder.setFragmentSamplerState(sampler, index: Int(index))
+    }
+    return 1
+}
+
+let gpuDrawIndexed: Call = { p, primitive, ib, count, first, wide in
+    guard let pass = objects[p] as? Pass, let indices = objects[ib] as? MTLBuffer else { return 0 }
+    let kind: MTLPrimitiveType = [.triangle, .triangleStrip, .line, .point][Int(min(primitive, 3))]
+    let size = wide != 0 ? 4 : 2
+    guard (Int(first) + Int(count)) * size <= indices.length else { return 0 }
+    pass.encoder.drawIndexedPrimitives(type: kind, indexCount: Int(count),
+                                       indexType: wide != 0 ? .uint32 : .uint16,
+                                       indexBuffer: indices, indexBufferOffset: Int(first) * size)
+    return 1
+}
+
 let gpuPassEnd: Call = { p, _, _, _, _, _ in
     guard let pass = objects.removeValue(forKey: p) as? Pass else { return 0 }
     pass.encoder.endEncoding()
+    // A FRAME TO PRINT: copied out of the drawable before it is presented, and printed once the GPU has done
+    if printNext.remove(pass.view) != nil, let device, pass.drawable.texture.pixelFormat == .bgra8Unorm {   // 8-bit only
+        let t = pass.drawable.texture
+        if let buffer = device.makeBuffer(length: t.width * t.height * 4, options: .storageModeShared),
+           let blit = pass.commands.makeBlitCommandEncoder() {
+            blit.copy(from: t, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: t.width, height: t.height, depth: 1), to: buffer,
+                      destinationOffset: 0, destinationBytesPerRow: t.width * 4,
+                      destinationBytesPerImage: t.width * t.height * 4)
+            blit.endEncoding()
+            let w = t.width, h = t.height
+            pass.commands.addCompletedHandler { _ in
+                DispatchQueue.main.async {
+                    if let image = frameImage(buffer, w, h) { printImage(image, title: "Picture") }
+                }
+            }
+        }
+    }
     pass.commands.present(pass.drawable)
     pass.commands.commit()
     return 1
@@ -177,4 +498,14 @@ func installGPU() {
     register("gpu_set_buffer", gpuSetBuffer)
     register("gpu_draw", gpuDraw)
     register("gpu_pass_end", gpuPassEnd)
+    register("gpu_view_size", gpuViewSize)
+    register("gpu_view_print", gpuViewPrint)
+    register("gpu_view_hdr", gpuViewHDR)
+    register("gpu_headroom", gpuHeadroom)
+    register("gpu_set_depth", gpuSetDepth)
+    register("gpu_set_cull", gpuSetCull)
+    register("gpu_set_bytes", gpuSetBytes)
+    register("gpu_texture_new", gpuTextureNew)
+    register("gpu_set_texture", gpuSetTexture)
+    register("gpu_draw_indexed", gpuDrawIndexed)
 }

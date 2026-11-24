@@ -325,22 +325,19 @@
            (declare (ignore args))
            (error 'undefined-function :name sym)))
         (t
-          (let ((c (%make-condition 'undefined-function (list :name sym))))
-            ;; PUBLISH the condition before unwinding — same sequence as the
-            ;; unbound-variable path above.  The old code longjmp'd with C
-            ;; never stored in *current-condition*, so the handler-case that
-            ;; caught it received whatever condition was caught LAST (a stale
-            ;; FILE-ERROR / cabinet NOT-FOUND): quickload's real
-            ;; UNDEFINED-FUNCTION on bare metal reported as NOT-FOUND
-            ;; "/ql/local-init", and a direct probe reproduced it on x64.
-            (setq *current-condition* c)
-            (%associate-active-restart-frames c)
-            (let ((handled (%signal-condition c)))
-              (if handled
-                  nil
-                  (if (%error-handler-active-p)
-                      (%hc-longjmp)
-                      (progn (error "undefined function") nil))))))))))
+         ;; The restarts SBCL gives an undefined function, as for an unbound
+         ;; variable in %E2-SYMBOL-VALUE-CHECKED: CONTINUE looks again (a
+         ;; handler that defined it resumes in place), USE-VALUE supplies the
+         ;; function this once, STORE-VALUE installs it.
+         ;; Through ERROR, which publishes the condition before it unwinds
+         ;; (the stale-condition bug the hand-rolled sequence here once had,
+         ;; quickload's UNDEFINED-FUNCTION reported as NOT-FOUND), inside the
+         ;; image's RESTART-CASE, which links only around a signalling form.
+         (restart-case (error 'undefined-function :name sym)
+           (continue () :report "Look the function up again." (symbol-function sym))
+           (use-value (f) :report "Call a function given now instead." f)
+           (store-value (f) :report "Define it as a function given now, and call that."
+             (setf (fdefinition sym) f) f)))))))
 
 (defvar *%e2-set-function-names* nil
   "Names (strings) whose definition was stored with (SETF SYMBOL-FUNCTION) /
@@ -371,6 +368,12 @@
 
 (defun %seam-cell (key)
   (and *seams* (gethash key *seams*)))
+
+;;; A runtime tier that binds a call to a name in a cell of its own (the i386 native
+;;; tier, mvm/jit-i386-native.lisp) is told here when a name's definition changes by
+;;; (SETF FDEFINITION) / (SETF SYMBOL-FUNCTION), which a DEFUN's own hook never sees.
+(declaim (overridable %fn-binding-changed))
+(defun %fn-binding-changed (name) name nil)
 
 (defun set-symbol-function (sym fn)
   "Set the function cell of SYM to FN.  Updates both the name-keyed
@@ -405,6 +408,7 @@
         (puthash name *%e2-set-function-names* t))
       (when *native-sym-function-table*
         (puthash hash *native-sym-function-table* fn))
+      (when (> (length name) 0) (%fn-binding-changed name))
       fn)))
 
 (defun %check-setf-function-name (x)
@@ -795,6 +799,7 @@
 
 (defun %macro-pkg-put-1 (sym key fn)
   (%mexp-memo-invalidate)
+  (%macro-defs-changed)
   (let ((pn (%macro-sym-pkg-name sym)))
     (when (and pn (stringp key))
       (unless *macro-pkg-table*
@@ -817,7 +822,9 @@
 (defun %macro-pkg-rem-1 (sym key)
   "T when there was an expander to drop.  The expansion memos are dropped only
    then: FMAKUNBOUND runs at every runtime DEFUN, and dropping the not-a-macro
-   set each time made every EVAL search every operator's expander again."
+   set each time made every EVAL search every operator's expander again.  The
+   macro epoch moves on the same condition, for the same reason -- it keys
+   *MVM-EVAL-CACHE*, and moving it at every DEFUN would empty that cache too."
   (let ((pn (%macro-sym-pkg-name sym)) (removed nil))
     (when (and pn *macro-pkg-table* (stringp key))
       (let ((al (gethash key *macro-pkg-table*))
@@ -826,6 +833,7 @@
           (if (string= (car e) pn) (setq removed t) (setq new (cons e new))))
         (when removed
           (%mexp-memo-invalidate)
+          (%macro-defs-changed)
           (puthash key *macro-pkg-table* new))))
     removed))
 
@@ -1049,8 +1057,17 @@
       ((null key) nil)
       ;; SYM's own-package expander wins over the legacy bare-name entry.
       ((%macro-pkg-get sym key))
-      ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P).
-      ((%macro-pkg-foreign-p sym key) nil)
+      ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P) --
+      ;; unless SYM is COMMON-LISP's own, exactly as MACRO-FUNCTION exempts
+      ;; it.  Without that, one package DEFMACROing its own DEFVAR (cortez's
+      ;; CORTEZ.GLOBAL:DEFVAR) left CL:DEFVAR and CL:DEFUN with NO expander
+      ;; here, so EVAL's no-compile path (%SIMPLE-OP-P) took them for
+      ;; functions and APPLIED them: (DEFVAR *X* ...) of a bound *X* signalled
+      ;; the compiler-macro shim's PROGRAM-ERROR.
+      ((and (not (let ((p (ignore-errors (symbol-package sym))))
+                   (and p (string= (package-name p) "COMMON-LISP"))))
+            (%macro-pkg-foreign-p sym key))
+       nil)
       ;; A symbol shadowing a CL name with no macro of its own has none: every
       ;; bare-name entry below is CL's (see MACRO-FUNCTION).
       ((%shadows-cl-name-p sym) nil)
@@ -1832,17 +1849,23 @@
                   (t (%word->val #x0BADB0B5)))))
    (if (not (eq v (%word->val #x0BADB0B5)))
       v
-      (let ((c (%make-condition 'unbound-variable (list :name sym))))
-        ;; Publish + run handler-bind stack first, then longjmp to the
-        ;; nearest handler-case — same sequence as %eval-sym-lookup.
-        (setq *current-condition* c)
-        (%associate-active-restart-frames c)
-        (let ((handled (%signal-condition c)))
-          (if handled
-              nil
-              (if (%error-handler-active-p)
-                  (%hc-longjmp)
-                  nil)))))))
+      ;; THE RESTARTS SBCL GIVES, around the signal (CLHS UNBOUND-VARIABLE
+      ;; is the ERROR the standard's restarts are for): CONTINUE reads it
+      ;; again, USE-VALUE answers with a value this once, STORE-VALUE sets it
+      ;; and answers with it.  A handler that makes the variable bound --
+      ;; cortez's resolver loads the file that defines it -- resumes the read
+      ;; in place with CONTINUE; without them it could only unwind, and the
+      ;; read it had fixed died anyway ("The variable ... is unbound" after
+      ;; the DEFVAR had run).
+      ;; Through ERROR, which publishes the condition and finds the nearest
+      ;; handler as the hand-rolled sequence here used to, and inside the
+      ;; image's RESTART-CASE, which links only around a signalling form.
+      (restart-case (error 'unbound-variable :name sym)
+        (continue () :report "Read the variable again."
+          (%e2-symbol-value-checked hash sym))
+        (use-value (v) :report "Use a value this time." v)
+        (store-value (v) :report "Set the variable and use its new value."
+          (set sym v) v)))))
 
 (defun %do-funcall (fn args)
   "Call FN with ARGS list."
@@ -2066,8 +2089,10 @@
                    (not (and *%extra-macro-names*
                              (gethash h *%extra-macro-names*)))
                    (fboundp op))
-          (let ((tb (or *%simple-ops* (setq *%simple-ops* (make-hash-table :test 'eql)))))
-            (setf (gethash h tb) (cons op (gethash h tb))))
+          ;; Main only, as %NOTE-NOT-MACRO (a worker's conses in main's table).
+          (when (%mvm-on-main-thread-p)
+            (let ((tb (or *%simple-ops* (setq *%simple-ops* (make-hash-table :test 'eql)))))
+              (setf (gethash h tb) (cons op (gethash h tb)))))
           t))))
 
 (defun %eval-simple-p (form depth)

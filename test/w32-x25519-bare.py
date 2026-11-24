@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """test/w32-x25519-bare.py -- time X25519 in a bare-metal CL image (W32 M0/M4).
 
-    test/w32-x25519-bare.py IMAGE [N]
+    test/w32-x25519-bare.py IMAGE [N] [check]
 
-Boots IMAGE (an i386 CL image built with MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1,
-no autostart) under qemu-system-i386, waits for the REPL prompt, and evaluates
-one form that runs RFC 7748 section 5.2's first vector once (warm-up, and the
-correctness check), then N more times between two markers.  Two clocks:
-the image's own GET-INTERNAL-REAL-TIME (RDTSC on bare i386) and the HOST's
+Boots IMAGE -- a bare CL image built with MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1
+MODUS_NET_NOAUTO=1 (crypto in, the NIC left alone) -- under qemu-system-i386,
+or qemu-system-arm (QEMU virt) with W32_X25519_ARCH=arm32 -- an arm32 image is
+built with MODUS_CRYPTO_BUILD=1 instead, since arm32 has no NIC; waits for the REPL
+prompt, and evaluates one form that runs RFC 7748 section 5.2's first vector
+once (warm-up, and the correctness check), then N more times between two
+markers.  Two clocks: the image's own GET-INTERNAL-REAL-TIME and the HOST's
 monotonic clock at the moment each marker line arrives on the serial port.
-Exit 0 iff every result equals the RFC's output.
+Exit 0 iff every result equals the RFC's output.  W32_X25519_DEADLINE (s,
+default 1800) bounds the whole run.
+
+With "check", EVERY one of the N results is compared with the RFC's (not just
+the last), and %GC-EPOCH is printed before and after: the collector test for
+the field layer (net/crypto-fast.lisp).  Run N large enough that the epoch
+moves, or the test proves nothing; MODUS_I386_MAX_HEAP_MB=32 at build time
+makes a bare i386 image collect several times per X25519.
 """
 import os, select, subprocess, sys, time
 
 IMAGE = sys.argv[1]
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+CHECK = len(sys.argv) > 3 and sys.argv[3] == "check"
 K = "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"
 U = "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"
 WANT = "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"
@@ -30,20 +40,28 @@ FORM = (
     "(format t \"~%XWARM ~A~%\" (funcall hx r0)) "
     "(format t \"~%XBEGIN~%\") "
     "(let ((t0 (get-internal-real-time))) "
-    f"(dotimes (i {N}) (setq r (modus.crypto::x25519 k u))) "
-    "(format t \"~%XEND us=~D per=~D ~A~%\" (- (get-internal-real-time) t0) "
+    + (f"(let ((bad 0) (e0 (modus-int::%gc-epoch))) "
+       f"(dotimes (i {N}) (setq r (modus.crypto::x25519 k u)) "
+       f"(unless (string= (funcall hx r) \"{WANT}\") (setq bad (+ bad 1)))) "
+       "(format t \"~%XCHECK bad=~D epoch=~D->~D~%\" bad e0 (modus-int::%gc-epoch))) "
+       if CHECK else f"(dotimes (i {N}) (setq r (modus.crypto::x25519 k u))) ")
+    + "(format t \"~%XEND us=~D per=~D ~A~%\" (- (get-internal-real-time) t0) "
     "internal-time-units-per-second (funcall hx r))))"
 )
 
+# W32_X25519_ARCH=arm32 boots an arm32 CL image (QEMU virt, run.sh's machine).
+QEMU = {"i386": ["qemu-system-i386"],
+        "arm32": ["qemu-system-arm", "-M", "virt,highmem=off", "-cpu", "cortex-a15"]}
 q = subprocess.Popen(
-    ["qemu-system-i386", "-kernel", IMAGE, "-m", "1024", "-display", "none",
+    QEMU[os.environ.get("W32_X25519_ARCH", "i386")] +
+    ["-kernel", IMAGE, "-m", "1024", "-display", "none",
      "-serial", "stdio", "-no-reboot"],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 buf = b""
 stamps = {}
 sent = False
 t_boot = time.monotonic()
-deadline = t_boot + 1800
+deadline = t_boot + int(os.environ.get("W32_X25519_DEADLINE", "1800"))
 try:
     while time.monotonic() < deadline:
         r, _, _ = select.select([q.stdout], [], [], 1.0)
@@ -71,10 +89,15 @@ finally:
 
 text = buf.decode("latin-1").replace("\r", "")
 lines = [l for l in text.split("\n") if l.startswith(("XWARM", "XEND"))]
+for l in text.split("\n"):
+    if l.startswith("XCHECK"):
+        print(l)
+        if "bad=0 " not in l:
+            lines = []          # any mismatch fails the run
 for l in lines:
     print(l)
 ok = len(lines) == 2 and all(l.endswith(WANT) for l in lines)
-if b"XEND" in stamps:
+if b"XEND" in stamps and lines:
     host = stamps[b"XEND"] - stamps[b"XBEGIN"]
     end = lines[-1].split()
     us = int(end[1][3:]); per = int(end[2][4:])

@@ -351,7 +351,7 @@
       (unless (gethash (+ +mvm-runtime-call-base+ n) runtime-table) (return n))
       (setq n (+ n 1)))))
 
-(defun %mvm-rt-entry (runtime-table bc pc)
+(defun %mvm-rt-entry-1 (runtime-table n)
   "The runtime stub the CALL / FN-ADDR target at PC names, as (NAME . CELL),
    from a vector RUNTIME-TABLE keeps under :RT-VEC, indexed by the stub's
    number.  The target itself is +MVM-RUNTIME-CALL-BASE+ + n: a BIGNUM on a
@@ -360,10 +360,7 @@
    comes from the bytes; an entry is made on the stub's first call.  The FASL
    writer keeps only positive integer keys and the JIT's callee scan only
    string values, so neither sees the vector."
-  (declare (type (simple-array (unsigned-byte 8) (*)) bc))
-  (let ((n (+ (* (- (aref bc (+ pc 3)) #x40) 16777216) (* (aref bc (+ pc 2)) 65536)
-              (* (aref bc (+ pc 1)) 256) (aref bc pc)))
-        (vec (gethash :rt-vec runtime-table)))
+  (let ((vec (gethash :rt-vec runtime-table)))
     (unless (and (simple-vector-p vec) (< n (length vec)))
       (let ((new (make-array (max (+ n 1) (%rt-stub-count runtime-table)) :initial-element nil)))
         (when (simple-vector-p vec) (replace new vec))
@@ -373,6 +370,35 @@
         (let ((target (+ +mvm-runtime-call-base+ n)))
           (setf (svref vec n)
                 (cons (gethash target runtime-table) (gethash (- target) runtime-table)))))))
+
+;;; A WORKER FILLS A SHARED MODULE'S STUB CACHE UNDER THE RUNTIME LOCK, as it makes a
+;;; shared table's pair (prelude.lisp, %HT-DICT-PAIR).  A module's RUNTIME-TABLE is
+;;; the thread's that compiled it -- main's, for a DEFUN of the script -- and its
+;;; :RT-VEC vector and (NAME . CELL) entries are made on a stub's FIRST call.  When
+;;; that call came on a worker they were the worker's own objects stored into main's
+;;; table, which the shared-store guard refuses ("a thread stored one of its own
+;;; objects into shared memory" at %MVM-RT-ENTRY): measured on AArch64, a thread
+;;; started from a DEFVAR's initform, whose body was even (+ 1 2), died before its
+;;; first form, while the same thread started from a LET -- after main had already
+;;; called through those stubs -- ran.  Inside the lock the vector and conses come
+;;; from the lock arena; a hit needs no lock, and main, a process with no threads,
+;;; and a worker's own table are unchanged.
+(defun %mvm-rt-entry (runtime-table bc pc)
+  "The runtime stub the CALL / FN-ADDR target at PC names, as (NAME . CELL) --
+   %MVM-RT-ENTRY-1, under the runtime lock when a worker fills a table not its
+   own."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bc))
+  (let* ((n (+ (* (- (aref bc (+ pc 3)) #x40) 16777216) (* (aref bc (+ pc 2)) 65536)
+               (* (aref bc (+ pc 1)) 256) (aref bc pc)))
+         (vec (gethash :rt-vec runtime-table)))
+    (or (and (simple-vector-p vec) (< n (length vec)) (svref vec n))
+        (if (or (eql (mem-ref #x10000DB8 :u32) 0) (eql (%dynb-block) 0)
+                (%own-region-object-p runtime-table))
+            (%mvm-rt-entry-1 runtime-table n)
+            (progn
+              (%rt-enter)
+              (unwind-protect (%mvm-rt-entry-1 runtime-table n)
+                (%rt-leave)))))))
 
 (defun %mvm-rt-target-p (runtime-table bc pc)
   "Is the u32 target at PC a runtime stub (>= +MVM-RUNTIME-CALL-BASE+, #x40000000)?
@@ -394,6 +420,24 @@
                   (progn (rplaca cell p) (cdr p))
                   (%mvm-resolve-runtime-fn name)))))
       (%mvm-resolve-runtime-fn name)))
+
+(defun %interp-undefined-call (entry name)
+  "The function to call for the runtime call ENTRY, whose callee NAME is undefined: signal
+   UNDEFINED-FUNCTION with SBCL's restarts, as compiled code's bridge does
+   (%JIT-BRIDGE-UNDEFINED).  CONTINUE looks the name up again -- a handler that has just
+   defined it resumes the call in place, and one that has not is asked again; USE-VALUE calls
+   the function it is given.  The interpreter used to signal with no restarts, so a handler
+   that could supply the function -- cortez's resolver, pulling a definition on demand -- had
+   nothing to resume, and EVAL'd code alone failed where compiled code went on."
+  (loop
+    (restart-case (error (quote undefined-function) :name (%runtime-fn-name-symbol name))
+      (continue ()
+        :report "Retry calling the function."
+        (let ((f (%mvm-rt-cell-fn-1 (cdr entry) name)))
+          (when f (return f))))
+      (use-value (f)
+        :report "Call a function given in its place."
+        (return (if (functionp f) f (fdefinition f)))))))
 
 (defun %mvm-rt-cell-store-p-1 (cell name)
   "%MVM-RT-CELL-STORE-P with the stub's cache cell in hand."
@@ -610,6 +654,32 @@
                                             (- (ash 1 width) 1 i)
                                             i))
                           (logand (ash val (* i -8)) #xFF))))))
+
+;;; A THREAD-LOCAL ACCESS IN THE INTERPRETER.  Native code reaches a window
+;;; slot (+WIDTH-TLS-BIT+: handler frames, the dynamic-binding block, the self
+;;; slot at #x10000C30 that says whose window this is) through its segment
+;;; base, which is this computation's window offset; the interpreter used to
+;;; drop the bit and read the slot at its plain address -- MAIN's window.  So
+;;; on a worker thread or a coroutine, interpreted code saw main's self slot
+;;; (zero), took the "main binds shallowly" fast path of every special read,
+;;; and read the global cell straight through the computation's own binding:
+;;; a HANDLER-CASE that EVAL ran in a coroutine dispatched on main's
+;;; *CURRENT-CONDITION* -- the last condition main had handled -- and a clause
+;;; for the real condition's type never matched.  The offset is what native
+;;; code itself reads at the self slot (zero on main, and when threads were
+;;; never armed); the MV slots the interpreter models itself stay as they are.
+(defun %interp-tls-addr (addr width)
+  "ADDR as native code reaches it with WIDTH: with +WIDTH-TLS-BIT+, plus this
+   computation's window offset; otherwise ADDR."
+  (if (or (eql (logand width +width-tls-bit+) 0)
+          (eql (mem-ref #x10000DB8 :u32) 0)
+          (%mv-slot-index addr (logand width 3)))
+      addr
+      (let ((lo (mem-ref #x10000C30 :u32))
+            (hi (mem-ref #x10000C34 :u32)))
+        (cond ((and (eql hi 0) (eql lo 0)) addr)
+              ((>= hi #x80000000) (+ addr (+ (* (* (- hi 4294967296) 65536) 65536) lo)))
+              (t (+ addr (+ (* (* hi 65536) 65536) lo)))))))
 
 ;; VALUE-domain load/store — what OP-LOAD and OP-STORE actually need.
 ;;
@@ -1068,6 +1138,35 @@
 ;;; working (funcall (lambda …) x) and capturing-closure cases keep their fast
 ;;; in-loop dispatch.
 
+;;; ARITY OF A MODULE FUNCTION.  A trampoline's code is shared by every
+;;; trampoline, so the closure says nothing about which function it runs; the
+;;; module's LAM-OFFSETS does, and keeps each function's (REQUIRED . MAX)
+;;; under the key (- -1 OFFSET) -- negative, so no entry offset can take it,
+;;; and an integer, so a fasl carries it like the rest.  A trampoline asked
+;;; with *%ARITY-PROBE* bound answers that instead of running its function
+;;; (%FUNCTION-ARITY, mvm-eval.lisp).
+(defvar *%arity-probe* nil)
+
+(defun %lam-offsets-note-arity (lam-offsets offset arity)
+  (when (and lam-offsets (integerp offset) arity)
+    (puthash (- -1 offset) lam-offsets arity)))
+
+(defun %module-fn-arity (offset lam-offsets)
+  (and (integerp offset) lam-offsets (hash-table-p lam-offsets)
+       (gethash (- -1 offset) lam-offsets)))
+
+;;; The code objects every trampoline of each kind shares, for %FUNCTION-ARITY
+;;; to know one when it sees it.  Noted by the first one made on the main
+;;; thread (a worker's object must not reach a global; image code is not one).
+(defvar *%trampoline-codes* nil)
+
+(defun %note-trampoline-code (f)
+  (when (%mvm-on-main-thread-p)
+    (let ((c (%prim-aref f 0)))
+      (unless (member c *%trampoline-codes* :test (function eq))
+        (setq *%trampoline-codes* (cons c *%trampoline-codes*)))))
+  f)
+
 (defun %mvm-make-trampoline (bc ftab rt offset env lam-offsets)
   "Return a native Modus closure that re-enters mvm-interpret at OFFSET (a
    bytecode entry) on BC with FTAB/RT, marshalling its call args into a fresh
@@ -1075,7 +1174,10 @@
    Native HOFs (mapcar/reduce/…) funcall this exactly like any other function.
    LAM-OFFSETS is threaded through so a lambda that itself escapes a lambda to a
    native HOF (nested mapcar) keeps working on the re-entry."
+  (%note-trampoline-code
   (lambda (&rest args)
+   (if *%arity-probe*
+    (%module-fn-arity offset lam-offsets)
     ;; Wrap the RESULT like mvm-eval-forms does (%mvm-wrap-escaping-result):
     ;; a body that returns an in-module #x52 lambda closure must hand the
     ;; native caller a re-entrant trampoline, not the raw module closure
@@ -1113,7 +1215,7 @@
                                    (setq acc (cons (%mvm-wrap-escaping-result
                                                     x bc ftab rt lam-offsets)
                                                    acc)))))
-                       (list r)))))))
+                       (list r)))))))))
 
 ;;; NOTE (retired predicate): there used to be a `%mvm-lambda-offset-p' here,
 ;;; used by %MVM-WRAP-ESCAPING to decide whether a BARE FIXNUM argument
@@ -1526,7 +1628,7 @@
   (let* ((state (make-mvm-state))
          ;; NIL's top half (the LI arm's NIL/T test), from NIL itself: as
          ;; +MVM-NIL-B3+/-B2+ constants these were bytes of an address folded
-         ;; into the code, which a Mac image cannot relocate (mac68k-reloc.py)
+         ;; into the code, which a Mac image cannot relocate (mac68k-reloc.lisp)
          (nil-hi16 (logand (ash (%val->word nil) -16) #xFFFF))
          (bc (if (typep bytecode '(simple-array (unsigned-byte 8) (*)))
                  bytecode
@@ -1710,7 +1812,8 @@
                  ;; store %val->word of the result in VR, continue after the CALL.
                  (let* ((entry (%mvm-rt-entry runtime-table bc pc))
                         (name (car entry))
-                        (fn (%mvm-rt-cell-fn-1 (cdr entry) name))
+                        (fn (or (%mvm-rt-cell-fn-1 (cdr entry) name)
+                                (%interp-undefined-call entry name)))
                         (nargs (mvm-nargs state)))
                    (if fn
                        (let ((args
@@ -2446,11 +2549,13 @@
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vaddr npc2) (%ifetch-reg bc npc)
                (multiple-value-bind (width npc3) (%ifetch-byte bc npc2)
-                 ;; Mask +WIDTH-TLS-BIT+: the interpreter simulates ONE
-                 ;; address space with one thread, so a thread-local width is
-                 ;; the plain width.  See mvm/mvm.lisp.
-                 (setf width (logand width 3))
-                 (let ((addr (reg-get regs vaddr)))
+                 ;; +WIDTH-TLS-BIT+: a slot of THIS computation's window, at
+                 ;; the address native code reaches through its segment base
+                 ;; (%INTERP-TLS-ADDR).  It used to be masked off -- "one
+                 ;; thread" -- so interpreted code on a worker or a coroutine
+                 ;; read MAIN's window.  See mvm/mvm.lisp.
+                 (let ((addr (%interp-tls-addr (reg-get regs vaddr) width)))
+                  (setf width (logand width 3))
                    ;; compile-mem-ref already untags the address (:shr addr 1),
                    ;; so the reg holds the raw address VALUE.  reg-get's %val->word
                    ;; restores the full address word; do NOT untag again (that
@@ -2469,8 +2574,8 @@
            (multiple-value-bind (vaddr npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
                (multiple-value-bind (width npc3) (%ifetch-byte bc npc2)
-                 (setf width (logand width 3))   ; +WIDTH-TLS-BIT+: see op-load
-                 (let ((addr (reg-get regs vaddr)) (val (reg-get regs vs)))
+                 (let ((addr (%interp-tls-addr (reg-get regs vaddr) width)) (val (reg-get regs vs)))
+                  (setf width (logand width 3))   ; +WIDTH-TLS-BIT+: see op-load
                    ;; See op-load: the address is already untagged by compile-
                    ;; mem-ref's :shr; reg-get restores its word — do NOT untag
                    ;; again (the extra halving collapsed MV slot spacing 4x).

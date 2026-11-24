@@ -560,7 +560,8 @@
 ;;; (word_bits - 2) bits: 62 on a 64-bit target, 30 on a 32-bit one.  Before
 ;;; this, the whole numeric tower hardcoded 62-bit magic numbers, which is why
 ;;; a 32-bit target could not have a working bignum path and crypto-32.lisp /
-;;; crypto-w32.lisp / 32bit-overrides.lisp had to be hand-forked.
+;;; crypto-w32.lisp / 32bit-overrides.lisp had to be hand-forked (all three
+;;; since deleted; so is the later crypto-32-fast.lisp -- docs/w32.md).
 ;;;
 ;;; DESIGN INVARIANT: a bignum LIMB is exactly a non-negative fixnum.  So the
 ;;; limb mask IS +fixnum-max+ and the limb width IS +fixnum-bits+ — ONE

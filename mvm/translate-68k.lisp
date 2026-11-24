@@ -230,7 +230,7 @@
 (defvar *68k-stream-table-label* nil)
 (defvar *68k-stream-section-label* nil)
 ;;; THE MAC'S STREAM LOADER (paged + Mac mode).  The disk builder
-;;; (scripts/mac68k-disk.py --paged) gives the boot blocks only the RESIDENT
+;;; (scripts/mac68k-disk.lisp --paged) gives the boot blocks only the RESIDENT
 ;;; part of the image and marks every stream-table entry "not loaded" -- bit 0
 ;;; set, its home address otherwise (streams are word-aligned).  COLD-ENTER
 ;;; takes such an entry to the loader, which reads the blocks holding the
@@ -251,7 +251,7 @@
   "Paged Mac: where the code cache's streams start (raw), past its owner map.")
 (defconstant +68k-mac-file-refnum+ #x10006050
   "The static block's word for a Mac image launched from Mac OS
-   (scripts/mac68k-chain.py): the reference number of the open file that IS
+   (scripts/mac68k-chain.lisp): the reference number of the open file that IS
    its boot disk, which the code loader and the disk service then _Read
    instead of the boot drive.  0 (as the core sends it) = the boot drive.")
 (defconstant +68k-mac-host+ #x10006054
@@ -1299,7 +1299,7 @@
 ;;; functions, followed by a TRAILER: the body-relative word offsets (/2) of
 ;;; its absolute references to itself, then their count (a word).  T is body +
 ;;; trailer; HOME the body's address as linked; I its index.  The tail is never
-;;; read at boot (mac68k-core.py puts it on the disk after the boot read), so
+;;; read at boot (mac68k-core.lisp puts it on the disk after the boot read), so
 ;;; HOME is only a disk position: disk byte = HOME - the descriptor's BIAS.
 ;;; At the first call COLD-ENTER reads the body into the code area's top (the
 ;;; JIT's grows from the bottom), adds (where it landed - HOME) at each trailer
@@ -3459,9 +3459,49 @@
        ;; Comparing (A3, A2) computes A2 - A3, so carry set means VA < VL.
        ;; Hosted, a full heap calls the collector; bare, it is still ILLEGAL.
        ;; A plain GC-CHECK right before a CONS: the shared CONS checks itself.
-       (unless (and (eql opcode +op-gc-check+)
-                    (m68k-next-is-unlabelled-cons-p mvm-pc))
-         (m68k-emit-gc-check buf)))
+       ;; HOSTED + SIZED (arm32's rule): test VA + SIZE, not VA.  The unsized
+       ;; check lets an object larger than the collector's margin (min 1 MB,
+       ;; a quarter of a semispace) run past VL into the conses the last
+       ;; collection copied to the TOP of the semispace.  Measured: the ANSI
+       ;; suite's live set nearly fills a 64 MB semispace, and the conses
+       ;; came back with character codes in their cdrs -- (TYPE-ERROR 112 is
+       ;; not LIST) in every *UNIVERSE* test of every shard, 129 failures.
+       (cond
+         ;; A CONSTANT size under 64 KB needs no more than the plain check:
+         ;; the smallest heap (1 MB, two 512 KB semispaces) keeps a 128 KB
+         ;; margin below the conses.  Most sites are such (structs, closures),
+         ;; and the sized form costs ~24 bytes a site (+1 MB on the CLI).
+         ((and *68k-gc-label*
+               (or (and (eql opcode +op-gc-check-n+)
+                        (>= (first operands) 65536))
+                   (eql opcode +op-gc-check-r+)))
+          (flet ((size+va ()
+                   ;; D0 = VA + an OVERestimate of the bytes about to go
+                   (if (eql opcode +op-gc-check-n+)
+                       (m68k-emit-move-imm-dn buf (logand (first operands) #xFFFFFFFF) +68k-d0+)
+                       (progn
+                         (m68k-load-vreg buf +68k-d0+ (first operands))
+                         (if (eql (second operands) 1)
+                             (m68k-emit-asr-imm buf +68k-d0+ 1)   ; TAGGED byte count
+                             (m68k-emit-lsl-imm buf +68k-d0+ 2))  ; UNTAGGED slots, 4 bytes
+                         (m68k-emit-addi buf +68k-d0+ 32)))
+                   (m68k-emit-word buf #xD08A)))                  ; ADD.L A2,D0
+            (let ((ok (mvm-make-label)))
+              (size+va)
+              (m68k-emit-word buf #xB08B)                         ; CMP.L A3,D0: D0 - VL
+              (m68k-emit-bcc-word buf +68k-cc-cs+ ok)             ; CS = fits below VL
+              (m68k-emit-bsr-long buf *68k-gc-label*)
+              (size+va)
+              (m68k-emit-word buf #xB08B)
+              (m68k-emit-bcc-word buf +68k-cc-cs+ ok)
+              ;; One object bigger than all the room a collection left: arm32's
+              ;; BKPT.  (Live data that outgrows the heap exits 3 with a message
+              ;; from the collector itself; this is the single huge object.)
+              (m68k-emit-illegal buf)
+              (m68k-emit-label buf ok))))
+         ((and (eql opcode +op-gc-check+)
+               (m68k-next-is-unlabelled-cons-p mvm-pc)))
+         (t (m68k-emit-gc-check buf))))
 
       (#.+op-write-barrier+
        (let ((vobj (first operands)))
@@ -4182,7 +4222,7 @@
       (ws #x4298)                                        ; CLR.L (A0)+
       (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
       (m68k-emit-lea-label buf pb +68k-a0+)
-      ;; the boot drive (D4 = 0) launched from Mac OS (scripts/mac68k-chain.py):
+      ;; the boot drive (D4 = 0) launched from Mac OS (scripts/mac68k-chain.lisp):
       ;; the disk is a file
       (ws #x4A44) (m68k-emit-bne buf drive)              ; TST.W D4
       (let ((a (conv-real +68k-mac-file-refnum+)))
@@ -5221,6 +5261,25 @@
         (m68k-emit-andi buf +68k-d0+ 15)
         (m68k-emit-cmpi buf +68k-d0+ 15)
         (m68k-emit-bne buf notfwd)
+        ;; ...AND it names a copy made THIS collection: an object in
+        ;; [to_start, A2) or a cons in [A3, to_end).  A cons's car can be an
+        ;; odd RAW word (the interpreter's operand stack holds raw machine
+        ;; words as values), and the nibble-only test took one for a forward
+        ;; and never copied the cons -- see translate-i386's
+        ;; I386-EMIT-GCNATIVE-FWD-TEST.
+        (let ((isfwd (lbl)))
+          (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d0+)
+          (m68k-emit-andi buf +68k-d0+ (logand (lognot 15) #xFFFFFFFF))
+          (m68k-emit-word buf #xB0B9) (m68k-emit-long buf (+ meta #x08)) ; CMP.L to_start,D0
+          (m68k-emit-bcc-word buf +68k-cc-cs+ notfwd)                     ; < to_start
+          (m68k-emit-cmpa buf +68k-a2+ +68k-d0+)                          ; A2 - D0
+          (m68k-emit-bcc-word buf +68k-cc-hi+ isfwd)                      ; < object free
+          (m68k-emit-cmpa buf +68k-a3+ +68k-d0+)                          ; A3 - D0
+          (m68k-emit-bcc-word buf +68k-cc-hi+ notfwd)                     ; in the gap
+          (m68k-emit-word buf #x90B9) (m68k-emit-long buf (+ meta #x08)) ; SUB.L to_start,D0
+          (m68k-emit-word buf #xB0B9) (m68k-emit-long buf (+ meta #x10)) ; CMP.L size,D0
+          (m68k-emit-bcc-word buf +68k-cc-cc+ notfwd)                     ; >= to_end
+          (here isfwd))
         ;; already forwarded: (fwd & ~15) | tag
         (m68k-emit-andi buf +68k-d3+ (logand (lognot 15) #xFFFFFFFF))
         (m68k-emit-or-dn-dn buf +68k-d1+ +68k-d3+)
@@ -5461,7 +5520,7 @@
 (defun m68k-emit-cold-native-resident (buf function-table label-map)
   "Cold native code, at the resident boundary: a stub for each cold function
    (at its label), COLD-ENTER, the descriptor and the external relocations'
-   index (filled by scripts/mac68k-reloc-disk.py).  Fills *68K-COLD-NATIVE*."
+   index (filled by scripts/mac68k-reloc-disk.lisp).  Fills *68K-COLD-NATIVE*."
   (let ((offs nil) (i 0) (first-stub (mvm-make-label)))
     (maphash (lambda (idx off) (declare (ignore idx))
                (when (>= off *68k-cold-pc*) (pushnew off offs)))
@@ -5485,7 +5544,7 @@
       (incf i))
     (m68k-emit-cold-enter buf)
     ;; the descriptor: "modusCLD", the disk BIAS (a body's disk byte is HOME -
-    ;; BIAS: the build's disk has the image at byte 1024; mac68k-core.py
+    ;; BIAS: the build's disk has the image at byte 1024; mac68k-core.lisp
     ;; rewrites it for the disk it makes), the cold section, the count, the
     ;; external relocations' index, the first stub (the I-th is 16 I on), and
     ;; the resident functions' end (*68K-ROUTINES-LABEL*)
@@ -5544,19 +5603,20 @@
         (m68k-emit-bsr buf *68k-mac-service-label*)
         (ws #x4A82) (m68k-emit-bne buf rfail)
         (ws #x2044 #xD1CA)                                   ; A0 = the body
-        ;; the trailer: count at T - 2, the offsets (/2) before it
+        ;; the trailer: count at T - 2, the offsets (/2, each a GAP) before it
         (ws #x2007 #x7200 #x3230 #x08FE)                     ; D1 = count
         (ws #x47F0 #x08FE #x97C1 #x97C1)                     ; A3 = the offsets
         (ws #x2A08 #x9A86)                                   ; D5 = A0 - HOME
+        (ws #x7400)                                          ; D2 = 0: the offsets are GAPS
         (m68k-emit-bra buf test)
         (m68k-emit-label buf lp)
-        (ws #x7000 #x301B #xD080)                            ; D0 = offset
-        (ws #xDBB0 #x0800)                                   ; ADD.L D5,(A0,D0.L)
+        (ws #x7000 #x301B #xD080 #xD480)                     ; D2 += the gap, in bytes
+        (ws #xDBB0 #x2800)                                   ; ADD.L D5,(A0,D2.L)
         (m68k-emit-label buf test)
         (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf lp :disp16) ; DBRA D1
         ;; a relocated application: the body's EXTERNAL relocations, as the
         ;; application's loader applies its own (scripts/mac68k-chain.s
-        ;; RELOCATE), from the list the index names (mac68k-reloc-disk.py):
+        ;; RELOCATE), from the list the index names (mac68k-reloc-disk.lisp):
         ;; entry = blocks << 25 | disk byte; the list = n8 n16 n7, then the
         ;; offsets (/2) of each kind
         (ws #x2A39) (l32 (conv-real +68k-reloc-delta+))      ; D5 = DELTA
@@ -5590,21 +5650,25 @@
         (ws #x0C38 #x0002 #x012F #x650C)
         (ws #x48E7 #xE0C0 #x7001 #xA198 #x4CDF #x0307)
         (ws #x4CDF #x5FFF #x4E75)                            ; MOVEM.L (SP)+; RTS: the body
-        ;; XG: add D2.W at the D1.W word offsets (/2) at A4 into the body at A0
+        ;; XG: add D2.W at the D1.W word GAPS (/2) at A4 into the body at A0
         (let ((xl (mvm-make-label)) (xt (mvm-make-label)))
           (m68k-emit-label buf xg)
+          (ws #x7600)                                        ; D3 = 0: GAPS, as above
           (m68k-emit-bra buf xt)
           (m68k-emit-label buf xl)
-          (ws #x7000 #x301C #xD080 #xD570 #x0800)            ; ADD.W D2,(A0,D0.L)
+          (ws #x7000 #x301C #xD080 #xD680)                   ; D3 += the gap, in bytes
+          (ws #xD570 #x3800)                                 ; ADD.W D2,(A0,D3.L)
           (m68k-emit-label buf xt)
           (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf xl :disp16)
           (ws #x4E75))
-        ;; XG7: add D7.L at the D1.W word offsets (/2) at A4 into the body at A0
+        ;; XG7: add D7.L at the D1.W word GAPS (/2) at A4 into the body at A0
         (let ((xl (mvm-make-label)) (xt (mvm-make-label)))
           (m68k-emit-label buf xg7)
+          (ws #x7600)                                        ; D3 = 0: GAPS
           (m68k-emit-bra buf xt)
           (m68k-emit-label buf xl)
-          (ws #x7000 #x301C #xD080 #xDFB0 #x0800)            ; ADD.L D7,(A0,D0.L)
+          (ws #x7000 #x301C #xD080 #xD680)                   ; D3 += the gap, in bytes
+          (ws #xDFB0 #x3800)                                 ; ADD.L D7,(A0,D3.L)
           (m68k-emit-label buf xt)
           (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf xl :disp16)
           (ws #x4E75))
@@ -5633,10 +5697,21 @@
                  (let ((tp (gethash label labels)))
                    (when (and tp (>= tp start) (< tp here))
                      (push (- widx (ash start -1)) offs))))))
+    ;; Each offset (in words) as the GAP from the one before (from 0), so a
+    ;; body may be any size: only a 128 KB stretch with no absolute reference
+    ;; to itself does not encode.  (Offsets from 0 capped a body at 128 KB,
+    ;; and the compiler kept every body over ~48 KB of bytecode resident --
+    ;; 1.4 MB of a Mac image.)  COLD-ENTER and mac68k-reloc-disk.lisp agree.
     (setq offs (sort offs #'<))
-    (when (and offs (>= (car (last offs)) 65536))
-      (error "68k cold: a body of ~D bytes is too big to be cold (keep it)" (- here start)))
-    (dolist (o offs) (m68k-emit-word buf o))
+    (let ((prev 0))
+      (dolist (o offs)
+        (when (>= (- o prev) 65536)
+          (error "68k cold: a body of ~D bytes has a 128 KB stretch with no relocation (keep it)"
+                 (- here start)))
+        (m68k-emit-word buf (- o prev))
+        (setq prev o)))
+    (when (>= (length offs) 65536)
+      (error "68k cold: a body with ~D relocations (keep it)" (length offs)))
     (m68k-emit-word buf (length offs))
     (let* ((end (m68k-buffer-position buf)) (n (- end start)) (tw (second entry))
            (words (m68k-buffer-words buf)))
@@ -6422,7 +6497,7 @@
             (ws #x4298)                                        ; CLR.L (A0)+
             (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
             (m68k-emit-lea-label buf pb +68k-a0+)
-            ;; launched from Mac OS (scripts/mac68k-chain.py): the disk is a
+            ;; launched from Mac OS (scripts/mac68k-chain.lisp): the disk is a
             ;; file, its reference number in the static block
             (ws #x2039) (l32 (conv-real +68k-mac-file-refnum+))  ; MOVE.L slot,D0
             (m68k-emit-beq buf drive)
@@ -6551,7 +6626,7 @@
     ;; the descriptor: "modusPGD", the table's address, the count, the
     ;; section, and the DISK BIAS: home address - bias = the stream's byte on
     ;; the boot disk (load address - 1024 when the image follows the boot
-    ;; blocks; scripts/mac68k-disk.py rewrites it when the streams go elsewhere)
+    ;; blocks; scripts/mac68k-disk.lisp rewrites it when the streams go elsewhere)
     (dolist (w '(#x6D6F #x6475 #x7350 #x4744)) (m68k-emit-word buf w))
     (m68k-emit-abs32-data buf *68k-stream-table-label*)
     (m68k-emit-long buf (length fns))

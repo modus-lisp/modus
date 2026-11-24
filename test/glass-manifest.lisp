@@ -63,8 +63,13 @@
                 (("CRAM" nil)                  ; packages.lisp
                  ("CRAM" "RESET")              ; deflate.lisp
                  ("CRAM" "GZIP-DECOMPRESS")    ; inflate.lisp
+                 ("CRAM" "ZLIB-INFLATE-TO")    ; inflate-stream.lisp
                  ("CRAM" "RECENT-CACHE-REF")   ; prefix.lisp
-                 ("CRAM" "LZW-DECODE")))       ; lzw.lisp
+                 ("CRAM" "LZW-DECODE")         ; lzw.lisp
+                 ("CRAM" "TAR-LIST")           ; tar.lisp
+                 ("CRAM" "LZMA-DECOMPRESS")    ; lzma.lisp
+                 ("CRAM" "CRC16")              ; crc16.lisp
+                 ("CRAM" "ADC-DECOMPRESS")))   ; adc.lisp
                ("glass/fb"        ,glass ,(merge-pathnames "glass.asd" glass)
                 (("GLASS" nil)                 ; packages.lisp
                  ("GLASS" "WORD-NAME")         ; wordlist.lisp

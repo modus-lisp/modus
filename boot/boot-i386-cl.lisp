@@ -15,6 +15,10 @@
 ;;;;   VA #x10000000, 128 KB        -> PA after it   fixed block, globals,
 ;;;;                                                 handler frames, FP slots
 ;;;;   VA #x18700000 .. #x18800000  -> PA            the stack (1 MB)
+;;;;   VA #x04000000, 4 MB          -> PA            the net block: NIC buffers
+;;;;                                                 and state (32 MB+ machines)
+;;;;   VA #x0C000000, 4 MB          -> PA            the SSH block: e1000-state,
+;;;;                                                 ssh-conn, ssh-ipc (32 MB+)
 ;;;;   VA #xDEAD0000                -> PA            NIL's page, all NIL
 ;;;;   VA #x19000000, S + M         -> PA            the heap: two semispaces
 ;;;;                                                 of S/2, the guard M
@@ -146,6 +150,12 @@
    image's Lisp, uncached.")
 (defconstant +i386-cl-mmio-pt+ #x2A000
   "PA (= VA) of the MMIO window's page table, past pc-vbe.lisp's buffers.")
+(defconstant +i386-cl-ssh-va+ #x0C000000
+  "The SSH block's VA: build-cl-repl-common's *SSH-ADDR-MAP-SOURCE* puts
+   ssh-conn (#x0C200000), ssh-ipc (#x0C280000 .. #x0C316000), e1000-state
+   (#x0C320000) and fe-scratch (#x0C320900) here on the PC images.  CPU-only
+   state (no DMA), so its physical address is not recorded.")
+(defconstant +i386-cl-ssh-size+ #x400000)
 (defconstant +i386-cl-v-stacksz+ #x80A4
   "The stack's bytes: 1 MB, or 384 KB on a machine under 16 MB.")
 (defvar *i386-cl-gc-static*
@@ -345,8 +355,9 @@
                      (i386cl-abs '(#x8B #x0D) +i386-cl-v-jitsz+)
                      '(#xC1 #xE9 #x0C) '(:call 0 map)
                      '(:label jit-none))))
-       ;; the net block: 4 MB at +I386-CL-NET-VA+ on a machine of 32 MB or more,
-       ;; its physical address at +I386-CL-V-NETPA+ for DMA
+       ;; the net block and the SSH block: 4 MB each on a machine of 32 MB or
+       ;; more (a smaller one has no network); the net block's physical
+       ;; address at +I386-CL-V-NETPA+ for DMA
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-netpa+) (i386l-le32-list 0))
        (cons #x81 (cons #x3D (append (i386l-le32-list +i386-cl-v-ramend+)
                                      (i386l-le32-list #x2000000))))
@@ -357,6 +368,11 @@
        '(#x5E)                                                ; esi = PA
        (cons #xBF (i386l-le32-list +i386-cl-net-va+))
        (cons #xB9 (i386l-le32-list (floor +i386-cl-net-size+ 4096))) '(:call 0 map)
+       (cons #xB9 (i386l-le32-list +i386-cl-ssh-size+)) '(:call 0 alloc)
+       '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-ssh-size+)) '(:call 0 zero)
+       '(#x5E)                                                ; esi = PA
+       (cons #xBF (i386l-le32-list +i386-cl-ssh-va+))
+       (cons #xB9 (i386l-le32-list (floor +i386-cl-ssh-size+ 4096))) '(:call 0 map)
        '(:label net-none)
        ;; NIL's page, all NIL
        (cons #xB9 (i386l-le32-list 4096)) '(:call 0 alloc)
@@ -1039,13 +1055,13 @@
       (i386l-bytes buf #x81 #xE2) (i386l-le32 buf #xFFFF0000)
       (i386l-bytes buf #x81 #xCA) (i386l-le32 buf #x8E00)          ; present, 32-bit interrupt gate
       (i386l-bytes buf #x89 #x15) (i386l-le32 buf (+ gate 4)))
-    ;; EVERY PIC VECTOR HAS A GATE.  The IDT had the timer's (20h) and the
-    ;; NE2000's (29h); any other vector met a zeroed descriptor -- #GP, #DF, a
-    ;; triple fault.  Measured: a SPURIOUS IRQ 15 (an 8259 raises vector 2Fh when
-    ;; a line drops before it is acknowledged; the BIOS disk reads PM_READ makes
-    ;; are the usual cause) reset the machine in the middle of DHCP, once the
-    ;; timing allowed it.  Real hardware does this too.  Handlers, next to the
-    ;; existing two: 90420h EOI the master; 90440h return only.  20h..2Fh:
+    ;; EVERY PIC VECTOR HAS A GATE (the dos386 branch's 42ef0576, by hand).  The
+    ;; IDT had the timer's (20h) and the NE2000's (29h); any other vector met a
+    ;; zeroed descriptor -- #GP, #DF, a triple fault.  Measured there: a SPURIOUS
+    ;; IRQ 15 (an 8259 raises vector 2Fh when a line drops before it is
+    ;; acknowledged; the BIOS disk reads PM_READ makes are the usual cause)
+    ;; reset the machine in the middle of DHCP.  Handlers, next to the existing
+    ;; two: 90420h EOI the master; 90440h return only.  20h..2Fh:
     ;;   21-26 master EOI | 27 spurious (no EOI) | 28,2A-2E both (90410h)
     ;;   2F slave spurious: the master's EOI only (its cascade line was real)
     (i386l-bytes buf #xC7 #x05) (i386l-le32 buf #x90420) (i386l-le32 buf #xE620B050) ; push eax; mov al,20h; out 20h,al

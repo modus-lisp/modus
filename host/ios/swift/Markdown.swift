@@ -4,6 +4,12 @@
 
 import UIKit
 
+#if os(tvOS)
+private let codeBackground = UIColor.gray.withAlphaComponent(0.25)
+#else
+private let codeBackground = UIColor.secondarySystemBackground
+#endif
+
 enum Markdown {
     static func render(_ source: String, base: UIFont = .preferredFont(forTextStyle: .body)) -> NSAttributedString {
         let options = AttributedString.MarkdownParsingOptions(
@@ -70,7 +76,7 @@ enum Markdown {
                     traits.insert(.traitBold)
                 case .codeBlock:
                     font = mono
-                    attrs[.backgroundColor] = UIColor.secondarySystemBackground
+                    attrs[.backgroundColor] = codeBackground
                     if text.hasSuffix("\n") { text.removeLast() }
                 case .blockQuote:
                     attrs[.foregroundColor] = UIColor.secondaryLabel
@@ -82,7 +88,7 @@ enum Markdown {
                 if inline.contains(.emphasized) { traits.insert(.traitItalic) }
                 if inline.contains(.code) {
                     font = .monospacedSystemFont(ofSize: font.pointSize * 0.9, weight: .regular)
-                    attrs[.backgroundColor] = UIColor.secondarySystemBackground
+                    attrs[.backgroundColor] = codeBackground
                 }
                 if inline.contains(.strikethrough) { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
             }

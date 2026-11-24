@@ -187,42 +187,14 @@ Validated: hosted ladder 35/35 + h01 under tags3, `validate.sh` and the poison
 build identical to the references, core image included.  x64 and i386 ladder
 images byte-identical to before.
 
-## A REPL on a 1.44 MB floppy
+## A REPL on a 1.44 MB floppy (retired)
 
-The core image above, compressed, is 1.57 MB (xz -9e).  On one 1.44 MB disk
-(1,457,664 bytes under FAT12) it is 1,457,039 bytes, self-unpacking:
-
-    # 1. trim (EXPERIMENTAL, post-link): what a core image never runs again
-    qemu-m68k-static -d in_asm -D LOG IMAGE ...   # over a representative workload
-    grep -oE '^0x[0-9a-f]+' LOG | sort -u > EXEC
-    scripts/68k-floppy-trim.py IMAGE SYMMAP EXEC TRIMMED
-    # 2. the loader: LZMA1 decoder in Lisp, no runtime (a ladder rung's build)
-    MODUS_68K_LINUX_OUT=unlzma sbcl --script mvm/build-hosted.lisp 68k \
-        mvm/68k-unlzma.lisp mvm/unlzma-core.lisp
-    # 3. pack (--test: the image writes the unpacked bytes to stdout instead)
-    scripts/68k-floppy-pack.py unlzma TRIMMED FLOPPY
-
-- **The trim** blanks boot-only code (~300 KB: init, table fillers, the
-  x64/aarch64 JIT runtime) and zeroes the packed name tables (256 KB): xz 1.57
-  -> 1.456 MB.  The shim sources stay -- they are evaluated at first use.
-  It is a post-link hack; the real version is a build-time shake from the
-  core-boot path (see the script's header for the two traps it hit).
-- **The loader** (`mvm/68k-unlzma.lisp`, the Linux head, + `mvm/unlzma-core.lisp`,
-  the decoder; 13.6 KB) is LzmaSpec.cpp in fixnum
-  Lisp: the range coder's 32-bit values are 16-bit halves, the arithmetic the
-  raw `%FIXNUM-` ops on declared fixnums, so there are no overflow checks and
-  nothing to link (generic arithmetic made it 40 KB).  7.46 MB unpacks in
-  ~4 s under qemu; on a 68040, minutes.
-- **The copier** (`scripts/68k-floppy-copier.s`, 88 bytes) maps each segment
-  fresh, copies it in, restores the stack the process started with (the boot
-  stub's saved `stack_base`, `#x10000058`) and jumps to the image's entry --
-  reached from Lisp by `%JIT-CALL` (trap `#x0532`, now on 68k).
-- **The pack** is a raw LZMA1 stream, `lc=2 lp=1 pb=2` (best for 68k code,
-  1,443,186 vs xz's 1,456,180), mapped with the whole file from offset 0 so
-  the payload needs no page padding (its offset is in `e_ident[12..15]`).
-
-Validated: `validate.sh` and DESCRIBE / APROPOS / DOCUMENTATION / COMPILE
-probes identical to the untrimmed image.  The margin is 625 bytes.
+The first floppy (2026-11-11): the hosted Linux/68k core image, trimmed after
+linking and packed behind a self-unpacking LZMA loader written in fixnum Lisp,
+1,457,039 bytes on a 1.44 MB disk.  Its tools (`68k-floppy-trim.py`,
+`68k-floppy-pack.py`, `68k-floppy-copier.s`, `mvm/68k-unlzma.lisp`,
+`mvm/unlzma-core.lisp`) were removed on 2026-11-21, unused since the Mac boot
+floppy below took over; `git show f25d49bd` has them.
 
 ## The same, as a Mac boot floppy
 
@@ -238,9 +210,9 @@ message.  NOT measured: a swap in ONE drive -- headless Basilisk cannot insert
 a disk after boot.
 
 A bare-Mac image (`mvm/build-mac68k-cl-repl.lisp`, linked at `#x00100000`)
-goes behind a Mac loader (`scripts/mac68k-unlzma.s`, 68020 assembly since
-2026-11-20; it was this Lisp decoder with a Mac head, ~15 minutes on a real
-68040's clock): the
+goes behind a Mac loader (`scripts/mac68k-unlzma.s`, now vessel's, 68020
+assembly since 2026-11-20; it was the Lisp decoder above with a Mac head, ~15
+minutes on a real 68040's clock): the
 boot blocks read loader + stream to `#x01200000`, the loader unpacks to
 `#x00100000`, pushes the 68040's caches (`CPUSHA BC`: the image was written
 as data) and jumps.  No trim needed: the small REPL image (5,557,396 bytes,
@@ -257,7 +229,7 @@ framebuffer console included) is 1,222,613 bytes of LZMA + a 13 KB loader, a
 Unpacking is the difference: ~58 s interpreted, ~2 s under the JIT.  Debian's
 `BasiliskII-jit` crashes before the ROM loads (any disk, System 7.5.3 too): it
 is a PIE and its JIT bakes 32-bit absolute addresses of its globals and heap.
-`scripts/basilisk-unpie.py` relinks it at `#x10000000`; run it with
+`scripts/basilisk-unpie.lisp` relinks it at `#x10000000`; run it with
 `MALLOC_MMAP_MAX_=0` so every `malloc` comes from the (now low) brk heap.
 
 ## Plan
@@ -341,7 +313,7 @@ no serial port there, so `scripts/mac68k-mame-serial.lua` taps the SCC's
 channel A data register (`#xBFFFFF`) for the ladder's oracle:
 
     MODUS_MAC68K_MACHINE=classic MODUS_68K_CPU=68000 MAC68K_EMULATOR=mame \
-      MAC68K_MAME=mame MAC68K_ROMPATH=ROMS scripts/mac68k-ladder.py
+      MAC68K_MAME=mame MAC68K_ROMPATH=ROMS sbcl --script scripts/mac68k-ladder.lisp
 
 ### Boot's live heap, measured (`MODUS_68K_GC_PEAK=1`)
 
@@ -369,11 +341,11 @@ session's growth, not for boot.
     MODUS_MAC68K_MACHINE=classic MODUS_68K_PAGED=1 MODUS_68K_CPU=68000 \
       MODUS_SMALL_IMAGE=1 MODUS_NARROW_STRINGS=1 MODUS_68K_THREADED=1 \
       MODUS_68K_HOT=/dev/null ... sbcl --script mvm/build-mac68k-cl-repl.lisp
-    scripts/mac68k-core.py IMAGE DISK          # boots it once on a 32 MB Mac
+    scripts/mac68k-core.lisp IMAGE DISK          # boots it once on a 32 MB Mac
 
 Every function threaded and paged: 804 KB resident (stubs, handlers, the
 512 KB constant pool), 3.96 MB of streams on disk.  A Classic cannot boot the
-image from scratch (a 5 MB heap, ~50 MB of allocation), so `mac68k-core.py`
+image from scratch (a 5 MB heap, ~50 MB of allocation), so `mac68k-core.lisp`
 boots the SAME binary once on Basilisk II with 32 MB -- the stub's :BOOT- heap,
 code cache and stack above 4 MB -- where it freezes and sends its core over
 serial; the static heap (1.28 MB of objects, 0.27 MB of conses) is moved to
@@ -405,7 +377,7 @@ ID, marked open), adds a locked, non-ejectable drive, and the ROM boots that
 drive's boot blocks.  PRIME reads through the SCSI Manager (Get, Select, READ(6)
 Cmd, RBlind, Complete).  `_SCSIDispatch` is a Toolbox trap: it may clobber
 D0-D2/A0-A1 under Pascal's convention, which first read as a SCSI error of
-5696.  `scripts/mac68k-mame-repl.lua` types forms when the prompt shows and taps
+5696.  vessel's `tools/mac68k/mame-repl.lua` types forms when the prompt shows and taps
 the SCC for what the Mac sends.  Measured, in emulated time: the prompt at
 288 s from power-on, `(+ 1 2)` => 3, `(defun sq ...)` => SQ, `(sq 12)` => 144,
 on the Classic's 1-bit screen.
@@ -491,7 +463,7 @@ A 68000 has no MMU, so there is no page fault to catch: data comes off the
 disk where it is ASKED FOR, through a function, as the code streams do.
 **Cold names** (`mvm/mac68k-cold.lisp`) are the first: the build writes the
 12,247 names, sorted by hash, to 512-byte pages (`IMAGE.cold`, 203 KB);
-`mac68k-core.py` puts them on the disk after the streams; the core run drops
+`mac68k-core.lisp` puts them on the disk after the streams; the core run drops
 `*SYM-NAME-TABLE*`; and `SYMBOL-NAME`, where the table would have answered,
 asks `%COLD-SYM-NAME` -- a binary search of the pages' first hashes (in the
 image), ONE block read (`SYSCALL3` service 1 on a bare Mac, the code loader's
@@ -511,7 +483,7 @@ customers, or replaced by a test on what is already resident.
 
 ## Shrinking what stays, and a code cache that can evict anything
 
-**The core's own collection** (`mac68k-core.py`): a core boot's only roots are
+**The core's own collection** (`mac68k-core.lisp`): a core boot's only roots are
 the low block's words, so the builder keeps what they reach and compacts it --
 326 KB the freeze had kept live through a stale stack word went.  **Hash
 tables**: the symbol-function table is a compact dict now -- keys and values
@@ -554,7 +526,7 @@ REPL forms throughout, every answer right:
 | low block | 128 KB | 56 KB | the layout's `:ALLOC-START`; the 72 KB went to the young semispaces (64 -> 100 KB) |
 | prompt | 74 s | 55 s | less to read at boot |
 
-`MAC68K_CORE_CENSUS=1 scripts/mac68k-core.py` prints the saved heap by subtag.
+`MAC68K_CORE_CENSUS=1 scripts/mac68k-core.lisp` prints the saved heap by subtag.
 What is left in it is live: symbols and their intern tables (~130 KB), the
 package tables, the bytecode of the 47 runtime macros boot compiles (56 KB),
 dict indexes, conses (60 KB).
@@ -709,10 +681,10 @@ its expander in nested EVALs (297 s).  Heap exhaustion is still fatal.
 
 Modules over 1 KB of bytecode (every DEFSTRUCT) stay interpreted.
 
-## Launched from Mac OS: `MODUS_MAC68K_MACHINE=classicos` + `scripts/mac68k-chain.py`
+## Launched from Mac OS: `MODUS_MAC68K_MACHINE=classicos` + `scripts/mac68k-chain.lisp`
 
 No floppy and no disk of our own: a Mac application, "Modus", whose data fork
-IS the boot disk `mac68k-core.py` writes.  Double-clicked (or set as the
+IS the boot disk `mac68k-core.lisp` writes.  Double-clicked (or set as the
 startup application), it opens its own data fork, reads the image to its
 address, stores the open file's reference number in the image's static block
 (`#x10006050`, `+68K-MAC-FILE-REFNUM+`) and jumps.  The image runs on top of

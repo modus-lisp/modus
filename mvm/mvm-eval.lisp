@@ -460,9 +460,19 @@
                 (not (string-equal hn "DEFSTRUCT"))
                 (%macro-expander (car f) (normalize-name (car f))))
            acc)
+          ;; A LOOK, not an expansion of the program: %QUIET-MACROEXPAND-1, the
+          ;; compiler's own look-ahead, which expands with the hook at FUNCALL
+          ;; behind a barrier and passes a THROW in flight on.  This was
+          ;; (handler-case (macroexpand-1-mvm f) (t (c) (cons f nil))), through
+          ;; the user's *MACROEXPAND-HOOK*: a hook that leaves an expansion by
+          ;; THROW (cortez carries a missing name out that way) threw from HERE,
+          ;; the catch-all took the throw for a failure and returned, and
+          ;; *CATCH-ACTIVE* stayed set -- after which no HANDLER-CASE in the
+          ;; image caught an ERROR again: each passed it on as a throw in
+          ;; flight, out of the whole LOAD.  The hook sees the one real
+          ;; expansion, COMPILE-FORM's, as on SBCL.
           (t
-           (let ((ex (handler-case (macroexpand-1-mvm f)
-                       (t (c) (cons f nil)))))
+           (let ((ex (or (%quiet-macroexpand-1 f) (cons f nil))))
              (if (cdr ex)
                  (%e2-scan-persist (car ex) acc (+ depth 1))
                  acc)))))))
@@ -1241,14 +1251,30 @@
     (%jit-thunk-new-page))
   (if *jit-thunk-page* t nil))
 
+;; The hand-assembled thunks store to PER-THREAD WINDOW slots (the nargs slot,
+;; the bridge index), so the store is the window access every compiled store to
+;; those slots is: `mov dword fs:[SLOT], IMM' on Linux.  Windows overrides it
+;; with the TEB-slot form (boot/boot-win64.lisp), which is longer and uses RAX --
+;; free in a thunk, whose next instruction loads RAX -- and gives thunks a
+;; bigger slot (%JIT-THUNK-STRIDE).  SLOT is the window slot's low 16 bits
+;; (#x10000000 + SLOT); IMM is 32 bits.
+(declaim (overridable %jit-window-store))
+(defun %jit-window-store (slot imm)
+  (list #x64 #xC7 #x04 #x25 (logand slot 255) (logand (ash slot -8) 255) #x00 #x10
+        (logand imm 255) (logand (ash imm -8) 255) (logand (ash imm -16) 255)
+        (logand (ash imm -24) 255)))
+
+(declaim (overridable %jit-thunk-stride))
+(defun %jit-thunk-stride () 48)
+
 (defun %jit-thunk-alloc ()
-  "Address of a fresh 48-byte thunk slot, or NIL."
-  (when (> (+ *jit-thunk-bump* 48) 4096)
+  "Address of a fresh thunk slot (%JIT-THUNK-STRIDE bytes, 16-aligned), or NIL."
+  (when (> (+ *jit-thunk-bump* (%jit-thunk-stride)) 4096)
     (%jit-thunk-new-page))
   (if (null *jit-thunk-page*)
       nil
       (let ((a (+ *jit-thunk-page* *jit-thunk-bump*)))
-        (setq *jit-thunk-bump* (+ *jit-thunk-bump* 48))
+        (setq *jit-thunk-bump* (+ *jit-thunk-bump* (%jit-thunk-stride)))
         a)))
 
 (defun %jit-emit-bytes (addr bytes)
@@ -1277,11 +1303,11 @@
    threads called through bridges."
   (%jit-emit-bytes (+ addr k) (list #x48 #xBE))
   (%jit-write-imm64 addr (+ k 2) (ash idx 1))
-  (%jit-emit-bytes (+ addr k 10) (list #x64 #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
-  (%jit-emit-bytes (+ addr k 22) (list #x48 #xB8))
-  (%jit-write-imm64 addr (+ k 24) (%jit-bridge-entry nargs))
-  (%jit-emit-bytes (+ addr k 32) (list #xFF #xE0))
-  (+ k 34))
+  (let ((j (+ k 10 (%jit-emit-bytes (+ addr k 10) (%jit-window-store #x150 (+ nargs 1))))))
+    (%jit-emit-bytes (+ addr j) (list #x48 #xB8))
+    (%jit-write-imm64 addr (+ j 2) (%jit-bridge-entry nargs))
+    (%jit-emit-bytes (+ addr j 10) (list #xFF #xE0))
+    (+ j 12)))
 
 (defun %jit-thunk-fill (addr name nargs)
   (let ((idx *jit-bridge-count*))
@@ -1307,11 +1333,10 @@
             (let ((idx *jit-bridge-count*))
               (setf (aref *jit-bridge-names* idx) name)
               (setq *jit-bridge-count* (+ idx 1))
-              (%jit-emit-bytes addr (list #x64 #xC7 #x04 #x25 #x78 #x01 #x00 #x10
-                                          (logand idx 255) (logand (ash idx -8) 255) 0 0))
-              (%jit-emit-bytes (+ addr 12) (list #x48 #xB8))
-              (%jit-write-imm64 addr 14 (or to (%jit-bridge-any-entry)))
-              (%jit-emit-bytes (+ addr 22) (list #xFF #xE0))
+              (let ((j (%jit-emit-bytes addr (%jit-window-store #x178 idx))))
+                (%jit-emit-bytes (+ addr j) (list #x48 #xB8))
+                (%jit-write-imm64 addr (+ j 2) (or to (%jit-bridge-any-entry)))
+                (%jit-emit-bytes (+ addr j 10) (list #xFF #xE0)))
               addr)))))
 
 (defvar *jit-fnaddr-x64-thunks* nil
@@ -1850,6 +1875,7 @@
           (puthash name *kernel-redirects* pad)
           t)))))
 
+(declaim (overridable %kernel-redirect-hook))   ; the web arm (build-web.lisp): no pads
 (defun %kernel-redirect-hook (name)
   "From %JIT-FNADDR-THUNK-INVALIDATE, before NAME's binding changes."
   (when (and (stringp name) (> (length name) 0) (%jit-enabled-p)
@@ -2945,8 +2971,13 @@
     (%jit-note-forward name bc fwd)
     (setf (car self)
     (lambda (&rest args)
-      (if (or (car fwd) (<= left 0))
-          (values-list (multiple-value-list (apply (or (car fwd) inner) args)))
+      (cond
+       ;; asked its arity (%FUNCTION-ARITY): the interpreted body's, which is
+       ;; the function's, never by calling the native one it may forward to
+       (*%arity-probe* (funcall inner))
+       ((or (car fwd) (<= left 0))
+          (values-list (multiple-value-list (apply (or (car fwd) inner) args))))
+       (t
           (let* ((t0 (%irt-ns))
                  (vals (multiple-value-list (apply inner args))))
             (setq left (- left 1))
@@ -2957,7 +2988,8 @@
                     (progn (unless (%mvm-on-main-thread-p) (%jit-want fwd))
                            (setq left (%jit-hot-call-threshold) spent 0))
                     (setq left 0))))
-            (values-list vals)))))
+            (values-list vals))))))
+    (%note-trampoline-code (car self))
     (%note-fn-name (car self) name)
     (car self)))
 
@@ -3158,7 +3190,8 @@
 ;;; toplevel form's thunk -- so their code was credited to whichever DEFUN sat
 ;;; below it in the arena (a method body profiled as ASDF::%QUIRK-FLOAT-
 ;;; FEATURES).  Every x64 page now records each function's exact extent,
-;;; (START END NAME), newest first; net/hosted-backtrace.lisp reads it.  Main
+;;; (START END NAME ARITY), newest first; net/hosted-backtrace.lisp reads the
+;;; first three, %FUNCTION-ARITY the fourth.  Main
 ;;; thread only, as the other JIT caches: a worker's conses must not reach a
 ;;; global.  The x64 arena is bump-allocated and never reused, so extents
 ;;; never go stale.
@@ -3170,7 +3203,7 @@
       (dolist (e ft-list)
         (let* ((lbl (gethash (car e) fn-map))
                (p (and lbl (label-position lbl))))
-          (when (integerp p) (setq starts (cons (cons p (car e)) starts)))))
+          (when (integerp p) (setq starts (cons (cons p e) starts)))))
       (setq starts (sort starts (function <) :key (function car)))
       (let ((l starts))
         (loop
@@ -3179,8 +3212,34 @@
                 (e (if (cdr l) (car (car (cdr l))) nlen)))
             (when (< s e)
               (setq *jit-code-map*
-                    (cons (list (+ base s) (+ base e) (cdr (car l))) *jit-code-map*))))
+                    (cons (list (+ base s) (+ base e) (car (cdr (car l)))
+                                (car (cdr (cdr (cdr (cdr (car l)))))))
+                          *jit-code-map*))))
           (setq l (cdr l)))))))
+
+(defun %function-arity (fn)
+  "How many arguments FN takes, as (REQUIRED . MAX) with MAX NIL when it takes
+   any number more (&rest, &key), or NIL when that is not known: image code,
+   and code another thread compiled.  What the entry check of a run-time
+   compiled function accepts, kept as data (FUNCTION-INFO-ARITY) since the
+   check itself is only compare-and-branch code.  A trampoline is asked, not
+   called (*%ARITY-PROBE*); JIT code -- a closure by its slot 0 -- is found in
+   *JIT-CODE-MAP* by its address."
+  (when (functionp fn)
+    (let ((head (ignore-errors (%prim-aref fn 0))))
+      (if (and head (member head *%trampoline-codes* :test (function eq)))
+          (let ((*%arity-probe* t)) (funcall fn))
+          (let* ((scratch (+ (%tls-self-base) (%conv-addr #x100050A0)))
+                 (w (%gc-word-of fn scratch))
+                 (code (if (= (logand w 15) 3)
+                           (- w 3)
+                           (and (functionp head)
+                                (let ((c (%gc-word-of head scratch)))
+                                  (and (= (logand c 15) 3) (- c 3)))))))
+            (when (and code (consp *jit-code-map*))
+              (let ((e (find-if (lambda (e) (and (<= (first e) code) (< code (second e))))
+                                *jit-code-map*)))
+                (and e (= code (first e)) (fourth e)))))))))
 
 ;; translate-x64.lisp's; declared here for the reads below.
 (defvar *x64-jit-shared-gc-tramp*)
@@ -3904,7 +3963,49 @@
           (setq *jit-retry-queue* keep))
       (setq *jit-retry-busy* nil))))
 
+(defvar *jit-host-flags* nil
+  "NIL, or ((SYMBOL . VALUE) ...): the translator settings this image's own
+   runtime JIT was configured with.  A builder CLI (mvm/builder.lisp) records
+   them at boot, because a build script it runs sets the same variables for the
+   image it is building -- a Linux image built on a Windows host would otherwise
+   make the host's JIT emit raw Linux syscalls and FS/GS window accesses.
+   %JIT-TRANSLATE-PAGE binds them around each translation.")
+
+(defun %jit-host-flags-swap (pairs)
+  "Set each (SYMBOL . VALUE) in PAIRS; the previous values, in the same shape."
+  (let ((old nil))
+    (dolist (p pairs)
+      (setq old (cons (cons (car p) (symbol-value (car p))) old))
+      (set (car p) (cdr p)))
+    old))
+
+(defun %jit-host-flags-keep (pairs)
+  "Record in PAIRS the values their symbols have now: what a host translation left
+   in the host's own state (a constant-vector high-water mark, say) is the host's
+   for the next one, not lost when the target's values are put back."
+  (dolist (p pairs) (setf (cdr p) (symbol-value (car p)))))
+
+(defun %host-compile-toplevel (form)
+  "MVM-COMPILE-TOPLEVEL for code that runs HERE (EVAL, LOAD, a script's
+   toplevel): with *JIT-HOST-FLAGS* in force, so a build script's settings for
+   its target (the Darwin layout's *CONV-DELTA*, say) do not reach the host's
+   own compiles."
+  (if *jit-host-flags*
+      (let ((saved (%jit-host-flags-swap *jit-host-flags*)))
+        (unwind-protect (mvm-compile-toplevel form)
+          (%jit-host-flags-keep *jit-host-flags*)
+          (%jit-host-flags-swap saved)))
+      (mvm-compile-toplevel form)))
+
 (defun %jit-translate-page (bc mvm-entry ft-list rt-table)
+  (if *jit-host-flags*
+      (let ((saved (%jit-host-flags-swap *jit-host-flags*)))
+        (unwind-protect (%jit-translate-page-0 bc mvm-entry ft-list rt-table)
+          (%jit-host-flags-keep *jit-host-flags*)
+          (%jit-host-flags-swap saved)))
+      (%jit-translate-page-0 bc mvm-entry ft-list rt-table)))
+
+(defun %jit-translate-page-0 (bc mvm-entry ft-list rt-table)
   "FLIP-SAFETY GUARD (Fix 1): translate + build a JIT exec page for BC, but
    turn ANY error signalled while translating/relocating (e.g. a translator
    gap such as `Unknown register: 0` in a flet/labels/CLOS-dispatch shape)
@@ -4322,6 +4423,17 @@
                     ;; name list).
                     (handler-case (%mvm-eval-jit-run %bc %entry %ftl %fnt %rt %lam t nil)
                       (t (c)
+                      ;; A THROW in flight (*CATCH-ACTIVE*) is not the run failing: it is
+                      ;; control leaving for its CATCH, and it goes on -- as every other
+                      ;; catch-all in the image passes one.  Taken for a failure, it was
+                      ;; either re-run interpreted (the form doubled, the flag left set)
+                      ;; or re-signalled as an ERROR; and with *CATCH-ACTIVE* stuck, no
+                      ;; HANDLER-CASE caught an error again (cortez's escape out of a
+                      ;; macro expanded under TI's COMPOSE-AUTOMATIC-METHODS).
+                       (when *catch-active*
+                         (setq *jit-native-ran* %jnr-save)
+                         (setq *jit-infra-fallback* %jif-save)
+                         (%hc-longjmp))
                          (let ((%ran *jit-native-ran*)
                                (%infra *jit-infra-fallback*))
                            ;; Restore the enclosing attempt's flags before we
@@ -4471,7 +4583,7 @@
            (defs (if last-defun-p forms (reverse (cdr rforms))))
            (toplevel (append defs (list (list (quote defun) (quote %mvm-eval-thunk) nil expr)))))
       (dolist (f toplevel)
-        (let ((result (mvm-compile-toplevel f)))
+        (let ((result (%host-compile-toplevel f)))
           (cond
             ((null result) nil)
             ((and (consp result) (eq (car result) :multi-result))
@@ -4540,7 +4652,8 @@
             ;; ADAPTER: (name offset length) for translate-mvm-to-x64 — same
             ;; structs, string name.  Reverse-consed then reversed to preserve
             ;; the all-ir order (which is what fn-table indices track too).
-            (setq ft-list (cons (list nm off len) ft-list))
+            (setq ft-list (cons (list nm off len (function-info-arity (car e))) ft-list))
+            (%lam-offsets-note-arity lam-offsets off (function-info-arity (car e)))
             (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
                      (not (eql off 0)))
                 (puthash off lam-offsets t)
@@ -4612,13 +4725,22 @@
       (setq *mexp-memo* s-memo) (setq *mexp-memo-gc* s-memogc)
       (setq *compile-target* s-ct))))
 
+(defvar *in-image-build* nil
+  "T while this image compiles an IMAGE (the builder CLI's %BUILDER-BUILD-IMAGE,
+   mvm/builder.lisp), whose build runs with *STATIC-BUILD-P* NIL as SBCL's does.
+   An EVAL reached mid-compile -- a target DEFMACRO's expander, a DEFCONSTANT
+   initform -- must then leave the compiler as it found it, as under a static
+   build: it SETQs *MVM-EVAL-RUNTIME-P* and *MVM-EMIT-HALVES* T, and the rest of
+   the build compiled in runtime mode (arity checks, :LI-HALVES; the builder's
+   own image differed from SBCL's by 1.8 MB).")
+
 (defun mvm-eval-forms (forms)
   ;; *%SOLE-EVAL-FORM* (compiler.lisp): the one form, for the compiler's
   ;; DEFMACRO; SETQ and put back, as evaluations nest
   (let ((saved (and (boundp '*%sole-eval-form*) *%sole-eval-form*)))
     (setq *%sole-eval-form* (and (consp forms) (null (cdr forms)) (car forms)))
     (unwind-protect
-         (if *static-build-p*
+         (if (or *static-build-p* (and (boundp '*in-image-build*) *in-image-build*))
              (%mvm-eval-forms-nested-in-static-build forms)
              (%mvm-eval-forms-1 forms))
       (setq *%sole-eval-form* saved))))
@@ -4977,7 +5099,8 @@
           ;; layout comment).  reverse → source order (fn-table order).
           ;; FORMS rides at index 6 so a hit can check its literals are
           ;; the SAME objects (%mvm-literals-same-p).
-          (list bc entry (reverse ft-list) fn-table rt-table lam-offsets forms)))
+          ;; and index 7 the macro-definitions epoch it was compiled under.
+          (list bc entry (reverse ft-list) fn-table rt-table lam-offsets forms %cacheable)))
   ;; Conditions PROPAGATE (see %mvm-eval-run-tuple): production EVAL
   ;; must let an error signalled by the form reach the caller's
   ;; handler-case instead of returning (:interp-err e) as a value.
@@ -5053,6 +5176,12 @@
                                           fn-table rt-table lam-offsets nil
                                           persist-names)
                         (t (c)
+                         ;; A THROW in flight goes on -- see %MVM-EVAL-RUN-TUPLE.
+                         (when *catch-active*
+                           (setq *jit-native-ran* %jnr-saved)
+                           (setq *jit-infra-fallback* %jif-saved)
+                           (setq *e2-active-defun-names* %adn-saved)
+                           (%hc-longjmp))
                            (let ((%ran *jit-native-ran*)
                                  (%infra *jit-infra-fallback*))
                              (setq *jit-native-ran* %jnr-saved)
@@ -5164,15 +5293,20 @@
   ;; none of the setup/hash-alloc cost either.
   ;; Not for COMPILE-FILE's own compile of a toplevel form (mvm/fasl.lisp): a
   ;; hit would RUN the form, and record nothing.
+  ;; %CACHEABLE is the macro-definitions epoch the compile starts under (see
+  ;; *MACRO-DEFS-EPOCH*), or NIL: an entry is only the form's meaning while no
+  ;; macro has been defined, redefined or removed since it was compiled.
   (let ((%cacheable (and (not *mvm-eval-no-cache*)
                          (> (%mvm-eval-cache-limit) 0)
                          (not (and *fasl-compile-only* (%fasl-compile-only-here-p)))
-                         (%mvm-eval-cacheable-p forms))))
+                         (%mvm-eval-cacheable-p forms)
+                         (or *macro-defs-epoch* 0))))
     (when %cacheable
       (unless *mvm-eval-cache*
         (setq *mvm-eval-cache* (make-hash-table :test (quote equal))))
       (let ((%hit (gethash forms *mvm-eval-cache*)))
-        (when (and %hit (%mvm-literals-same-p (nth 6 %hit) forms))
+        (when (and %hit (eql (nth 7 %hit) %cacheable)
+                   (%mvm-literals-same-p (nth 6 %hit) forms))
           (%eval-lock-drop-for-run)
           (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
   (setq *%mexp-impure* nil)
@@ -5253,7 +5387,7 @@
       ;; materialised as a closure instead of escaping as a raw offset.
       (setq *e2-module-defuns* persist-names)
       (dolist (f toplevel)
-        (let ((result (mvm-compile-toplevel f)))
+        (let ((result (%host-compile-toplevel f)))
           (cond
             ((null result) nil)
             ((and (consp result) (eq (car result) :multi-result))
@@ -5402,8 +5536,11 @@
               (setq ft-list
                     (cons (list (string (function-info-name (car e)))
                                 (function-info-bytecode-offset (car e))
-                                (function-info-bytecode-length (car e)))
+                                (function-info-bytecode-length (car e))
+                                (function-info-arity (car e)))
                           ft-list))
+              (%lam-offsets-note-arity lam-offsets (function-info-bytecode-offset (car e))
+                                       (function-info-arity (car e)))
               (let ((nm (string (function-info-name (car e))))
                     (off (function-info-bytecode-offset (car e))))
                 ;; The T vs :DEFUN distinction is now COSMETIC (both entries
@@ -5739,7 +5876,9 @@
              (handler-case
                  (let ((tramp (%e2ic-mvm-eval-nocache form)))
                    (if (functionp tramp) tramp nil))
-               (t (c) nil))))))))
+               ;; A compile failure falls back; a THROW in flight (a macroexpand
+               ;; hook leaving the expansion) goes on -- see %MVM-EVAL-RUN-TUPLE.
+               (t (c) (if *catch-active* (%hc-longjmp) nil)))))))))
 
 (defun %e2ic-cached (fn)
   "The per-closure compile cache: slot 5 of the %interp-closure list

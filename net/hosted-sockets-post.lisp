@@ -808,7 +808,7 @@
                     (%gc-write64 (+ (%ha-thread-block) #x340) k)
                     (%gc-region-init rcb2 *ha-r1-from* *ha-r1-to* *ha-rsize*
                                      (%gc-meta-read (+ r0 #x18) k) k)
-                    (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* *ha-rsize*
+                    (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* (%ha-rsize 1)
                                      (+ *ha-t2-stack* *ha-t2-stack-size*) k)
                     (%gc-write64 (+ (%ha-thread-block) #x4D0) rcb3)
                     (%ha-set-percpu-mode 1)

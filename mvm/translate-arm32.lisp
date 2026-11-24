@@ -1219,29 +1219,49 @@
     (arm32-emit-label buf done)
     (arm32-pop buf +arm32-r1-r3+)))
 
+(defun arm32-emit-fatal (buf msg status)
+  "Hosted Linux: MSG on stderr, then exit_group(STATUS).  Never returns; the
+   text follows an unreachable UDF."
+  (let* ((bytes (map 'vector #'char-code msg))
+         (n (length bytes))
+         (text (mvm-make-label)))
+    (arm32-mov-imm buf +arm-r0+ 0 2)
+    (arm32-emit-pcrel-addr buf +arm-r1+ text)
+    (arm32-load-imm32 buf +arm-r2+ n)
+    (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-write+)
+    (arm32-svc buf)
+    (arm32-load-imm32 buf +arm-r0+ status)
+    (arm32-load-imm32 buf +arm-r7+ 248)               ; exit_group
+    (arm32-svc buf)
+    (arm32-emit buf #xE7F000F0)                       ; UDF, unreachable
+    (arm32-emit-label buf text)
+    (loop for i from 0 below n by 4
+          do (arm32-emit buf (loop for k from 0 below 4
+                                   sum (ash (if (< (+ i k) n) (aref bytes (+ i k)) 0)
+                                            (* 8 k)))))))
+
 (defun arm32-emit-hstack-fatal (buf)
   "Nothing armed at an overflowing push: hosted Linux writes why to stderr and
    exit_group(70); otherwise UDF.  Never a branch through a zero frame."
   (if *arm32-linux-mode*
-      (let* ((msg (format nil "~%modus: the handler-frame stack is exhausted (CATCH / UNWIND-PROTECT / HANDLER-CASE nested too deep) and no handler is armed; stopping.~%"))
-             (bytes (map 'vector #'char-code msg))
-             (n (length bytes))
-             (text (mvm-make-label)))
-        (arm32-mov-imm buf +arm-r0+ 0 2)
-        (arm32-emit-pcrel-addr buf +arm-r1+ text)
-        (arm32-load-imm32 buf +arm-r2+ n)
-        (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-write+)
-        (arm32-svc buf)
-        (arm32-mov-imm buf +arm-r0+ 0 70)
-        (arm32-load-imm32 buf +arm-r7+ 248)               ; exit_group
-        (arm32-svc buf)
-        (arm32-emit buf #xE7F000F0)                       ; UDF, unreachable
-        (arm32-emit-label buf text)
-        (loop for i from 0 below n by 4
-              do (arm32-emit buf (loop for k from 0 below 4
-                                       sum (ash (if (< (+ i k) n) (aref bytes (+ i k)) 0)
-                                                (* 8 k))))))
+      (arm32-emit-fatal buf (format nil "~%modus: the handler-frame stack is exhausted (CATCH / UNWIND-PROTECT / HANDLER-CASE nested too deep) and no handler is armed; stopping.~%") 70)
       (arm32-emit buf #xE7F000F0)))                       ; UDF
+
+;;; A HARDWARE FAULT WITH NO HANDLER ARMED SAYS WHAT IT WAS (translate-x64's
+;;; story): it was exit_group(139) and not a word.  The signal is in the word
+;;; the stub just wrote (#x10000CB0); one line names it, exit 70 as on x86-64
+;;; and AArch64.  No address or PC: this port's fault record is that one word.
+(defun arm32-emit-uncaught-fault-report (buf)
+  (arm32-load-imm32 buf +arm-r12+ #x10000CB0)
+  (arm32-ldr buf +arm-r12+ +arm-r12+ 0)
+  (dolist (k '((11 . "memory fault (SIGSEGV)") (7 . "bus error (SIGBUS)")
+               (8 . "arithmetic fault (SIGFPE)") (4 . "illegal instruction (SIGILL)")))
+    (let ((next (mvm-make-label)))
+      (arm32-cmp-imm buf +arm-r12+ 0 (car k))
+      (arm32-b-cond buf +arm-cc-ne+ next)
+      (arm32-emit-fatal buf (format nil "~%modus: ~A with no handler armed; stopping.~%" (cdr k)) 70)
+      (arm32-emit-label buf next)))
+  (arm32-emit-fatal buf (format nil "~%modus: hardware fault with no handler armed; stopping.~%") 70))
 
 (defun arm32-emit-hstack-helpers (buf)
   "The out-of-line slow paths of ARM32-EMIT-HANDLER-PUSH / -POP; see THE
@@ -3113,10 +3133,7 @@
     (arm32-svc buf)
     (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 8)
     (arm32-emit-longjmp-to-armed
-     buf (lambda ()
-           (arm32-mov-imm buf +arm-r0+ 0 139)
-           (arm32-load-imm32 buf +arm-r7+ 248)         ; exit_group
-           (arm32-svc buf)))
+     buf (lambda () (arm32-emit-uncaught-fault-report buf)))
     ;; ---- sa_restorer ----
     (arm32-emit-label buf restorer)
     (arm32-load-imm32 buf +arm-r7+ 173)                ; rt_sigreturn
@@ -3508,8 +3525,13 @@
           (arm32-str buf +arm-r1+ +arm-sp+ 40)                   ; saved r10 (VL)
           (arm32-pop buf #x5FFF)
           (arm32-bx buf +arm-lr+)
+          ;; HOSTED, SAY SO: this was a bare BKPT (SIGTRAP, exit 133, not a
+          ;; word) -- what any runaway recursion ends in here, since the
+          ;; interpreter keeps its frames on the heap.  x86-64's text and 137.
           (here exhausted)
-          (arm32-emit-bkpt buf #xF0))
+          (if *arm32-linux-mode*
+              (arm32-emit-fatal buf (format nil "~%Modus: heap exhausted -- the live data does not fit the heap after a full collection~%") 137)
+              (arm32-emit-bkpt buf #xF0)))
         ;; ================= SCAN (r0 = slot address) =================
         (let ((ret (lbl)) (isptr (lbl)) (kobj (lbl)) (kok (lbl)) (notfwd (lbl))
               (obj (lbl)) (ovf (lbl)) (cl (lbl)))
@@ -3542,6 +3564,22 @@
           (arm32-and-imm buf +arm-r1+ +arm-r12+ 0 15)
           (arm32-cmp-imm buf +arm-r1+ 0 15)
           (arm32-b-cond buf +arm-cc-ne+ notfwd)
+          ;; ...AND it names a copy made THIS collection: an object in
+          ;; [r6, r8) or a cons in [r9, r7).  A cons's car can be an odd RAW
+          ;; word (the interpreter's operand stack holds raw machine words as
+          ;; values), and a nibble-only test took one for a forward and never
+          ;; copied the cons -- see translate-i386's I386-EMIT-GCNATIVE-FWD-TEST.
+          (let ((isfwd (lbl)))
+            (arm32-bic-imm buf +arm-r1+ +arm-r12+ 0 15)
+            (arm32-cmp buf +arm-r1+ +arm-r6+)
+            (arm32-b-cond buf +arm-cc-cc+ notfwd)                ; < to_start
+            (arm32-cmp buf +arm-r1+ +arm-r8+)
+            (arm32-b-cond buf +arm-cc-cc+ isfwd)                 ; < object free
+            (arm32-cmp buf +arm-r1+ +arm-r9+)
+            (arm32-b-cond buf +arm-cc-cc+ notfwd)                ; in the gap
+            (arm32-cmp buf +arm-r1+ +arm-r7+)
+            (arm32-b-cond buf +arm-cc-cs+ notfwd)                ; >= to_end
+            (here isfwd))
           ;; already forwarded: (fwd & ~15) | tag
           (arm32-bic-imm buf +arm-r12+ +arm-r12+ 0 15)
           (arm32-orr buf +arm-r12+ +arm-r12+ +arm-r2+)
@@ -3599,7 +3637,9 @@
           (here ret)
           (arm32-bx buf +arm-lr+)
           (here ovf)
-          (arm32-emit-bkpt buf #xF1))))))
+          (if *arm32-linux-mode*
+              (arm32-emit-fatal buf (format nil "~%Modus: collector to-space overflow~%") 137)
+              (arm32-emit-bkpt buf #xF1)))))))
 
 (defun translate-mvm-to-arm32 (bytecode function-table &key (v7 nil))
   "Translate MVM bytecode to ARM32 native code.

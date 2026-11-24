@@ -18086,8 +18086,23 @@
                        for i from 0
                        collect (list var (closure-env-accessor i))))
                (all-bindings (cons env-binding var-bindings))
+               ;; THE CAPTURED VARIABLES' TYPES.  A type declaration on a binding holds for every reference to
+               ;; it, a closure's included (CLHS 3.3.4), and an inferred type is only ever stamped on a variable
+               ;; nothing assigns -- in the closure either -- so the snapshot has the type the outer binding
+               ;; has.  Without them every captured array was untyped in the closure and every captured float
+               ;; boxed: a FLET reading the caller's declared single-float arrays was 35x SBCL (mill's
+               ;; depthwise convolution's edges, 106 ns an element).
+               (captured-types
+                 (and *mvm-eval-runtime-p*
+                      (loop for var in captured-vars
+                            for b = (env-lookup env var)
+                            when (and b (binding-dtype b)
+                                      (member (binding-location b) '(:reg :stack :fpreg :fpdreg :fpvreg)))
+                              collect (list 'type (binding-dtype b) var))))
                ;; Wrap body in let* that loads captured values
-               (wrapped-body `((let* ,all-bindings ,@actual-body)))
+               (wrapped-body `((let* ,all-bindings
+                                 ,@(when captured-types `((declare ,@captured-types)))
+                                 ,@actual-body)))
                ;; Compile the closure function.  Parent env: NOT the full
                ;; outer env (captured vars are loaded as locals from the
                ;; closure env at entry; outer :stack slots must not leak),

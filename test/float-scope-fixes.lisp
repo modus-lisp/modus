@@ -65,6 +65,31 @@
   (check "let* broadcast" (coerce r 'list) '(0.5 1.5 2.5 3.5))
   (check "let* broadcast no call" (calls-in 'sub-broadcast) 0))
 
+;; A closure sees its captured variables' declared types (%COMPILE-LAMBDA-1's CAPTURED-TYPES): a FLET over the
+;; caller's declared arrays and floats was 35x SBCL.  The values, and the cases the types must not break: a
+;; variable the closure assigns (no inferred width may be stamped on it) and one captured from a float register.
+(defun flet-dot (a b n)
+  (declare (type (simple-array single-float (*)) a b) (type fixnum n) (optimize (speed 3) (safety 0)))
+  (let ((acc 0f0) (scale 2f0))
+    (declare (type single-float acc scale))
+    (flet ((tap (j) (declare (type fixnum j)) (* scale (aref a j) (aref b j))))
+      (dotimes (j n) (setq acc (+ acc (tap j)))))
+    acc))
+(let ((a (make-array 5 :element-type 'single-float :initial-contents '(1.0 2.0 3.0 4.0 5.0)))
+      (b (make-array 5 :element-type 'single-float :initial-element 0.5)))
+  (check "flet over declared arrays" (flet-dot a b 5) 15.0))
+(defun closure-assigns (k)
+  (let ((x 1))                                        ; a width-provable init, assigned in the closure
+    (flet ((grow () (setq x (* x k k k k k k k k k k k k))))
+      (grow) (grow))
+    x))
+(check "closure assigns its capture" (closure-assigns (expt 2 10)) (expt 2 240))
+(defun closure-float (x)
+  (declare (type double-float x))
+  (let ((y (* x 2d0))) (declare (type double-float y))
+    (mapcar (lambda (k) (+ y (float k 1d0))) '(1 2 3))))
+(check "closure over a double" (closure-float 1.5d0) '(4d0 5d0 6d0))
+
 ;; LOG of a single: SBCL's bits
 (defun single-bits (f)
   #+sbcl (sb-kernel:single-float-bits f)

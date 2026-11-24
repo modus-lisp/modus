@@ -2890,6 +2890,10 @@
            ((and (fixnump store-item) (<= 0 store-item 4294967295) (%u32-bare-p seq))
             (%fill-u32 seq i eff-end store-item)
             seq)
+           ;; packed single floats (every new float tensor is zeroed or filled this way)
+           ((and (floatp store-item) (%f32-bare-p seq) (typep store-item 'single-float))
+            (%fill-f32 seq i eff-end store-item)
+            seq)
            ((and (not (stringp seq)) (%bulk-copy-ok-p seq seq))
             ;; plain word-slot array (general or typed-generic, not a
             ;; string / wrapper / mda): raw slot stores — a VP8 macroblock

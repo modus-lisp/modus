@@ -10458,6 +10458,23 @@
     ;; PSETQ of a symbol macro is PSETF of its expansion (CLHS PSETQ).
     (and changed (cons (if psetq-p 'psetf (car form)) (nreverse out)))))
 
+(defun %mod-pow2-rewrite (form env)
+  "(LOGAND X (1- D)) when FORM is (CL:MOD X D) with D a positive power of two -- a literal, or a constant whose
+   value is one (mill's +F32-LANES+) -- and X provably a fixnum: the same value for every integer X, negatives
+   included (MOD takes the divisor's sign).  As a call to the generic MOD it was a dozen instructions and calls,
+   and a call in a float scope boxes every float in it: DO-VECTORIZED's (MOD N +F32-LANES+) took every lane of
+   mill's element-wise kernels off the vector registers.  NIL otherwise."
+  (and (consp form) (symbolp (car form))
+       (eq (symbol-package (car form)) (find-package "COMMON-LISP"))
+       (string= (symbol-name (car form)) "MOD")
+       (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+       (let* ((x (cadr form)) (d (caddr form))
+              (dv (cond ((integerp d) d)
+                        ((and d (symbolp d) (not (env-lookup env d))) (%const-int-value d)))))
+         (and (integerp dv) (> dv 0) (= (logand dv (- dv 1)) 0)
+              (or (integerp x) (and (or (and x (symbolp x)) (consp x)) (%expr-width x env)))
+              (list 'logand x (- dv 1))))))
+
 (defun compile-compound (form env dest)
   "Compile a compound form (operator . args)"
   (let* ((op (car form))
@@ -10497,6 +10514,9 @@
       ;; prologue correctly (same path #'fn funcall uses).
       ((null op-name)
        (compile-funcall form env dest))
+      ;; (MOD X 2^k) of a fixnum: LOGAND (%MOD-POW2-REWRITE)
+      ((and (symbolp op) (%mod-pow2-rewrite form env))
+       (compile-form (%mod-pow2-rewrite form env) env dest))
       ;; NOT A NAME ANY CLAUSE BELOW TESTS FOR -- a call to a function, which
       ;; is most compound forms.  Every clause from here to the last tests
       ;; OP-NAME against name hashes (or is %VIL-OP-P), in a chain 300 long
@@ -15793,14 +15813,16 @@
   '("+" "-" "*" "1+" "1-" "<" ">" "<=" ">=" "=" "/=" "LOGAND" "LOGIOR" "ASH"
     "MIN" "MAX" "ZEROP" "PLUSP" "MINUSP" "EQ" "EQL"))
 
-(defun %fp-scope-extend-let (env bindings body)
+(defun %fp-scope-extend-let (env bindings body &optional sequential)
   "A scratch env with the LET's variables as frame bindings carrying their
    declared types (and FIXNUM for an integer-literal / width-typed init),
-   so the walker can judge arithmetic on them."
+   so the walker can judge arithmetic on them.  SEQUENTIAL (a LET*): each init
+   is judged with the bindings before it in scope, as it is evaluated."
   (let ((new env))
     (dolist (b bindings)
-      (let ((var (if (consp b) (car b) b))
-            (init (if (and (consp b) (consp (cdr b))) (cadr b) nil)))
+      (let* ((var (if (consp b) (car b) b))
+             (init (if (and (consp b) (consp (cdr b))) (cadr b) nil))
+             (env (if sequential (%apply-declared-types new body) env)))
         ;; env-extend-stack returns (NEW-ENV . SLOT) — a cons, despite its
         ;; docstring's "values"; the image's checked accessors caught the
         ;; mismatch (the host's unchecked ones did not).
@@ -15812,10 +15834,10 @@
                           (%expr-width init env)))
                  (let ((bb (car (compile-env-bindings new))))
                    (setf (binding-dtype bb) 'fixnum)))
-                ((%inferred-single-local-p var init bindings (strip-declares body) env)
+                ((%inferred-single-local-p var init (if sequential nil bindings) (strip-declares body) env)
                  (let ((bb (car (compile-env-bindings new))))
                    (setf (binding-dtype bb) 'single-float)))
-                ((%inferred-vector-local-p var init bindings (strip-declares body) env)
+                ((%inferred-vector-local-p var init (if sequential nil bindings) (strip-declares body) env)
                  (let ((bb (car (compile-env-bindings new))))
                    (setf (binding-dtype bb) (%fp-kind-dtype :vector))))))))
     (%apply-declared-types new body)
@@ -15851,7 +15873,7 @@
                (every (lambda (f) (%fp-scope-call-free-p f env (1+ depth))) (cdr form)))
               ((or (string= n "LET") (string= n "LET*"))
                (and (consp (cdr form))
-                    (let ((inner (%fp-scope-extend-let env (cadr form) (cddr form))))
+                    (let ((inner (%fp-scope-extend-let env (cadr form) (cddr form) (string= n "LET*"))))
                       (and (every (lambda (b)
                                     (or (atom b) (null (cdr b))
                                         (%fp-scope-call-free-p (cadr b) (if (string= n "LET*") inner env) (1+ depth))))
@@ -15955,6 +15977,21 @@
               ((%vil-lookup n *vi-umov-ops*)
                (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
                     (integerp (caddr form)) (%vil-tree-need (cadr form) env) t))
+              ;; (%F32-BITS-REF A i) / (%F32-BITS-SET A i bits) of a declared single-float array: one F32-REF /
+              ;; F32-SET -- where a fixnum holds 32 bits; a narrower tower calls %F32-BITS-REF-NARROW &c.  A float
+              ;; kernel that splits a single into exponent and mantissa had every double in its scope boxed.
+              ((and (or (string= n "%F32-BITS-REF") (string= n "%F32-BITS-SET"))
+                    (>= (ct-fixnum-bits) 32))
+               (and (consp (cdr form)) (consp (cddr form)) (symbolp (cadr form))
+                    (%declared-f32-array-var-p (cadr form) env)
+                    (%simple-index-form-p (caddr form))
+                    (if (string= n "%F32-BITS-SET")
+                        (and (consp (cdddr form)) (null (cddddr form))
+                             (let ((v (cadddr form)))
+                               (and (%fp-scope-call-free-p v env (1+ depth))
+                                    (or (integerp v) (and (or (and v (symbolp v)) (consp v)) (%expr-width v env)))))
+                             t)
+                        (null (cdddr form)))))
               ((string= n "AREF")
                (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
                     (symbolp (cadr form))
@@ -15994,6 +16031,9 @@
                                  ((%declared-generic-array-var-p (cadr place) env)
                                   (%fp-scope-call-free-p val env (1+ depth)))
                                  (t nil))))))
+              ;; (MOD X 2^k) of a fixnum compiles as LOGAND
+              ((and (string= n "MOD") (%mod-pow2-rewrite form env))
+               (%fp-scope-call-free-p (%mod-pow2-rewrite form env) env (1+ depth)))
               ;; fixnum arithmetic / comparison: every operand width-typed
               ((member n *fp-scope-fixnum-ops* :test #'string=)
                (every (lambda (a)
@@ -16076,43 +16116,56 @@
    its whole scope, as %INFERRED-SINGLE-LOCAL-P for a single: INIT is an f32x4
    tree and nothing in BODY assigns VAR.  mill's elementwise cores bind
    (let ((xa (f32v-ref da i)) ...)) undeclared, and each lane group was boxed."
-  (and init (consp init)
-       (let ((x (%tree-expand init)))
-         (and (consp x) (symbolp (car x))
-              (let ((n (symbol-name (car x))))
-                (and (> (length n) 5) (string= (subseq n 0 5) "%F32V")))))
+  (and init
+       ;; an %F32V tree, or a variable already known to hold a vector (mill's scalar-operand cores bind
+       ;; (let ((xb bv)) ...) inside the lane loop, and that boxed every lane group of Add / Sub / Mul)
+       (or (and (consp init)
+                (let ((x (%tree-expand init)))
+                  (and (consp x) (symbolp (car x))
+                       (let ((n (symbol-name (car x))))
+                         (and (> (length n) 5) (string= (subseq n 0 5) "%F32V"))))))
+           (and (symbolp init) (%declared-f32v-var-p init env)))
        (%v4-tree-need init env)
        (not (%form-mentions-any-p (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
                                   init))
        (notany (lambda (f) (%form-setqs-var-p var f 0)) body)))
 
-(defun %let-fp-kinds (bindings decl-body body env)
+(defun %let-fp-kinds (bindings decl-body body env &optional sequential)
   "For a LET: an array of :scalar / :vector / NIL per binding when at least
    one variable is a declared float/vector local AND the body is call-free
-   AND *mvm-eval-runtime-p*; else NIL."
+   AND *mvm-eval-runtime-p*; else NIL.  SEQUENTIAL (a LET*): a binding's init
+   is judged with the earlier bindings in scope -- (let* ((x (aref a 0))
+   (v (%f32v-broadcast x))) ...) has V a vector only once X is known a single,
+   and judged in the outer env it boxed every lane of mill's element-wise ops."
   (when (and (or (%runtime-fpd-p) *fp-locals-force* (ct-has-fpd-p)) (consp bindings))
     (let* ((pairs (%declared-types decl-body))
            (kinds (make-array (length bindings) :initial-element nil))
-           (any nil) (i 0))
+           (any nil) (i 0) (outer env))
       (dolist (b bindings)
-        (let* ((var (if (consp b) (car b) b))
+        (let* ((env (if sequential
+                        (%fp-scope-extend-let outer (subseq bindings 0 i) decl-body t)
+                        env))
+               (var (if (consp b) (car b) b))
                (pair (find var pairs :key #'car :test #'equal))
                (k (if pair
                       (%fp-type-kind (cdr pair))
+                      ;; in a LET* the earlier bindings are in ENV with their types, so an init that
+                      ;; names them is not the outer variable the parallel-LET rule guards against
                       (and (consp b) (consp (cdr b))
-                           (cond ((%inferred-single-local-p var (cadr b) bindings body env)
-                                  :scalar)
-                                 ((%inferred-vector-local-p var (cadr b) bindings body env)
-                                  :vector))))))
+                           (let ((others (if sequential nil bindings)))
+                             (cond ((%inferred-single-local-p var (cadr b) others body env)
+                                    :scalar)
+                                   ((%inferred-vector-local-p var (cadr b) others body env)
+                                    :vector)))))))
           (when k (setf (aref kinds i) k) (setq any t)))
         (setq i (+ i 1)))
-      (and any
-           ;; any failure in the analysis = not eligible (always safe)
-           (handler-case
-               (let ((scope (%fp-scope-extend-let env bindings decl-body)))
-                 (every (lambda (f) (%fp-scope-call-free-p f scope 0)) body))
-             (error () nil))
-           kinds))))
+      (let ((ok (and any
+                     ;; any failure in the analysis = not eligible (always safe)
+                     (handler-case
+                         (let ((scope (%fp-scope-extend-let env bindings decl-body sequential)))
+                           (every (lambda (f) (%fp-scope-call-free-p f scope 0)) body))
+                       (error (e) (list :error e))))))
+        (and (eq ok t) kinds)))))
 
 (defun %fp-kind-dtype (kind)
   "The binding dtype of an FP-resident local of KIND."
@@ -16393,7 +16446,7 @@
          ;; same as compile-let.  A let* init can reference an earlier binding, so
          ;; an fp-resident var must carry its DTYPE (vi-pack / f32v-pack) in the
          ;; env for the later init's vector-tree recognition to see it.
-         (fp-kinds (and (> n-bindings 0) (%let-fp-kinds bindings decl-body body env)))
+         (fp-kinds (and (> n-bindings 0) (%let-fp-kinds bindings decl-body body env t)))
          (n-fp 0)
          (new-env env)
          ;; Declared types of THIS let*'s variables, scanned once up front so
@@ -24472,6 +24525,14 @@
    it, only runtime-compiled code did, and the runtime's own double math --
    EXP, LOG, SIN -- was ~40 boxed operations a call.")
 
+(defun %fpd-int-conversion-var (form env)
+  "V when FORM converts a lexical variable V that is provably a fixnum to a double ((FLOAT V 1d0), (COERCE V
+   'DOUBLE-FLOAT)): widened in register by one FPD-ITOF, so it is a leaf of a double tree, not a call.  Before
+   this, (float k 1d0) of an integer -- a log's exponent -- hoisted a call to FLOAT out of the tree, and a call in
+   a scope boxes every double in it (an fdlibm log ran 30 times slower than the same code without it)."
+  (let ((x (%double-conversion-arg form)))
+    (and x (symbolp x) (env-lookup env x) (%expr-width x env) x)))
+
 (defun %fpd-tree-need (form env)
   "FP registers needed to evaluate FORM as an unboxed double tree, or NIL."
   (cond
@@ -24500,6 +24561,8 @@
     ;; a single-float tree widened in register (fcvt d<-s), not a hoisted call
     ((and (%double-conversion-arg form) (%fp-tree-need (%double-conversion-arg form) env))
      (%fp-tree-need (%double-conversion-arg form) env))
+    ;; a fixnum variable widened in register (FPD-ITOF)
+    ((%fpd-int-conversion-var form env) 1)
     ;; (EXP d) of a double tree: %EMIT-EXP-DOUBLE-FULL, no call.  Its peak is 8
     ;; with the result: x held beside the core's 7.  An over-estimate costs
     ;; real code: ten made (/ 1d0 (+ 1d0 (exp ...))) -- a sigmoid -- not fit
@@ -24528,7 +24591,8 @@
   (let ((acc nil))
     (labels ((walk (f)
                (cond ((%double-conversion-arg f)
-                      (unless (and env (%fp-tree-need (%double-conversion-arg f) env))
+                      (unless (and env (or (%fp-tree-need (%double-conversion-arg f) env)
+                                           (%fpd-int-conversion-var f env)))
                         (push f acc)))
                      ((and (consp f) (symbolp (car f))
                            (or (member (symbol-name (car f)) '("+" "-" "*" "/") :test #'string=)
@@ -24566,6 +24630,12 @@
            (compile-double-unboxed (caddr form) env ft)
            (emit-ir :fp-op2 fd fd ft (if (eq (%fp-minmax-op form) :max) 2 3))
            (free-fp-reg))
+         (return-from compile-double-unboxed nil))
+        ((%fpd-int-conversion-var form env)                     ; a fixnum variable: FPD-ITOF
+         (let ((tmp (alloc-temp-reg)))
+           (compile-form (%fpd-int-conversion-var form env) env tmp)
+           (emit-ir :fpd-itof fd tmp)
+           (free-temp-reg))
          (return-from compile-double-unboxed nil))
         ((and (%double-conversion-arg form) (%fp-tree-need (%double-conversion-arg form) env))
          (compile-float-unboxed (%double-conversion-arg form) env fd)
@@ -30515,6 +30585,9 @@
                  (dolist (a (cdr args) w)
                    (let ((wa (%expr-width a env)))
                      (if (and w wa) (setq w (max w wa)) (return nil)))))))
+         ;; (MOD X 2^k) of a fixnum is its LOGAND (%MOD-POW2-REWRITE)
+         ((and (string= op "MOD") (%mod-pow2-rewrite form env))
+          (%expr-width-1 (%mod-pow2-rewrite form env) env))
          ((string= op "LOGAND")
           ;; Widths include the sign, so LOGAND only narrows when an operand
           ;; is known NON-NEGATIVE (a literal mask >= 0: result in [0, mask]).

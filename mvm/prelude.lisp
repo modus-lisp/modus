@@ -673,6 +673,11 @@
   "True for a plain packed (unsigned-byte 32) vector (subtag #x17): no header, no wrapper."
   (and x (not (consp x)) (not (%mda-p x)) (eq (obj-subtag x) #x17)))
 
+(defun %f32-bare-p (x)
+  "True for a plain packed SINGLE-FLOAT vector (subtag #x12): no header, no wrapper.  Its lanes are 4 bytes at
+   the same places a packed u32 vector's are, so the u32 lane copy moves them unchanged."
+  (and x (not (consp x)) (not (%mda-p x)) (eq (obj-subtag x) #x12)))
+
 (defun %bulk-copy-u32-ok-p (dst src)
   "Both plain packed u32 vectors: copy 4-byte lanes (%BULK-COPY-OK-P excludes #x17 -- its
    slots are not words)."
@@ -705,6 +710,15 @@
       (setq i (+ i 1)))))
 
 (declaim (overridable %fill-words))
+(declaim (overridable %fill-f32))
+(defun %fill-f32 (seq start end item)
+  "Lanes [START, END) of the packed single-float vector SEQ set to ITEM.  A lane at a time; the aarch64 and x64
+   images replace this with one store and log2 N doubling moves (native-bulk.lisp)."
+  (let ((i start))
+    (loop (when (>= i end) (return seq))
+      (setf (aref seq i) item)
+      (setq i (+ i 1)))))
+
 (defun %fill-words (seq start end item)
   "SEQ[START..END) := ITEM in raw word slots (%BULK-COPY-OK-P SEQ SEQ, END within
    it).  The aarch64 and x64 images replace this with one BULK-FILL."

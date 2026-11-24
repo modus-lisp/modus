@@ -36,6 +36,17 @@
           (setq done (+ done k))))))
   seq)
 
+(defun %fill-f32 (seq start end item)
+  ;; as %FILL-U32: the first lane stored, then the filled span doubled by forward moves
+  (when (< start end)
+    (setf (aref seq start) item)
+    (let ((done 1) (n (- end start)))
+      (loop (when (>= done n) (return nil))
+        (let ((k (min done (- n done))))
+          (%bulk-move seq (* 4 (+ start done)) seq (* 4 start) (* 4 k) 1)
+          (setq done (+ done k))))))
+  seq)
+
 (defun %fill-words (seq start end item)
   (when (< start end) (%bulk-fill seq start (- end start) item 0))
   seq)

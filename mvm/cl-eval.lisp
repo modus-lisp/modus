@@ -1174,7 +1174,7 @@
     (and pn
          (not (string= pn "COMMON-LISP"))
          (not (string= pn "KEYWORD"))
-         (not (%kernel-package-name-p pn))
+         (not (%kernel-home-pkg-name-p pn))
          (fboundp sym))))
 
 (defun set-macro-function (sym fn &rest env)
@@ -5405,6 +5405,11 @@
           (return-from %replace-pos seq1))
         ;; packed u32 (glass's framebuffers: its window blit is a REPLACE a row)
         (when (%bulk-copy-u32-ok-p seq1 seq2)
+          (%bulk-copy-u32 seq1 start1 seq2 start2 count)
+          (return-from %replace-pos seq1))
+        ;; packed single floats: the same 4-byte lanes (mill's Slice, Concat and Transpose copy them a row
+        ;; at a time; the general path below consed a list of every element first)
+        (when (and (%f32-bare-p seq1) (%f32-bare-p seq2))
           (%bulk-copy-u32 seq1 start1 seq2 start2 count)
           (return-from %replace-pos seq1))
         (when (%bulk-copy-ok-p seq1 seq2)

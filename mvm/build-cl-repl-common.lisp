@@ -395,13 +395,23 @@
 ;;; allocator's own range check re-initialises a garbage bump pointer to base —
 ;;; see the #x0531 arm.
 (defvar *cl-repl-jit-region-source*
-  (if *cl-repl-virt-p*
-      "
+  (cond (*cl-repl-virt-p*
+         "
 (defun %jit-exec-bump () 67108848)
 (defun %jit-exec-lo   () 67108864)
 (defun %jit-exec-hi   () 83886080)
-"
-      ""))
+")
+        ;; bare x64 with the JIT: translate-x64's #x0531 bare arm bumps the word at
+        ;; 0x10000FB8 through [#x30000000, #x38000000) (%X64-BARE-JIT-LO / -HI), and the
+        ;; arena bookkeeping (%CORE-JIT-ARENA-*, %JIT-DATA-PAGE, %JIT-ARENA-ROOM-P) must
+        ;; see the same region
+        ((and *cl-repl-x64-p* *jit-on*)
+         "
+(defun %jit-exec-bump () 268439480)
+(defun %jit-exec-lo   () 805306368)
+(defun %jit-exec-hi   () 939524096)
+")
+        (t "")))
 
 ;;; ------------------------------------------------------------
 ;;; BRING-UP CULLS (#209 rung 4).  Chain-loading a 20MB image over a 9600-baud
@@ -986,7 +996,52 @@
 ;; Back to lib/save-image.lisp's defaults.  Last definition wins.
 (defun %core-progress (k) k)
 (defun %core-pre-restore () t)
-")
+"
+       (if (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)
+           ""
+           "
+;;; THE CLOCK ON A BARE PC.  Trap #x0311 (CNTFRQ) answers 0 on bare x64 -- no
+;;; OS clock to measure the TSC against -- and cl-fileio's defaults are a Linux
+;;; syscall, so GET-INTERNAL-REAL-TIME read 0 and the hot-function JIT's 10 ms
+;;; budget never fired: one expensive call never promoted its DEFUN.  The
+;;; reference is the 8254's channel 2, as in Linux's pit_calibrate_tsc: gate on
+;;; and speaker off (port #x61), mode 0 with a 10 ms count, and OUT2 (#x61 bit
+;;; 5) rises at zero.  Measured once, kept in a global SET at run time (a
+;;; DEFVAR initform does not run here).  No PIT answering within ~5 s of TSC
+;;; (a chipset that gates it off) leaves 0, \"no clock\", the old answer.  Not
+;;; under SEV-SNP: that guest must not touch legacy ports.
+(defun %pc-tsc-hz ()
+  (let ((hz (if (boundp '*pc-tsc-hz*) (symbol-value '*pc-tsc-hz*) nil)))
+    (if (integerp hz)
+        hz
+        (let ((latch 11932))
+          (io-out-byte #x61 (logior (logand (io-in-byte #x61) #xFC) 1))
+          (io-out-byte #x43 #xB0)
+          (io-out-byte #x42 (logand latch #xFF))
+          (io-out-byte #x42 (ash latch -8))
+          (let ((t0 (rdtsc)) (cap 17179869184))
+            (loop while (and (zerop (logand (io-in-byte #x61) #x20))
+                             (< (- (rdtsc) t0) cap)))
+            (let* ((dt (- (rdtsc) t0))
+                   (v (if (< dt cap) (floor (* dt 1193182) latch) 0)))
+              (setf (symbol-value '*pc-tsc-hz*) v)
+              v))))))
+(defun get-internal-real-time ()
+  (let ((hz (%pc-tsc-hz)))
+    (if (> hz 0)
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000)
+             (floor (* (mod ticks hz) 1000000) hz)))
+        0)))
+(defun %irt-ns ()
+  (let ((hz (%pc-tsc-hz)))
+    (if (> hz 0)
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000000)
+             (floor (* (mod ticks hz) 1000000000) hz)))
+        0)))
+(defun %irun-ns () (%irt-ns))
+"))
       (concatenate 'string
         (string #\Newline)
         (mvm-text "lib/fdt.lisp")
@@ -4271,6 +4326,16 @@
   (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
   (setf modus.mvm.x64::*x64-linux-mode* nil)
   (setf modus.mvm.x64::*x64-gc-enabled* t)
+  ;; THE JIT CONSTANT VECTOR IS A ROOT OF THIS IMAGE'S COLLECTOR (build-generic-cli's
+  ;; rule).  The in-image co-init (%INIT-X64-TRANSLATOR) sets the flag, so JIT
+  ;; pages load their thunk constants through the vector at 0x10000F00 -- but
+  ;; without the host-side half the collector never forwarded it, the vector
+  ;; dangled at the first collection, and %JIT-CONSTVEC-COVERS-P's intactness
+  ;; check then refused every page: measured on the UEFI image, no hot DEFUN
+  ;; built after one collection.  The page at 0x10000000 is zeroed by the boot
+  ;; stub, so the root starts out "no vector".
+  (when cl-user::*jit-on*
+    (setf modus.mvm.x64::*x64-jit-constvec-p* t))
   ;; THE CONS-KIND scan_word REJECT IS ON, ON BARE x64 TOO (MODUS_X64_KINDCHECK=0
   ;; turns it off for an A/B).  It used to be forced OFF here on the argument
   ;; that the kind bitmap's address, [bitmap_base]+delta, is a Linux layout

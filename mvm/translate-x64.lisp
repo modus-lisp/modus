@@ -296,6 +296,14 @@
 
 (defun emit-abs32 (buf addr) (emit-u32 buf addr))
 
+;;; BARE-METAL JIT region (#x0531's bare arm): code pages bump UP from LO, the JIT's
+;;; data pages (linkage cells) come DOWN from HI.  Above the bare heap (#x04000000..),
+;;; the collector's metadata (#x1E000000..) and the core-save area (#x20000000..);
+;;; inside 1 GB.  DEFUNS, as aarch64's %JIT-EXEC-*: this file is baked into the image
+;;; and a defvar's initform does not run there.
+(defun %x64-bare-jit-lo () #x30000000)
+(defun %x64-bare-jit-hi () #x38000000)
+
 (defun emit-cmp-abs64-zero (buf addr)
   "cmp qword [ADDR], 0   (absolute, no segment)"
   (emit-bytes buf #x48 #x83 #x3C #x25) (emit-abs32 buf addr) (emit-bytes buf #x00))
@@ -2380,6 +2388,35 @@
               ;; process puts its JIT pages at the same addresses and a snapshot
               ;; carries [arena, bump) verbatim -- the aarch64 arm's shape.  Bump
               ;; word 0 (no arena, or a bare image) is the mmap(NULL) path below.
+              (if (not *x64-linux-mode*)
+                ;; BARE METAL: no mmap.  Bump-allocate from the fixed RWX region
+                ;; [%X64-BARE-JIT-LO, %X64-BARE-JIT-HI) (the UEFI and multiboot stubs
+                ;; identity-map RAM with no NX), the bump word at 0x10000FB8 as on the
+                ;; hosted arena.  RAM is not zeroed, so a bump word outside the region
+                ;; restarts at its base -- aarch64's #x0531 shape.  A page that would
+                ;; pass the top returns 0: the JIT then interprets the form.  One CPU:
+                ;; a plain store.
+                (let ((have (make-label)) (reset (make-label)) (full (make-label)) (bdone (make-label)))
+                  (emit-mov-reg-imm buf 'rdi #x10000FB8)         ; rdi = &bump
+                  (emit-mov-reg-mem buf 'rax 'rdi 0)             ; rax = bump
+                  (emit-cmp-reg-imm buf 'rax (%x64-bare-jit-lo)) (emit-jcc buf :b reset)
+                  (emit-cmp-reg-imm buf 'rax (%x64-bare-jit-hi)) (emit-jcc buf :ae reset)
+                  (emit-jmp buf have)
+                  (emit-label buf reset)
+                  (emit-mov-reg-imm buf 'rax (%x64-bare-jit-lo))
+                  (emit-label buf have)
+                  (emit-mov-reg-reg buf 'rdx 'rsi)               ; rdx = tagged size
+                  (emit-bytes buf #x48 #xD1 #xFA)                ; sar rdx, 1
+                  (emit-bytes buf #x48 #x83 #xC2 #x0F)           ; add rdx, 15
+                  (emit-bytes buf #x48 #x83 #xE2 #xF0)           ; and rdx, -16
+                  (emit-add-reg-reg buf 'rdx 'rax)               ; rdx = new bump
+                  (emit-cmp-reg-imm buf 'rdx (%x64-bare-jit-hi)) (emit-jcc buf :a full)
+                  (emit-mov-mem-reg buf 'rdi 'rdx 0)             ; bump = new
+                  (emit-bytes buf #x48 #x8D #x34 #x00)           ; lea rsi, [rax+rax]  (tagged page)
+                  (emit-jmp buf bdone)
+                  (emit-label buf full)
+                  (emit-bytes buf #x31 #xF6)                     ; xor esi, esi: no page
+                  (emit-label buf bdone))
               (let ((fallback (make-label)) (done (make-label)))
                 (when (and *x64-linux-mode*
                            (not (equal (sb-ext:posix-getenv "MODUS_X64_ARENA_TRAP") "0")))  ; A/B knob
@@ -2408,7 +2445,7 @@
                 (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
                 (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag result)
                 (emit-bytes buf #x48 #x89 #xC6)    ; mov rsi, rax → V0
-                (emit-label buf done))
+                (emit-label buf done)))
               (emit-bytes buf #x41 #x5B)         ; pop r11
               (emit-bytes buf #x41 #x5A)         ; pop r10
               (emit-bytes buf #x41 #x59)         ; pop r9

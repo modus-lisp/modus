@@ -999,6 +999,11 @@
                      *selfhost-cross-tooling-source*
                      (mvm-text "mvm/builder.lisp") (string #\Newline))))
 
+;; Hosted x64 only: fill the cons-kind delta word if this image's boot stub left it
+;; zero, before the JIT can read it (%CORE-KINDBITMAP-DELTA, in the hosted text).
+(defun x64-kind-delta-init-form ()
+  (if *cli-bare-metal* "" "(%core-kindbitmap-delta) "))
+
 ;;; ARCH SLOT — boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins
 ;;; over mvm-eval.lisp's base version (last-defun-wins).  When JIT is OFF both
 ;;; defuns are inert; the two tiny defuns are ALWAYS baked (an empty string here
@@ -1031,15 +1036,15 @@
     ((and (eq *cli-arch* :x64) *cli-builder-p*)
      ;; the builder CLI also configures its foreign translators at boot, as
      ;; modus-sh does (their globals' DEFVAR inits never run in-image)
-     "
-(defun %jit-boot-init () (%init-x64-translator) (%builder-boot-init) (setq *use-jit* t) t)
+     (format nil "
+(defun %jit-boot-init () ~A(%init-x64-translator) (%builder-boot-init) (setq *use-jit* t) t)
 (defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))
-")
+" (x64-kind-delta-init-form)))
     ((eq *cli-arch* :x64)
-     "
-(defun %jit-boot-init () (%init-x64-translator) (setq *use-jit* t) t)
+     (format nil "
+(defun %jit-boot-init () ~A(%init-x64-translator) (setq *use-jit* t) t)
 (defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))
-")
+" (x64-kind-delta-init-form)))
     (t
      (concatenate 'string
       "
@@ -1748,7 +1753,20 @@
                    ;; (lib/save-image-x64.lisp; the stub and the trap arm agree).
                    ;; The cons-kind bitmap's offset follows the heap chosen at
                    ;; startup (--dynamic-space-size): the word the stub wrote.
-                   (format nil "(defun %core-kindbitmap-delta () (%gc-read64 (%conv-addr #x10000F98)))~%")
+                   ;; ZERO there means a stub that predates the word: the boot
+                   ;; stub is the BUILDING host's (MVM-LOAD adopts boot/ on a
+                   ;; modus host), so a builder made by an older release builder
+                   ;; has a stub that never writes it, and its JIT, which adds
+                   ;; [0x10000F98], set cons-kind bits in the START bitmap --
+                   ;; a corrupt heap within seconds (Windows' two-stage self
+                   ;; build).  That stub laid out the host's default layout, so
+                   ;; the host's delta is the right value; %JIT-BOOT-INIT calls
+                   ;; this first on x64, before anything can be JIT-built.
+                   (format nil "(defun %core-kindbitmap-delta ()
+  (let ((d (%gc-read64 (%conv-addr #x10000F98))))
+    (if (zerop d)
+        (progn (%gc-write64 (%conv-addr #x10000F98) ~D) ~D)
+        d)))~%" modus.mvm.x64::*mcgc-kindbitmap-delta* modus.mvm.x64::*mcgc-kindbitmap-delta*)
                    (mvm-text "lib/save-image-x64.lisp")
                    (string #\Newline)
                    ;; THE SSH-2 SERVER OVER A LINUX STREAM (docs/nitro-enclaves.md,

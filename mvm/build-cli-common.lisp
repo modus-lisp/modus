@@ -132,8 +132,12 @@
     (and v (string= v "1"))))
 (defvar *cli-68k-jit*
   (and (boundp '*cli-arch*) (eq *cli-arch* :68k) (%cli-tier-knob "MODUS_68K_JIT")))
+;; The i386 CLI's native tier is ON by default (2026-11-24: its ANSI sweep with the tier on was
+;; 21681/21681); MODUS_I386_JIT=0 builds it off.  The bare i386 images keep their own opt-in
+;; (build-cl-repl-common), measured so far only on the T420.
 (defvar *cli-i386-jit*
-  (and (boundp '*cli-arch*) (eq *cli-arch* :i386) (%cli-tier-knob "MODUS_I386_JIT")))
+  (and (boundp '*cli-arch*) (eq *cli-arch* :i386)
+       (not (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "0"))))
 ;; translate-68k.lisp decided *68K-JIT-SHAPES* from MODUS_68K_JIT when it loaded
 ;; (it serves the bare Mac too); the CLI's default is decided here.
 (when *cli-68k-jit*

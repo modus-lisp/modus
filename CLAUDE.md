@@ -1073,8 +1073,9 @@ because every syscall address travels as a tagged fixnum. i386 has no x64-style
 JIT (`*JIT-ON*` is x64-only), but it has a **native tier**: `mvm/jit-i386-native.lisp`.
 The image carries `translate-i386.lisp`, and a runtime DEFUN is translated at its
 first call, `(compile 'f)` at once, and closure-building top-level forms natively.
-It is OFF by default: build with `MODUS_I386_JIT=1` to get it; without it
-`mvm-eval` interprets all runtime code. Whatever the tier refuses stays
+It is ON by default in the CLI since 2026-11-24 (`MODUS_I386_JIT=0` builds it off; the
+bare i386 images still opt in with `MODUS_I386_JIT=1`); without it `mvm-eval` interprets
+all runtime code. Whatever the tier refuses stays
 interpreted, with the reason in `*N386-REFUSED*`. The i386 ANSI sweep with it on:
 2026-11-23, 21653/21681; **2026-11-24, 21681/21681** (dos386 38d896fa, main merged:
 the variable-count ASH guard and the 32-bit collector fix cleared all 28 below).

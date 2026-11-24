@@ -1061,6 +1061,19 @@
       (ppc-emit-srad buf ra rs rb)
       (ppc-emit-sraw buf ra rs rb)))
 
+;;; Shifts by a CONSTANT: one RLWINM on ppc32, not `li rX,n' and a shift by
+;;; register (every array access, length and allocation emitted that pair).
+;;; PPC64 and out-of-range counts keep the register form.
+(defun ppc-emit-shl-const (buf ra rs n count-reg)
+  (if (and (not *ppc-64-bit*) (< -1 n 32))
+      (ppc-emit-rlwinm buf ra rs n 0 (- 31 n))
+      (progn (ppc-emit-addi buf count-reg 0 n) (ppc-emit-shift-left buf ra rs count-reg))))
+
+(defun ppc-emit-shr-const (buf ra rs n count-reg)
+  (if (and (not *ppc-64-bit*) (< 0 n 32))
+      (ppc-emit-rlwinm buf ra rs (- 32 n) n 31)
+      (progn (ppc-emit-addi buf count-reg 0 n) (ppc-emit-shift-right buf ra rs count-reg))))
+
 (defun ppc-emit-shift-right-arith-imm (buf ra rs sh)
   "Shift right algebraic immediate (sradi or srawi depending on *ppc-64-bit*)."
   (if *ppc-64-bit*
@@ -1101,8 +1114,7 @@
 (defun ppc-load-vreg (buf phys-dst vreg)
   "Load a virtual register into a physical register. If the vreg has a
    physical mapping, emit MR. If it spills, load from the frame."
-  (let ((phys (and (< vreg (length *ppc-vreg-map*))
-                   (aref *ppc-vreg-map* vreg))))
+  (let ((phys (ppc-vreg-phys vreg)))
     (if phys
         (unless (= phys phys-dst)
           (ppc-emit-mr buf phys-dst phys))
@@ -1112,18 +1124,61 @@
 (defun ppc-store-vreg (buf vreg phys-src)
   "Store a physical register value into a virtual register. If the vreg
    has a physical mapping, emit MR. If it spills, store to frame."
-  (let ((phys (and (< vreg (length *ppc-vreg-map*))
-                   (aref *ppc-vreg-map* vreg))))
+  (let ((phys (ppc-vreg-phys vreg)))
     (if phys
         (unless (= phys phys-src)
           (ppc-emit-mr buf phys phys-src))
         ;; Spill: store to stack frame
         (ppc-emit-store-word buf phys-src +ppc-r31+ (ppc-spill-offset vreg)))))
 
+;;; THE LOCAL REGISTERS (ppc32).  V9-V15 were spill slots; PPC32 has r22-r28
+;;; doing nothing outside the collector (which saves every register).  They
+;;; hold V9-V15 now: the compiler's register promotion puts a loop's hottest
+;;; locals in V9-V13 (compiler.lisp %PROMOTE-LOCALS-P, aarch64's x6/x7/x4/x5/x8)
+;;; and temps past V8 land in V14/V15.  CALLEE-SAVED, and only by a function
+;;; that writes them (*PPC-SAVED-LOCALS*, from a scan of its bytecode), in the
+;;; ppc32 frame's free words at +PPC32-LOCALS-SAVE-BASE+; a SETJMP parks them in
+;;; the (now unused) V9-V15 spill slots and reloads them where both of its
+;;; returns land, as translate-aarch64 does -- a thrower's epilogues never run.
+;;; PPC64's frame has no free words there: it keeps the spill slots.
+(defconstant +ppc32-locals-save-base+ 60
+  "r1-relative: r22..r28's save words in a ppc32 frame (r31's is at 56, the
+   spill slots start at 128).")
+
+(defvar *ppc-saved-locals* nil
+  "The local registers (r22..r28) the function being emitted writes: what its
+   prologue saves and its epilogue and tail calls restore.")
+
 (defun ppc-vreg-phys (vreg)
   "Return the physical register for a vreg, or NIL if it spills."
-  (and (< vreg (length *ppc-vreg-map*))
-       (aref *ppc-vreg-map* vreg)))
+  (if (and (not *ppc-64-bit*) (<= 9 vreg 15))
+      (+ vreg 13)                                         ; V9..V15 = r22..r28
+      (and (< vreg (length *ppc-vreg-map*))
+           (aref *ppc-vreg-map* vreg))))
+
+(defun ppc-fn-local-regs (bc start end)
+  "The local registers (r22..r28) a function's bytecode [START, END) names --
+   every :REG operand in V9..V15 -- for *PPC-SAVED-LOCALS*.  PPC32 only."
+  (if *ppc-64-bit*
+      nil
+      (let ((regs nil) (pc start))
+        (loop while (< pc end)
+              do (multiple-value-bind (op operands npc) (decode-instruction-mv bc pc)
+                   (let ((info (gethash op *opcode-table*)))
+                     (loop for type in (and info (opcode-info-operands info))
+                           for v in operands
+                           do (when (and (eq type :reg) (<= 9 v 15))
+                                (pushnew (+ v 13) regs))))
+                   (setq pc npc)))
+        (sort regs #'<))))
+
+(defun ppc-emit-save-locals (buf)
+  (dolist (r *ppc-saved-locals*)
+    (ppc-emit-store-word buf r +ppc-r1+ (+ +ppc32-locals-save-base+ (* 4 (- r 22))))))
+
+(defun ppc-emit-restore-locals (buf)
+  (dolist (r *ppc-saved-locals*)
+    (ppc-emit-load-word buf r +ppc-r1+ (+ +ppc32-locals-save-base+ (* 4 (- r 22))))))
 
 ;;; ============================================================
 ;;; Immediate Loading (32-bit or 64-bit)
@@ -1641,6 +1696,7 @@
       (ppc-emit-store-word buf +ppc-r16+ +ppc-r1+ (+ base (* 2 ws)))
       (ppc-emit-store-word buf +ppc-r17+ +ppc-r1+ (+ base (* 3 ws)))
       (ppc-emit-store-word buf +ppc-r18+ +ppc-r1+ (+ base (* 4 ws)))
+      (ppc-emit-save-locals buf)
       ;; r19 (VA), r20 (VL) and r21 (VN) ARE NOT SAVED -- see ppc-emit-epilogue.
       ;; Their three slots stay unused.
       (ppc-emit-store-word buf +ppc-r31+ +ppc-r1+ (+ base (* 8 ws)))) ; VFP
@@ -1658,6 +1714,7 @@
       (ppc-emit-load-word buf +ppc-r16+ +ppc-r1+ (+ base (* 2 ws)))
       (ppc-emit-load-word buf +ppc-r17+ +ppc-r1+ (+ base (* 3 ws)))
       (ppc-emit-load-word buf +ppc-r18+ +ppc-r1+ (+ base (* 4 ws)))
+      (ppc-emit-restore-locals buf)
       ;; VA, VL AND VN ARE GLOBAL STATE AND MUST NOT BE RESTORED.  r19 is the
       ;; ALLOCATION POINTER; restoring it on return rolls the heap pointer back
       ;; over everything the callee allocated, so the caller's next CONS is
@@ -1747,8 +1804,17 @@
               (loop for r in (list +ppc-r14+ +ppc-r15+ +ppc-r16+ +ppc-r17+ +ppc-r18+)
                     for i from 3
                     do (ppc-emit-store-word buf r +ppc-r12+ (* i ws)))
+              ;; ppc32's local registers are not in the jmpbuf: parked in this
+              ;; frame's V9-V15 spill slots, back on either return (see
+              ;; PPC-VREG-PHYS)
+              (unless *ppc-64-bit*
+                (loop for v from 9 to 15
+                      do (ppc-emit-store-word buf (+ v 13) +ppc-r31+ (ppc-spill-offset v))))
               (ppc-emit-mr buf +ppc-r3+ +ppc-r21+)              ; first return: NIL
-              (ppc-emit-label buf resume)))
+              (ppc-emit-label buf resume)
+              (unless *ppc-64-bit*
+                (loop for v from 9 to 15
+                      do (ppc-emit-load-word buf (+ v 13) +ppc-r31+ (ppc-spill-offset v))))))
            ((= code #x0511)
             ;; LONGJMP: PPC-EMIT-LONGJMP-BODY.  Nothing armed: trap, rather
             ;; than jump to address zero.
@@ -2309,8 +2375,9 @@
              (amt (third operands)))
          (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
            (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
-             (ppc-emit-addi buf +ppc-scratch2+ 0 amt)
-             (ppc-emit-shift-left buf pd ps +ppc-scratch2+)
+             (cond ((or *ppc-64-bit* (not (< -1 amt 32)))
+                    (ppc-emit-shl-const buf pd ps amt +ppc-scratch2+))
+                   (t (ppc-emit-rlwinm buf pd ps amt 0 (- 31 amt))))   ; slwi
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
@@ -2320,8 +2387,9 @@
              (amt (third operands)))
          (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
            (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
-             (ppc-emit-addi buf +ppc-scratch2+ 0 amt)
-             (ppc-emit-shift-right buf pd ps +ppc-scratch2+)
+             (cond ((or *ppc-64-bit* (not (< 0 amt 32)))
+                    (ppc-emit-shr-const buf pd ps amt +ppc-scratch2+))
+                   (t (ppc-emit-rlwinm buf pd ps (- 32 amt) amt 31)))  ; srwi
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
@@ -2397,15 +2465,22 @@
 
       ;; (cmp-imm / test-imm Va imm32): the sign-extended immediate into
       ;; scratch2, then as CMP / TEST
+      ;; A 16-bit immediate is CMPWI / ANDI. itself: one instruction.
       (#.+op-cmp-imm+
-       (let ((pa (vreg-or-scratch (first operands) +ppc-scratch1+)))
-         (ppc-emit-li buf +ppc-scratch2+ (%imm32-signed (second operands)))
-         (ppc-emit-cmp-word buf pa +ppc-scratch2+)))
+       (let ((pa (vreg-or-scratch (first operands) +ppc-scratch1+))
+             (imm (%imm32-signed (second operands))))
+         (if (<= -32768 imm 32767)
+             (ppc-emit-cmpi-word buf pa imm)
+             (progn (ppc-emit-li buf +ppc-scratch2+ imm)
+                    (ppc-emit-cmp-word buf pa +ppc-scratch2+)))))
 
       (#.+op-test-imm+
-       (let ((pa (vreg-or-scratch (first operands) +ppc-scratch1+)))
-         (ppc-emit-li buf +ppc-scratch2+ (%imm32-signed (second operands)))
-         (ppc-emit-word buf (ppc-x-form 31 pa +ppc-r0+ +ppc-scratch2+ 28 1))))
+       (let ((pa (vreg-or-scratch (first operands) +ppc-scratch1+))
+             (imm (%imm32-signed (second operands))))
+         (if (<= 0 imm 65535)
+             (ppc-emit-andi-dot buf +ppc-r0+ pa imm)                 ; andi. r0,pa,imm
+             (progn (ppc-emit-li buf +ppc-scratch2+ imm)
+                    (ppc-emit-word buf (ppc-x-form 31 pa +ppc-r0+ +ppc-scratch2+ 28 1))))))
 
       ;;; --- Branches ---
       (#.+op-br+
@@ -2707,8 +2782,7 @@
            (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
              (ppc-emit-andi-dot buf pd ps #xF)
              ;; Tag as fixnum: shl 1
-             (ppc-emit-addi buf +ppc-r0+ 0 1)
-             (ppc-emit-shift-left buf pd pd +ppc-r0+)
+             (ppc-emit-shl-const buf pd pd 1 +ppc-r0+)
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
@@ -2740,8 +2814,7 @@
                ;; The subtag is the header's LOW byte: (count << 8) | subtag.
                (ppc-emit-andi-dot buf pd pd #xFF)             ; mask 8 bits
                ;; Tag as fixnum
-               (ppc-emit-addi buf +ppc-scratch2+ 0 1)
-               (ppc-emit-shift-left buf pd pd +ppc-scratch2+)
+               (ppc-emit-shl-const buf pd pd 1 +ppc-scratch2+)
                (ppc-emit-b buf done)
                (ppc-emit-label buf zero)
                (ppc-emit-li buf pd 0)
@@ -3090,6 +3163,7 @@
          (ppc-emit-load-word buf +ppc-r16+ +ppc-r1+ (+ base (* 2 ws)))
          (ppc-emit-load-word buf +ppc-r17+ +ppc-r1+ (+ base (* 3 ws)))
          (ppc-emit-load-word buf +ppc-r18+ +ppc-r1+ (+ base (* 4 ws)))
+         (ppc-emit-restore-locals buf)
          (ppc-emit-load-word buf +ppc-r31+ +ppc-r1+ (+ base (* 8 ws)))
          ;; Restore LR from this frame -- BEFORE the frame is popped.
          (ppc-emit-load-word buf +ppc-r0+ +ppc-r1+ (ppc-lr-slot))
@@ -3232,8 +3306,7 @@
               (ws (ppc-word-size))
               (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
          ;; header = (count << 8) | #x32   (array subtag, as on i386)
-         (ppc-emit-addi buf +ppc-scratch2+ 0 8)
-         (ppc-emit-shift-left buf +ppc-r0+ pc +ppc-scratch2+)
+         (ppc-emit-shl-const buf +ppc-r0+ pc 8 +ppc-scratch2+)
          (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x32)
          (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
          ;; bytes = align16((count + 1) * ws), computed in r12.  NOT IN r0:
@@ -3241,8 +3314,7 @@
          ;; zero -- so the size came out 0 and VA was never bumped past the
          ;; array: every later allocation overlapped it.
          (ppc-emit-addi buf +ppc-scratch2+ pc 1)
-         (ppc-emit-addi buf +ppc-r0+ 0 (if (= ws 8) 3 2))
-         (ppc-emit-shift-left buf +ppc-scratch2+ +ppc-scratch2+ +ppc-r0+)
+         (ppc-emit-shl-const buf +ppc-scratch2+ +ppc-scratch2+ (if (= ws 8) 3 2) +ppc-r0+)
          (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ 15)
          (ppc-emit-clear-low4 buf +ppc-scratch2+ +ppc-scratch2+)
          ;; result = VA | 9, then bump VA (order matters: VA is still the base)
@@ -3259,8 +3331,7 @@
               (ws (ppc-word-size))
               (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
          ;; Address in r12 — r0 is not a base register (see :obj-ref).
-         (ppc-emit-addi buf +ppc-r0+ 0 (if (= ws 8) 2 1))
-         (ppc-emit-shift-left buf +ppc-scratch2+ pidx +ppc-r0+)
+         (ppc-emit-shl-const buf +ppc-scratch2+ pidx (if (= ws 8) 2 1) +ppc-r0+)
          (if (= (second operands) +vreg-vfp+)
              ;; VARIABLE-INDEX FRAME SLOT load: the &rest prologue's loop
              ;; (emit-rest-prologue) walks frame slots with `aref VFP idx'.  The
@@ -3290,8 +3361,7 @@
               (ws (ppc-word-size))
               (pval (ppc-vreg-phys (third operands))))
          ;; Address in r12 — r0 is not a base register (see :obj-ref).
-         (ppc-emit-addi buf +ppc-r0+ 0 (if (= ws 8) 2 1))
-         (ppc-emit-shift-left buf +ppc-scratch2+ pidx +ppc-r0+)
+         (ppc-emit-shl-const buf +ppc-scratch2+ pidx (if (= ws 8) 2 1) +ppc-r0+)
          (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ pobj)
          ;; The value is loaded LAST, into r11, which the address no longer
          ;; needs, so computing the address cannot clobber it.
@@ -3313,15 +3383,15 @@
          (ppc-emit-addi buf +ppc-scratch2+ pobj
                         (logand (- +tag-object+) #xFFFF))
          (ppc-emit-load-word buf pd +ppc-scratch2+ 0)
-         (ppc-emit-addi buf +ppc-r0+ 0 8)
-         (ppc-emit-shift-right buf pd pd +ppc-r0+)
-         ;; mask to 24 bits by shifting out and back
-         (ppc-emit-addi buf +ppc-r0+ 0 (- bits 24))
-         (ppc-emit-shift-left buf pd pd +ppc-r0+)
-         (ppc-emit-addi buf +ppc-r0+ 0 (- bits 24))
-         (ppc-emit-shift-right buf pd pd +ppc-r0+)
-         (ppc-emit-addi buf +ppc-r0+ 0 1)
-         (ppc-emit-shift-left buf pd pd +ppc-r0+)   ; tag as fixnum
+         (if *ppc-64-bit*
+             (progn
+               (ppc-emit-shr-const buf pd pd 8 +ppc-r0+)
+               ;; mask to 24 bits by shifting out and back
+               (ppc-emit-shl-const buf pd pd (- bits 24) +ppc-r0+)
+               (ppc-emit-shr-const buf pd pd (- bits 24) +ppc-r0+)
+               (ppc-emit-shl-const buf pd pd 1 +ppc-r0+))   ; tag as fixnum
+             ;; ((h >> 8) & #xFFFFFF) << 1 = (h >> 7) & #x01FFFFFE: one RLWINM
+             (ppc-emit-rlwinm buf pd pd 25 7 30))
          (unless (ppc-vreg-phys vd)
            (ppc-store-vreg buf vd pd))))
 
@@ -3337,8 +3407,7 @@
               (ws (ppc-word-size))
               (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
          (ppc-emit-shift-right-arith-imm buf +ppc-scratch2+ pc 1)   ; N
-         (ppc-emit-addi buf +ppc-r0+ 0 8)
-         (ppc-emit-shift-left buf +ppc-r0+ +ppc-scratch2+ +ppc-r0+)
+         (ppc-emit-shl-const buf +ppc-r0+ +ppc-scratch2+ 8 +ppc-r0+)
          (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x11)                  ; u8 subtag
          (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
          ;; bytes = align16(N + ws), in r12 (N is already there).  Not r0: see
@@ -3358,14 +3427,12 @@
               (pc (vreg-or-scratch (second operands) +ppc-scratch1+))
               (ws (ppc-word-size))
               (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
-         (ppc-emit-addi buf +ppc-scratch2+ 0 8)
-         (ppc-emit-shift-left buf +ppc-r0+ pc +ppc-scratch2+)
+         (ppc-emit-shl-const buf +ppc-r0+ pc 8 +ppc-scratch2+)
          (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x31)                  ; string subtag
          (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
          ;; bytes = align16((count + 1) * ws), in r12 -- not r0 (see :alloc-array)
          (ppc-emit-addi buf +ppc-scratch2+ pc 1)
-         (ppc-emit-addi buf +ppc-r0+ 0 (if (= ws 8) 3 2))
-         (ppc-emit-shift-left buf +ppc-scratch2+ +ppc-scratch2+ +ppc-r0+)
+         (ppc-emit-shl-const buf +ppc-scratch2+ +ppc-scratch2+ (if (= ws 8) 3 2) +ppc-r0+)
          (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ 15)
          (ppc-emit-clear-low4 buf +ppc-scratch2+ +ppc-scratch2+)
          (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
@@ -3384,8 +3451,7 @@
          (ppc-emit-shift-right-arith-imm buf +ppc-scratch2+ pidx 1)
          (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ parr)
          (ppc-emit-lbz buf pd +ppc-scratch2+ (- ws +tag-object+))
-         (ppc-emit-addi buf +ppc-r0+ 0 1)
-         (ppc-emit-shift-left buf pd pd +ppc-r0+)                   ; tag
+         (ppc-emit-shl-const buf pd pd 1 +ppc-r0+)                   ; tag
          (unless (ppc-vreg-phys vd)
            (ppc-store-vreg buf vd pd))))
 
@@ -3430,8 +3496,7 @@
          (ppc-emit-addi buf +ppc-scratch2+ ps
                         (logand (- +tag-object+) #xFFFF))
          (ppc-emit-load-word buf pd +ppc-scratch2+ ws)
-         (ppc-emit-addi buf +ppc-r0+ 0 1)
-         (ppc-emit-shift-left buf pd pd +ppc-r0+)
+         (ppc-emit-shl-const buf pd pd 1 +ppc-r0+)
          (unless (ppc-vreg-phys vd)
            (ppc-store-vreg buf vd pd))))
 
@@ -3447,8 +3512,7 @@
       (#.+op-get-nargs+
        (let ((vd (first operands)))
          (ppc-emit-load-abs buf +ppc-scratch1+ (ppc-nargs-addr))
-         (ppc-emit-addi buf +ppc-scratch2+ 0 1)
-         (ppc-emit-shift-left buf +ppc-scratch1+ +ppc-scratch1+ +ppc-scratch2+)
+         (ppc-emit-shl-const buf +ppc-scratch1+ +ppc-scratch1+ 1 +ppc-scratch2+)
          (ppc-store-vreg buf vd +ppc-scratch1+)))
 
       (#.+op-set-cenv+
@@ -4025,10 +4089,12 @@
    Returns a PPC buffer (convert with ppc-buffer-to-bytes)."
   (setf *ppc-li-const-patches* nil)
   (let* ((*ppc-64-bit* 64-bit)
+         (*ppc-saved-locals* nil)
          (*ppc-gc-label* (and *ppc-linux-mode* (mvm-make-label)))
          (*ppc-hstack-push-slow-label* (mvm-make-label))
          (*ppc-hstack-pop-ext-label* (and *ppc-linux-mode* (mvm-make-label)))
          (fn-entries (make-hash-table :test 'eql))
+         (fn-locals nil)
          (buf (make-ppc-buffer))
          (label-map (make-hash-table :test 'eql))
          (bc bytecode)
@@ -4081,7 +4147,12 @@
                  (setf (gethash mvm-offset fn-entries) t))
                function-table))
 
-    ;; Second pass: translate instructions
+    ;; Second pass: translate instructions.  Each function's local registers
+    ;; (PPC-FN-LOCAL-REGS) from its entry to the next.
+    (let ((starts (sort (loop for k being the hash-keys of fn-entries collect k) #'<)))
+      (setf fn-locals (make-hash-table))
+      (loop for (a b) on starts
+            do (setf (gethash a fn-locals) (ppc-fn-local-regs bytecode a (or b len)))))
     (setf pc 0)
     (loop while (< pc len)
           do (progn
@@ -4092,6 +4163,7 @@
                ;; did not align at all.  NOP padding is harmless: a function
                ;; never falls through (it ends in BLR or a branch).
                (when (gethash pc fn-entries)
+                 (setf *ppc-saved-locals* (gethash pc fn-locals))
                  (ppc-maybe-emit-pool buf)
                  (when (and *ppc-native-tier* (eql pc *ppc-export-marker-offset*))
                    (ppc-emit-native-exports buf))

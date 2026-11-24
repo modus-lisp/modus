@@ -63,6 +63,30 @@ def main():
         out, buf = buf, bytearray()
         return out + b'[TIMEOUT]'
 
+    def read_until_any(pats, timeout):
+        """Until the first of PATS (the earliest in the stream)."""
+        nonlocal buf
+        end = time.time() + timeout
+        start = 0
+        while time.time() < end:
+            hits = [(buf.find(p, start), p) for p in pats]
+            hits = [(i, p) for i, p in hits if i >= 0]
+            if hits:
+                i, p = min(hits)
+                out, buf = buf[:i + len(p)], buf[i + len(p):]
+                return out
+            start = max(0, len(buf) - max(len(p) for p in pats) + 1)
+            try:
+                c = s.recv(65536)
+                if not c: break
+                buf += c
+                if stamps:
+                    stamps.write(f'{time.time() - t0:8.1f} {c.decode("latin-1")!r}\n'); stamps.flush()
+            except socket.timeout:
+                pass
+        out, buf = buf, bytearray()
+        return out + b'[TIMEOUT]'
+
     def emit(b):
         log.write(b.decode('latin-1').replace('\r', '')); log.flush()
 
@@ -75,10 +99,10 @@ def main():
 
     # A machine whose firmware console was its screen keeps the desk; a byte on
     # the serial port hands it back to the REPL (ppcmac-desk.lisp, DESK).
-    out = read_until(b'glass.wm: up', 3600)
-    if b'[TIMEOUT]' in out:
-        emit(out)                                  # no desk: the REPL as it comes
-        out = read_until(b'MVM-EVAL.\n> ', 600)
+    out = read_until_any([b'glass.wm: up', b'MVM-EVAL.\n> '], 3600)
+    if b'glass.wm: up' not in out:
+        emit(out)                                  # no desk: the REPL came first
+        out = b''
     else:
         emit(out)
         out = read_until(b'MVM-EVAL.\n> ', 60)

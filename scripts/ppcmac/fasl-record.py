@@ -6,8 +6,8 @@
 A fasl replays only in the image that recorded it (mvm/fasl.lisp: the key
 holds the build), so the image records them itself, once, under QEMU:
 
-  1. a disk with --fasl-record: the boot compiles the payload as always and
-     sends each file's fasl on the serial port (FASL key length / hex / FASL-END;
+  1. a disk with --fasl-record, less the desk (the last .lisp entry): the boot
+     compiles the payload as always and sends each file's fasl on the serial port (FASL key length / hex / FASL-END;
      build-cl-repl-common.lisp %PPCMAC-FASL-DUMP);
   2. those become FASLDIR/KEY.mfasl;
   3. OUT.dsk is built with --fasls FASLDIR: the fasls ride in the payload ahead
@@ -28,7 +28,14 @@ def main():
     work = tempfile.mkdtemp(prefix='fasl-record-')
     rec_disk, log, script = (os.path.join(work, n) for n in ('record.dsk', 'boot.log', 'none.script'))
     open(script, 'w').close()
-    subprocess.run(['sbcl', '--script', disk_lisp, image, rec_disk, '--payload', payload, '--fasl-record'], check=True)
+    # The record boot leaves out the LAST .lisp entry -- the desk, which runs the
+    # machine rather than defining a library: recording state and a running desk
+    # together outgrew the heap, and the desk's own file is small to compile.
+    lines = open(payload).read().splitlines()
+    last = max(i for i, l in enumerate(lines) if l.split('\t')[0].endswith('.lisp'))
+    rec_list = os.path.join(work, 'record.list')
+    open(rec_list, 'w').write('\n'.join(lines[:last] + lines[last + 1:]) + '\n')
+    subprocess.run(['sbcl', '--script', disk_lisp, image, rec_disk, '--payload', rec_list, '--fasl-record'], check=True)
     subprocess.run([sys.executable, os.path.join(here, 'macrun.py'), rec_disk, script, '--log', log], check=True)
     text = open(log, encoding='latin-1').read()
     n = 0

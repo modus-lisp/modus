@@ -15541,8 +15541,12 @@
 (defun %promote-locals-p ()
   (and *promote-locals*
        *mvm-eval-runtime-p*
-       (boundp (quote *jit-target-arch*))
-       (eq (symbol-value (quote *jit-target-arch*)) :aarch64)))
+       (or (and (boundp (quote *jit-target-arch*))
+                (eq (symbol-value (quote *jit-target-arch*)) :aarch64))
+           ;; PPC32's native tier (mvm/jit-ppc-native.lisp): V9-V15 are r22-r28
+           ;; there, callee-saved (translate-ppc PPC-VREG-PHYS).  Only a ppc32
+           ;; image has *NPPC-READY*; it is T once the tier is running.
+           (and (boundp (quote *nppc-ready*)) (symbol-value (quote *nppc-ready*))))))
 (defun %local-vregs-active-p ()
   "Local registers (V9/V10) are reserved for promotion in this compile."
   (and (%promote-locals-p) (not *promote-inhibit*)))

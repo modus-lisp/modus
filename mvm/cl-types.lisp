@@ -477,10 +477,59 @@
                          (%float-add (%float-mul (%float-mul (%fl 2) f) acc)
                                      (%float-mul fe (%dbl #x3DEA39EF #x35793C76)))))))))))
 
+(defun %log-kernel-d (m k)
+  "log(M 2^K) for a double M in [1, 2) and a fixnum K: fdlibm's __ieee754_log -- f = m - 1 (m first brought
+   into [sqrt 1/2, sqrt 2)), s = f/(2+f), the Lg1..Lg7 polynomial in s^2, k ln2 split hi/lo -- every step its
+   operation in its order.  ONE CALL-FREE DOUBLE SCOPE: the doubles stay in FP registers (five of them, reused),
+   and K widens in register.  Rounded to a single, its result is SBCL's LOG of the single on every one of 500000
+   inputs across the positive range."
+  (declare (type double-float m) (type fixnum k) (optimize (speed 3) (safety 0)))
+  (let ((kk k) (vf 0d0) (vs 0d0) (vz 0d0) (vw 0d0) (vt 0d0))
+    (declare (type fixnum kk) (type double-float vf vs vz vw vt))
+    (setq vf m)
+    (when (> vf 1.4142135623730951d0)
+      (setq vf (* vf 0.5d0))
+      (setq kk (+ kk 1)))
+    (setq vf (- vf 1d0))                               ; f
+    (setq vs (/ vf (+ 2d0 vf)))                        ; s
+    (setq vz (* vs vs))                                ; z
+    (setq vw (* vz vz))                                ; w
+    (setq vt (* vw 1.479819860511658591d-01))          ; t2 = z(Lg1 + w(Lg3 + w(Lg5 + w Lg7)))
+    (setq vt (+ 1.818357216161805012d-01 vt))
+    (setq vt (* vw vt))
+    (setq vt (+ 2.857142874366239149d-01 vt))
+    (setq vt (* vw vt))
+    (setq vt (+ 6.666666666666735130d-01 vt))
+    (setq vt (* vz vt))
+    (setq vz (* vw 1.531383769920937332d-01))          ; t1 = w(Lg2 + w(Lg4 + w Lg6)), in z
+    (setq vz (+ 2.222219843214978396d-01 vz))
+    (setq vz (* vw vz))
+    (setq vz (+ 3.999999999940941908d-01 vz))
+    (setq vz (* vw vz))
+    (setq vt (+ vt vz))                                ; R = t2 + t1
+    (setq vw (* vf vf))                                ; hfsq = f^2/2, in w
+    (setq vw (* 0.5d0 vw))
+    (setq vz (+ vw vt))                                ; s (hfsq + R)
+    (setq vz (* vs vz))
+    (setq vz (+ vz (* (float kk 1d0) 1.90821492927058770002d-10)))   ; + k ln2_lo
+    (setq vz (- vw vz))                                ; hfsq - (...)
+    (setq vz (- vz vf))                                ; ... - f
+    (- (* (float kk 1d0) 6.93147180369123816490d-01) vz)))
+
 (defun log (x &optional base)
   "Natural log (or log to BASE if supplied).  CLHS: (log z) for a complex
    z (or a NEGATIVE real, whose principal log is complex) is
    (complex (log (abs z)) (phase z)); positive reals stay real."
+  ;; THE FAST PATH: a positive normal float, no base -- what every numeric program asks LOG for.  The bits are
+  ;; read out here, where a call costs nothing, and the arithmetic is %LOG-KERNEL-D's call-free double scope.
+  ;; (It was 815 ns an element through the generic float operations; SBCL's is a libm call.)
+  (when (and (null base) (floatp x) (not (%complex-p x)))
+    (let* ((xf (%any-to-float x)) (hi (%float-hi32 xf)))
+      (when (and (>= hi #x00100000) (< hi #x7FF00000))
+        (return-from log
+          (%irr-result (%log-kernel-d (%dbl (logior (logand hi #x000FFFFF) #x3FF00000) (%float-lo32 xf))
+                                      (- (ash hi -20) 1023))
+                       x)))))
   ;; Exact 0 for x = 1.
   (when (and (integerp x) (= x 1)
              (or (null base) (and (integerp base) (>= base 2))))

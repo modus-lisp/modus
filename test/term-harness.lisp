@@ -2,8 +2,16 @@
 ;;;; tests load it.  The caller provides DECODE-PTR-ADDR (the decoder's read cursor); here it is a cell of
 ;;;; this script's own.  Everything else is the shipped code.
 
-(defparameter *cell* (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))
-(defparameter *buf* (make-array 65536 :element-type '(unsigned-byte 8) :initial-element 0))
+;; STATIC: the encoder writes, and the decoder reads through the cursor in *CELL*, at RAW ADDRESSES into these,
+;; and a collection while a big term is decoded (20000 rows cons a lot) moved an ordinary array out from under
+;; the cursor -- the decoder read the old copy's garbage (a tag-5 bignum, MAKE-BIGNUM-N undefined).  The
+;; bridge's own staging buffer does not move either.
+(defun term-buffer (n)
+  (if (fboundp 'modus-int::make-static-vector)
+      (funcall 'modus-int::make-static-vector n)
+      (make-array n :element-type '(unsigned-byte 8) :initial-element 0)))
+(defparameter *cell* (term-buffer 8))
+(defparameter *buf* (term-buffer 65536))
 
 (defun %addr (array)
   (+ (modus-int::%gc-word-of array (modus-int::%conv-addr #x100050A0)) 7))

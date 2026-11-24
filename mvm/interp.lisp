@@ -1569,6 +1569,11 @@
         (or (and pkg (find-symbol sym-name pkg)) name))))
 
 (defun %mmap-exec-page-1 (n) (%mmap-exec-page n))
+;; The same for %MMAP-SHARED-PAGE (#x0504) and %JIT-FREE-PAGE (#x0534): inside the range the FRAME-ALLOC arm
+;; below takes as a no-op, so interpreted code that asked for a shared page got its own SIZE back as the
+;; address (test/hosted-term-encode-syms.lisp wrote to #x1000; CLAUDE.md's "echoed its argument").
+(defun %mmap-shared-page-1 (n) (%mmap-shared-page n))
+(defun %jit-free-page-1 (base len) (%jit-free-page base len))
 (defun %jit-call-1 (entry) (%jit-call entry))
 (defun %jit-icache-flush-1 (addr len) (%jit-icache-flush addr len))
 
@@ -2225,6 +2230,15 @@
                 (setf pc npc))
                ((= code #x0500)
                 (sys-exit (svref regs +vreg-v0+)))
+               ;; %MMAP-SHARED-PAGE / %JIT-FREE-PAGE natively (see their wrappers), BEFORE the FRAME-ALLOC
+               ;; range below, as the syscall traps are
+               ((= code #x0504)
+                (setf (svref regs +vreg-v0+) (%mmap-shared-page-1 (svref regs +vreg-v0+)))
+                (setf pc npc))
+               ((= code #x0534)
+                (setf (svref regs +vreg-v0+)
+                      (%jit-free-page-1 (svref regs +vreg-v0+) (svref regs +vreg-v1+)))
+                (setf pc npc))
                ;; BEFORE the FRAME-ALLOC range below: #x0502 / #x0503 / #x050B
                ;; are inside [#x100, +FRAME-ENTER-SIZED+), and placed after it
                ;; these arms never ran -- an interpreted (syscall6 39 ...)

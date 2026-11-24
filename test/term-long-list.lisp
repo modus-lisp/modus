@@ -5,7 +5,7 @@
 ;;;;   ./modus --script test/term-long-list.lisp        (run from the modus checkout)
 
 (load "test/term-harness.lisp")
-(setf *buf* (make-array (* 8 1024 1024) :element-type '(unsigned-byte 8) :initial-element 0))
+(setf *buf* (term-buffer (* 8 1024 1024)))
 
 (defvar *pass* 0)
 (defvar *fail* 0)
@@ -20,9 +20,14 @@
     (values (term-decode-step) n)))
 
 ;; the bytes of nested and dotted lists, by hand: tag 2 per cell, its car, then on down the cdr
-(check "a dotted pair's bytes" (equal (term-hex '(1 . 2)) "0201000000000000000001020000000000000000"))
+;; tag 1 is a fixnum as a LITTLE-ENDIAN u64 (net/term.lisp, Term.swift): 1 is 01 0100000000000000.  The bytes
+;; these were first written with put each value's byte a place late (20 bytes for a 19-byte term); the encoder,
+;; the decoder and the Swift reader all agree on the spec's.
+(check "a dotted pair's bytes"
+       (equal (term-hex '(1 . 2)) (concatenate 'string "02" "010100000000000000" "010200000000000000")))
 (check "a nested list's bytes"
-       (equal (term-hex '((1) 2)) "020201000000000000000000020102000000000000000000"))
+       (equal (term-hex '((1) 2)) (concatenate 'string "02" "02" "010100000000000000" "00"
+                                                       "02" "010200000000000000" "00")))
 (dolist (v (list '(1 2 3) '(1 (2 (3 . 4)) . 5) '(nil nil) '("a" (:k "v") . "tail") '((((1))))))
   (multiple-value-bind (back n) (wire-round-trip v)
     (check (format nil "round trip ~S" v) (equal back v))

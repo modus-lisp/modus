@@ -5039,9 +5039,21 @@
   (when (and *mvm-eval-runtime-p* (%cg-on-p (quote *cg-make-array-dtype*))
              (consp form) (symbolp (car form)) (name-eq (car form) "MAKE-ARRAY")
              (consp (cdr form)))
-    (let ((n (cadr form)) (keys (cddr form)) (et t) (ok t))
-      (when (not (or (integerp n) (%expr-width n env)))
-        (setq ok nil))
+    (let ((n (cadr form)) (keys (cddr form)) (et t) (ok t)
+          ;; TWO DIMENSIONS, (list A B) or '(A B) of provable integers: a rank-2
+          ;; MDA over a word vector, which COMPILE-AREF-FORM reads in place
+          (dims (list '*)))
+      (cond ((or (integerp n) (%expr-width n env)))
+            ((and (consp n) (symbolp (car n)) (name-eq (car n) "LIST")
+                  (consp (cdr n)) (consp (cddr n)) (null (cdddr n))
+                  (or (integerp (cadr n)) (%expr-width (cadr n) env))
+                  (or (integerp (caddr n)) (%expr-width (caddr n) env)))
+             (setq dims (list '* '*)))
+            ((and (consp n) (symbolp (car n)) (name-eq (car n) "QUOTE") (consp (cdr n))
+                  (consp (cadr n)) (consp (cdr (cadr n))) (null (cddr (cadr n)))
+                  (typep (car (cadr n)) '(integer 0)) (typep (cadr (cadr n)) '(integer 0)))
+             (setq dims (list '* '*)))
+            (t (setq ok nil)))
       (loop
         (when (or (not ok) (null keys)) (return))
         (if (or (not (consp keys)) (not (consp (cdr keys))) (not (keywordp (car keys))))
@@ -5055,14 +5067,27 @@
                     (t (setq ok nil)))
               (setq keys (cddr keys)))))
       (when ok
-        (let ((ty (list 'simple-array et (list '*))))
-          (cond ((%u8-simple-array-decl-p ty) ty)
+        (let ((ty (list 'simple-array et dims)))
+          (cond ((cdr dims)
+                 ;; rank 2: only a word-vector store (the in-place read is a word load)
+                 (and (%word-element-type-p et) (list 'simple-array t dims)))
+                ((%u8-simple-array-decl-p ty) ty)
                 ((%u32-simple-array-decl-p ty) ty)
                 ((%generic-element-type-p et) ty)
                 ;; the packed single-float vector a declared f32 array is
                 ;; (illatio's f32-dot16 accumulator: every AREF was generic)
                 ((%f32-simple-array-decl-p ty) ty)
+                ;; ANY OTHER TYPE MAKE-ARRAY STORES AS WORDS -- (integer 0 1000), a
+                ;; member type -- is a T array: cl-bench's 1D-ARRAYS went generic
+                ((%word-element-type-p et) (list 'simple-array t dims))
                 (t nil)))))))
+
+(defun %word-element-type-p (et)
+  "At a runtime compile, ET upgrades to T: MAKE-ARRAY stores it as a plain #x32
+   word vector.  Asked of the running image, so it is what MAKE-ARRAY does."
+  (and *mvm-eval-runtime-p* (fboundp (quote upgraded-array-element-type))
+       (handler-case (eq (funcall (quote upgraded-array-element-type) et) t)
+         (error () nil))))
 
 (defun %expr-dtype (form env)
   "Declared type of FORM: a variable's (lexical or global) declaration, the
@@ -13372,11 +13397,24 @@
   (cond ((integerp x) (and (<= (integer-length x) 61) (+ 1 (integer-length x))))
         ((or (and x (symbolp x)) (consp x)) (%expr-width x env))
         (t nil)))
+(defun %the-leaf (form)
+  "X of (THE TYPE X) with X a symbol (THE nested any depth), else NIL.  THE
+   compiles to its form alone, so it reads X where X is: a promoted
+   variable's register, a frame slot.  (the (unsigned-byte 29) i) as an
+   operand was a PUSH and a POP around the other operand's load."
+  (loop
+    (cond ((not (and (consp form) (symbolp (car form)) (name-eq (car form) "THE")
+                     (consp (cdr form)) (consp (cddr form)) (null (cdddr form))))
+           (return nil))
+          ((and (caddr form) (symbolp (caddr form))) (return (caddr form)))
+          (t (setq form (caddr form))))))
+
 (defun %operand-reg (form env)
   "The register of FORM when it is a variable held in a local register, else NIL."
-  (and form (symbolp form)
-       (let ((b (env-lookup env form)))
-         (and b (eq (binding-location b) :reg) (binding-reg b)))))
+  (let ((form (or (%the-leaf form) form)))
+    (and form (symbolp form)
+         (let ((b (env-lookup env form)))
+           (and b (eq (binding-location b) :reg) (binding-reg b))))))
 (defun %compile-test-branch (test env dest false-label)
   "Compile TEST so that control falls through when it is true and branches
    to FALSE-LABEL when it is false.  DEST is scratch."
@@ -15787,6 +15825,26 @@
                               (when (and v (symbolp v))
                                 (push (cons v (* mult (%var-ref-weight v lbody))) out))))))
                       (walk-list (cdr f) mult depth))
+                     ;; A LOOP FORM'S OWN VARIABLES: (dotimes (j n) ...), (dolist (x l) ...),
+                     ;; (do ((k 0 (1+ k))) ...).  Unexpanded here, they bound no LET this
+                     ;; walk saw, so the outer bindings took every register and the
+                     ;; innermost counter -- the most-read variable of a loop nest -- had
+                     ;; a frame slot (cl-bench 2D-ARRAYS: J read and written through
+                     ;; memory per element).  Weighted over the whole form, step and end
+                     ;; test included, times 8 for the loop.
+                     ((and (member (symbol-name (car f)) *promote-loop-ops* :test #'string=)
+                           (consp (cdr f)) (consp (cadr f)))
+                      (let ((lform (cons 'progn (cdr f))))
+                        (if (or (name-eq (car f) "DO") (name-eq (car f) "DO*"))
+                            (dolist (b (cadr f))
+                              (let ((v (if (consp b) (car b) b)))
+                                (when (and v (symbolp v))
+                                  (push (cons v (* mult 8 (%var-ref-weight v lform))) out))))
+                            (let ((v (car (cadr f))))
+                              (when (and v (symbolp v) (not (name-eq (car f) "LOOP")))
+                                ;; + 2: the counter's own test and step, not in the source
+                                (push (cons v (* mult 8 (+ 2 (%var-ref-weight v lform)))) out)))))
+                      (walk-list (cdr f) (* mult 8) depth))
                      ((member (symbol-name (car f)) *promote-loop-ops* :test #'string=)
                       (walk-list (cdr f) (* mult 8) depth))
                      (t (walk-list (cdr f) mult depth))))
@@ -30763,6 +30821,7 @@
         ((and form (symbolp form) env)
          (let ((b (env-lookup env form)))
            (and b (member (binding-location b) (list :stack :reg)))))
+        ((%the-leaf form) (%leaf-operand-p (%the-leaf form) env))
         (t nil)))
 
 ;;; WHEN A BINARY OP'S LEFT OPERAND NEEDS NO SAVING.  It sits in DEST while the right operand compiles; the
@@ -31909,6 +31968,14 @@
                            (list '%u8-ref data idx)
                            (list '%word-aref data idx))
                        env dest)))
+      ;; A RANK-2 WORD ARRAY whose row length is not a literal -- (simple-array T
+      ;; (* *)), declared or what a MAKE-ARRAY provably made (%MAKE-ARRAY-DTYPE):
+      ;; both subscripts checked against the header's dimensions, then one load
+      ;; from the data vector in place.  Anything the test refuses (a bignum or
+      ;; out-of-range subscript) is %AREF2's, which signals as it always did.
+      ;; It was a call of %AREF2 per element: cl-bench 2D-ARRAYS 11x SBCL.
+      ((and (consp subs) (consp (cdr subs)) (null (cddr subs)) (%rank2-word-array-p arr env))
+       (compile-form (%rank2-access arr (car subs) (cadr subs) nil env) env dest))
       ((null subs)
        ;; 0-sub aref on a 0-dim MDA → slot 0 of data.  %aref-multi-public
        ;; lifts a string-MDA element to a CHARACTER (CL conformance).
@@ -32073,6 +32140,45 @@
           (t (%prim-aset ,g-arr ,g-idx ,g-sto) ,g-val))))
      env dest)))
 
+;;; RANK-2 WORD ARRAYS read and written in place (COMPILE-AREF-FORM,
+;;; COMPILE-ASET-FORM).  ARR is a variable whose type is (simple-array ET (D1
+;;; D2)) over a word store: never displaced, its data a #x32 vector (MDA slot
+;;; 6), its dimensions the list in slot 1.
+(defun %rank2-word-array-p (arr env)
+  (and (symbolp arr) arr
+       (let ((ty (%expr-dtype arr env)))
+         (and (consp ty) (symbolp (car ty)) (name-eq (car ty) "SIMPLE-ARRAY")
+              (consp (cdr ty)) (consp (cddr ty)) (null (cdddr ty))
+              (consp (caddr ty)) (consp (cdr (caddr ty))) (null (cddr (caddr ty)))
+              (or (%generic-element-type-p (cadr ty)) (%word-element-type-p (cadr ty)))))))
+
+(defun %rank2-access (arr i j val env)
+  "The form for (AREF ARR I J), or for its store of (CAR VAL) when VAL is a list.
+   Subscripts and value are evaluated once, in order.  A subscript that is a
+   frame variable the value form does not assign is read where it is, not
+   copied: each copy was a frame slot written and read per element."
+  (labels ((direct-p (x)
+             (and (%leaf-operand-p x env) (symbolp x)
+                  (or (null val) (null (collect-setq-vars-in-body (car val) (list x)))))))
+    (let* ((gi (if (direct-p i) i (%mvm-gensym "A2I")))
+           (gj (if (direct-p j) j (%mvm-gensym "A2J")))
+           (gv (%mvm-gensym "A2V")) (gd (%mvm-gensym "A2D")) (g2 (%mvm-gensym "A2N"))
+           (fi `(the (unsigned-byte 29) ,gi)) (fj `(the (unsigned-byte 29) ,gj))
+           (index `(+ (* ,fi (the (unsigned-byte 29) ,g2)) ,fj)))
+      `(let* (,@(unless (eq gi i) `((,gi ,i))) ,@(unless (eq gj j) `((,gj ,j)))
+              ,@(when val `((,gv ,(car val))))
+              (,gd (%slot-ref ,arr 1)) (,g2 (%ucar (%ucdr ,gd))))
+         (declare (type fixnum ,g2))
+         ;; below 2^29 each (the row length too), the row-major index is a 60-bit
+         ;; product and sum: no overflow checks.  A larger array takes %AREF2.
+         (if (and (fixnump ,gi) (fixnump ,gj) (>= ,gi 0) (>= ,gj 0)
+                  (< ,gi (the fixnum (%ucar ,gd))) (< ,gj ,g2)
+                  (< ,gi #x20000000) (< ,g2 #x20000000))
+             ,(if val
+                  `(progn (%word-aset (%slot-ref ,arr 6) ,index ,gv) ,gv)
+                  `(%word-aref (%slot-ref ,arr 6) ,index))
+             ,(if val `(%aset2 ,arr ,gv ,gi ,gj) `(%aref2 ,arr ,gi ,gj)))))))
+
 (defun compile-aset-form (form env dest)
   "Compile (aset ARR SUB1 [SUB2 …] VAL).  Modus's `aset` always takes
    VAL as the LAST arg (per the existing 3-arg convention); the
@@ -32108,6 +32214,8 @@
                   (setq cur (cdr cur))))))
          (let ((subs (nreverse subs)))
            (cond
+             ((and (consp subs) (consp (cdr subs)) (null (cddr subs)) (%rank2-word-array-p arr env))
+              (compile-form (%rank2-access arr (car subs) (cadr subs) (list val) env) env dest))
              ((and (consp subs) (consp (cdr subs)) (null (cddr subs)))
               (compile-form `(%aset2 ,arr ,val ,(car subs) ,(cadr subs)) env dest))
              ((and (consp subs) (consp (cdr subs)) (consp (cddr subs)) (null (cdddr subs)))

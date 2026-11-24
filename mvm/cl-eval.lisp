@@ -3175,8 +3175,13 @@
 (defun code-char (n) (if (characterp n) n (code-char n)))
 
 
-(defun max (a &rest more) (let ((r a)) (dolist (x more r) (when (> x r) (setq r x)))))
-(defun min (a &rest more) (let ((r a)) (dolist (x more r) (when (< x r) (setq r x)))))
+;; two arguments without an &rest list (see = in cl-types.lisp)
+(defun max (a &optional (b nil bp) &rest more)
+  (if (not bp) a
+      (let ((r (if (> b a) b a))) (dolist (x more r) (when (> x r) (setq r x))))))
+(defun min (a &optional (b nil bp) &rest more)
+  (if (not bp) a
+      (let ((r (if (< b a) b a))) (dolist (x more r) (when (< x r) (setq r x))))))
 
 (defun %float-non-finite-p (f)
   "True iff F is an IEEE float whose exponent is all-ones (±inf or NaN).

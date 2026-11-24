@@ -7520,9 +7520,16 @@
        s0 * (D1*D2*…) + s1 * (D2*…) + … + sN-1.
    Computed by walking dims and subs in parallel, with `tail-product`
    recomputed from a pass that pre-sums dim products."
-  (let ((idx 0) (cur-d dims) (cur-s subs))
+  (let ((idx 0) (cur-d dims) (cur-s subs) (axis 0))
     (loop
       (when (null cur-d) (return idx))
+      ;; each subscript within its own dimension (only the row-major index was
+      ;; ever checked, against the data's length: (aref a 0 4) of a 3x4 array
+      ;; read element (1 0))
+      (unless (and (integerp (car cur-s)) (>= (car cur-s) 0) (< (car cur-s) (car cur-d)))
+        (error "Invalid index ~s for axis ~d of an array of dimensions ~s, should be a non-negative integer below ~d."
+               (car cur-s) axis dims (car cur-d)))
+      (setq axis (+ axis 1))
       ;; tail-product = product of dims AFTER the current one
       (let ((tail 1) (rest (cdr cur-d)))
         (loop (when (null rest) (return nil))
@@ -7588,18 +7595,28 @@
 ;;; -- takes %AREF-MULTI-PUBLIC / %ASET-MULTI unchanged.
 ;;; Slots: 0 rank, 1 dims, 3 displaced-to, 5 element type, 6 data (%ALLOC-MDA).
 ;;; (Spelled out in each function: image sources define no macros.)
+;;; EACH SUBSCRIPT IN ITS OWN DIMENSION: the fast paths checked only the row-major
+;;; index against the data's length, so (aref a 0 4) of a 3x4 array read element
+;;; (1 0) where it must signal.  Out of range goes to the general path, which does.
+(defun %subscripts-in-p (dims i j k)
+  (and (>= i 0) (< i (car dims))
+       (>= j 0) (< j (car (cdr dims)))
+       (or (null k) (and (>= k 0) (< k (car (cdr (cdr dims))))))))
+
 (defun %aref2 (a i j)
   "Two-subscript AREF without &rest/APPLY: a rank-2 MDA on the fast path above
    is served in place, everything else goes through %aref-multi-public."
   (if (and (fixnump i) (fixnump j) (%mda-p a) (eq (%slot-ref a 0) 2) (null (%slot-ref a 3))
-           (%prim-simple-vector-p (%slot-ref a 6)) (not (eq (%slot-ref a 5) 'bit)))
+           (%prim-simple-vector-p (%slot-ref a 6)) (not (eq (%slot-ref a 5) 'bit))
+           (%subscripts-in-p (%slot-ref a 1) i j nil))
       (%word-aref (%slot-ref a 6) (+ (* i (car (cdr (%slot-ref a 1)))) j))
       (%aref-multi-public a i j)))
 
 (defun %aset2 (a val i j)
   "Two-subscript ASET counterpart of %aref2; returns VAL."
   (if (and (fixnump i) (fixnump j) (%mda-p a) (eq (%slot-ref a 0) 2) (null (%slot-ref a 3))
-           (%prim-simple-vector-p (%slot-ref a 6)) (not (eq (%slot-ref a 5) 'bit)))
+           (%prim-simple-vector-p (%slot-ref a 6)) (not (eq (%slot-ref a 5) 'bit))
+           (%subscripts-in-p (%slot-ref a 1) i j nil))
       (progn (%word-aset (%slot-ref a 6) (+ (* i (car (cdr (%slot-ref a 1)))) j) val) val)
       (%aset-multi a val i j)))
 
@@ -7608,7 +7625,8 @@
    the &rest path, APPLY, NREVERSE and a dims walk per access: 400 ns,
    cl-bench 3D-ARRAYS 162x.)"
   (if (and (fixnump i) (fixnump j) (fixnump k) (%mda-p a) (eq (%slot-ref a 0) 3) (null (%slot-ref a 3))
-           (%prim-simple-vector-p (%slot-ref a 6)) (not (eq (%slot-ref a 5) 'bit)))
+           (%prim-simple-vector-p (%slot-ref a 6)) (not (eq (%slot-ref a 5) 'bit))
+           (%subscripts-in-p (%slot-ref a 1) i j k))
       (let ((dims (cdr (%slot-ref a 1))))
         (%word-aref (%slot-ref a 6) (+ (* (+ (* i (car dims)) j) (car (cdr dims))) k)))
       (%aref-multi-public a i j k)))
@@ -7616,7 +7634,8 @@
 (defun %aset3 (a val i j k)
   "Three-subscript ASET counterpart of %AREF3; returns VAL."
   (if (and (fixnump i) (fixnump j) (fixnump k) (%mda-p a) (eq (%slot-ref a 0) 3) (null (%slot-ref a 3))
-           (%prim-simple-vector-p (%slot-ref a 6)) (not (eq (%slot-ref a 5) 'bit)))
+           (%prim-simple-vector-p (%slot-ref a 6)) (not (eq (%slot-ref a 5) 'bit))
+           (%subscripts-in-p (%slot-ref a 1) i j k))
       (let ((dims (cdr (%slot-ref a 1))))
         (%word-aset (%slot-ref a 6) (+ (* (+ (* i (car dims)) j) (car (cdr dims))) k) val)
         val)

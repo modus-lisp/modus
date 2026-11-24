@@ -888,19 +888,33 @@
 (defparameter *ppc-mac-tb-shift* 16
   "The clock is the timebase >> this: a 30-bit fixnum of it lasts 4 days at
    QEMU mac99's 100 MHz.")
+(defconstant +ppc-mac-tb-rate+ #x07F80118
+  "The word #x0311 reads: the timebase's rate >> *PPC-MAC-TB-SHIFT*, TAGGED,
+   from the boot stub (Open Firmware's /cpus timebase-frequency).")
 (defparameter *ppc-mac-tb-hz* 100000000
   "The timebase frequency: Open Firmware's /cpus/@0 timebase-frequency.")
 (defconstant +ppc-mac-hstack-ext-base+ #x07000000
   "The handler-frame extension on the Mac: a fixed 2 MB region, not an mmap
    (boot/boot-ppcmac.lisp's map; the stub writes the frame limit).")
 
+(defconstant +ppc-mac-serial-dead+ #x07F80114
+  "A word the boot stub zeroes: non-zero once a byte has waited out the
+   transmitter (PPC-EMIT-MAC-PUTC), after which bytes are dropped at once.")
+
 (defun ppc-emit-mac-putc (buf rb)
   "Write the byte in RB (not r0, r10 or r12) to the ESCC's channel A, waiting
    for the transmit buffer -- a BOUNDED wait: a PowerBook's SCC drives only its
    internal modem and may be unclocked, and an unbounded wait there hung the
-   machine at its first byte.  After #x40000 polls the byte is dropped.
-   Clobbers r0, r10, r12 and CR0."
-  (let ((wait (mvm-make-label)) (gone (mvm-make-label)) (ready (mvm-make-label)))
+   machine at its first byte.  After #x40000 polls the byte is dropped, and the
+   port is taken for dead (+PPC-MAC-SERIAL-DEAD+): every later byte is dropped
+   without waiting -- else the boot's few thousand bytes would each cost the
+   whole wait.  Clobbers r0, r10, r12 and CR0."
+  (let ((wait (mvm-make-label)) (gone (mvm-make-label)) (ready (mvm-make-label))
+        (dead (mvm-make-label)))
+    (ppc-emit-li buf +ppc-r12+ +ppc-mac-serial-dead+)
+    (ppc-emit-lwz buf +ppc-r0+ +ppc-r12+ 0)
+    (ppc-emit-cmpwi buf +ppc-r0+ 0)
+    (ppc-emit-bne buf gone)
     (ppc-emit-li buf +ppc-r12+ *ppc-mac-escc-a*)
     (ppc-emit-li buf +ppc-r10+ #x40000)
     (ppc-emit-label buf wait)
@@ -910,10 +924,15 @@
     (ppc-emit-addi buf +ppc-r10+ +ppc-r10+ -1)
     (ppc-emit-cmpwi buf +ppc-r10+ 0)
     (ppc-emit-bne buf wait)
-    (ppc-emit-b buf gone)
+    (ppc-emit-b buf dead)
     (ppc-emit-label buf ready)
     (ppc-emit-stb buf rb +ppc-r12+ 16)
     (ppc-emit-eieio buf)
+    (ppc-emit-b buf gone)
+    (ppc-emit-label buf dead)
+    (ppc-emit-li buf +ppc-r12+ +ppc-mac-serial-dead+)
+    (ppc-emit-li buf +ppc-r0+ 1)
+    (ppc-emit-stw buf +ppc-r0+ +ppc-r12+ 0)
     (ppc-emit-label buf gone)))
 
 ;;; THE NATIVE TIER (mvm/jit-ppc-native.lisp): a runtime DEFUN translated by this
@@ -1831,8 +1850,12 @@
               (ppc-emit-or buf +ppc-r3+ +ppc-r3+ +ppc-r12+)
               (ppc-emit-rlwinm buf +ppc-r3+ +ppc-r3+ 1 2 30)))   ; 30 bits, tagged
            ((and (= code #x0311) *ppc-mac-mode*)
-            ;; its rate, TAGGED
-            (ppc-emit-li buf +ppc-r3+ (* 2 (ash *ppc-mac-tb-hz* (- *ppc-mac-tb-shift*)))))
+            ;; its rate, TAGGED: the machine's own -- the boot stub reads Open
+            ;; Firmware's timebase-frequency (a PowerBook's runs at a quarter of
+            ;; its bus, not QEMU's 100 MHz) and leaves rate >> shift, tagged, at
+            ;; +PPC-MAC-TB-RATE+
+            (ppc-emit-li buf +ppc-r3+ +ppc-mac-tb-rate+)
+            (ppc-emit-lwz buf +ppc-r3+ +ppc-r3+ 0))
            ((and (member code '(#x0500 #x0304)) *ppc-mac-mode*)
             ;; exit / halt: nothing to return to
             (ppc-emit-word buf #x48000000))                  ; b .
@@ -1842,6 +1865,25 @@
            ((and (member code '(#x0502 #x0503 #x050B)) *ppc-mac-mode*)
             ;; a Linux system call on a bare Mac: -1 (TAGGED for #x0502/#x050B)
             (ppc-emit-li buf +ppc-r3+ (if (= code #x0503) -1 -2)))
+           ((and (= code #x0330) *ppc-mac-mode*)
+            ;; MMIO-DO-READ32 on a Mac: a PCI register, little-endian.  The
+            ;; address is the raw word at #x07F80100; the value goes to
+            ;; #x07F80108 (build-cl-repl-common's PPCMAC-IN32LE)
+            (ppc-emit-sync buf)
+            (ppc-emit-li buf +ppc-r12+ #x07F80100)
+            (ppc-emit-lwz buf +ppc-r11+ +ppc-r12+ 0)
+            (ppc-emit-word buf (logior (ash 31 26) (ash +ppc-r11+ 21) (ash +ppc-r11+ 11) (ash 534 1))) ; lwbrx r11,0,r11
+            (ppc-emit-stw buf +ppc-r11+ +ppc-r12+ 8))
+           ((and (= code #x0331) *ppc-mac-mode*)
+            ;; MMIO-DO-WRITE32 on a Mac: the word at #x07F80108 to the register
+            ;; whose address is at #x07F80100, little-endian; then SYNC, so it
+            ;; is done before anything after it (PPCMAC-OUT32LE)
+            (ppc-emit-sync buf)
+            (ppc-emit-li buf +ppc-r12+ #x07F80100)
+            (ppc-emit-lwz buf +ppc-r11+ +ppc-r12+ 0)
+            (ppc-emit-lwz buf +ppc-r12+ +ppc-r12+ 8)
+            (ppc-emit-word buf (logior (ash 31 26) (ash +ppc-r12+ 21) (ash +ppc-r11+ 11) (ash 662 1))) ; stwbrx r12,0,r11
+            (ppc-emit-sync buf))
            ((and *ppc-mac-mode* (>= code #x0300) (<= code #x0534))
             ;; a Linux service trap with no Mac arm: a gap, recorded, TW if run
             (pushnew (+ #x10000 code) *ppc-unimpl-opcodes*)

@@ -515,6 +515,24 @@
 ;;; DEFUNs become native code; any other entry is kept, as an octet vector, in
 ;;; *PPCMAC-FILES* by name.  Run before the REPL; a failing entry is reported
 ;;; and the rest go on.
+;;; PCI DEVICE REGISTERS: one 32-bit access, in the bus's (little-endian) byte
+;;; order.  (setf (mem-ref a :u32) v) cannot be one: on a 32-bit target a u32
+;;; may be a bignum, so it is two 16-bit stores -- right for memory, wrong for a
+;;; register, which takes each half as a whole write.  These go through
+;;; translate-ppc's Mac traps #x0330 / #x0331 (i386's MMIO-DO-READ32 /
+;;; -WRITE32): the address and the value in words at #x07F80100 / #x07F80108,
+;;; LWBRX / STWBRX between, SYNC after.  Kernel functions, so native code:
+;;; the interpreter never meets the traps.
+(defun ppcmac-in32le (addr)
+  (setf (mem-ref #x07F80100 :u32) addr)
+  (mmio-do-read32)
+  (mem-ref #x07F80108 :u32))
+(defun ppcmac-out32le (addr value)
+  (setf (mem-ref #x07F80100 :u32) addr)
+  (setf (mem-ref #x07F80108 :u32) value)
+  (mmio-do-write32)
+  value)
+(defun ppcmac-sync () (memory-barrier) nil)
 (defvar *ppcmac-files* nil)
 (defun %ppcmac-u32 (a) (+ (* 65536 (mem-ref a :u16)) (mem-ref (+ a 2) :u16)))
 (defun %ppcmac-octets (a n)

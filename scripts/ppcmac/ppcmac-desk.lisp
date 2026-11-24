@@ -62,6 +62,9 @@
         (b (%payload-file "LiberationSans-Bold.ttf")))
     (when r (setf glass::*font-regular* (scribe:open-font r)))
     (when b (setf glass::*font-bold* (scribe:open-font b)))
+    ;; the listener's monospace face (glass/term reads it from glass's fonts/)
+    (let ((m (%payload-file "JetBrainsMono-Regular.ttf")))
+      (when m (setf glass-term::*term-fonts* (list (scribe:open-font m)))))
     (and r b t)))
 
 (defun desk-blit (fb x0 y0 x1 y1)
@@ -121,6 +124,9 @@
     (unless (string= (first a) "Media")
       (glass.wm:wm-register-app *wm* (first a) (second a)
                                 :width (getf (cddr a) :width 400) :height (getf (cddr a) :height 300))))
+  ;; Lisp: a listener in a window.  No listener thread (glass-repl:*listener* NIL):
+  ;; a form is evaluated in place, on this thread -- the image's main one
+  (glass.wm:wm-register-app *wm* "Lisp" 'glass-repl:repl-app :width 640 :height 400)
   (glass.wm:wm-redraw *wm*)
   *wm*)
 
@@ -170,5 +176,7 @@
 (handler-case (progn (desk 1)
                      (modus-int::write-string-serial "glass.wm: up") (modus-int::write-char-serial 10)
                      (when (and (= (mem-ref #x07F80000 :u16) #x5050) (= (mac-boot-info 48) 0))
+                       ;; the screen is the console: open a listener on it
+                       (glass.wm:wm-open *wm* "Lisp")
                        (desk)))
   (error (c) (modus-int::write-string-serial "glass.wm: ") (princ c) (modus-int::write-char-serial 10)))

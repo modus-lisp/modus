@@ -76,7 +76,10 @@
     "glass/src/wm/package.lisp"
     "glass/src/wm/chrome.lisp"
     "glass/src/wm/wm.lisp"
-    "glass/src/wm/rack.lisp")
+    "glass/src/wm/rack.lisp"
+    ;; the listener: a REPL in a window, for a Mac whose console is its screen
+    "glass/src/term.lisp"
+    "glass/src/repl.lisp")
   "REPO/PATH, in load order.")
 
 (defparameter *repos*
@@ -95,6 +98,7 @@
       (format o "~A~C~A~%" f #\Tab (repo-path f)))
     (dolist (font '("LiberationSans-Regular.ttf" "LiberationSans-Bold.ttf"))
       (format o "~A~C~A~%" font #\Tab (repo-path (concatenate 'string "scribe/fonts/" font))))
-    (dolist (f '("ppcmac-input.lisp" "ppcmac-desk.lisp"))
+    (format o "~A~C~A~%" "JetBrainsMono-Regular.ttf" #\Tab (repo-path "glass/fonts/JetBrainsMono-Regular.ttf"))
+    (dolist (f '("ppcmac-input.lisp" "ppcmac-usb.lisp" "ppcmac-desk.lisp"))
       (format o "~A~C~A~%" f #\Tab (namestring (merge-pathnames (concatenate 'string "ppcmac/" f) *scripts*)))))
-  (format t "ppcmac-glass-payload: ~A: ~D entries~%" out (+ (length *files*) 4)))
+  (format t "ppcmac-glass-payload: ~A: ~D entries~%" out (+ (length *files*) 6)))

@@ -69,6 +69,8 @@
       (dolist (e entries)
         (blob (ascii-bytes (car e)))
         (blob (read-bytes (cdr e)))))
+    ;; it ends below NIL's block (#x07800000; boot/boot-ppcmac.lisp's map)
+    (assert (<= (length v) #x600000) () "the payload (~D bytes) is over 6 MB" (length v))
     (format t "ppcmac-disk: payload: ~D entries, ~D bytes at #x~X~%" (length entries) (length v) +payload-addr+)
     (coerce v '(simple-array (unsigned-byte 8) (*)))))
 

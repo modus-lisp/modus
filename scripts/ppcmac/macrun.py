@@ -39,6 +39,8 @@ def main():
     m = socket.socket(socket.AF_UNIX); m.connect(mon); m.settimeout(0.5)
     buf = b''
     t0 = time.time()
+    # MACRUN_STAMPS=FILE: every chunk from the serial port, with its time since start
+    stamps = open(os.environ['MACRUN_STAMPS'], 'w') if os.environ.get('MACRUN_STAMPS') else None
 
     def read_until(pat, timeout):
         nonlocal buf
@@ -52,6 +54,8 @@ def main():
                 c = s.recv(65536)
                 if not c: break
                 buf += c
+                if stamps:
+                    stamps.write(f'{time.time() - t0:8.1f} {c.decode("latin-1")!r}\n'); stamps.flush()
             except socket.timeout:
                 pass
         out, buf = buf, b''

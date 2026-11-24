@@ -30,6 +30,9 @@
 ;;;;   #x06000000..#x07000000  the stack, down from +PPCMAC-STACK-TOP+
 ;;;;   #x07000000..#x07200000  the handler-frame extension (fixed, 64K frames)
 ;;;;   #x07800000..#x07820000  NIL's 128 KB BAT block
+;;;;   #x07A00000..#x07A10000  the first stage (modus-boot.elf), dead once here
+;;;;   #x07B00000..#x07C00000  Open Firmware's device tree, copied (+PPCMAC-DT+)
+;;;;   #x07C00000..#x07D00000  USB's DMA: OHCI's HCCA, descriptors, buffers
 ;;;;   #x07D00000..#x07D10000  the mutex arena (%BARE-SYNC-ARENA)
 ;;;;   #x07E00000, #x07F00000  the CLI's scratch pages
 ;;;;   #x10000000..            the heap, +PPCMAC-HEAP-SIZE+, then its guard
@@ -69,8 +72,9 @@
   "What Open Firmware said, written by the stub: \"PPCM\", then the framebuffer's
    VA (0: none), width, height, bytes per row, depth; mac-io's VA; the VIA's
    kind (1 CUDA, 2 PMU, 0 unknown); RAM bytes; the framebuffer's and mac-io's PAs;
-   the PVR; 1 when Open Firmware's console was a serial port.  A word each, from
-   +4.")
+   the PVR; 1 when Open Firmware's console was a serial port; the device window
+   (VA +PPCMAC-DEVICE-VA+): its PA and size; the timebase's frequency.  A word
+   each, from +4.")
 
 (defun ppcmac-emit-mfspr (buf rt spr)
   (ppc-emit-word buf (logior (ash 31 26) (ash rt 21) (ash (logand spr 31) 16)
@@ -96,7 +100,101 @@
 (defparameter *ppcmac-of-strings*
   '("finddevice" "getprop" "child" "peer" "open" "call-method" "screen" "address"
     "assigned-addresses" "width" "height" "linebytes" "depth" "mac-io" "name"
-    "/memory" "reg" "color!" "/chosen" "stdout" "instance-to-package" "device_type"))
+    "/memory" "reg" "color!" "/chosen" "stdout" "instance-to-package" "device_type"
+    "nextprop" "getproplen" "claim" "/cpus" "timebase-frequency"))
+
+(defconstant +ppcmac-dt+ #x07B00000
+  "Open Firmware's device tree, copied by the stub for Lisp (PPCMAC-EMIT-DT-DUMP):
+   \"DTRE\", then records of words -- 1 a node begins (its properties, then its
+   children, follow), 2 a property: its NUL-terminated name in 32 bytes, its
+   length, the length kept (at most 1 KB), the data padded to a word -- 3 a node
+   ends, 9 the end.")
+(defconstant +ppcmac-dt-limit+ #x07BE0000 "No property record starts past here.")
+(defconstant +ppcmac-dt-stack+ #x07BF0000 "The walk's stack of parent phandles.")
+
+(defun ppcmac-emit-dt-dump (buf cif li)
+  "Copy Open Firmware's device tree to +PPCMAC-DT+ (its format there).  A
+   depth-first walk: child, then peer, a stack of parents at +PPCMAC-DT-STACK+;
+   each node's properties by nextprop / getproplen / getprop.  CIF and LI are
+   PPCMAC-EMIT-OF-QUERY's helpers; r14 = the cursor, r15 = the node, r16 = the
+   stack, r17 = the previous property's name, r18, r19, r28 scratch."
+  (flet ((cif (&rest a) (apply cif a)) (li (r v) (funcall li r v)))
+    (let ((node (mvm-make-label)) (prop (mvm-make-label)) (props-done (mvm-make-label))
+          (leaf (mvm-make-label)) (up (mvm-make-label)) (pop (mvm-make-label))
+          (finish (mvm-make-label)) (none (mvm-make-label)))
+      (cif "claim" (list (list :imm +ppcmac-dt+) (list :imm #x100000) (list :imm 0)) 1)
+      (li +ppc-r14+ +ppcmac-dt+)
+      (li +ppc-r3+ #x44545245) (ppc-emit-stw buf +ppc-r3+ +ppc-r14+ 0)   ; "DTRE"
+      (ppc-emit-addi buf +ppc-r14+ +ppc-r14+ 4)
+      (li +ppc-r16+ +ppcmac-dt-stack+)
+      (li +ppc-r3+ 0) (ppc-emit-stw buf +ppc-r3+ +ppc-r16+ -4)        ; "" for the first nextprop
+      (cif "peer" (list (list :imm 0)) 1 +ppc-r15+)                    ; the root
+      (ppc-emit-cmpwi buf +ppc-r15+ 0) (ppc-emit-beq buf finish)
+      (ppc-emit-cmpwi buf +ppc-r15+ -1) (ppc-emit-beq buf finish)
+      ;; a node: 1, its properties
+      (ppc-emit-label buf node)
+      (li +ppc-r3+ 1) (ppc-emit-stw buf +ppc-r3+ +ppc-r14+ 0)
+      (ppc-emit-addi buf +ppc-r14+ +ppc-r14+ 4)
+      (li +ppc-r19+ +ppcmac-dt-stack+) (ppc-emit-addi buf +ppc-r17+ +ppc-r19+ -4)
+      (ppc-emit-label buf prop)
+      (li +ppc-r3+ +ppcmac-dt-limit+)
+      (ppc-emit-cmpl-word buf +ppc-r14+ +ppc-r3+) (ppc-emit-bge buf props-done)
+      (li +ppc-r3+ 2) (ppc-emit-stw buf +ppc-r3+ +ppc-r14+ 0)
+      (ppc-emit-addi buf +ppc-r28+ +ppc-r14+ 4)
+      (cif "nextprop" (list +ppc-r15+ +ppc-r17+ +ppc-r28+) 1 +ppc-r18+)
+      (ppc-emit-cmpwi buf +ppc-r18+ 1) (ppc-emit-bne buf props-done)
+      (ppc-emit-addi buf +ppc-r17+ +ppc-r14+ 4)                       ; the next one's previous
+      (cif "getproplen" (list +ppc-r15+ +ppc-r17+) 1 +ppc-r18+)
+      (ppc-emit-stw buf +ppc-r18+ +ppc-r14+ 36)
+      (ppc-emit-mr buf +ppc-r19+ +ppc-r18+)
+      (let ((pos (mvm-make-label)) (small (mvm-make-label)) (get (mvm-make-label)) (skip (mvm-make-label)))
+        (ppc-emit-cmpwi buf +ppc-r19+ 0) (ppc-emit-bge buf pos)
+        (li +ppc-r19+ 0)
+        (ppc-emit-label buf pos)
+        (ppc-emit-cmpwi buf +ppc-r19+ 1024) (ppc-emit-ble buf small)
+        (li +ppc-r19+ 1024)
+        (ppc-emit-label buf small)
+        (ppc-emit-stw buf +ppc-r19+ +ppc-r14+ 40)
+        (ppc-emit-cmpwi buf +ppc-r19+ 0) (ppc-emit-beq buf skip)
+        (ppc-emit-label buf get)
+        (ppc-emit-addi buf +ppc-r28+ +ppc-r14+ 44)
+        (cif "getprop" (list +ppc-r15+ +ppc-r17+ +ppc-r28+ +ppc-r19+) 1)
+        (ppc-emit-label buf skip))
+      (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ 3)
+      (ppc-emit-rlwinm buf +ppc-r19+ +ppc-r19+ 0 0 29)                ; to a word
+      (ppc-emit-add buf +ppc-r14+ +ppc-r14+ +ppc-r19+)
+      (ppc-emit-addi buf +ppc-r14+ +ppc-r14+ 44)
+      (ppc-emit-b buf prop)
+      ;; its children: down, the node on the stack
+      (ppc-emit-label buf props-done)
+      (cif "child" (list +ppc-r15+) 1 +ppc-r18+)
+      (ppc-emit-cmpwi buf +ppc-r18+ 0) (ppc-emit-beq buf leaf)
+      (ppc-emit-cmpwi buf +ppc-r18+ -1) (ppc-emit-beq buf leaf)
+      (ppc-emit-stw buf +ppc-r15+ +ppc-r16+ 0)
+      (ppc-emit-addi buf +ppc-r16+ +ppc-r16+ 4)
+      (ppc-emit-mr buf +ppc-r15+ +ppc-r18+)
+      (ppc-emit-b buf node)
+      ;; no children: 3, then the peer, or up
+      (ppc-emit-label buf leaf)
+      (li +ppc-r3+ 3) (ppc-emit-stw buf +ppc-r3+ +ppc-r14+ 0)
+      (ppc-emit-addi buf +ppc-r14+ +ppc-r14+ 4)
+      (ppc-emit-label buf up)
+      (cif "peer" (list +ppc-r15+) 1 +ppc-r18+)
+      (ppc-emit-cmpwi buf +ppc-r18+ 0) (ppc-emit-beq buf pop)
+      (ppc-emit-cmpwi buf +ppc-r18+ -1) (ppc-emit-beq buf pop)
+      (ppc-emit-mr buf +ppc-r15+ +ppc-r18+)
+      (ppc-emit-b buf node)
+      (ppc-emit-label buf pop)
+      (li +ppc-r3+ +ppcmac-dt-stack+)
+      (ppc-emit-cmpl-word buf +ppc-r16+ +ppc-r3+) (ppc-emit-ble buf finish)
+      (ppc-emit-addi buf +ppc-r16+ +ppc-r16+ -4)
+      (ppc-emit-lwz buf +ppc-r15+ +ppc-r16+ 0)
+      (li +ppc-r3+ 3) (ppc-emit-stw buf +ppc-r3+ +ppc-r14+ 0)
+      (ppc-emit-addi buf +ppc-r14+ +ppc-r14+ 4)
+      (ppc-emit-b buf up)
+      (ppc-emit-label buf finish)
+      (li +ppc-r3+ 9) (ppc-emit-stw buf +ppc-r3+ +ppc-r14+ 0)
+      (ppc-emit-label buf none))))
 
 (defun ppcmac-emit-of-query (buf)
   "Ask Open Firmware's client interface (r5 at entry) what this Mac is, before
@@ -159,6 +257,8 @@
                 do (ppc-emit-word buf (logior (ash a 24) (ash b 16) (ash c 8) d)))))
       (ppc-emit-label buf past)
       (ppc-emit-mflr buf +ppc-r29+)
+      ;; ---- the whole tree, for Lisp's drivers (USB's controllers, ...)
+      (ppcmac-emit-dt-dump buf #'cif #'li)
       (dolist (r (list +ppc-r20+ +ppc-r21+ +ppc-r22+ +ppc-r23+ +ppc-r24+ +ppc-r25+ +ppc-r26+ +ppc-r27+))
         (li r 0))
       ;; ---- the screen
@@ -278,6 +378,19 @@
         (cif "getprop" (list +ppc-r28+ (list :str "reg") (list :buf 0) (list :imm 8)) 1)
         (ppc-emit-lwz buf +ppc-r27+ +ppc-r1+ (+ 512 4))
         (ppc-emit-label buf none))
+      ;; ---- the timebase's rate: the first CPU's timebase-frequency, into r28
+      ;; (QEMU's 100 MHz when the firmware does not say)
+      (let ((none (mvm-make-label)) (have (mvm-make-label)))
+        (cif "finddevice" (list (list :str "/cpus")) 1 +ppc-r28+)
+        (ppc-emit-cmpwi buf +ppc-r28+ -1) (ppc-emit-beq buf none)
+        (cif "child" (list +ppc-r28+) 1 +ppc-r28+)
+        (ppc-emit-cmpwi buf +ppc-r28+ 0) (ppc-emit-beq buf none)
+        (ppc-emit-cmpwi buf +ppc-r28+ -1) (ppc-emit-beq buf none)
+        (prop +ppc-r28+ "timebase-frequency" +ppc-r28+)
+        (ppc-emit-cmpwi buf +ppc-r28+ 0) (ppc-emit-bne buf have)
+        (ppc-emit-label buf none)
+        (li +ppc-r28+ 100000000)
+        (ppc-emit-label buf have))
       (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 2048))))
 
 (defun ppcmac-emit-device-bats (buf)
@@ -285,7 +398,8 @@
    gave none) and the framebuffer (PA r20).  r17 = mac-io's VA, r18 = the
    framebuffer's.  When the framebuffer is within 28 MB of mac-io's 32 MB-aligned
    base (QEMU mac99: #x81000000), ONE 32 MB BAT at +PPCMAC-DEVICE-VA+ maps both.
-   Otherwise (a real Mac's graphics card) mac-io gets 1 MB there and, on a G4e
+   Otherwise (a real Mac's graphics card) mac-io's 16 MB-aligned 16 MB go there
+   (the PCI devices beside it too: USB's controllers) and, on a G4e
    (PVR in r16), DBAT4 maps the framebuffer's 16 MB-aligned 16 MB at
    +PPCMAC-FB-VA+ with HID0[HIGH_BAT_EN]; on a 7400/7410 there is no BAT left
    and the framebuffer is not mapped (r18 = 0).  All cache-inhibited, guarded."
@@ -304,17 +418,23 @@
       (ppc-emit-cmpwi buf +ppc-r20+ 0)
       (ppc-emit-beq buf split)
       ;; one BAT: both
+      (li +ppc-r3+ +ppcmac-boot-info+)                             ; the window, for Lisp
+      (ppc-emit-stw buf +ppc-r14+ +ppc-r3+ 52)
+      (li +ppc-r4+ #x02000000) (ppc-emit-stw buf +ppc-r4+ +ppc-r3+ 56)
       (ppc-emit-ori buf +ppc-r3+ +ppc-r14+ #x2A) (ppcmac-mtspr buf 543 +ppc-r3+)
       (li +ppc-r3+ (logior +ppcmac-device-va+ #x3FF)) (ppcmac-mtspr buf 542 +ppc-r3+)
       (ppc-emit-subf buf +ppc-r17+ +ppc-r14+ +ppc-r25+)
       (ppc-emit-addis buf +ppc-r17+ +ppc-r17+ (ash +ppcmac-device-va+ -16))
       (ppc-emit-addis buf +ppc-r18+ +ppc-r15+ (ash +ppcmac-device-va+ -16))
       (ppc-emit-b buf done)
-      ;; mac-io alone: 1 MB
+      ;; mac-io alone: its 16 MB (and the PCI devices beside it: USB's controllers)
       (ppc-emit-label buf split)
-      (ppc-emit-rlwinm buf +ppc-r14+ +ppc-r25+ 0 0 11)            ; 1 MB-aligned
+      (ppc-emit-rlwinm buf +ppc-r14+ +ppc-r25+ 0 0 7)             ; 16 MB-aligned
+      (li +ppc-r3+ +ppcmac-boot-info+)                             ; the window, for Lisp
+      (ppc-emit-stw buf +ppc-r14+ +ppc-r3+ 52)
+      (li +ppc-r4+ #x01000000) (ppc-emit-stw buf +ppc-r4+ +ppc-r3+ 56)
       (ppc-emit-ori buf +ppc-r3+ +ppc-r14+ #x2A) (ppcmac-mtspr buf 543 +ppc-r3+)
-      (li +ppc-r3+ (logior +ppcmac-device-va+ #x1F)) (ppcmac-mtspr buf 542 +ppc-r3+)
+      (li +ppc-r3+ (logior +ppcmac-device-va+ #x1FF)) (ppcmac-mtspr buf 542 +ppc-r3+)
       (ppc-emit-subf buf +ppc-r17+ +ppc-r14+ +ppc-r25+)
       (ppc-emit-addis buf +ppc-r17+ +ppc-r17+ (ash +ppcmac-device-va+ -16))
       (li +ppc-r18+ 0)
@@ -440,6 +560,12 @@
       ;; ---- 3b. what the firmware said, where Lisp reads it (+PPCMAC-BOOT-INFO+)
       (li +ppc-r11+ +ppcmac-boot-info+)
       (li +ppc-r12+ #x5050434D) (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ 0)   ; "PPCM"
+      (li +ppc-r12+ 0) (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ #x114)          ; the serial port: alive
+      ;; the timebase's rate for #x0311 (translate-ppc +PPC-MAC-TB-RATE+):
+      ;; r28 >> 16, tagged = r28 >> 15 with bit 0 clear; and in the boot info
+      (ppc-emit-rlwinm buf +ppc-r12+ +ppc-r28+ 17 14 30)
+      (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ #x118)
+      (ppc-emit-stw buf +ppc-r28+ +ppc-r11+ 60)
       (loop for (r off) in (list (list +ppc-r18+ 4) (list +ppc-r21+ 8) (list +ppc-r22+ 12)
                                  (list +ppc-r23+ 16) (list +ppc-r24+ 20) (list +ppc-r17+ 24)
                                  (list +ppc-r26+ 28) (list +ppc-r27+ 32) (list +ppc-r20+ 36)
@@ -448,7 +574,7 @@
       ;; and on the console: the PVR, the framebuffer PA and VA, its depth, mac-io
       ;; PA, the VIA kind (1 CUDA, 2 PMU), the RAM
       (let ((*ppc-mac-mode* t))
-        (dolist (r (list +ppc-r16+ +ppc-r20+ +ppc-r18+ +ppc-r24+ +ppc-r25+ +ppc-r26+ +ppc-r27+ +ppc-r19+))
+        (dolist (r (list +ppc-r16+ +ppc-r20+ +ppc-r18+ +ppc-r24+ +ppc-r25+ +ppc-r26+ +ppc-r27+ +ppc-r19+ +ppc-r28+))
           (ppcmac-emit-put-hex buf r)))
       ;; ---- 4. what the hosted stub does after its mmaps ----------------------
       (li +ppc-r1+ (- +ppcmac-stack-top+ 64))

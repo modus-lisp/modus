@@ -157,14 +157,53 @@
 (defvar *mac-via-kind* nil "1 CUDA, 2 PMU (boot-ppcmac's boot info, +28).")
 
 (defun mac-boot-info (off)
-  (+ (* 65536 (mem-ref (+ #x07F80000 off) :u16)) (mem-ref (+ #x07F80002 off) :u16)))
+  ;; MEM-REF :U32, not (+ (* 65536 hi) lo): a word >= 2^29 (a PCI address) is a
+  ;; bignum here, which MEM-REF builds and a fixnum multiply would wrap
+  (mem-ref (+ #x07F80000 off) :u32))
 
 (defun mac-input-init ()
   (setq *mac-via-kind* (if (and (= (mem-ref #x07F80000 :u16) #x5050) (= (mac-boot-info 28) 2)) 2 1))
   (if (= *mac-via-kind* 2)
       (progn (pmu-init) (pmu-adb-reset) (pmu-autopoll))
       (progn (cuda-init) (adb-reset) (cuda-autopoll t)))
+  (mac-set-clock)
+  ;; USB keyboards and mice (ppcmac-usb.lisp, when the payload has it)
+  (when (fboundp 'usb-init)
+    (handler-case (funcall 'usb-init)
+      (error (c) (ignore-errors (modus-int::write-string-serial "usb: ") (princ c)))))
   *mac-via-kind*)
+
+;;; ---- the clock -------------------------------------------------------------
+;;;
+;;; Both microcontrollers keep the real-time clock: seconds since 1904-01-01
+;;; (the Mac's epoch; Mac OS keeps it in local time), four bytes, big-endian.
+;;; CUDA's pseudo command 3 (GET_TIME) answers [1 flags 3 t3 t2 t1 t0]; the
+;;; PMU's #x38 (READ_RTC) answers the four bytes.  CL's epoch is 1900: four
+;;; years (1900 was not a leap year) earlier.
+
+(defconstant +mac-epoch-offset+ (* 1460 86400) "1904-01-01 minus 1900-01-01: 4 x 365 days.")
+
+(defun %be32 (bytes) (reduce (lambda (a b) (+ (* a 256) b)) bytes :initial-value 0))
+
+(defun mac-rtc ()
+  "The Mac's clock as a universal time, or NIL."
+  (if (eql *mac-via-kind* 2)
+      (let ((r (pmu-command #x38 nil :reply 4)))
+        (and (= (length r) 4) (+ (%be32 r) +mac-epoch-offset+)))
+      (dotimes (i 8 nil)
+        (let ((p (if (zerop i) (cuda-send (list 1 3))
+                     (dotimes (j 200000 nil) (when (cuda-treq-p) (return (cuda-read-packet)))))))
+          (cond ((null p) (return nil))
+                ((and (= (first p) 1) (>= (length p) 7) (= (third p) 3))
+                 (return (+ (%be32 (subseq p 3 7)) +mac-epoch-offset+)))
+                (t (%mac-adb-packet p)))))))      ; an ADB packet got there first
+
+(defun mac-set-clock ()
+  "Set the image's clock from the Mac's.  The universal time, or NIL."
+  (let ((ut (ignore-errors (mac-rtc))))
+    (when (and ut (> ut 3600000000))              ; after 2014: a clock that was set
+      (modus-int::set-universal-time ut))
+    ut))
 
 ;;; ---- events ---------------------------------------------------------------
 
@@ -242,7 +281,9 @@
                              (list (list :pointer mask *mac-mouse-x* *mac-mouse-y*)))))))))))
 
 (defun mac-input-poll ()
-  "Read every packet the ADB master has; queue their events.  How many packets."
+  "Read every packet the ADB master has, and every USB report; queue their
+   events.  How many ADB packets."
+  (when (fboundp 'usb-poll) (funcall 'usb-poll))
   (if (eql *mac-via-kind* 2)
       (pmu-poll)
       (let ((n 0))

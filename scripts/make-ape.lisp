@@ -145,14 +145,23 @@ MODUS_APE=$o exec \"$e\" \"$@\"~%exit 1~%"
     (replace out stored :start1 elf-at)
     (values out name elf-at)))
 
+(defun ape-opt (name)
+  (let ((v (funcall (find-symbol "POSIX-GETENV" "SB-EXT") name))) (and v (plusp (length v)) v)))
+
 (let* ((pe (ape-read (ape-env "MODUS_APE_PE")))
        (elf (ape-read (ape-env "MODUS_APE_ELF")))
        (path (ape-env "MODUS_APE_OUT" "modus.com"))
        ;; MODUS_APE_CRAM (cram's source): the Linux image goes in gzip-compressed
-       (elf-z (let ((v (funcall (find-symbol "POSIX-GETENV" "SB-EXT") "MODUS_APE_CRAM")))
-                (and v (plusp (length v)) (ape-gzip elf)))))
-  (multiple-value-bind (out0 name elf-at) (make-ape pe elf elf-z)
-    (let ((out (ape-trailer out0 (ape-segments-from-env)
+       (elf-z (and (ape-opt "MODUS_APE_CRAM") (ape-gzip elf)))
+       ;; MODUS_APE_STUB (mvm/build-ape-stub.lisp's launcher), with MODUS_APE_CRAM: the file's
+       ;; PE is the launcher, and the Windows CLI goes in gzip-compressed as the segment
+       ;; windows-x64.exe.gz, which the launcher inflates, caches and runs
+       (stub (and (ape-opt "MODUS_APE_STUB") (ape-read (ape-opt "MODUS_APE_STUB"))))
+       (pe-z (and stub (or elf-z (error "make-ape: MODUS_APE_STUB needs MODUS_APE_CRAM"))
+                  (ape-gzip pe))))
+  (multiple-value-bind (out0 name elf-at) (make-ape (or stub pe) elf elf-z)
+    (let ((out (ape-trailer out0 (append (and pe-z (list (cons "windows-x64.exe.gz" pe-z)))
+                                         (ape-segments-from-env))
                             (list (list (if elf-z "linux-x64.elf.gz" "linux-x64.elf")
                                         elf-at (length (or elf-z elf)))))))
       (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)

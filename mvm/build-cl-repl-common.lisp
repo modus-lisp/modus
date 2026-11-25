@@ -551,6 +551,19 @@
     (when (< n 511) (dotimes (i 8) (%gc-write64 (+ a (* i 8)) 0)))
     (setf (mem-ref #x50000 :u32) (+ n 1))
     a))
+;; HOW THE UEFI STUB'S LOAD OF \\CORE.BIN WENT (boot-uefi-x64.lisp EMIT-UEFI-CORE-LOAD): the
+;; last step it tried, that call's EFI status, the file's size and where it had to be read
+;; (0: at 0x20000000 itself), under the banner.  On a machine whose screen is the only witness,
+;; this is how a core that did not restore says why.  Multiboot images have no such stub.
+(defun %srepl-after-banner ()
+  (let ((step (mem-ref #x1B0E0 :u32)))
+    (unless (or (= step 0) (> step 11))
+      (write-string-serial \"UEFI CORE.BIN: step \") (print-dec step)
+      (write-string-serial \" status \") (print-dec (mem-ref #x1B0E8 :u32))
+      (write-string-serial \" size \") (print-dec (mem-ref #x1B0F0 :u32))
+      (write-string-serial \" moved from \") (print-dec (mem-ref #x1B0F8 :u32))
+      (write-string-serial (if (%core-requested-p) \" (a core is in RAM)\" \" (no core in RAM)\"))
+      (write-char-serial 10))))
 "
         "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
@@ -1059,6 +1072,19 @@
   (%core-slice fd stage #x18)
   (%core-slice fd #x10000FD0 8)
   (%core-slice fd stage #x28))
+;; THE CORE IS ONE CONTIGUOUS RANGE HERE.  The Pi's %CORE-READ-ALL above also follows a
+;; SPLIT core (U-Boot's netboot leaves the tail at a spill address) through a descriptor
+;; word at 0x111F1F20, which the Pi's %CORE-PRE-RESTORE clears in its Device RAM.  On
+;; this layout 0x111F1F20 is INSIDE THE HEAP: once a restored heap reached past it (a desk's
+;; ~35 MB did; a small core's did not), whatever object landed there read as a slot end,
+;; and every later slice -- the bitmaps, then the JIT arena -- was taken from the wrong
+;; place.  The restored process then ran bytecode as code (measured: the arena at
+;; 0x307A5000 held x86 in the core file and MVM bytecode after the restore).
+(defun %core-read-all (fd addr len)
+  (let ((src (%gc-read64 fd)) (padded (logand (+ len 7) -8)))
+    (%core-copy-words addr src len)
+    (%gc-write64 fd (+ src padded))
+    len))
 "
        (if (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)
            ""

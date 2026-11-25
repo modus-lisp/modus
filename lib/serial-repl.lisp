@@ -178,6 +178,11 @@
 ;;; The loop
 ;;; ===========================================================================
 
+;;; What a board has to say once the console is up, after the banner: nothing by default.
+;;; The UEFI x64 image reports how its stub's load of \CORE.BIN went (build-cl-repl-common).
+(declaim (overridable %srepl-after-banner))
+(defun %srepl-after-banner () nil)
+
 (defun cl-serial-repl ()
   "Interactive CL read-eval-print loop over the serial port.  Never returns."
   (%srepl-init-buf)
@@ -185,6 +190,7 @@
   (handler-case (%console-init) (t (c) nil))
   (write-string-serial "Modus CL REPL (bare metal).  EVAL = MVM-EVAL.")
   (write-char-serial 10)
+  (handler-case (%srepl-after-banner) (t (c) nil))
   (loop
     (write-string-serial "> ")
     (let ((n (%srepl-read-form-text)))

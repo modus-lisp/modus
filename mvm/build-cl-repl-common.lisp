@@ -1173,7 +1173,19 @@
 ;; leaves it), and its progress word #x111F1F00 is inside the bare x64 heap.
 ;; Back to lib/save-image.lisp's defaults.  Last definition wins.
 (defun %core-progress (k) k)
-(defun %core-pre-restore () t)
+;; ENOUGH RAM FOR WHAT THE CORE COVERS.  A core restores the JIT arena at 0x30000000 and runs from
+;; it, so a machine without RAM up to the arena's top (~896 MB) wrote the code into nothing and
+;; faulted somewhere unrelated (measured under QEMU at -m 768: no desk, no reason).  Test the
+;; arena's last words: on a smaller machine say so and boot the plain REPL instead.
+(defun %core-pre-restore ()
+  (let ((a #x37FFFFF0))
+    (setf (mem-ref a :u32) #x1234567 (mem-ref (+ a 4) :u32) #x7654321)
+    (if (and (= (mem-ref a :u32) #x1234567) (= (mem-ref (+ a 4) :u32) #x7654321))
+        t
+        (progn
+          (write-string-serial \"core: not restored -- this machine has less than 1 GB of RAM, and the core's JIT code lives at 0x30000000\")
+          (write-char-serial 10)
+          nil))))
 ;; THE GEOMETRY, READ EXACTLY.  boot-x64's stub stores the GC control block and
 ;; the MCGC config words RAW (as hosted x64's does), so lib/save-image.lisp's
 ;; mem-ref :u64 defaults HALVE them: a core saved with them claimed its heap

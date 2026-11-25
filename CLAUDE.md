@@ -1309,6 +1309,43 @@ Bootable USB for real hardware (ThinkPad T420 etc.):
 sudo dd if=/tmp/modus-usb.img of=/dev/sdX bs=1M status=progress  # write to USB
 ```
 
+### Bare x64: the runtime JIT, saved cores on UEFI, the clock (2026-11-25)
+
+**The runtime JIT runs on bare x64** with `MODUS_X64_JIT=1` (opt-in): trap `#x0531`'s bare
+arm bump-allocates exec pages from `[#x30000000, #x38000000)` (bump word `0x10000FB8`,
+reset to the base when out of range; RAM is not zeroed), and the build sets the host-side
+`*X64-JIT-CONSTVEC-P*` so the image's collector roots the constant vector -- without it the
+in-image co-init's thunk loads dangled at the first collection and every later page was
+refused.  Hot DEFUNs promote by count and by time: `fib 25` 10.7 s -> 0.01 s on its second call.
+
+**A clock** (`%PC-TSC-HZ`, the x64 arm of `*CLI-ARCH-OVERRIDE-SOURCE*`): trap `#x0311` answers
+0 on bare x64, so the TSC's rate is measured once against PIT channel 2 (Linux's
+`pit_calibrate_tsc`; 0 if no PIT answers within ~5 s of TSC).  `GET-INTERNAL-REAL-TIME`,
+`%IRT-NS`, `%SLEEP-MS`, and `GET-UNIVERSAL-TIME` / `SET-UNIVERSAL-TIME` (seconds since boot
+plus an offset, the boards' shape) run on it.  Not under SEV-SNP (no legacy ports there).
+
+**Saved cores boot from the ESP.**  `SAVE-AND-DIE` writes a RAM-range core at `0x20000000`;
+`scripts/uefi-core.py EFI OUT` (CORE_FORMS) builds one under OVMF and reads it out over QMP,
+and `scripts/uefi-disk.sh EFI CORE OUT [SECTORS]` writes a GPT disk whose ESP holds
+`\EFI\BOOT\BOOTX64.EFI` and `\CORE.BIN`.  The stub reads `\CORE.BIN` before
+ExitBootServices (LoadedImage -> SimpleFileSystem -> Open -> AllocatePages(AllocateAddress)
+-> Read), falling back to any pages below 4 GB and a move after ExitBootServices; its record
+(last step, EFI status, size, source) is printed under the banner and, on GOP, drawn as
+blocks a webcam can read.  Three things this took, each a dead core first:
+- **The core geometry seams read the raw GC words** (`%GC-READ64`), as hosted x64's do: the
+  shared `mem-ref :u64` defaults halved them and a core claimed its heap began at `#x08000800`.
+- **`%CORE-READ-ALL` is contiguous here.**  The Pi's follows a split core through a descriptor
+  at `0x111F1F20`, which on this layout is INSIDE THE HEAP: any core with more than ~18 MB of
+  heap read its later slices from the wrong place and ran bytecode as code.  Found by a QEMU
+  gdbstub watchpoint on the arena word (`gdb-multiarch`, no ptrace needed).
+- **1024 handler frames** at `0x0FD00000` (`X64-BARE-HSTACK-BASE`, translate-x64; SNP keeps 64
+  at `0x10000408`): 64 could not hold a library install's nesting (peak measured: 91).
+
+A network-only x64 image (no SSH) now has `E1000-STATE-BASE` (only the SSH map had it), and
+the mutex arena (`0x50000..0x58000`, zeroed by boot-x64 every boot).  Bare x64 has **no
+generational GC** (the barrier is emitted in Linux mode only).  `kiln t420 --x64` builds the
+T420 desk this way (vessel `src/t420-x64.lisp`).
+
 ### Hosted Windows x86-64 (`modus.exe`) — docs/win64.md
 ```bash
 sbcl --dynamic-space-size 4096 --script mvm/build-win64-cli.lisp   # -> modus.exe (PE32+)

@@ -568,13 +568,27 @@
 ;; this is how a core that did not restore says why.  Multiboot images have no such stub.
 (defun %srepl-after-banner ()
   (let ((step (mem-ref #x1B0E0 :u32)))
-    (unless (or (= step 0) (> step 11))
+    (unless (> step 11)
       (write-string-serial \"UEFI CORE.BIN: step \") (print-dec step)
       (write-string-serial \" status \") (print-dec (mem-ref #x1B0E8 :u32))
       (write-string-serial \" size \") (print-dec (mem-ref #x1B0F0 :u32))
       (write-string-serial \" moved from \") (print-dec (mem-ref #x1B0F8 :u32))
       (write-string-serial (if (%core-requested-p) \" (a core is in RAM)\" \" (no core in RAM)\"))
-      (write-char-serial 10))))
+      (write-char-serial 10)
+      ;; ... and in blocks a webcam can read, on GOP's screen: a white square per step
+      ;; reached, the status's low byte as eight bits (red 1, grey 0, high bit first),
+      ;; then green when a core is in RAM, red when not.
+      (when (= (mem-ref #x1B020 :u32) 1)
+        (let ((base (mem-ref #x1B000 :u64)) (pitch (* 4 (mem-ref #x1B008 :u32))))
+          (flet ((sq (col row rgb)
+                   (let ((x0 (+ 40 (* col 50))) (y0 (+ 300 (* row 60))))
+                     (dotimes (y 40)
+                       (let ((a (+ base (* (+ y0 y) pitch) (* x0 4))))
+                         (dotimes (x 40) (setf (mem-ref (+ a (* x 4)) :u32) rgb)))))))
+            (dotimes (i (max step 1)) (sq i 0 (if (= step 0) #x404040 #xFFFFFF)))
+            (let ((st (logand (mem-ref #x1B0E8 :u32) 255)))
+              (dotimes (b 8) (sq b 1 (if (logbitp (- 7 b) st) #xFF0000 #x404040))))
+            (sq 0 2 (if (%core-requested-p) #x00FF00 #xFF0000))))))))
 "
         "")
     ;; The PowerPC Mac's mutex arena: 64 KB of low RAM below the scratch pages
@@ -1254,6 +1268,20 @@
              (floor (* (mod ticks hz) 1000000000) hz)))
         0)))
 (defun %irun-ns () (%irt-ns))
+;;; THE DATE, as the boards have it: seconds since boot on the same clock, plus an offset
+;;; SET-UNIVERSAL-TIME stores once something knows the date (the T420 desk: SNTP, or the
+;;; CMOS clock).  cl-fileio's GET-UNIVERSAL-TIME is a Linux syscall, which answers ~0 here,
+;;; and without a SET-UNIVERSAL-TIME the desk redefined GET-UNIVERSAL-TIME with a closure --
+;;; which late-bound callers saw and its own native code did not (the Clock read 19:00:00).
+(defun %pc-uptime-s ()
+  (let ((hz (%pc-tsc-hz))) (if (> hz 0) (floor (rdtsc) hz) 0)))
+(defun get-universal-time ()
+  (+ (%pc-uptime-s)
+     (if (boundp '*universal-time-offset*) (symbol-value '*universal-time-offset*) 0)))
+(defun set-universal-time (ut)
+  \"Tell this PC what time it is: UT (seconds since 1900) now.  UT.\"
+  (setf (symbol-value '*universal-time-offset*) (- ut (%pc-uptime-s)))
+  ut)
 "))
       (concatenate 'string
         (string #\Newline)

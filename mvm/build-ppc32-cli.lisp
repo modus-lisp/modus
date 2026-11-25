@@ -1,0 +1,205 @@
+;;;; build-ppc32-cli.lisp -- the hosted Modus CLI for Linux/PowerPC (32-bit).
+;;;;
+;;;; A :linux-ppc32 ELF (big-endian, classic FPU) run under qemu-ppc-static.
+;;;; Same SBCL-faithful toplevel as ./modus (x64) and the other CLI ports.
+;;;;
+;;;;   sbcl --dynamic-space-size 12288 --script mvm/build-ppc32-cli.lisp
+;;;;   -> /tmp/modus-ppc32-cli   (override with MODUS_CLI_OUT)
+;;;;
+;;;; The first PowerPC CL image, and the stepping stone to the bare PowerPC Mac
+;;;; (the same translator and memory map, Linux's services swapped for the
+;;;; Mac's).  A thin tail over build-cli-common.lisp, cut from
+;;;; build-arm32-cli.lisp.  Linux/PowerPC uses the legacy (i386) syscall table
+;;;; for most of what this slot touches, with its own differences:
+;;;;   exit_group 234, getcwd 182, getdents64 202, clock_gettime 246,
+;;;;   and struct stat64 (big-endian): st_size is 64 bits at +48, so its low
+;;;;   word is at +52; st_mtime at +80.
+;;;; An error comes back as CR0.SO with a POSITIVE errno; the syscall traps
+;;;; (translate-ppc.lisp) negate it, so the shared "negative is errno" holds.
+;;;; ARGV is read from the copy boot-linux-ppc.lisp stages at #x10009000.
+
+(defvar *cli-arch* :ppc32)
+
+(defvar *cli-arch-syscall-source* "
+(defun sys-exit (code)
+  (let ((c code))
+    (syscall3 234 c 0 0)))
+(defun halt ()
+  (syscall3 234 1 0 0))
+")
+
+(defvar *cli-arch-probe-source* "
+(defun %argv-string-at (addr)
+  (let ((len 0))
+    (let ((i 0))
+      (loop
+        (let ((b (mem-ref (+ addr i) :u8)))
+          (when (= b 0) (return nil))
+          (setq i (+ i 1)))
+        (setq len i)))
+    (if (zerop len) nil
+        (let ((s (%make-string-array len)) (i 0))
+          (loop
+            (when (>= i len) (return s))
+            (aset s i (mem-ref (+ addr i) :u8))
+            (setq i (+ i 1)))))))
+(defun %argc  () (mem-ref #x10000200 :u32))
+(defun %hc-depth () (mem-ref #x10000400 :u32))
+(defun %hc-armed-p () (if (eql (mem-ref #x10000180 :u32) 0) nil t))
+")
+
+;;; The heap mapping is zero-filled and covers the low block; nothing to set up.
+(defvar *cli-arch-kernel-prologue* "")
+
+;;; Scratch pages below the allocator (heap+#x20000): cstr at #x10001000
+;;; (rename uses +2048), the 4 KB I/O page at #x10002000 -- RV32's layout.
+(defvar *cli-arch-io-scratch-source* "  (setq *cstr-scratch* #x10001000)
+  ;; getdents64 scratch: cl-fileio's default is a fixed #x1DD00000, which on
+  ;; this layout is INSIDE the heap (it starts at #x10000000 and reaches
+  ;; #x1F800000), so listing a directory wrote dirents over live objects --
+  ;; found when the 68k CLI died in install-tarball, in a directory with a
+  ;; thousand entries.  4 KB is all it uses.
+  (setq *%dirent-buf-addr* #x10003000)
+  (setq *io-buf-addr*  #x10002000)
+  (setq *scratch-mmapped* t)
+")
+
+(defvar *cli-arch-kernel-epilogue*
+"  ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
+  (handler-case (cli-toplevel) (t (c) (sys-exit 1))))
+")
+
+(defvar *cli-arch-override-source* "
+(defun %sys-open-rdonly (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 0 0))
+(defun %sys-open-wronly (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 577 420))
+(defun %sys-open-append (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 1089 420))
+(defun %sys-open-rdwr (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 66 420))
+(defun %sys-open-wronly-existing (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 1 0))
+(defun %sys-open-create-excl (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 193 420))
+(defun %sys-close (fd) (syscall3 6 fd 0 0))
+(defun %sys-getpid () (syscall3 20 0 0 0))
+;; getcwd(2) is syscall 182 on PowerPC (cl-fileio's %sys-getcwd asks this).
+(defun %sys-getcwd-nr () 182)
+(defun %sys-read-raw (fd buf-addr count) (syscall3 3 fd buf-addr count))
+(defun %sys-write-raw (fd buf-addr count) (syscall3 4 fd buf-addr count))
+(defun %sys-lseek (fd offset whence) (syscall3 19 fd offset whence))
+(defun %sys-unlink (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 10 *cstr-scratch* 0 0))
+(defun %sys-rename (old-str new-str)
+  (%string-to-cstr old-str *cstr-scratch*)
+  (let ((new-addr (+ *cstr-scratch* 2048)))
+    (%string-to-cstr new-str new-addr)
+    (syscall3 38 *cstr-scratch* new-addr 0)))
+(defun %sys-mkdir (path-str mode)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 39 *cstr-scratch* mode 0))
+(defun %sys-rmdir (path-str)                     ; rmdir(2): 40 here, as mkdir is 39
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 40 *cstr-scratch* 0 0))
+(defun %sys-readlink (path-str) (declare (ignore path-str)) nil)   ; links not followed here yet
+
+(defun %sys-stat-exists (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*)))
+    (if (< (syscall3 33 path-addr 0 0) 0) nil t)))
+(defun %sys-stat-size (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (syscall3 195 path-addr buf-addr 0)))
+      (if (< ret 0) -1 (mem-ref (+ buf-addr 52) :u32)))))
+(defun %sys-stat-mtime (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (syscall3 195 path-addr buf-addr 0)))
+      (if (< ret 0) 0 (mem-ref (+ buf-addr 80) :u32)))))
+(defun %sys-fstat-size (fd)
+  (let ((buf-addr *io-buf-addr*))
+    (let ((ret (syscall3 197 fd buf-addr 0)))
+      (if (< ret 0) -1 (mem-ref (+ buf-addr 52) :u32)))))
+(defun %sys-getdents64 (fd buf-addr buf-size) (syscall3 202 fd buf-addr buf-size))
+;; clock_gettime is 246 on PowerPC (263 on ARM EABI, 265 on i386), and the struct timespec is
+;; two 32-bit longs, so tv_nsec is at +4, not +8.  Without this override
+;; GET-INTERNAL-REAL-TIME fell back to its call counter and every timing on
+;; i386 read 1 tick.  (32-bit time_t: good until 2038.)
+(defun %clock-gettime-ns (clk)
+  (let ((buf *io-buf-addr*))
+    (if (eql (syscall3 246 clk buf 0) 0)
+        (+ (* (mem-ref buf :u32) 1000000000) (mem-ref (+ buf 4) :u32))
+        0)))
+
+(defun %cli-argv-base () 268472320)   ; #x10009000 — the staged pointer array
+
+(defun %cli-collect-argv ()
+  (let ((argc (%cli-argc)) (base (%cli-argv-base)) (acc nil) (i 0))
+    (loop
+      (when (>= i argc) (return (reverse acc)))
+      (let ((ptr (mem-ref (+ base (* 4 i)) :u32)))
+        (when (eql ptr 0) (return (reverse acc)))
+        (setq acc (cons (%cli-cstr-at ptr) acc)))
+      (setq i (+ i 1)))))
+
+(defun %cli-getenv (name)
+  ;; envp begins one slot past argv's NULL terminator, exactly as on the real
+  ;; stack.  NB the equals sign is built with code-char: this source is a LISP
+  ;; STRING and a double quote in it would terminate the string early.
+  (let ((argc (%cli-argc)) (base (%cli-argv-base)) (i 0))
+    (let ((envp (+ base (* 4 (+ argc 1))))
+          (prefix (concatenate (quote string) name (string (code-char 61)))))
+      (let ((plen (length prefix)))
+        (loop
+          (let ((ptr (mem-ref (+ envp (* 4 i)) :u32)))
+            (when (eql ptr 0) (return nil))
+            (let ((entry (%cli-cstr-at ptr)))
+              (when (and entry (>= (length entry) plen)
+                         (string= (subseq entry 0 plen) prefix))
+                (return (subseq entry plen)))))
+          (setq i (+ i 1)))))))
+")
+
+(require :sb-posix)
+
+(load (merge-pathnames "build-cli-common.lisp"
+                       (directory-namestring (truename *load-truename*))))
+
+(mvm-load "boot/boot-linux-ppc.lisp")
+
+(in-package :modus.mvm)
+
+(let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
+  (when (and sm (> (length sm) 0))
+    (setf *write-symmap-path* sm)))
+
+(install-ppc32-translator)
+(ppc-set-linux-mode t)
+;; MODUS_PPC_JIT=1: the native tier (mvm/jit-ppc-native.lisp) -- the image
+;; carries the export table its runtime translator needs.
+(setf *ppc-native-tier* (equal (sb-ext:posix-getenv "MODUS_PPC_JIT") "1"))
+
+(let* ((out (or (sb-ext:posix-getenv "MODUS_CLI_OUT")
+                "/tmp/modus-ppc32-cli"))
+       (image (build-image :target :linux-ppc32
+                           :source-text cl-user::*full-source*)))
+  (if *ppc-unimpl-opcodes*
+      (format t "~%  *** TRANSLATOR GAPS: ~{#x~X~^ ~} (#x1xxxx = trap xxxx) ***~%"
+              (sort (copy-list *ppc-unimpl-opcodes*) #'<))
+      (format t "~%  TRANSLATOR: no unimplemented opcodes or traps.~%"))
+  (ensure-directories-exist out)
+  (with-open-file (o out :direction :output :element-type '(unsigned-byte 8)
+                         :if-exists :supersede)
+    (write-sequence (kernel-image-image-bytes image) o))
+  (funcall (find-symbol "CHMOD" "SB-POSIX") out #o755)
+  (format t "~%Wrote ~D bytes to ~A~%"
+          (length (kernel-image-image-bytes image)) out)
+  (format t "Run: qemu-ppc-static ~A --eval EXPR --quit~%" out))

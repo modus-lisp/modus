@@ -767,6 +767,9 @@
 ;;; and the SFT key by hash.
 (defvar *struct-types* nil)
 
+(declaim (inline %struct-type-desc-hash %struct-type-desc-name %struct-type-desc-parent
+                 %struct-type-desc-slots %struct-type-desc-conc
+                 %struct-instance-p %struct-type-name))
 (defun %struct-type-desc-hash (d)   (aref d 0))
 (defun %struct-type-desc-name (d)   (aref d 1))
 (defun %struct-type-desc-parent (d) (aref d 2))
@@ -780,7 +783,14 @@
     (if nh (cdr nh) nil)))
 
 (defun %find-struct-type (name)
-  "Return the struct-type descriptor for NAME (a symbol), or NIL."
+  "Return the struct-type descriptor for NAME (a symbol), or NIL.  The
+   registry is searched for NAME itself first (EQ), then by name hash."
+  (let ((cur *struct-types*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (%struct-type-desc-name (cdr (car cur))) name)
+        (return-from %find-struct-type (cdr (car cur))))
+      (setq cur (cdr cur))))
   (let ((key (%struct-name-hash name)))
     (if (null key) nil
       (let ((cur *struct-types*))
@@ -826,6 +836,14 @@
 (defun %struct-type-ancestor-p (type-name ancestor-name)
   "True if struct type TYPE-NAME is, or descends (via :include) from,
    ANCESTOR-NAME.  Compares by name-hash so symbol-flavor doesn't matter."
+  ;; The :include chain by EQ first: no hashing when the names are the
+  ;; symbols the registry holds (the common case).
+  (let ((cur type-name))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq cur ancestor-name) (return-from %struct-type-ancestor-p t))
+      (let ((desc (%find-struct-type cur)))
+        (setq cur (if desc (%struct-type-desc-parent desc) nil)))))
   (let ((target (%struct-name-hash ancestor-name))
         (cur-name type-name))
     (if (null target) nil
@@ -878,12 +896,11 @@
    predicate works even when the boot-time %register-struct-type thunk
    for this type didn't run."
   (if (not (%struct-instance-p x)) nil
-    (let ((th (%struct-name-hash (%struct-type-name x)))
-          (nh (%struct-name-hash type-name)))
-      (cond
-        ((and th nh (= th nh)) t)
-        ((%struct-type-ancestor-p (%struct-type-name x) type-name) t)
-        (t nil)))))
+   (if (eq (%struct-type-name x) type-name) t   ; the same symbol: no hashing
+    ;; %STRUCT-TYPE-ANCESTOR-P walks the chain by EQ and then by name hash,
+    ;; and its hash walk starts with this type's own name: the same-hash
+    ;; direct case this used to test first.
+    (if (%struct-type-ancestor-p (%struct-type-name x) type-name) t nil))))
 
 (defun %alloc-struct (type-name slot-values)
   "Allocate a struct instance of TYPE-NAME with SLOT-VALUES (a list in

@@ -4522,6 +4522,8 @@
           (t
            (let ((sym (%alloc-sym3)))
              (aset sym 0 name-hash)
+             (aset sym 3 nil)    ; property list (cl-packages %SYM-PLIST)
+             (aset sym 4 nil)    ; qualified-name memo (cl-eval %SYM-QN-REMEMBER)
              ;; Look up the home package.  pkg-hash=0 means none.
              ;;
              ;; A NON-zero pkg-hash means compile-quote knew this literal's

@@ -131,14 +131,27 @@
 ;;; package-qualified name; building and hashing that string was most of a
 ;;; SYMBOL-FUNCTION (3 us -- and FUNCALL / MAPCAR of a symbol, and every
 ;;; #'NAME across modules, go through it).  The pair is memoised per symbol
-;;; (EQ), filled on the main thread only, as the CLOS memos.
+;;; (EQ), filled on the main thread only, as the CLOS memos: in the symbol's
+;;; slot 4 when it has one (every heap symbol, %ALLOC-SYM3), else in a table.
 (defvar *sym-qn-memo* nil)
 
 (defun %sym-qn-remember (sym pair)
   (when (if (= (mem-ref #x10000FF8 :u32) 0) t (if (= (percpu-ref 16) 0) t nil))
-    (unless (consp *sym-qn-memo*) (setq *sym-qn-memo* (make-hash-table :test 'eq)))
-    (puthash sym *sym-qn-memo* (cons (%cl-sym-package sym) pair)))
+    (let ((e (cons (%cl-sym-package sym) pair)))
+      (if (>= (array-length sym) 5)
+          (aset sym 4 e)
+          (progn
+            (unless (consp *sym-qn-memo*) (setq *sym-qn-memo* (make-hash-table :test 'eq)))
+            (puthash sym *sym-qn-memo* e)))))
   pair)
+
+(defun %sym-qn-recall (sym)
+  "%SYM-QN-REMEMBER's pair for CL symbol SYM while its home package is the
+   one it was computed under, else NIL."
+  (let ((e (if (>= (array-length sym) 5)
+               (%word-aref sym 4)
+               (let ((m *sym-qn-memo*)) (and (consp m) (gethash sym m))))))
+    (and e (eq (car e) (%cl-sym-package sym)) (cdr e))))
 
 (defvar *kernel-fn-names* nil
   "The names of the image's own non-CL functions (EQUAL hash), snapshotted by
@@ -249,11 +262,7 @@
     ;; A hit is trusted only while the symbol's home package is the one it
     ;; was computed under: a symbol can get its home package after its first
     ;; lookup (ANSI load.15 lost its function cell to a stale bare key).
-    ((and (%cl-sym-p sym)
-          (let ((m *sym-qn-memo*))
-            (and (consp m)
-                 (let ((e (gethash sym m)))
-                   (and e (eq (car e) (%cl-sym-package sym)) (cdr e)))))))
+    ((and (%cl-sym-p sym) (%sym-qn-recall sym)))
     ((%cl-sym-p sym)
      (let ((nm (%cl-sym-name sym)))
        (when nm

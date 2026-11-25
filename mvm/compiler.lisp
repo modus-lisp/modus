@@ -17576,13 +17576,24 @@
            ;; wraps that in a native trampoline.  Stored raw, it outlived the
            ;; module: `(setq *fn* (let ((k 7)) (lambda (x) (+ x k))))' and a
            ;; later form's (funcall *fn* 1) jumped to the offset (x64 and
-           ;; aarch64 alike).  Counters and flags keep the fast path.
+           ;; aarch64 alike).  What the bridge wraps is the closure itself and
+           ;; closures inside a LIST (%MVM-COLLECT-CALL-ARGS walks conses, never
+           ;; vectors), so a CONS or a #x52 closure takes the call; every other
+           ;; heap object -- a struct, a vector, a string, a float -- is stored
+           ;; in place like a fixnum or NIL (cl-bench RICHARDS SETQs its
+           ;; globals to structs: 13% of it was this call).
            (let ((fast (make-compiler-label)))
              (emit-ir :test-imm dest 1)
              (emit-ir :beq fast)
              (emit-ir :mov zed +vreg-vn+)
              (emit-ir :cmp dest zed)
+             (emit-ir :beq fast)
+             (emit-ir :obj-tag zed dest)
+             (emit-ir :cmp-imm zed (ash (ct-tag-object) +fixnum-shift+))
              (emit-ir :bne slow)
+             (emit-ir :obj-subtag zed dest)
+             (emit-ir :cmp-imm zed (ash #x52 +fixnum-shift+))
+             (emit-ir :beq slow)
              (emit-ir-label fast))
            (emit-ir :li-const tmp (%e2-const-register cell))
            (emit-ir :setcdr tmp dest)
@@ -30386,14 +30397,18 @@
   (emit-ir :alloc-obj dest 1 +subtag-keyword+))
 
 (defun compile-alloc-sym3 (dest)
-  "Compile (%alloc-sym3) — allocate a 3-slot object with symbol subtag
-   (#x50). Slots are uninitialized; the caller fills them. Used by the
-   CL symbol allocator to build a full package-aware symbol with slots
-   [hash, package, name] without going through make-array (which would
-   give subtag #x32 and require a header rewrite).
+  "Compile (%alloc-sym3) — allocate a symbol-subtag (#x50) object with
+   slots [hash, package, name, plist, qn-memo]; the name keeps its
+   history.  The last two came later, each out of an EQ hash table the
+   symbol was looked up in: the property list (every GET a table probe --
+   cl-bench BOYER and DDERIV spent 30-45% there) and %SYM-NAME-OR-HASH's
+   memo (under every SYMBOL-FUNCTION, FBOUNDP and struct type check).  Slots are uninitialized; the caller fills them.  Built without
+   make-array (which would give subtag #x32 and require a header rewrite).
+   A static symbol (cross.lisp, lean images) keeps three slots, and its
+   plist the table: see %SYM-PLIST.
    GC-check first (overshoot-past-R14 hazard; see compile-make-bignum)."
   (emit-ir :gc-check)
-  (emit-ir :alloc-obj dest 3 +subtag-symbol+))
+  (emit-ir :alloc-obj dest 5 +subtag-symbol+))
 
 (defun compile-alloc-mda-raw (dest)
   "Compile (%alloc-mda-raw) — allocate a 7-slot object with multi-dim

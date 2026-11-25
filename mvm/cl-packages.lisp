@@ -192,6 +192,8 @@
     (aset sym 1 nil)         ; package
     ;; name: narrow when it fits (CL forbids modifying a symbol's name)
     (aset sym 2 (%narrow-copy name-string))
+    (aset sym 3 nil)         ; property list (see %SYM-PLIST)
+    (aset sym 4 nil)         ; qualified-name memo (cl-eval %SYM-QN-REMEMBER)
     sym))
 
 ;;; --- Global package registry ---
@@ -2669,9 +2671,30 @@
     (setq *symbol-plists* (make-hash-table :test 'eq)))
   *symbol-plists*)
 
+(declaim (inline %sym-plist-slot-p))
+(defun %sym-plist-slot-p (x)
+  "True when symbol X carries its property list in slot 3: every symbol the
+   heap allocates (%ALLOC-SYM3).  A static symbol (three slots, outside the
+   heap) and a native one (one slot) keep theirs in *SYMBOL-PLISTS*."
+  (and x (not (fixnump x)) (not (consp x)) (not (characterp x))
+       (= (obj-subtag x) #x50) (>= (array-length x) 4)))
+
+(defun %sym-plist (symbol)
+  (if (%sym-plist-slot-p symbol)
+      (%word-aref symbol 3)
+      (gethash symbol (%get-plist-ht))))
+
+(defun %sym-plist-set (symbol plist)
+  (if (%sym-plist-slot-p symbol)
+      (aset symbol 3 plist)
+      (puthash symbol (%get-plist-ht) plist))
+  plist)
+
 (defun get (symbol indicator &optional default)
   "Get property INDICATOR from SYMBOL's property list."
-  (let ((plist (gethash symbol (%get-plist-ht))))
+  (let ((plist (if (%sym-plist-slot-p symbol)
+                   (%word-aref symbol 3)
+                   (gethash symbol (%get-plist-ht)))))
     (if (null plist)
         default
         (let ((cur plist))
@@ -2724,22 +2747,19 @@
    all 16 of its DEFANNOTATION forms died here.
    (setf (get s i DEFAULT) v) reaches here as (SET-GET s i DEFAULT v): the
    value is the LAST argument (upstream GET.6, GET.ORDER.4)."
-  (let ((ht (%get-plist-ht))
-        (value (car (last default-and-value))))
-    (let ((plist (gethash symbol ht)))
-      (puthash symbol ht (%plist-set (if (null plist) nil plist) indicator value)))
+  (let ((value (car (last default-and-value))))
+    (%sym-plist-set symbol (%plist-set (%sym-plist symbol) indicator value))
     value))
 
 (defun remprop (symbol indicator)
   "Remove the FIRST INDICATOR property from SYMBOL's property list, in place
    (CLHS REMPROP: destructive, first occurrence only; this used to rebuild
    the list without every occurrence -- upstream REMPROP.4).  T if found."
-  (let* ((ht (%get-plist-ht))
-         (plist (gethash symbol ht)))
+  (let ((plist (%sym-plist symbol)))
     (cond
       ((null plist) nil)
       ((eq (car plist) indicator)
-       (puthash symbol ht (cddr plist))
+       (%sym-plist-set symbol (cddr plist))
        t)
       (t
        (let ((prev (cdr plist)) (cur (cddr plist)))
@@ -2753,8 +2773,7 @@
 
 (defun symbol-plist (symbol)
   "Return SYMBOL's property list."
-  (let ((plist (gethash symbol (%get-plist-ht))))
-    (if (null plist) nil plist)))
+  (%sym-plist symbol))
 
 ;; UPDATE-INSTANCE-FOR-REDEFINED-CLASS and UPDATE-INSTANCE-FOR-
 ;; DIFFERENT-CLASS are defined as real GFs at the bottom of this file
@@ -2779,8 +2798,7 @@
   ;; PUTHASH is (KEY TABLE VALUE): this passed the PLIST as the table, so
   ;; (setf (symbol-plist s) l) stored nothing and signalled on GET
   ;; (upstream GET.4, REMPROP.2-4, PSETF.30, ROTATEF.30).
-  (puthash symbol (%get-plist-ht) plist)
-  plist)
+  (%sym-plist-set symbol plist))
 
 (defun set (symbol value)
   "CLHS SET: set SYMBOL's value cell to VALUE.  Equivalent to

@@ -5372,6 +5372,12 @@
     ;; generic function is the GF object itself; dispatch closures are not
     ;; arrays.
     ((%raw-arrayp x) (if (%gf-p x) t nil))
+    ;; AND A BOXED NUMBER BEFORE IT TOO -- a float, ratio, bignum or complex is a heap
+    ;; object, never a raw code address (those are fixnum-shaped, hence NOT FIXNUMP).
+    ;; TYPEP asks %FIN-P, which asks this, of every object it tests against a symbol:
+    ;; (typep 1.5 'single-float) walked the whole registry -- 400 ns in a world with
+    ;; a few hundred generic functions, and FILL asks it of every float it stores.
+    ((and (not (fixnump x)) (numberp x)) nil)
     ((%generic-function-p x) t)
     ;; A BIGNUM is a tagged object (tag 9), so it slips past the tagged-fn
     ;; (nibble 3) and code-range checks and used to hit the `(t t)' fallback →
@@ -5463,6 +5469,20 @@
     (let ((n1 (- end1 start1))
           (n2 (- end2 start2)))
       (let ((count (if (< n1 n2) n1 n2)))
+        ;; TWO PACKED VECTORS OF ONE KIND, by one subtag read each: single floats (#x12) and
+        ;; (unsigned-byte 32) (#x17) are 4-byte lanes, bytes (#x11) bytes.  The predicates below
+        ;; asked u8, then u32, then f32 -- six calls before a float row moved (mill's Slice, Concat
+        ;; and Transpose copy a row at a time).  The copies are the ones those arms make.
+        (when (and (eql (%lowtag seq1) 9) (eql (%lowtag seq2) 9)
+                   (not (eq seq1 t)) (not (eq seq2 t)))
+          (let ((st (obj-subtag seq1)))
+            (when (eq st (obj-subtag seq2))
+              (cond ((or (eq st #x12) (eq st #x17))
+                     (%bulk-copy-u32 seq1 start1 seq2 start2 count)
+                     (return-from %replace-pos seq1))
+                    ((eq st #x11)
+                     (%bulk-copy-u8 seq1 start1 seq2 start2 count)
+                     (return-from %replace-pos seq1))))))
         ;; Fast path: two plain word-slot arrays of the same element kind.
         ;; %bulk-copy is memmove-correct — it copies DESCENDING when the
         ;; regions overlap forward — so it gets CLHS's overlap guarantee

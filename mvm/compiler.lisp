@@ -5160,6 +5160,16 @@
    array type a MAKE-ARRAY call provably returns (%MAKE-ARRAY-DTYPE)."
   (cond ((symbolp form) (%var-dtype form env))
         ((%make-array-dtype form env))
+        ;; DOUBLE ARITHMETIC AND EXP OF A DOUBLE, at a run-time compile: a DOUBLE-FLOAT, so a LET of one
+        ;; (mill's softmax: (let ((e (exp (- x top)))) ...)) is a double local, not a boxed value every
+        ;; use of which is a generic call.  Only the shapes %EXPR-DOUBLE-FLOAT-P decides without asking
+        ;; back here.
+        ((and *mvm-eval-runtime-p* (consp form) (symbolp (car form)) (consp (cdr form))
+              (or (and (member (symbol-name (car form)) '("+" "-" "*" "/") :test #'string=)
+                       (consp (cddr form)))
+                  (and (name-eq (car form) "EXP") (null (cddr form))))
+              (%expr-double-float-p form env))
+         'double-float)
         ;; (THE TYPE x) promises TYPE exactly as a declaration does, and is
         ;; trusted the same way: cram's (aref (the (simple-array (unsigned-byte
         ;; 16) (*)) (huff-fast h)) i) once per decoded symbol went the whole
@@ -10568,6 +10578,118 @@
           ((string= n "ATOM") 'atom)
           (t nil))))
 
+;;; TYPEP OF A CONSTANT TYPE, AT A RUN-TIME COMPILE.  The type is a DEFTYPE expanded now, and what
+;;; the run-time TYPEP would answer is written in place: the predicate its clause for that name
+;;; calls, an integer range's tests, OR / AND / NOT / MEMBER / EQL of those.  The call it replaces
+;;; walked the class, struct and condition registries before the DEFTYPE table: (typep i 'index)
+;;; of mill's (deftype index () '(unsigned-byte 62)) took 970 ns, (typep x '(unsigned-byte 62))
+;;; 200, (typep x 'single-float) 48 -- SBCL 1-2 -- and CHECK-TYPE / ETYPECASE are TYPEP.  A type
+;;; this cannot write keeps the call, with the DEFTYPE already expanded.
+(defun %typep-expand-deftype (ty)
+  "TY with DEFTYPEs expanded at its head (the running image's table), or TY."
+  (let ((n 0))
+    (loop
+      (when (or (> n 16) (not (fboundp (quote %expand-deftype)))
+                (not (or (and (symbolp ty) ty) (and (consp ty) (symbolp (car ty))))))
+        (return ty))
+      (let ((x (handler-case (funcall (quote %expand-deftype) ty) (error () nil))))
+        (if (or (null x) (equal x ty)) (return ty) (setq ty x)))
+      (setq n (+ n 1)))))
+
+(defun %typep-int-bound (b)
+  "An integer-range bound: an integer, (integer) exclusive, or * -- as (values ok value exclusive)."
+  (cond ((or (null b) (and (symbolp b) (string= (symbol-name b) "*"))) (values t nil nil))
+        ((integerp b) (values t b nil))
+        ((and (consp b) (integerp (car b)) (null (cdr b))) (values t (car b) t))
+        (t (values nil nil nil))))
+
+(defun %typep-int-range (g lo hi)
+  "The test that G (a variable) is an integer in [LO, HI] (NIL = unbounded).  A fixnum is
+   compared against the bounds clipped to the fixnum range -- a bound past it constrains no
+   fixnum -- so the common case is a tag test and two fixnum compares."
+  (let* ((fl (and lo (> lo most-negative-fixnum) lo))
+         (fh (and hi (< hi most-positive-fixnum) hi))
+         (ftest (cons 'and (append (if fl (list (list '>= g fl)) nil)
+                                   (if fh (list (list '<= g fh)) nil)
+                                   (list t))))
+         (itest (cons 'and (append (list (list 'integerp g))
+                                   (if lo (list (list '>= g lo)) nil)
+                                   (if hi (list (list '<= g hi)) nil)))))
+    (list 'if (list 'fixnump g) ftest itest)))
+
+(defun %typep-inline-test (ty g depth)
+  "A form testing variable G as (TYPEP G 'TY) would, as a one-element list, or NIL."
+  (setq ty (%typep-expand-deftype ty))
+  (cond
+    ((> depth 12) nil)
+    ((null ty) (list nil))
+    ((symbolp ty)
+     (let ((n (symbol-name ty)) (pred (%typep-fold-pred ty)))
+       (cond ((string= n "T") (list t))
+             ((or (string= n "CONS") (string= n "LIST") (string= n "ATOM")) nil)  ; %CL-CONS-P: TYPEP's own
+             (pred (list (list pred g)))
+             ((or (string= n "SINGLE-FLOAT") (string= n "SHORT-FLOAT")) (list (list 'single-float-p g)))
+             ((or (string= n "DOUBLE-FLOAT") (string= n "LONG-FLOAT")) (list (list 'double-float-p g)))
+             ((string= n "FLOAT") (list (list 'floatp-impl g)))
+             ((string= n "RATIO") (list (list 'ratiop g)))
+             ((string= n "BIGNUM") (list (list 'bignump g)))
+             ((string= n "RATIONAL") (list (list 'or (list 'integerp g) (list 'ratiop g))))
+             ((string= n "REAL") (list (list 'or (list 'integerp g) (list 'floatp-impl g) (list 'ratiop g))))
+             ((string= n "BIT") (list (%typep-int-range g 0 1)))
+             ((string= n "UNSIGNED-BYTE") (list (%typep-int-range g 0 nil)))
+             ((string= n "SIGNED-BYTE") (list (list 'integerp g)))
+             ((string= n "BOOLEAN") (list (list 'or (list 'null g) (list 'eq g t))))
+             (t nil))))
+    ((not (consp ty)) nil)
+    ((not (symbolp (car ty))) nil)
+    (t
+     (let ((n (symbol-name (car ty))) (args (cdr ty)))
+       (cond
+         ((or (string= n "OR") (string= n "AND"))
+          (let ((parts nil) (ok t))
+            (dolist (sub args)
+              (let ((f (and ok (%typep-inline-test sub g (+ depth 1)))))
+                (if f (setq parts (cons (car f) parts)) (setq ok nil))))
+            (and ok (list (cons (if (string= n "OR") 'or 'and) (reverse parts))))))
+         ((and (string= n "NOT") (consp args) (null (cdr args)))
+          (let ((f (%typep-inline-test (car args) g (+ depth 1))))
+            (and f (list (list 'not (car f))))))
+         ((string= n "MEMBER")
+          (list (cons 'or (mapcar (lambda (x) (list 'eql g (list 'quote x))) args))))
+         ((and (string= n "EQL") (consp args) (null (cdr args)))
+          (list (list 'eql g (list 'quote (car args)))))
+         ((string= n "INTEGER")
+          (multiple-value-bind (ok1 lo lx) (%typep-int-bound (car args))
+            (multiple-value-bind (ok2 hi hx) (%typep-int-bound (cadr args))
+              (and ok1 ok2 (null (cddr args))
+                   (list (%typep-int-range g (if (and lo lx) (+ lo 1) lo) (if (and hi hx) (- hi 1) hi)))))))
+         ((and (or (string= n "UNSIGNED-BYTE") (string= n "SIGNED-BYTE") (string= n "MOD"))
+               (consp args) (null (cdr args)))
+          (let ((k (car args)))
+            (cond ((and (string= n "MOD") (integerp k) (> k 0)) (list (%typep-int-range g 0 (- k 1))))
+                  ((and (string= n "UNSIGNED-BYTE") (integerp k) (> k 0))
+                   (list (%typep-int-range g 0 (- (ash 1 k) 1))))
+                  ((and (string= n "SIGNED-BYTE") (integerp k) (> k 0))
+                   (list (%typep-int-range g (- (ash 1 (- k 1))) (- (ash 1 (- k 1)) 1))))
+                  ((and (symbolp k) (string= (symbol-name k) "*"))
+                   (%typep-inline-test (car ty) g (+ depth 1)))
+                  (t nil))))
+         (t nil))))))
+
+(defun %typep-constant-rewrite (form)
+  "At a run-time compile, (TYPEP X 'TYPE) as an inline test (a LET of X and the test), or a TYPEP
+   of TYPE's DEFTYPE expansion, or NIL to leave FORM alone."
+  (when (and *mvm-eval-runtime-p*
+             (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+             (consp (caddr form)) (eq (car (caddr form)) 'quote) (consp (cdr (caddr form))))
+    (let* ((ty (cadr (caddr form)))
+           (g (%mvm-gensym "TYPEP"))
+           (f (handler-case (%typep-inline-test ty g 0) (error () nil))))
+      (cond (f (list 'let (list (list g (cadr form))) (car f)))
+            (t (let ((x (%typep-expand-deftype ty)))
+                 (and (not (equal x ty))
+                      (list 'typep (cadr form) (list 'quote x)))))))))
+
 (defun %symbol-macro-place-expansion (place env)
   "The expansion of PLACE when it is a symbol naming a symbol macro in ENV
    (lexical first, then global), else NIL."
@@ -10692,6 +10814,8 @@
             (consp (caddr form)) (eq (car (caddr form)) 'quote)
             (symbolp (cadr (caddr form))) (%typep-fold-pred (cadr (caddr form))))
        (compile-form (list (%typep-fold-pred (cadr (caddr form))) (cadr form)) env dest))
+      ((and (= op-name #.(compute-name-hash "TYPEP")) (%typep-constant-rewrite form))
+       (compile-form (%typep-constant-rewrite form) env dest))
       ((= op-name 463569520)                                           ; IF
        (if (eq form *unused-value-form*)
            (compile-if-unused (cdr form) env dest)
@@ -10735,7 +10859,10 @@
               (specials (append declared implicit)))
          (if specials
              (compile-let-with-specials bindings body specials env dest)
-             (compile-let bindings body env dest))))
+             (let ((dv (%inferred-double-let-vars bindings body env)))
+               ;; a provably double, never-assigned binding is declared so: an FP local
+               (when dv (setq body (cons (list 'declare (cons 'type (cons 'double-float dv))) body)))
+               (compile-let bindings body env dest)))))
       ((= op-name 431241200)  ; LET*
        (let* ((bindings (cadr form))
               ;; A LET* that is itself a discarded statement discards its last
@@ -13882,6 +14009,9 @@
               (symbolp (cadr (cadr args))) (%typep-fold-pred (cadr (cadr args))))
          (%compile-test-branch (list (%typep-fold-pred (cadr (cadr args))) (car args))
                                env dest false-label)
+         t)
+        ((and two (is "TYPEP") (%typep-constant-rewrite (cons 'typep args)))
+         (%compile-test-branch (%typep-constant-rewrite (cons 'typep args)) env dest false-label)
          t)
         ((and (is "IF") (consp (cdr args)) (listp (cddr args)) (null (cdddr args)))
          ;; (if C X Y) as a test: X and Y are tests too.
@@ -25176,7 +25306,16 @@
                (%f64-simple-array-decl-p (%expr-dtype (cadr form) env))))
          ((and (member (symbol-name op) '("+" "-" "*" "/") :test #'string=)
                (consp (cdr form)) (consp (cddr form)))
-          (every (lambda (a) (%expr-double-float-p a env)) (cdr form)))
+          (or (every (lambda (a) (%expr-double-float-p a env)) (cdr form))
+              ;; contagion: doubles beside single trees are doubles (%SINGLE-TREE-OPERAND-P)
+              (and *mvm-eval-runtime-p*
+                   (some (lambda (a) (%expr-double-float-p a env)) (cdr form))
+                   (every (lambda (a) (or (%expr-double-float-p a env) (%single-tree-operand-p a env)))
+                          (cdr form)))))
+         ;; EXP of a double is a double (an overflow is the infinity); LOG is not -- a negative
+         ;; argument's is complex
+         ((and *mvm-eval-runtime-p* (name-eq op "EXP") (consp (cdr form)) (null (cddr form)))
+          (%expr-double-float-p (cadr form) env))
          ;; unary minus, or ABS, of a double
          ((and (or (name-eq op "-") (name-eq op "ABS"))
                (consp (cdr form)) (null (cddr form)))
@@ -25199,7 +25338,7 @@
        (or (every (lambda (a) (%expr-double-float-p a env)) args)
            ;; doubles and single-float literals (%FPD-WIDENS-P), when the fpd tree takes them
            (and (or (%runtime-fpd-p) (ct-has-fpd-p))
-                (every (lambda (a) (or (%single-literal-p a) (%expr-double-float-p a env))) args)
+                (every (lambda (a) (or (%single-operand-p a env) (%expr-double-float-p a env))) args)
                 (%fpd-widens-p args env)))))
 
 ;;; Unboxed double trees: a call-free tree of double literals and lexical
@@ -25235,10 +25374,24 @@
 ;;; a double: (+ 1.0 2.0) is single-float arithmetic and stays so.
 (defun %single-literal-p (form)
   (let ((v (%fp-literal-value form))) (and v (typep v 'single-float))))
+(defun %single-tree-operand-p (a env)
+  "At a run-time compile, A is a single-float tree that is not a literal -- a declared single-float
+   variable, a lane of a declared single-float vector, arithmetic of those: beside a double it is
+   that double (CL's float contagion), widened in register.  mill's softmax subtracts its single
+   TOP from a double, and that one operand boxed the whole (EXP ...) around it: 84 ns an element,
+   6 with the widening."
+  (and *mvm-eval-runtime-p* (not (%single-literal-p a))
+       (not (%expr-double-float-p a env)) (not (%fpd-tree-need a env))
+       (%fp-tree-need a env)))
+
+(defun %single-operand-p (a env)
+  (or (%single-literal-p a) (%single-tree-operand-p a env)))
+
 (defun %fpd-widens-p (args env)
-  "ARGS (of + - * / or a comparison) hold a single-float literal and a double tree."
-  (and (some (function %single-literal-p) args)
-       (some (lambda (a) (and (not (%single-literal-p a)) (%fpd-tree-need a env))) args)))
+  "ARGS (of + - * / or a comparison) hold a single-float operand (a literal, or at a run-time
+   compile a single tree) and a double tree."
+  (and (some (lambda (a) (%single-operand-p a env)) args)
+       (some (lambda (a) (and (not (%single-operand-p a env)) (%fpd-tree-need a env))) args)))
 
 (defun %fpd-tree-need (form env)
   "FP registers needed to evaluate FORM as an unboxed double tree, or NIL."
@@ -25257,7 +25410,9 @@
           (consp (cdr form)) (consp (cddr form)))
      ;; a SINGLE-FLOAT LITERAL beside a double operand is that double (%FPD-WIDENS-P)
      (let ((widen (%fpd-widens-p (cdr form) env)))
-       (flet ((need (a) (if (and widen (%single-literal-p a)) 1 (%fpd-tree-need a env))))
+       (flet ((need (a) (cond ((and widen (%single-literal-p a)) 1)
+                              ((and widen (%single-tree-operand-p a env)) (%fp-tree-need a env))
+                              (t (%fpd-tree-need a env)))))
          (let ((worst (need (cadr form))))
            (and worst
                 (dolist (a (cddr form) worst)
@@ -25404,12 +25559,18 @@
          (return-from compile-double-unboxed nil)))
   (if (and (consp form) (not (name-eq (car form) "QUOTE")))
       (let ((op (%fpd-arith-op (symbol-name (car form)))))
-        (compile-double-unboxed (cadr form) env fd)
+        ;; a single tree beside the doubles (%FPD-WIDENS-P) is widened in register
+        (flet ((operand (a reg)
+                 (if (%single-tree-operand-p a env)
+                     (progn (compile-float-unboxed a env reg)
+                            (emit-ir :fp-op1 reg reg 2))                 ; fcvt d<-s
+                     (compile-double-unboxed a env reg))))
+        (operand (cadr form) fd)
         (dolist (arg (cddr form))
           (let ((ft (alloc-fp-reg)))
-            (compile-double-unboxed arg env ft)
+            (operand arg ft)
             (emit-ir op fd fd ft)
-            (free-fp-reg))))
+            (free-fp-reg)))))
       (let ((b (and (symbolp form) form (env-lookup env form))))
         (if (and b (eq (binding-location b) :fpdreg))
             ;; an FP-resident double local: a register move, no unbox
@@ -25432,7 +25593,11 @@
    A whole call-free tree goes through the FP pool unboxed instead."
   ;; single-float literals beside the doubles are those doubles (%FPD-WIDENS-P):
   ;; every path below, the boxed fold too, sees double operands only
-  (setq args (mapcar (lambda (a) (if (%single-literal-p a) (float (%fp-literal-value a) 1d0) a)) args))
+  (setq args (mapcar (lambda (a) (cond ((%single-literal-p a) (float (%fp-literal-value a) 1d0))
+                                       ;; a single tree: its widening, which the tree compiles in register
+                                       ((%single-tree-operand-p a env) (list 'float a 1d0))
+                                       (t a)))
+                     args))
   (let ((tree (cons (%float-op-symbol op-name) args)))
     (when (or (%runtime-fpd-p) (ct-has-fpd-p))
       ;; Conversion operands are calls, and FP registers are caller-clobbered:
@@ -31861,6 +32026,51 @@
                        (setf (binding-dtype b)
                              (list 'signed-byte (max w aw)))))))))))))))
 
+;;; A DOUBLE THE CODE NEVER DECLARED.  (let ((e (exp (- x top)))) (incf sum e) ...) -- mill's
+;;; softmax -- has E a double by its init (%EXPR-DTYPE) but no declaration, and the FP-register
+;;; locals are chosen from declarations: E was a boxed value, made per element and unboxed at each
+;;; use (35 ns an element; 6 declared).  At a run-time compile, a LET binding whose init is provably
+;;; a DOUBLE-FLOAT, which nothing in the body assigns and the body does not already declare, gets
+;;; the declaration the programmer could have written -- the promise holds by construction.
+(defun %body-declares-var-p (body var)
+  (dolist (f body nil)
+    (unless (and (consp f) (symbolp (car f)) (name-eq (car f) "DECLARE")) (return nil))
+    (when (labels ((mentions (x) (cond ((eq x var) t)
+                                       ((consp x) (or (mentions (car x)) (mentions (cdr x))))
+                                       (t nil))))
+            (mentions (cdr f)))
+      (return t))))
+
+(defun %var-in-place-op-p (form var)
+  "VAR appears inside a MULTIPLE-VALUE-SETQ, ROTATEF, SHIFTF, PUSH, POP or PUSHNEW in FORM --
+   assignments COLLECT-SETQ-VARS-IN-BODY does not look for."
+  (labels ((mentions (x) (cond ((eq x var) t)
+                               ((consp x) (or (mentions (car x)) (mentions (cdr x))))
+                               (t nil)))
+           (walk (x)
+             (and (consp x)
+                  (or (and (symbolp (car x)) (car x)
+                           (member (symbol-name (car x))
+                                   '("MULTIPLE-VALUE-SETQ" "ROTATEF" "SHIFTF" "PUSH" "POP" "PUSHNEW")
+                                   :test #'string=)
+                           (mentions (cdr x)))
+                      (walk (car x))
+                      (walk (cdr x))))))
+    (walk form)))
+
+(defun %inferred-double-let-vars (bindings body env)
+  (when (and *mvm-eval-runtime-p* (listp bindings))
+    (let ((acc nil))
+      (dolist (b bindings)
+        (when (and (consp b) (symbolp (car b)) (car b) (consp (cdr b)) (null (cddr b))
+                   (consp (cadr b))
+                   (eq (%expr-dtype (cadr b) env) 'double-float)
+                   (not (%body-declares-var-p body (car b)))
+                   (null (collect-setq-vars-in-body (cons 'progn body) (list (car b))))
+                   (not (%var-in-place-op-p (cons 'progn body) (car b))))
+          (push (car b) acc)))
+      (nreverse acc))))
+
 (defun %setq-value-widths (var body env)
   "Walk BODY for every assignment to VAR.  Returns the maximum %expr-width
    over their value forms, or NIL if any assignment is not a plain
@@ -32748,6 +32958,11 @@
               `(((and (eq ,g-st ,+subtag-mda+) (null (%word-aref ,g-arr 3))
                       (%prim-u8-vector-p (%word-aref ,g-arr 6)))
                  (%u8-ref (%word-aref ,g-arr 6) ,g-idx))))
+          ;; and a packed single-float vector (#x12) is the boxed lane in place: it was
+          ;; %AREF-SLOW's LAST arm, a call and a dozen shape tests a read (24 ns where the
+          ;; declared spelling takes 4) -- mill's convolution reads its input that way
+          ,@(when (and *mvm-eval-runtime-p* (not (eql (ct-target-soft-float) 1)))
+              `(((eq ,g-st #x12) (%f32-load ,g-arr ,g-idx))))
           ,@rest-arms))
      env dest)))
 
@@ -32891,6 +33106,21 @@
               (free-fp-reg))
             (free-temp-reg) (free-temp-reg)))
       (return-from compile-aset-1 nil))
+    ;; A CHOICE OF TWO FLOAT VALUES -- (setf (aref r i) (if c (aref a j) (aref b k))), mill's Where --
+    ;; is the store in each arm: the tree compiler has no IF, so the value was boxed and stored by a
+    ;; %F32-ASET call per element.  Only with a variable array and index, which the arms then read
+    ;; again with nothing between (no evaluation moves), and arms that fit a tree themselves.
+    (when (and *mvm-eval-runtime-p* (consp val-form) (symbolp (car val-form))
+               (name-eq (car val-form) "IF") (consp (cdr val-form)) (consp (cddr val-form))
+               (consp (cdddr val-form)) (null (cddddr val-form))
+               (symbolp arr-form) (%leaf-operand-p arr-form env)
+               (or (integerp idx-form) (and (symbolp idx-form) (%leaf-operand-p idx-form env)))
+               (%fp-tree-fits-p (caddr val-form) env) (%fp-tree-fits-p (cadddr val-form) env))
+      (return-from compile-aset-1
+        (compile-form (list 'if (cadr val-form)
+                            (list 'setf (list 'aref arr-form idx-form) (caddr val-form))
+                            (list 'setf (list 'aref arr-form idx-form) (cadddr val-form)))
+                      env dest)))
     (return-from compile-aset-1
       (compile-form (list '%f32-aset arr-form idx-form val-form) env dest)))
   ;; DECLARED (simple-array (unsigned-byte 32) …) in a packing build: the raw lane -- the
@@ -32946,6 +33176,12 @@
             (cond
               ((%prim-simple-vector-p ,g-arr) (%word-aset ,g-arr ,g-idx ,g-val) ,g-val)
               ((%prim-u8-vector-p ,g-arr) (%u8-set ,g-arr ,g-idx ,g-val) ,g-val)
+              ;; a packed single-float vector straight to its store (%ASET-SLOW's chain
+              ;; first tested every header and string shape); run-time code only, as AREF
+              ,@(when *mvm-eval-runtime-p*
+                  `(((and (not (consp ,g-arr)) (eq (%lowtag ,g-arr) ,(ct-tag-object))
+                          (not (eq ,g-arr t)) (eq (obj-subtag ,g-arr) #x12))
+                     (%f32-aset ,g-arr ,g-idx ,g-val))))
               (t (%aset-slow ,g-arr ,g-idx ,g-val))))
      `(let* ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form)
              (,g-sto (%aset-store-val ,g-arr ,g-val)))

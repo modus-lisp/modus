@@ -4764,6 +4764,16 @@
    (vector *), (vector * 2), (simple-string 5) — uses the head symbol
    for dispatch (per CLHS, compound array/string subtypes are still
    the same family of result-type)."
+  ;; A NUMBER TO SINGLE-FLOAT / DOUBLE-FLOAT: a float already of the type (by its exact subtag,
+  ;; #x64 single / #x60 double -- the other float subtags keep the general road) is itself, a fixnum
+  ;; is FLOAT of it.  mill coerces every fill value to its tensor's element type: 80 ns where SBCL
+  ;; takes 3, through %COERCE-CANON-HEAD's MEMBER tests and the DEFTYPE table.
+  (when (or (eq result-type 'single-float) (eq result-type 'double-float))
+    (cond ((fixnump object)
+           (return-from coerce (if (eq result-type 'single-float) (float object 1.0f0) (float object 1d0))))
+          ((%ieee-float-p object)
+           (when (eql (obj-subtag object) (if (eq result-type 'single-float) #x64 #x60))
+             (return-from coerce object)))))
   ;; A LIST OR A SIMPLE-VECTOR TO LIST / VECTOR / SIMPLE-VECTOR, the shape and
   ;; argument conversions every caller does, without %COERCE-EXPAND-TYPE (a
   ;; DEFTYPE-table lookup per call).  An object already of the type is itself.

@@ -8616,7 +8616,9 @@
              ;; yields garbage magnitude — broke (float 2^70 1d0) round-trip.
              ((integerp n) (%bignum-to-float n))
              ((ratiop n) (%ratio-to-double n))
-             (t n))))
+             ;; anything else is not a REAL (CLHS FLOAT): it came back unchanged, so a symbol
+             ;; stored into a single-float vector went in as its bits
+             (t (error 'type-error :datum n :expected-type 'real)))))
     (cond
       ((not (%ieee-float-p f)) f)
       ;; Prototype supplied: result has PROTO's exact float format

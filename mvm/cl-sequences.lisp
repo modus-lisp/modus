@@ -2894,7 +2894,7 @@
             (%fill-u32 seq i eff-end store-item)
             seq)
            ;; packed single floats (every new float tensor is zeroed or filled this way)
-           ((and (floatp store-item) (%f32-bare-p seq) (typep store-item 'single-float))
+           ((and (single-float-p store-item) (%f32-bare-p seq))
             (%fill-f32 seq i eff-end store-item)
             seq)
            ((and (not (stringp seq)) (%bulk-copy-ok-p seq seq))
@@ -5762,6 +5762,29 @@
 
 (defun make-array (dim &rest kwargs)
   "ANSI make-array — see file-level comment above for current scope."
+  ;; A VECTOR OF A PACKED ELEMENT TYPE, THE COMMON CALL: a fixnum length and :ELEMENT-TYPE (a
+  ;; variable, so the compiler cannot type it) of SINGLE-FLOAT or (UNSIGNED-BYTE 8), with at most an
+  ;; :INITIAL-ELEMENT the fresh zeroed vector already holds or a single to fill with.  The general
+  ;; road below scans the keyword list three times and expands the type through the DEFTYPE table:
+  ;; 120 ns where SBCL takes 12, for every tensor mill makes.  Anything else -- another type, another
+  ;; keyword, a duplicate -- goes there unchanged; these are the objects it would have built.
+  (when (and (fixnump dim) (>= dim 0) (consp kwargs) (consp (cdr kwargs))
+             (or (null (cddr kwargs))
+                 (and (consp (cdddr kwargs)) (null (cdr (cdddr kwargs))))))
+    (let ((et nil) (et-p nil) (ie nil) (ie-p nil) (ok t) (rest kwargs))
+      (loop (when (null rest) (return nil))
+        (cond ((and (eq (car rest) :element-type) (not et-p)) (setq et (cadr rest) et-p t))
+              ((and (eq (car rest) :initial-element) (not ie-p)) (setq ie (cadr rest) ie-p t))
+              (t (setq ok nil)))
+        (setq rest (cddr rest)))
+      (when (and ok et-p)
+        (cond ((eq et 'single-float)
+               (cond ((or (not ie-p) (eql ie 0.0)) (return-from make-array (%make-f32-vector dim)))
+                     ((single-float-p ie)
+                      (return-from make-array (%f32-fill (%make-f32-vector dim) ie dim)))))
+              ((and (consp et) (eq (car et) 'unsigned-byte) (consp (cdr et)) (eql (cadr et) 8)
+                    (null (cddr et)) (or (not ie-p) (eql ie 0)))
+               (return-from make-array (%make-u8-vector dim)))))))
   (let* ((dim-list (cond ((null dim) nil)
                          ((consp dim) dim)
                          (t (list dim))))
@@ -5924,7 +5947,7 @@
                           ;; Both were a generic ASET per element -- every mill
                           ;; tensor (make-tensor zeroes its data this way).
                           ((and f32-elt (eql store 0.0)) a)
-                          ((and f32-elt (typep store 'single-float)) (%f32-fill a store total))
+                          ((and f32-elt (single-float-p store)) (%f32-fill a store total))
                           (t
                            (loop (when (>= i total) (return a))
                              (aset a i store)

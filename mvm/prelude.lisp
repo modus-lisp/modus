@@ -392,6 +392,12 @@
     ;; through SYMBOLP, CHARACTERP, NUMBERP and FUNCTIONP first.
     ((%prim-simple-vector-p seq)
      (if (%marked-vector-p seq) (%signal-type-error) (array-length seq)))
+    ;; ... and a packed single-float (#x12), (unsigned-byte 32) (#x17) or narrow-string (#x13)
+    ;; vector: its header count too.  They fell to the not-a-sequence tests at the bottom -- FUNCTIONP
+    ;; among them -- on every LENGTH of a float tensor's data (REPLACE asks it of every row mill copies).
+    ((and (eql (%lowtag seq) 9) (not (eq seq t))
+          (let ((st (obj-subtag seq))) (or (eq st #x12) (eq st #x17) (eq st #x13))))
+     (array-length seq))
     ;; No cons-based wrappers in this image: a cons is a list.
     ((and (consp seq) *%no-cons-array-wrappers*) (list-length seq))
     ((consp seq)

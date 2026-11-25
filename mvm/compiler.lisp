@@ -2854,6 +2854,23 @@
     (unless (eq (car (aref v j)) :label) (return j))))
 
 ;;; ---------------------------------------------------------------------------
+;;; The same passes over RUNTIME-compiled code (mvm-eval.lisp, after
+;;; FUSE-GC-CHECKS): every DEFUN, LAMBDA and toplevel thunk compiled in the
+;;; image, which until now went to bytecode with THREAD-JUMPS alone -- all of
+;;; a program loaded at run time (cl-bench, every library) missed the copy
+;;; propagation, slot forwarding and dead-store removal the image's own
+;;; functions get.  A DEFVAR's initial value never runs in the image, so the
+;;; switch is the one whose default is NIL.
+
+(defvar *rt-ir-passes-off* nil
+  "T: runtime-compiled IR skips %RT-IR-PASSES (bisecting aid).")
+
+(defun %rt-ir-passes (ir)
+  "MVM-COMPILE-ALL's Phase 2b'' for one runtime-compiled function's IR:
+   %IR-PEEPHOLE, %IR-DATAFLOW, %IR-PEEPHOLE."
+  (%ir-peephole (%ir-dataflow (%ir-peephole ir))))
+
+;;; ---------------------------------------------------------------------------
 ;;; %IR-DATAFLOW: liveness, copy propagation and frame-slot forwarding over one
 ;;; function's finished IR (every target: it runs on the MVM IR, before any
 ;;; translator).  Conservative by construction: an opcode the shape table
@@ -9715,6 +9732,9 @@
                    form))
          ;; (an optimisation: one that cannot be made leaves the form as written)
          ;; (a THROW passing through is not its error: see the expander's guard below)
+         (form (or (handler-case (%global-hoist-rewrite form env)
+                     (error () (if *catch-active* (%hc-longjmp) nil)))
+                   form))
          (form (or (handler-case (%fp-region-rewrite form env)
                      (error () (if *catch-active* (%hc-longjmp) nil)))
                    form))
@@ -22709,6 +22729,106 @@
                                    res))
                        (list loop2)))))))))
 
+;;; ---------------------------------------------------------------------------
+;;; GLOBAL ARRAYS IN A LOOP THAT CALLS NOTHING: every reference to a special is a
+;;; full global read (the thread gate, the cell, the unbound test), and a loop
+;;; over a global array -- (aref *puzzle-p* i k) in cl-bench PUZZLE's FIT --
+;;; paid it per element for an array that cannot change under it.  When the loop
+;;; calls no function and assigns nothing that could be the global, a global
+;;; DECLAIMed an array type is read once into a lexical of that type, the loop
+;;; reading the lexical.  Only an array: a flag another thread sets, polled by a
+;;; loop -- (loop until *done*) -- must stay a read each time, and a global
+;;; container swapped mid-loop by another thread was a race anyway.  Only a
+;;; global bound when the code is compiled (MAKUNBOUND is a no-op, so it stays
+;;; bound): the read moved ahead of a loop that might not run must not signal.
+
+(defparameter *global-hoist-ops*
+  '("PROGN" "IF" "WHEN" "UNLESS" "AND" "OR" "NOT" "NULL" "EQ" "EQL" "=" "<" ">"
+    "<=" ">=" "/=" "+" "-" "*" "1+" "1-" "ZEROP" "PLUSP" "MINUSP" "ODDP" "EVENP"
+    "LOGAND" "LOGIOR" "LOGXOR" "LOGNOT" "ASH" "AREF" "SVREF" "SCHAR" "CHAR" "BIT"
+    "SBIT" "CAR" "CDR" "CONSP" "ATOM" "RETURN" "MIN" "MAX" "ABS")
+  "CL operators a GLOBAL-HOIST loop may use: none calls user code or assigns a global.")
+
+(defun %global-hoist-place-p (place)
+  (or (and place (symbolp place))
+      (and (consp place) (symbolp (car place)) (car place) (%cl-symbol-p (car place))
+           (member (symbol-name (car place)) '("AREF" "SVREF" "SCHAR" "CHAR" "BIT" "SBIT")
+                   :test #'string=))))
+
+(defun %global-hoist-walk (f assigned depth)
+  "T when F calls no function that could assign a global (*GLOBAL-HOIST-OPS* and
+   the binding / control forms), pushing every variable it assigns onto the
+   car of ASSIGNED."
+  (labels ((all (l) (loop (unless (consp l) (return t))
+                      (unless (%global-hoist-walk (car l) assigned (1+ depth)) (return nil))
+                      (setq l (cdr l))))
+           (spec-inits (specs)          ; LET / DO binding specs: their init (and step) forms
+             (every (lambda (b) (or (atom b) (all (cdr b)))) specs)))
+    (cond
+      ((> depth 100) nil)
+      ((atom f) t)
+      ((not (and (symbolp (car f)) (car f) (%cl-symbol-p (car f)))) nil)
+      (t
+       (let ((n (symbol-name (car f))))
+         (cond
+           ((member n '("QUOTE" "DECLARE" "GO") :test #'string=) t)
+           ((string= n "THE") (and (consp (cdr f)) (all (cddr f))))
+           ((member n '("BLOCK" "RETURN-FROM") :test #'string=) (and (consp (cdr f)) (all (cddr f))))
+           ((string= n "TAGBODY") (all (remove-if-not #'consp (cdr f))))
+           ((member n '("LET" "LET*") :test #'string=)
+            (and (consp (cdr f)) (listp (cadr f)) (spec-inits (cadr f)) (all (cddr f))))
+           ((member n '("DOTIMES" "DOLIST") :test #'string=)
+            (and (consp (cdr f)) (consp (cadr f)) (all (cdadr f)) (all (cddr f))))
+           ((member n '("DO" "DO*") :test #'string=)
+            (and (consp (cdr f)) (listp (cadr f)) (consp (cddr f)) (listp (caddr f))
+                 (spec-inits (cadr f)) (all (caddr f)) (all (cdddr f))))
+           ((string= n "COND") (every (lambda (c) (and (listp c) (all c))) (cdr f)))
+           ((string= n "LOOP") (and (every #'consp (cdr f)) (all (cdr f))))
+           ((member n '("SETQ" "SETF" "INCF" "DECF") :test #'string=)
+            (let ((args (cdr f)) (single (member n '("INCF" "DECF") :test #'string=)))
+              (loop
+                (unless (consp args) (return t))
+                (let ((place (car args)))
+                  (unless (%global-hoist-place-p place) (return nil))
+                  (if (symbolp place)
+                      (push place (car assigned))
+                      (unless (all (cdr place)) (return nil)))
+                  (unless (all (if single (cdr args) (list (cadr args)))) (return nil))
+                  (setq args (if single nil (cddr args)))))))
+           ((member n *global-hoist-ops* :test #'string=) (all (cdr f)))
+           (t nil)))))))
+
+(defun %global-hoist-array-type-p (ty)
+  (let ((h (if (consp ty) (car ty) ty)))
+    (and h (symbolp h)
+         (member (symbol-name h) '("SIMPLE-ARRAY" "SIMPLE-VECTOR" "ARRAY" "VECTOR"
+                                   "SIMPLE-STRING" "STRING" "SIMPLE-BIT-VECTOR" "BIT-VECTOR")
+                 :test #'string=))))
+
+(defun %global-hoist-rewrite (form env)
+  "FORM with its loop-invariant global arrays read once (see above), or NIL."
+  (when (and *fp-regions* *mvm-eval-runtime-p* (%fp-region-loop-p form))
+    (let* ((scan (%fp-region-scan form))
+           (syms (first scan)) (bound (second scan))
+           (assigned (list nil))
+           (cands nil))
+      (when (seventh scan)
+        (dolist (v syms)
+          (unless (or (member v cands :test #'eq) (member v bound :test #'eq)
+                      (env-lookup env v) (not (symbolp v)) (keywordp v) (null v) (eq v t))
+            (let ((ty (%global-dtype v)))
+              (when (and ty (%global-hoist-array-type-p ty)
+                         (%proclaimed-special-p v)
+                         (%runtime-global-cell v))
+                (push v cands)))))
+        (when (and cands (%global-hoist-walk form assigned 0))
+          (setq cands (remove-if (lambda (v) (member v (car assigned) :test #'eq)) cands))
+          (when cands
+            (let ((alist (mapcar (lambda (v) (cons v (%mvm-gensym (symbol-name v)))) (reverse cands))))
+              (list 'let (mapcar (lambda (p) (list (cdr p) (car p))) alist)
+                    (cons 'declare (mapcar (lambda (p) (list 'type (%global-dtype (car p)) (cdr p))) alist))
+                    (%fp-region-subst form alist)))))))))
+
 (defun %dotimes-direct-count-p (var count body env)
   "COUNT is a lexical variable (frame or register) that BODY never assigns and no
    declaration at BODY's head names, and not VAR: the loop can test it in place."
@@ -32322,9 +32442,18 @@
               (d2 (cadr (caddr ty)))
               (idx (list '+ (list '* (car subs) d2) (cadr subs)))
               (data (list '%prim-aref arr 6)))         ; %mda-data
-         (compile-form (if (%u8-simple-array-decl-p (list 'simple-array et (list '*)))
-                           (list '%u8-ref data idx)
-                           (list '%word-aref data idx))
+         (compile-form (cond ((%u8-simple-array-decl-p (list 'simple-array et (list '*)))
+                              (list '%u8-ref data idx))
+                             ;; a word array: %RANK2-ACCESS with the declared
+                             ;; dimensions -- each subscript checked against its
+                             ;; constant, the index unchecked, the data vector read
+                             ;; from its slot.  The generic %PRIM-AREF of the data
+                             ;; tested for every string subtype, and the index
+                             ;; arithmetic checked for overflow (cl-bench PUZZLE).
+                             ((%rank2-word-array-p arr env)
+                              (%rank2-access arr (car subs) (cadr subs) nil env
+                                             (car (caddr ty)) d2))
+                             (t (list '%word-aref data idx)))
                        env dest)))
       ;; A RANK-2 WORD ARRAY whose row length is not a literal -- (simple-array T
       ;; (* *)), declared or what a MAKE-ARRAY provably made (%MAKE-ARRAY-DTYPE):
@@ -32510,32 +32639,54 @@
               (consp (caddr ty)) (consp (cdr (caddr ty))) (null (cddr (caddr ty)))
               (or (%generic-element-type-p (cadr ty)) (%word-element-type-p (cadr ty)))))))
 
-(defun %rank2-access (arr i j val env)
+(defun %rank2-access (arr i j val env &optional d1 d2)
   "The form for (AREF ARR I J), or for its store of (CAR VAL) when VAL is a list.
    Subscripts and value are evaluated once, in order.  A subscript that is a
    frame variable the value form does not assign is read where it is, not
-   copied: each copy was a frame slot written and read per element."
+   copied: each copy was a frame slot written and read per element.  D1 / D2:
+   a dimension the array's declared type gives as a literal (below 2^29), so
+   the subscript is checked against the constant, not the header's."
   (labels ((direct-p (x)
              (and (%leaf-operand-p x env) (symbolp x)
-                  (or (null val) (null (collect-setq-vars-in-body (car val) (list x)))))))
-    (let* ((gi (if (direct-p i) i (%mvm-gensym "A2I")))
+                  (or (null val) (null (collect-setq-vars-in-body (car val) (list x))))))
+           (lit (d) (and (integerp d) (< 0 d #x20000000) d)))
+    (let* ((ty (%expr-dtype arr env))
+           (dims (and (consp ty) (consp (cdr ty)) (consp (cddr ty)) (consp (caddr ty))
+                      (caddr ty)))
+           (d1 (lit (or d1 (and dims (car dims)))))
+           (d2 (lit (or d2 (and dims (consp (cdr dims)) (cadr dims)))))
+           (gi (if (direct-p i) i (%mvm-gensym "A2I")))
            (gj (if (direct-p j) j (%mvm-gensym "A2J")))
-           (gv (%mvm-gensym "A2V")) (gd (%mvm-gensym "A2D")) (g2 (%mvm-gensym "A2N"))
+           (gv (%mvm-gensym "A2V")) (gd (%mvm-gensym "A2D")) (g2 (or d2 (%mvm-gensym "A2N")))
            (fi `(the (unsigned-byte 29) ,gi)) (fj `(the (unsigned-byte 29) ,gj))
-           (index `(+ (* ,fi (the (unsigned-byte 29) ,g2)) ,fj)))
-      `(let* (,@(unless (eq gi i) `((,gi ,i))) ,@(unless (eq gj j) `((,gj ,j)))
-              ,@(when val `((,gv ,(car val))))
-              (,gd (%slot-ref ,arr 1)) (,g2 (%ucar (%ucdr ,gd))))
-         (declare (type fixnum ,g2))
+           (index (if d2 `(+ (* ,fi ,d2) ,fj) `(+ (* ,fi (the (unsigned-byte 29) ,g2)) ,fj)))
+           (need-hdr (not (and d1 d2)))
+           ;; built with LIST, not nested backquotes: the image compiles this
+           ;; function too, and a comma inside an inner template reached it raw
+           ;; a global array (or any non-lexical) is read once: each mention
+           ;; of a special is a full global read
+           (ga (if (and (symbolp arr) (env-lookup env arr)) arr (%mvm-gensym "A2A")))
+           (bindings (append (unless (eq ga arr) (list (list ga arr)))
+                             (unless (eq gi i) (list (list gi i)))
+                             (unless (eq gj j) (list (list gj j)))
+                             (when val (list (list gv (car val))))
+                             (when need-hdr (list (list gd (list '%slot-ref ga 1))))
+                             (unless d2 (list (list g2 (list '%ucar (list '%ucdr gd)))))))
+           (decls (unless d2 (list (list 'declare (list 'type 'fixnum g2)))))
+           (d1-form (or d1 (list 'the 'fixnum (list '%ucar gd))))
+           (size-tests (append (unless d1 (list (list '< gi #x20000000)))
+                               (unless d2 (list (list '< g2 #x20000000))))))
+      `(let* ,bindings
+         ,@decls
          ;; below 2^29 each (the row length too), the row-major index is a 60-bit
          ;; product and sum: no overflow checks.  A larger array takes %AREF2.
          (if (and (fixnump ,gi) (fixnump ,gj) (>= ,gi 0) (>= ,gj 0)
-                  (< ,gi (the fixnum (%ucar ,gd))) (< ,gj ,g2)
-                  (< ,gi #x20000000) (< ,g2 #x20000000))
+                  (< ,gi ,d1-form) (< ,gj ,g2)
+                  ,@size-tests)
              ,(if val
-                  `(progn (%word-aset (%slot-ref ,arr 6) ,index ,gv) ,gv)
-                  `(%word-aref (%slot-ref ,arr 6) ,index))
-             ,(if val `(%aset2 ,arr ,gv ,gi ,gj) `(%aref2 ,arr ,gi ,gj)))))))
+                  `(progn (%word-aset (%slot-ref ,ga 6) ,index ,gv) ,gv)
+                  `(%word-aref (%slot-ref ,ga 6) ,index))
+             ,(if val `(%aset2 ,ga ,gv ,gi ,gj) `(%aref2 ,ga ,gi ,gj)))))))
 
 (defun compile-aset-form (form env dest)
   "Compile (aset ARR SUB1 [SUB2 …] VAL).  Modus's `aset` always takes

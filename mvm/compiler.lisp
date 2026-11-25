@@ -28558,14 +28558,8 @@
       (compile-form `(let ((%dv ,(car args)))
                        (cond ((%complex-p %dv) (complex-div 1 %dv))
                              ((integerp %dv) (exact-divide 1 %dv))
-                             ;; Rounded to the operand's format, as + - * are
-                             ;; (%AS-RESULT-FLOAT): a bare %FLOAT-DIV left a
-                             ;; single-float quotient with a double payload.
-                             ((%ieee-float-p %dv)
-                              (%as-result-float (%float-div (%float-from-int 1) %dv)
-                                                (%float-result-type %dv %dv)))
-                             ((ratiop %dv) (%rational-divide 1 %dv))
-                             (t (%idiv-trunc 1 %dv))))
+                             ;; a float, a ratio -- or not a number (%DIVIDE-OTHER)
+                             (t (%divide-other 1 %dv))))
                     env dest)
       ;; (/ a b …) — pairwise; per-step rational/float dispatch.
       (let ((acc (car args)))
@@ -28577,14 +28571,8 @@
                                 (complex-div ,a-sym ,b-sym))
                                ((and (integerp ,a-sym) (integerp ,b-sym))
                                 (exact-divide ,a-sym ,b-sym))
-                               ((or (%ieee-float-p ,a-sym)
-                                    (%ieee-float-p ,b-sym))
-                                (%as-result-float (%float-div (%any-to-float ,a-sym)
-                                                              (%any-to-float ,b-sym))
-                                                  (%float-result-type ,a-sym ,b-sym)))
-                               ((or (ratiop ,a-sym) (ratiop ,b-sym))
-                                (%rational-divide ,a-sym ,b-sym))
-                               (t (%idiv-trunc ,a-sym ,b-sym)))))))
+                               ;; a float, a ratio -- or not a number (%DIVIDE-OTHER)
+                               (t (%divide-other ,a-sym ,b-sym)))))))
         (compile-form acc env dest))))
 
 (defun %pass-wrapping-mark (cell args)

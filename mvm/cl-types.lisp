@@ -2694,6 +2694,39 @@
 
 
 
+;; When T, arithmetic on NIL -- or on any other non-number: a symbol, a
+;; character, a cons, a string -- signals TYPE-ERROR (CLHS) instead of doing raw
+;; fixnum arithmetic on the tagged word -- (1+ nil) returned a garbage object
+;; that failed somewhere unrelated much later (upstream FORMAT.E.1, via
+;; (1+ (position ...)) on a miss).  Armed by the CLI toplevel once boot is
+;; over: runtime init code still does arithmetic on NIL, and making it an
+;; error from the start broke boot.  Unset (every other image), a compiled
+;; read of it is NIL, so nothing changes there.
+(defvar *%arith-strict* nil)
+
+(defun %arith-type-error (a b)
+  "Signal the TYPE-ERROR for a generic arithmetic op whose operand A or B is
+   not a NUMBER (the first such is the datum).  The slow paths below reach
+   their non-number check only after every number they handle, so a
+   fixnum, bignum, ratio, float or complex never gets here.  Only under
+   *%ARITH-STRICT*: before it is armed the old raw fallback stands."
+  (%signal-type-error (if (numberp a) b a) 'number))
+
+(defun %divide-other (a b)
+  "COMPILE-DIV's arm for (/ A B) when A and B are neither both integers nor a
+   complex: a float divides as floats (contagion and rounding as + - * do,
+   %AS-RESULT-FLOAT), a ratio through %RATIONAL-DIVIDE.  A non-number is a
+   TYPE-ERROR under *%ARITH-STRICT* -- the float arm turned a symbol's tagged
+   word into a float, the last a raw truncating divide -- and keeps that old
+   behaviour before it is armed."
+  (cond
+    ((and *%arith-strict* (not (and (numberp a) (numberp b)))) (%arith-type-error a b))
+    ((or (%ieee-float-p a) (%ieee-float-p b))
+     (%as-result-float (%float-div (%any-to-float a) (%any-to-float b))
+                       (%float-result-type a b)))
+    ((or (ratiop a) (ratiop b)) (%rational-divide a b))
+    (t (%idiv-trunc a b))))
+
 (defun exact-divide (a b)
   "Divide A by B.  Integer if exact, tagged ratio otherwise.
    When either operand is a ratio, route through %rational-divide so
@@ -3131,15 +3164,6 @@
          (t (%ratio-to-double n)))))
     (t n)))
 
-;; When T, arithmetic on NIL signals TYPE-ERROR (CLHS) instead of doing raw
-;; fixnum arithmetic on the tagged word -- (1+ nil) returned a garbage object
-;; that failed somewhere unrelated much later (upstream FORMAT.E.1, via
-;; (1+ (position ...)) on a miss).  Armed by the CLI toplevel once boot is
-;; over: runtime init code still does arithmetic on NIL, and making it an
-;; error from the start broke boot.  Unset (every other image), a compiled
-;; read of it is NIL, so nothing changes there.
-(defvar *%arith-strict* nil)
-
 (defun generic-add (a b)
   ;; OBJ-SUBTAG is safe on any value (0 for a non-object), so the both-floats
   ;; case is decided by two inline reads and integer compares -- no predicate
@@ -3197,11 +3221,11 @@
      (make-ratio-obj (bignum-add (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
     ((and (ratiop a) (ratiop b))
      (%rat-add-knuth (aref a 0) (aref a 1) (aref b 0) (aref b 1)))
+    ((and *%arith-strict* (not (and (numberp a) (numberp b)))) (%arith-type-error a b))
     ((or (%complex-p a) (%complex-p b)) (complex-add a b))
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-add (%any-to-float a) (%any-to-float b))
                        (%float-result-type a b)))
-    ((and (or (null a) (null b) (characterp a) (characterp b)) *%arith-strict*) (%signal-type-error))
     (t (%fixnum-+ a b))))
 
 (defun generic-multiply (a b)
@@ -3252,12 +3276,12 @@
      (%rat-mul-knuth (aref a 0) (aref a 1) b 1))
     ((and (ratiop a) (ratiop b))
      (%rat-mul-knuth (aref a 0) (aref a 1) (aref b 0) (aref b 1)))
+    ((and *%arith-strict* (not (and (numberp a) (numberp b)))) (%arith-type-error a b))
     ((or (%complex-p a) (%complex-p b)) (complex-mul a b))
     ;; IEEE float fast path — SSE2 MULSD via %float-mul primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-mul (%any-to-float a) (%any-to-float b))
                        (%float-result-type a b)))
-    ((and (or (null a) (null b) (characterp a) (characterp b)) *%arith-strict*) (%signal-type-error))
     (t (%fixnum-* a b))))
 
 (defun generic-subtract (a b)
@@ -3314,12 +3338,12 @@
      (make-ratio-obj (bignum-sub (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
     ((and (ratiop a) (ratiop b))
      (%rat-add-knuth (aref a 0) (aref a 1) (bignum-negate (aref b 0)) (aref b 1)))
+    ((and *%arith-strict* (not (and (numberp a) (numberp b)))) (%arith-type-error a b))
     ((or (%complex-p a) (%complex-p b)) (complex-sub a b))
     ;; IEEE float fast path — SSE2 SUBSD via %float-sub primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-sub (%any-to-float a) (%any-to-float b))
                        (%float-result-type a b)))
-    ((and (or (null a) (null b) (characterp a) (characterp b)) *%arith-strict*) (%signal-type-error))
     (t (%fixnum-- a b))))
 
 (defun generic-1+ (x)

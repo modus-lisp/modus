@@ -85,7 +85,8 @@
            "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE" "QUIT"
            "SUBPROCESS-ERROR" "SUBPROCESS-ERROR-CODE" "SUBPROCESS-ERROR-COMMAND"
            "SUBPROCESS-ERROR-PROCESS" "PROCESS-INFO" "PROCESS-INFO-PID"
-           "FILE-EXISTS-P" "DIRECTORY-EXISTS-P" "TRUENAMIZE" "ENSURE-PATHNAME"))
+           "FILE-EXISTS-P" "DIRECTORY-EXISTS-P" "TRUENAMIZE" "ENSURE-PATHNAME"
+           "DELETE-FILE-IF-EXISTS"))
 
 (defpackage "ASDF"
   (:use "COMMON-LISP" "UIOP")
@@ -297,6 +298,11 @@
   "X's truename (in directory form) when it names a directory, else NIL."
   (and x (ignore-errors
           (probe-file (concatenate 'string (string-right-trim "/" (namestring x)) "/")))))
+(defun uiop::delete-file-if-exists (x)
+  "Delete the file X if there is one (cairn's partial files and stale refs); T if it did."
+  (when (and x (uiop::file-exists-p x))
+    (delete-file x)
+    t))
 (defun uiop::truenamize (x)
   "X's truename when it exists, else X merged with *DEFAULT-PATHNAME-DEFAULTS*."
   (or (ignore-errors (truename x)) (merge-pathnames x)))

@@ -58,12 +58,15 @@
   "Up to 1 MB kept free below VL, never more than a quarter of a semispace.")
 (defconstant +linux-ppc-sys-sysinfo+ 116)
 
-(defconstant +linux-ppc-heap-alloc-start+ #x2000
+(defconstant +linux-ppc-heap-alloc-start+ #x28000
   "Where the bump allocator starts, as an offset into the heap.  NOT #x200: the
    whole fixed absolute block the shared runtime owns lives in the first 4 KB of
    the heap base (metadata #x40, globals #x80, MV #x90..#x138, intern tables,
    argc #x200, handler frames #x400..#xC2F, per-CPU mode #xFF8), so an allocator
-   starting below #x1000 allocates on top of it.  The RV64 hosted port starts at
+   starting below #x1000 allocates on top of it.  And past that, the CLI's
+   scratch pages (#x1000-#x8FFF) and the staged argv (#x9000-#x1DFFF): #x28000,
+   ARM32's and RV32's start.  It was #x2000, enough for the ladder, whose images
+   use neither.  The RV64 hosted port starts at
    #x200 — exactly where it writes argc — and has not noticed only because no
    payload there reads argc yet.")
 
@@ -197,6 +200,83 @@
       (ppc-emit-slli buf +ppc-r17+ +ppc-r17+ 17)                 ; KB/128 * 128 KB
       (ppc-emit-label buf skip))))
 
+;;; Staged argv/envp, below 2^29 -- RV32's and ARM32's layout.  The initial
+;;; stack is far above what a tagged MEM-REF address can express, so the stub
+;;; copies the vectors down.  Pointers are a word each (4 on ppc32).
+(defconstant +linux-ppc-argv-ptrs+       #x10009000)
+(defconstant +linux-ppc-argv-ptrs-end+   #x1000A000)
+(defconstant +linux-ppc-argv-arena+      #x1000A000)
+(defconstant +linux-ppc-argv-arena-end+  #x1001E000)
+
+(defun emit-linux-ppc-nil-page-and-argv (buf ws)
+  "THE NIL PAGE and the STAGED ARGV, after the heap is mapped.
+   (car nil) / (cdr nil) are plain loads near #xDEAD0000, so that page is mapped
+   and NIL-filled, as on RV32 and ARM32.  Then argv[] and envp[] are copied to
+   +LINUX-PPC-ARGV-PTRS+ with their strings in the arena after it, stopping
+   early (both vectors still terminated) rather than overrun either region.
+   r1 still points at argc.  Uses r3..r12 only."
+  (let ((fill (mvm-make-label)) (top (mvm-make-label)) (copy (mvm-make-label))
+        (cloop (mvm-make-label)) (full (mvm-make-label)) (done (mvm-make-label)))
+    ;; mmap(#xDEAD0000, 4096, RW, PRIVATE|ANON|FIXED, -1, 0)
+    (ppc-emit-li buf +ppc-r3+ #xDEAD0000)
+    (ppc-emit-li buf +ppc-r4+ 4096)
+    (ppc-emit-li buf +ppc-r5+ 3)
+    (ppc-emit-li buf +ppc-r6+ #x32)
+    (ppc-emit-li buf +ppc-r7+ -1)
+    (ppc-emit-li buf +ppc-r8+ 0)
+    (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-mmap+)
+    (ppc-emit-sc buf)
+    (ppc-emit-li buf +ppc-r3+ #xDEAD0000)
+    (ppc-emit-li buf +ppc-r4+ +nil-value+)
+    (ppc-emit-li buf +ppc-r5+ (floor 4096 ws))
+    (ppc-emit-label buf fill)
+    (ppc-emit-store-word buf +ppc-r4+ +ppc-r3+ 0)
+    (ppc-emit-addi buf +ppc-r3+ +ppc-r3+ ws)
+    (ppc-emit-addi buf +ppc-r5+ +ppc-r5+ -1)
+    (ppc-emit-cmpi-word buf +ppc-r5+ 0)
+    (ppc-emit-bne buf fill)
+    ;; r3 = source slot (argv[0]), r4 = destination slot, r5 = arena cursor,
+    ;; r6 = NULLs still to copy, r7/r8 = the regions' limits, r9 = string, r10 = byte
+    (ppc-emit-addi buf +ppc-r3+ +ppc-r1+ ws)
+    (ppc-emit-li buf +ppc-r4+ +linux-ppc-argv-ptrs+)
+    (ppc-emit-li buf +ppc-r5+ +linux-ppc-argv-arena+)
+    (ppc-emit-li buf +ppc-r6+ 2)
+    (ppc-emit-li buf +ppc-r7+ (- +linux-ppc-argv-ptrs-end+ (* 2 ws)))
+    (ppc-emit-li buf +ppc-r8+ (- +linux-ppc-argv-arena-end+ 4096))
+    (ppc-emit-label buf top)
+    (ppc-emit-load-word buf +ppc-r9+ +ppc-r3+ 0)
+    (ppc-emit-addi buf +ppc-r3+ +ppc-r3+ ws)
+    (ppc-emit-cmpi-word buf +ppc-r9+ 0)
+    (ppc-emit-bne buf copy)
+    ;; a NULL: copy it; stop after the second
+    (ppc-emit-li buf +ppc-r10+ 0)
+    (ppc-emit-store-word buf +ppc-r10+ +ppc-r4+ 0)
+    (ppc-emit-addi buf +ppc-r4+ +ppc-r4+ ws)
+    (ppc-emit-addi buf +ppc-r6+ +ppc-r6+ -1)
+    (ppc-emit-cmpi-word buf +ppc-r6+ 0)
+    (ppc-emit-bne buf top)
+    (ppc-emit-b buf done)
+    (ppc-emit-label buf copy)
+    (ppc-emit-cmpl-word buf +ppc-r4+ +ppc-r7+)
+    (ppc-emit-bge buf full)
+    (ppc-emit-cmpl-word buf +ppc-r5+ +ppc-r8+)
+    (ppc-emit-bge buf full)
+    (ppc-emit-store-word buf +ppc-r5+ +ppc-r4+ 0)            ; ptr[k] = arena
+    (ppc-emit-addi buf +ppc-r4+ +ppc-r4+ ws)
+    (ppc-emit-label buf cloop)
+    (ppc-emit-lbz buf +ppc-r10+ +ppc-r9+ 0)
+    (ppc-emit-stb buf +ppc-r10+ +ppc-r5+ 0)
+    (ppc-emit-addi buf +ppc-r9+ +ppc-r9+ 1)
+    (ppc-emit-addi buf +ppc-r5+ +ppc-r5+ 1)
+    (ppc-emit-cmpi-word buf +ppc-r10+ 0)
+    (ppc-emit-bne buf cloop)
+    (ppc-emit-b buf top)
+    (ppc-emit-label buf full)
+    (ppc-emit-li buf +ppc-r10+ 0)
+    (ppc-emit-store-word buf +ppc-r10+ +ppc-r4+ 0)
+    (ppc-emit-store-word buf +ppc-r10+ +ppc-r4+ ws)
+    (ppc-emit-label buf done)))
+
 (defun emit-linux-ppc-entry-common (mbuf 64-bit-p load-addr)
   "Emit the Linux/PowerPC userspace entry into MBUF (cross.lisp's mvm-buffer).
 
@@ -255,9 +335,14 @@
     (ppc-emit-load-word buf +ppc-r14+ +ppc-r1+ 0)
     (ppc-emit-li buf +ppc-r11+ (+ +linux-ppc-heap-addr+ #x200))
     (ppc-emit-stw buf +ppc-r14+ +ppc-r11+ 0)
+    ;; ppc32 only: the CL CLI's needs.  (On ppc64 #xDEAD0000 would be built
+    ;; sign-extended by LIS, and no ppc64 CL image exists yet.)
+    (unless 64-bit-p (emit-linux-ppc-nil-page-and-argv buf ws))
     ;; --- r18 = midpoint = S/2;  r14 = space_size = mid - alloc-start
     (ppc-emit-srli buf +ppc-r18+ +ppc-r17+ 1)
-    (ppc-emit-addi buf +ppc-r14+ +ppc-r18+ (- +linux-ppc-heap-alloc-start+))
+    ;; (alloc-start does not fit ADDI's signed 16 bits: through r12)
+    (ppc-emit-li buf +ppc-r12+ +linux-ppc-heap-alloc-start+)
+    (ppc-emit-subf buf +ppc-r14+ +ppc-r12+ +ppc-r18+)
     ;; --- r15 = margin = min(margin-max, space_size/4), 16-aligned
     (ppc-emit-srli buf +ppc-r15+ +ppc-r14+ 2)
     (ppc-emit-clear-low4 buf +ppc-r15+ +ppc-r15+)
@@ -267,7 +352,8 @@
     (ppc-emit-mr buf +ppc-r15+ +ppc-r12+)
     (ppc-emit-label buf no-cap)
     ;; --- MVM allocation registers.  VA=r19, VL=r20, VN=r21 (see target.lisp).
-    (ppc-emit-addi buf +ppc-r19+ +ppc-r16+ +linux-ppc-heap-alloc-start+)
+    (ppc-emit-li buf +ppc-r12+ +linux-ppc-heap-alloc-start+)
+    (ppc-emit-add buf +ppc-r19+ +ppc-r16+ +ppc-r12+)
     (ppc-emit-add buf +ppc-r20+ +ppc-r16+ +ppc-r18+)
     (ppc-emit-subf buf +ppc-r20+ +ppc-r15+ +ppc-r20+)            ; VL = mid - margin
     ;; VN = NIL = +NIL-VALUE+, not zero — see boot-linux-riscv.lisp.

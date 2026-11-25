@@ -472,7 +472,7 @@
           ;; a megabyte of dead code.  mvm-eval's JIT seam falls back cleanly, so
           ;; the image is CORRECT, just slower.  Removing this line is the whole
           ;; change when a RISC-V JIT arm lands.
-          ((member *cli-arch* '(:riscv64 :riscv32 :arm32 :68k)) nil)
+          ((member *cli-arch* '(:riscv64 :riscv32 :arm32 :68k :ppc32)) nil)
           ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
           (v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))  ; explicit
           ;; WS5 #206: DEFAULT is ON again.  It was turned OFF in 2d95d3e
@@ -956,6 +956,28 @@
                  (modus.mvm::%source-file-trailer "mvm/translate-i386.lisp")
                  (string #\Newline))))
 
+;;; THE NATIVE PowerPC TIER (mvm/jit-ppc-native.lisp): the i386 tier's design on
+;;; ppc32.  MODUS_PPC_JIT=1 bakes translate-ppc.lisp (up to its host-only tail,
+;;; at PPC-NATIVE-STATE-NAME-P, DEFVAR initforms stripped) into the translator
+;;; slot, and jit-ppc-native.lisp into the late slot.  The emitter's settings
+;;; are filled in when BUILD-IMAGE compiles (PPC-NATIVE-COINIT-TEXT).  The build
+;;; sets *PPC-NATIVE-TIER* so the image carries the export table.
+(defun %ppc-native-tier-p ()
+  (and (eq *cli-arch* :ppc32) (equal (sb-ext:posix-getenv "MODUS_PPC_JIT") "1")))
+
+(defun %ppc-native-tier-source ()
+  (pushnew (cons "'(:nppc-coinit :pending)" 'modus.mvm::ppc-native-coinit-text)
+           modus.mvm::*late-source-fills* :test #'equal)
+  (let* ((src (mvm-text "mvm/translate-ppc.lisp"))
+         (marker "(defun ppc-native-state-name-p")
+         (pos (search marker src)))
+    (unless pos (error "ppc native tier: no PPC-NATIVE-STATE-NAME-P strip marker"))
+    (concatenate 'string
+                 (%strip-global-inits (subseq src 0 pos))
+                 modus.mvm::*build-package-reset-text*
+                 (modus.mvm::%source-file-trailer "mvm/translate-ppc.lisp")
+                 (string #\Newline))))
+
 ;;; The assembled translator slot, spliced into *all-runtime-source* and
 ;;; *full-source* as ONE unit.  Both arches: <encoder?> <translator> <co-init>,
 ;;; each followed by a newline — byte-identical on x64 to the three separate
@@ -976,9 +998,10 @@
     ;; i386 / riscv64: no in-image JIT translator — see the *JIT-ON* comment.
     ((%68k-native-tier-p) (%68k-native-tier-source))
     ((%i386-native-tier-p) (%i386-native-tier-source))
-    ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32 :68k)) "")
+    ((%ppc-native-tier-p) (%ppc-native-tier-source))
+    ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32 :68k :ppc32)) "")
     (t (error "build-cli-common: unknown *cli-arch* ~S ~
-               (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32 or :68k)"
+               (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32, :68k or :ppc32)"
               *cli-arch*))))
 
 ;;; THE BUILDER CLI (MODUS_BUILDER=1, x64 with the JIT): the same CLI plus the
@@ -1554,7 +1577,7 @@
       "(defun %set-signal-disposition (signum disposition) signum disposition 0)
 (defun %ignore-sigpipe () 0)"))
   (let ((nr (ecase *cli-arch*
-              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32 :68k) 174))))
+              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32 :68k) 174) (:ppc32 173))))
     (concatenate 'string
       (if (member *cli-arch* '(:x64 :aarch64))
           (format nil "(defun %set-signal-disposition (signum disposition)
@@ -1957,7 +1980,7 @@
 (defun %machine-type-source ()
   (let ((m (ecase *cli-arch*
              (:x64 "x86_64") (:aarch64 "aarch64") (:i386 "i386")
-             (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l") (:68k "m68k"))))
+             (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l") (:68k "m68k") (:ppc32 "ppc"))))
     (format nil "~%(defun machine-type () ~S)~%(defun machine-version () ~S)~%" m m)))
 
 ;; MODUS_LISP_SPIN_AT spin points inside kernel-main (see %LISP-SPIN-FORM in
@@ -2971,7 +2994,7 @@
                                                      (mapcar (lambda (f) (merge-pathnames f *modus-base*))
                                                              (list "mvm/compiler.lisp" "mvm/cross.lisp"
                                                                    ;; this architecture's translator
-                                                                   (format nil "mvm/translate-~(~A~).lisp" *cli-arch*))))))))
+                                                                   (format nil "mvm/translate-~(~A~).lisp" (if (eq *cli-arch* :ppc32) :ppc *cli-arch*)))))))))
                       (maphash (lambda (k v) (declare (ignore v)) (push k r)) h)
                       r))))
       ;; a boot step lean boot skips is never a root, whoever names it
@@ -2983,7 +3006,9 @@
   (if (and *cli-68k-jit*
            (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
       (mvm-text "mvm/jit-68k.lisp")
-      (if (%i386-native-tier-p) (mvm-text "mvm/jit-i386-native.lisp") ""))
+      (cond ((%i386-native-tier-p) (mvm-text "mvm/jit-i386-native.lisp"))
+            ((%ppc-native-tier-p) (mvm-text "mvm/jit-ppc-native.lisp"))
+            (t "")))
   "Arch source placed after the CL runtime, the compiler and mvm-eval (see the
    slot in *FULL-SOURCE*).  A build may bind it first to add its own.")
 
@@ -3012,7 +3037,7 @@
                    (remove-if-not #'probe-file
                                   (mapcar (lambda (f) (merge-pathnames f *modus-base*))
                                           (list "mvm/compiler.lisp" "mvm/cross.lisp"
-                                                (format nil "mvm/translate-~(~A~).lisp" *cli-arch*))))))
+                                                (format nil "mvm/translate-~(~A~).lisp" (if (eq *cli-arch* :ppc32) :ppc *cli-arch*)))))))
          (roots (let ((r (list "KERNEL-MAIN")) (h (make-hash-table :test #'equal)))
                   (do-external-symbols (s "COMMON-LISP") (push (symbol-name s) r))
                   ;; and the de-facto APIs portable code calls: the MOP

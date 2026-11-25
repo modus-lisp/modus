@@ -106,9 +106,9 @@
 ;;; file; there is deliberately no default, so a new wrapper that forgets it
 ;;; fails loudly here instead of silently building a Pi image.
 (declaim (special *cl-repl-platform*))
-(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32 :mac68k))
+(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32 :mac68k :ppcmac))
   (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI, :VIRT, ~
-          :X64, :I386, :ARM32 or :MAC68K."
+          :X64, :I386, :ARM32, :MAC68K or :PPCMAC."
          *cl-repl-platform*))
 (defvar *cl-repl-rpi-p*  (eq *cl-repl-platform* :rpi))
 (defvar *cl-repl-virt-p* (eq *cl-repl-platform* :virt))
@@ -137,9 +137,16 @@
 ;; 68k layout kept in RAM, the translator in *68K-MAC-MODE* (bare traps over the
 ;; hosted layout, arm32's shape).  Console: the ROM's serial driver.  Soft float:
 ;; the 68LC040 has no FPU.
+;; :PPCMAC -- a bare PowerPC Macintosh (mvm/build-ppcmac-cl-repl.lisp): loaded
+;; by Open Firmware from its own HFS disk (scripts/ppcmac-disk.lisp), the hosted
+;; ppc32 layout kept under BATs (boot/boot-ppcmac.lisp), the translator in
+;; *PPC-MAC-MODE* (Mac traps over the hosted layout, arm32's shape).  Console:
+;; the ESCC's channel A.
+(defvar *cl-repl-ppcmac-p* (eq *cl-repl-platform* :ppcmac))
 (defvar *cl-repl-mac68k-p* (eq *cl-repl-platform* :mac68k))
 ;; The 32-bit images: 30-bit fixnums, 4-byte object headers.
-(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p* *cl-repl-mac68k-p*))
+(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p* *cl-repl-mac68k-p*
+                           *cl-repl-ppcmac-p*))
 (defvar *cl-repl-pc-p* (or *cl-repl-x64-p* *cl-repl-i386-p*)
   "T for the PC machines, 64- and 32-bit: no actor scheduler in the net image
    (the SSH server is ip.lisp's synchronous poll loop) and no USB NIC.")
@@ -156,7 +163,7 @@
              (setq start (+ at (length old))))
     (get-output-stream-string out)))
 (defun %pc32-zero-loops (text)
-  (if (not *cl-repl-i386-p*)
+  (if (not (or *cl-repl-i386-p* *cl-repl-ppcmac-p*))
       text
       (%replace-all text "(setf (mem-ref (+ s (* i 8)) :u64) 0)"
                     "(progn (setf (mem-ref (+ s (* i 8)) :u32) 0) (setf (mem-ref (+ s (* i 8) 4) :u32) 0))")))
@@ -261,6 +268,7 @@
 ;; layout co-init (*conv-relative*, *a64-x18-base*) into a 32-bit x86 image.
 (defvar *cli-arch* (cond (*cl-repl-x64-p* :x64) (*cl-repl-i386-p* :i386)
                          (*cl-repl-arm32-p* :arm32) (*cl-repl-mac68k-p* :68k)
+                         (*cl-repl-ppcmac-p* :ppc32)
                          (t :aarch64)))
 (defvar *cli-soft-float*
   (or *cl-repl-mac68k-p*
@@ -356,6 +364,8 @@
     (*cl-repl-arm32-p* nil)
     ;; :MAC68K — no 68k JIT.
     (*cl-repl-mac68k-p* nil)
+    ;; :PPCMAC — no PowerPC JIT.
+    (*cl-repl-ppcmac-p* nil)
     ;; :X64 bare metal: JIT OFF by default (translate-x64's exec pages come
     ;; from mmap(2) in linux mode; the bare-metal bump allocator the aarch64
     ;; arm has is not ported yet).  MODUS_X64_JIT=1 opts in for the port work.
@@ -498,8 +508,9 @@
     (mvm-text "lib/bare-log.lisp")
     ;; i386: SLEEP on the clock the image has (the PIT's ticks, translate-i386
     ;; *I386-PIT-CLOCK*) -- bare-sync's %SLEEP-MS is a busy loop sized for one
-    ;; board, which a 486 and a modern PC are not.
-    (if *cl-repl-i386-p*
+    ;; board, which a 486 and a modern PC are not.  The PowerPC Mac's clock is
+    ;; the timebase (translate-ppc's #x0310/#x0311), the same contract.
+    (if (or *cl-repl-i386-p* *cl-repl-ppcmac-p*)
         "
 (defun %sleep-ms (ms)
   (let ((end (+ (rdtsc) (ceiling (* (max ms 0) (cntfrq)) 1000))))
@@ -551,6 +562,119 @@
     (when (< n 511) (dotimes (i 8) (%gc-write64 (+ a (* i 8)) 0)))
     (setf (mem-ref #x50000 :u32) (+ n 1))
     a))
+"
+        "")
+    ;; The PowerPC Mac's mutex arena: 64 KB of low RAM below the scratch pages
+    ;; (boot/boot-ppcmac.lisp's map).  Without one, %SYNC-CELL's cells are
+    ;; address 0 -- every SB-THREAD lock glass makes would write the page of
+    ;; exception vectors.
+    (if *cl-repl-ppcmac-p*
+        "
+(declaim (overridable %bare-sync-arena))
+(defun %bare-sync-arena () (values #x07D00000 #x07D10000))
+
+;;; THE BOOT PAYLOAD (scripts/ppcmac-disk.lisp --payload): a second ELF segment
+;;; Open Firmware loads at #x04800000 (up to 24 MB, below the stack), memory no
+;;; layout uses (boot/boot-ppcmac.lisp's map).  \"MDPL\", a count, then per
+;;; entry a name (u32 length, bytes) and its data (u32 length, bytes, padded to
+;;; 4).  A .lisp entry is evaluated as LOAD would (%IT-EVAL-SOURCE), in order --
+;;; under the native tier its DEFUNs become native code; any other entry is
+;;; kept, as an octet vector, in *PPCMAC-FILES* by name.  Run before the REPL;
+;;; a failing entry is reported and the rest go on.
+;;;
+;;; THE FASL CACHE (mvm/fasl.lisp) makes the second boot of an image fast:
+;;;   \"fasl-record\"  (an empty entry) -- record each source's fasl in memory,
+;;;                   and send it on the serial port as it closes:
+;;;                   FASL <key> <length> NL <hex> NL (scripts/ppcmac/fasl-record.py
+;;;                   collects them);
+;;;   \"fasl:KEY\"     -- a fasl that boot recorded: in the cache before the
+;;;                   sources, which then replay instead of compiling.
+;;; A fasl replays only in the image that recorded it (its key holds the build).
+;;; PCI DEVICE REGISTERS: one 32-bit access, in the bus's (little-endian) byte
+;;; order.  (setf (mem-ref a :u32) v) cannot be one: on a 32-bit target a u32
+;;; may be a bignum, so it is two 16-bit stores -- right for memory, wrong for a
+;;; register, which takes each half as a whole write.  These go through
+;;; translate-ppc's Mac traps #x0330 / #x0331 (i386's MMIO-DO-READ32 /
+;;; -WRITE32): the address and the value in words at #x07F80100 / #x07F80108,
+;;; LWBRX / STWBRX between, SYNC after.  Kernel functions, so native code:
+;;; the interpreter never meets the traps.
+(defun ppcmac-in32le (addr)
+  (setf (mem-ref #x07F80100 :u32) addr)
+  (mmio-do-read32)
+  (mem-ref #x07F80108 :u32))
+(defun ppcmac-out32le (addr value)
+  (setf (mem-ref #x07F80100 :u32) addr)
+  (setf (mem-ref #x07F80108 :u32) value)
+  (mmio-do-write32)
+  value)
+(defun ppcmac-sync () (memory-barrier) nil)
+(defvar *ppcmac-files* nil)
+(defun %ppcmac-u32 (a) (+ (* 65536 (mem-ref a :u16)) (mem-ref (+ a 2) :u16)))
+(defun %ppcmac-octets (a n)
+  (let ((v (make-array n :element-type (quote (unsigned-byte 8)))))
+    (dotimes (i n v) (setf (aref v i) (mem-ref (+ a i) :u8)))))
+(defun ppcmac-file (name)
+  (cdr (assoc name *ppcmac-files* :test (function string=))))
+(defun %ppcmac-hex-out (data)
+  (let ((digits \"0123456789abcdef\") (col 0))
+    (dotimes (i (length data))
+      (let ((b (aref data i)))
+        (write-char-serial (char-code (char digits (ash b -4))))
+        (write-char-serial (char-code (char digits (logand b 15))))
+        (setq col (+ col 1))
+        (when (= col 64) (write-char-serial 10) (setq col 0))))
+    (write-char-serial 10)))
+(defun %ppcmac-fasl-dump ()
+  \"Send each fasl recorded since the last call (FASL key length, hex).\"
+  (let ((keys (reverse *fasl-recorded*)))
+    (setq *fasl-recorded* nil)
+    (dolist (k keys)
+      (let ((b (cdr (assoc k *fasl-mem* :test (function string=)))))
+        (when b
+          (write-string-serial \"FASL \") (write-string-serial k) (write-string-serial \" \")
+          (print-dec (length b)) (write-char-serial 10)
+          (%ppcmac-hex-out b)
+          (write-string-serial \"FASL-END\") (write-char-serial 10)))
+      ;; sent: out of the heap (a whole payload's fasls would fill it)
+      (setq *fasl-mem* (remove k *fasl-mem* :key (function car) :test (function string=))))))
+(defun %ppcmac-boot-payload ()
+  (let ((a #x04800000))
+    (unless (boundp (quote *fasl-mem*)) (setq *fasl-mem* nil))
+    (when (and (= (mem-ref a :u16) #x4D44) (= (mem-ref (+ a 2) :u16) #x504C))
+      (let ((n (%ppcmac-u32 (+ a 4))) (p (+ a 8)) (nfasl 0))
+        (write-string-serial \"payload: \") (print-dec n) (write-string-serial \" entries\")
+        (write-char-serial 10)
+        (dotimes (i n)
+          (let* ((nl (%ppcmac-u32 p))
+                 (name (map (quote string) (function code-char) (%ppcmac-octets (+ p 4) nl)))
+                 (q (+ p 4 (* 4 (ceiling nl 4))))
+                 (dl (%ppcmac-u32 q))
+                 (fasl (and (> (length name) 5) (string= \"fasl:\" name :end2 5)))
+                 ;; a fasl stays where the firmware put it: (address . length)
+                 (data (if fasl (cons (+ q 4) dl) (%ppcmac-octets (+ q 4) dl))))
+            (setq p (+ q 4 (* 4 (ceiling dl 4))))
+            (cond
+              (fasl
+               (fasl-mem-put (subseq name 5) data)
+               (setq nfasl (+ nfasl 1)))
+              ((string= name \"fasl-record\")
+               (setq *fasl-recorded* nil)
+               (setq *fasl-record-mem* t)
+               (write-string-serial \"  fasl: recording\") (write-char-serial 10))
+              (t
+               (when (> nfasl 0)
+                 (write-string-serial \"  fasl: \") (print-dec nfasl) (write-string-serial \" cached\")
+                 (write-char-serial 10)
+                 (setq nfasl 0))
+               (write-string-serial \"  \") (write-string-serial name) (write-char-serial 10)
+               (if (and (> (length name) 5) (string= \".lisp\" name :start2 (- (length name) 5)))
+                   (progn
+                     (handler-case (%it-eval-source (%it-utf8-bytes-to-string data) name)
+                       (t (c) (write-string-serial \"  payload error: \")
+                              (handler-case (write-object c) (t (c2) c2 nil))
+                              (write-char-serial 10)))
+                     (when (%fasl-record-mem-p) (%ppcmac-fasl-dump)))
+                   (setq *ppcmac-files* (cons (cons name data) *ppcmac-files*)))))))))))
 "
         "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
@@ -1514,7 +1638,7 @@
                        (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
 
 (defvar *cli-arch-io-scratch-source*
-  (if (or *cl-repl-x64-p* *cl-repl-mac68k-p*)   ; no device tree to probe
+  (if (or *cl-repl-x64-p* *cl-repl-mac68k-p* *cl-repl-ppcmac-p*)   ; no device tree to probe
       (concatenate 'string "  (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)
   (setq *scratch-mmapped* nil)
@@ -1580,6 +1704,15 @@
                   ("-4611686018427387903" . "-536870911"))))
     (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
       (unless at (error "32-bit: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
+      (setq *cli-arch-io-scratch-source*
+            (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
+                         (subseq *cli-arch-io-scratch-source* (+ at (length (car pair)))))))))
+
+;;; :PPCMAC: the two scratch pages below boot-ppcmac's 128 MB of low RAM.
+(when *cl-repl-ppcmac-p*
+  (dolist (pair '(("#x0FE00000" . "#x07E00000") ("#x0FF00000" . "#x07F00000")))
+    (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
+      (unless at (error "ppcmac: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
       (setq *cli-arch-io-scratch-source*
             (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
                          (subseq *cli-arch-io-scratch-source* (+ at (length (car pair)))))))))
@@ -1666,7 +1799,7 @@
 ;; The SYNCHRONOUS server -- no actor scheduler, ip.lisp's poll loop serves each
 ;; connection inline, the NIC already up from the pipeline -- on the PC images and
 ;; on QEMU virt.  Only the Pi runs the actor/USB shape.
-(defvar *ssh-sync-p* (or *cl-repl-pc-p* *cl-repl-virt-p*))
+(defvar *ssh-sync-p* (or *cl-repl-pc-p* *cl-repl-virt-p* *cl-repl-ppcmac-p*))
 
 ;; THE NETWORK SERVICE: a threaded Pi SSH build serves SSH through it (net/net-service.lisp,
 ;; net/ssh-inetd.lisp) -- SSH-BOOT starts the USB I/O core, the service and the server, and
@@ -1829,6 +1962,8 @@
     ;; per-connection block and ssh-ipc in DRAM (PA 0x50260000..0x50396000,
     ;; identity-mapped by L1[1]), clear of the image, heap and DMA rings.
     (*cl-repl-virt-p* "")
+    ;; :PPCMAC: net/arch-ppcmac-cl.lisp puts them in the free DRAM at #x073..
+    (*cl-repl-ppcmac-p* "")
     (*cl-repl-pc-p*
      "
 (defun ssh-conn-base ()      #x0C200000)
@@ -1919,7 +2054,7 @@
         ;; had already given up ("#VX 51 0 0": 51 polls, buffer empty, peer
         ;; open).  Every connection after the first failed that way once the
         ;; key exchange stopped taking long enough for the ring to drain.
-        (if *cl-repl-i386-p*
+        (if (or *cl-repl-i386-p* *cl-repl-ppcmac-p*)
             "(defun %i386-ssh-clock () (get-internal-real-time))
 (defun %i386-ssh-wait-expired-p (count limit since)
   (or (modus.ssh:ssh-peer-closed-p)
@@ -2145,6 +2280,11 @@
             (%rpi-net-text "ne2000.lisp")          (string #\Newline)
             (%rpi-net-text "e1000.lisp")           (string #\Newline)
             (%rpi-net-text "arch-i386-cl.lisp")    (string #\Newline))
+      (if *cl-repl-ppcmac-p*
+          (concatenate 'string
+            ;; the PowerPC Mac's GMAC (Sun GEM), and the board's adapter
+            (%rpi-net-text "arch-ppcmac-cl.lisp")  (string #\Newline)
+            (%rpi-net-text "sungem.lisp")          (string #\Newline))
       (if *cl-repl-x64-p*
           (concatenate 'string
             (%rpi-net-text "arch-x86-cl.lisp")     (string #\Newline)
@@ -2237,7 +2377,7 @@
             ;; ... and read-write through the Arasan controller, for a board the firmware
             ;; booted alone (kiln zero's cards): EMMC-INIT, EMMC-READ/WRITE-SECTORS.
             ;; Nothing calls it at boot.
-            (%rpi-net-text "emmc.lisp")          (string #\Newline)))))))
+            (%rpi-net-text "emmc.lisp")          (string #\Newline))))))))
 
 ;; THE NIC INTERFACE (builder packages step 3): net/nic.lisp's MODUS.NET
 ;; NIC-SEND / -RECEIVE / -RX-BUF / -PROBE, which ip.lisp, ssh.lisp and
@@ -2297,6 +2437,13 @@
                (bind "modus.net.e1000:e1000-hw-send" "modus.net.e1000:e1000-hw-receive"
                      "modus.net.e1000:e1000-hw-rx-buf" "modus.net.e1000:e1000-hw-probe"
                      "modus.net.e1000:e1000-read-reg")))
+      (*cl-repl-ppcmac-p*
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.sungem:gem-send" "modus.net.sungem:gem-receive"
+                     "modus.net.sungem:gem-rx-buf" "modus.net.sungem:gem-probe"
+                     "modus.net::no-read-reg")))
       ;; the boards with usb-netdev (the SSH builds): NIC-PROBE picks the
       ;; RTL8153 or CDC-ECM, as does a hot-plug edge, and the rest dispatch
       ;; on that choice
@@ -2329,7 +2476,7 @@
                          (format nil "  (modus.ssh::%bind-ssh-seams)~%~A~A~A"
                                  (if (or *cl-repl-x64-p* *cl-repl-rpi-p*)
                                      (format nil "  (modus.board::%bind-board-ssh-seams)~%") "")
-                                 (if *cl-repl-i386-p*
+                                 (if (or *cl-repl-i386-p* *cl-repl-ppcmac-p*)
                                      (format nil "  (%bind-i386-ssh-seams)~%") "")
                                  (if *ssh-isolated-p*
                                      (format nil "  (%bind-isolated-ssh-seams)~%") ""))
@@ -2415,7 +2562,7 @@
         ;; target (+7) but a 4-byte header on i386 (+4 - 9 = -5).  TCP-RX-COPY's
         ;; word copy writes there; a literal +7 put every i386 body 12 bytes
         ;; late (and 12 bytes past the vector's end).
-        (format nil "~%(defun %u8-data-delta () ~D)~%" (if *cl-repl-i386-p* -5 7))
+        (format nil "~%(defun %u8-data-delta () ~D)~%" (if (or *cl-repl-i386-p* *cl-repl-ppcmac-p*) -5 7))
         "
 (defun tcp-rx-copy (dest dest-off)
   (let ((buf (modus.net:nic-rx-buf)))
@@ -2856,7 +3003,46 @@
       "          (handler-case (ql-net-setup) (t (c) nil))
           (net-install-and-call (%net-fetch-url)))))"))
 
+;; :PPCMAC: the GMAC Open Firmware left running (no PCI work), DHCP from the
+;; other end (the Pi's dnsmasq; QEMU's slirp), else the address a network boot
+;; used: 10.0.0.9, gateway 10.0.0.1.  No library fetch: the image is a desk.
+(defvar *net-ppcmac-pipeline-source*
+  (%pc32-zero-loops "(defun dhcp-wait-tries () 250000)
+;; NET-ACTOR-MAIN's idle step, a SEAM (net/nic.lisp's mechanism): it calls through
+;; *YIELD-FN*, so a (setf fdefinition) at run time rebinds the compiled callers too.
+;; A wait by default; the desk (scripts/ppcmac/ppcmac-desk.lisp) makes it a turn of
+;; the desk, so the screen and SSH share the one thread.
+(defvar *yield-fn* nil)
+(defun yield () (funcall *yield-fn*))
+(defun %idle-wait () (io-delay))
+(defun run-net-pipeline ()
+  (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
+  (modus-int::%define-seam 'yield '*yield-fn*)
+  ;; (a kernel DEFVAR's initform does not run: the cell may be unbound)
+  (unless (and (boundp '*yield-fn*) *yield-fn*) (setf (fdefinition 'yield) (function %idle-wait)))
+  (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (if (zerop (handler-case (modus.net:nic-probe) (t (c) 0)))
+      (progn (write-string-serial \"NET-PIPELINE-ABORT\") (write-char-serial 10) nil)
+      (let ((state (e1000-state-base)))
+        (dotimes (attempt 4)
+          (when (zerop (mem-ref (+ state #x18) :u8))
+            (handler-case (dhcp-client) (t (c) nil))))
+        (when (zerop (mem-ref (+ state #x18) :u8))
+          (setf (mem-ref (+ state #x18) :u8) 10) (setf (mem-ref (+ state #x19) :u8) 0)
+          (setf (mem-ref (+ state #x1A) :u8) 0) (setf (mem-ref (+ state #x1B) :u8) 9)
+          (setf (mem-ref (+ state #x1C) :u8) 10) (setf (mem-ref (+ state #x1D) :u8) 0)
+          (setf (mem-ref (+ state #x1E) :u8) 0) (setf (mem-ref (+ state #x1F) :u8) 1))
+        (write-string-serial \"IP=\")
+        (print-dec (mem-ref (+ state #x18) :u8)) (write-char-serial 46)
+        (print-dec (mem-ref (+ state #x19) :u8)) (write-char-serial 46)
+        (print-dec (mem-ref (+ state #x1A) :u8)) (write-char-serial 46)
+        (print-dec (mem-ref (+ state #x1B) :u8)) (write-char-serial 10)
+        (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10)
+        t)))
+"))
+
 (defvar *net-pipeline-defun-source*
+  (if *cl-repl-ppcmac-p* *net-ppcmac-pipeline-source*
   (if *cl-repl-qemu-p*
       (%pc32-zero-loops (concatenate 'string ";; QEMU user-mode net: slirp answers a DISCOVER in tens of ms, which is more
 ;; than 2500 of the x86 adapter's io-delays (DHCP:F five times, then the OFFERs
@@ -2925,7 +3111,7 @@
           ;;    (rung 3) install it, load it, and call a function from it.
           (net-install-and-call (%net-fetch-url)))))
   (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
-" *net-rpi-nic-init* *net-rpi-addr-block*)))
+" *net-rpi-nic-init* *net-rpi-addr-block*))))
 
 (defvar *net-driver-source*
   (if *net-build-p*
@@ -3413,6 +3599,18 @@
            (write-char-serial 10)))
   (halt))
 "))
+
+;;; :PPCMAC: the boot payload runs after boot, before the REPL.
+(when *cl-repl-ppcmac-p*
+  (let* ((old "  ;; --- the REPL (lib/serial-repl.lisp) ------------------------------------")
+         (at (search old *cli-arch-kernel-epilogue*)))
+    (unless at (error "ppcmac: the REPL moved in *CLI-ARCH-KERNEL-EPILOGUE*"))
+    (setq *cli-arch-kernel-epilogue*
+          (concatenate 'string (subseq *cli-arch-kernel-epilogue* 0 at)
+                       "  (handler-case (%ppcmac-boot-payload)
+    (t (c) (write-string-serial \"payload died\") (write-char-serial 10)))
+"
+                       (subseq *cli-arch-kernel-epilogue* at)))))
 
 ;;; :MAC68K: its boot files now (their layout is needed by the texts below):
 ;;; the image's first act is to set the runtime-data region's delta for the
@@ -4379,6 +4577,17 @@
             (symbol-value (sym "*POOL-NARROW-STRINGS*"))
             (symbol-value (sym "*NARROW-LITERALS-P*")))))
 
+(when cl-user::*cl-repl-ppcmac-p*
+  (cl-user::mvm-load "boot/boot-linux-ppc.lisp")
+  (cl-user::mvm-load "boot/boot-ppcmac.lisp")
+  (funcall (intern "INSTALL-PPC32-TRANSLATOR" "MODUS.MVM"))
+  (funcall (intern "PPC-SET-MAC-MODE" "MODUS.MVM") t)
+  ;; MODUS_PPC_JIT=1: the native tier's export table (build-cli-common)
+  (setf (symbol-value (intern "*PPC-NATIVE-TIER*" "MODUS.MVM"))
+        (equal (sb-ext:posix-getenv "MODUS_PPC_JIT") "1"))
+  (format t "~&;; CONSOLE: ESCC channel A at #x~X (mac-io + #x13020)~%"
+          (symbol-value (intern "*PPC-MAC-ESCC-A*" "MODUS.MVM"))))
+
 (when cl-user::*cl-repl-arm32-p*
   (cl-user::mvm-load "boot/boot-linux-arm32.lisp")
   (cl-user::mvm-load "boot/boot-arm32-cl.lisp")
@@ -4549,7 +4758,7 @@
 ;; "CONSOLE: COM1 via port I/O" and "CONSOLE: PL011 UART0 0x3F201000", which is
 ;; how it was caught — two consoles for one image is always a fall-through.
 (if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p* cl-user::*cl-repl-arm32-p*
-        cl-user::*cl-repl-mac68k-p*)
+        cl-user::*cl-repl-mac68k-p* cl-user::*cl-repl-ppcmac-p*)
     nil
  (if cl-user::*cl-repl-virt-p*
     (format t "~&;; CONSOLE: PL011 via the fixpoint boot descriptor, VA 20000000 ~
@@ -4943,6 +5152,7 @@
            (cond (cl-user::*cl-repl-virt-p* :fixpoint) (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                  (cl-user::*cl-repl-x64-p* :x86-64) (cl-user::*cl-repl-i386-p* :i386)
                  (cl-user::*cl-repl-arm32-p* :armv7-cl)
+                 (cl-user::*cl-repl-ppcmac-p* :ppcmac-cl)
                  (cl-user::*cl-repl-mac68k-p* :mac68k) (t :rpi))))
     (with-open-file (o p :direction :output :if-exists :supersede)
       (write-string cl-user::*full-source* o))
@@ -4953,6 +5163,7 @@
                                         (cl-user::*cl-repl-x64-p* :x86-64)
                                         (cl-user::*cl-repl-i386-p* :i386-cl)
                                         (cl-user::*cl-repl-arm32-p* :armv7-cl)
+                                        (cl-user::*cl-repl-ppcmac-p* :ppcmac-cl)
                                         (cl-user::*cl-repl-mac68k-p* :mac68k)
                                         (t :rpi))
                           :source-text cl-user::*full-source*)))
@@ -4962,6 +5173,7 @@
                         (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
                         (cl-user::*cl-repl-i386-p* "/tmp/modus-i386-cl-repl.bin")
                         (cl-user::*cl-repl-arm32-p* "/tmp/modus-arm32-cl-repl.bin")
+                        (cl-user::*cl-repl-ppcmac-p* "/tmp/modus-ppcmac.elf")
                         (cl-user::*cl-repl-mac68k-p* "/tmp/modus-mac68k-cl-repl.bin")
                         (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)
@@ -5057,6 +5269,32 @@
                (when (> (+ end #x200000) top)
                  (error "mac68k layout: the image ends at #x~X, within 2 MB of the stack top ~
                          #x~X." end top))))))
+      ;; ---- the PowerPC Mac (boot-ppcmac.lisp's map) --------------------
+      ;; The image runs at #x10000 and grows up; the stack grows DOWN from
+      ;; +PPCMAC-STACK-TOP+; Open Firmware loads the file at #x04000000.
+      (cl-user::*cl-repl-ppcmac-p*
+       (let ((gaps (symbol-value (intern "*PPC-UNIMPL-OPCODES*" "MODUS.MVM"))))
+         (if gaps
+             (format t "~&;; *** ppcmac TRANSLATOR GAPS (TW if run): ~{#x~X~^ ~} ***~%"
+                     (sort (copy-list gaps) #'<))
+             (format t "~&;; ppcmac: no unimplemented opcodes or traps.~%")))
+       (let* ((image-end (+ (symbol-value (intern "+PPCMAC-LOAD-ADDR+" "MODUS.MVM"))
+                            (length (kernel-image-image-bytes image))))
+              (stack-top (symbol-value (intern "+PPCMAC-STACK-TOP+" "MODUS.MVM"))))
+         (format t "~&;; ppcmac map: image #x10000 .. #x~X (~,1F MB), stack top #x~X, ~
+                   heap #x10000000..~%"
+                 image-end (/ image-end 1048576.0) stack-top)
+         ;; with its BSS (1 MB), below the native tier's code area at #x02800000
+         (when (> (+ image-end #x100000) #x02800000)
+           (error "ppcmac layout: the image and its BSS end past #x~X, the native ~
+                   tier's code area at #x02800000." (+ image-end #x100000))))
+       ;; the first stage, beside the image: OUT.boot (boot-ppcmac.lisp)
+       (let ((boot (concatenate 'string path ".boot"))
+             (elf (funcall (intern "PPCMAC-LOADER-ELF" "MODUS.MVM"))))
+         (with-open-file (o boot :direction :output :element-type '(unsigned-byte 8)
+                                 :if-exists :supersede)
+           (write-sequence elf o))
+         (format t "~&;; ppcmac first stage: ~A (~D bytes)~%" boot (length elf))))
       ;; ---- ARMv7 QEMU virt (boot-arm32-cl.lisp's map) -----------------
       ;; The image runs at VA #x10000 and grows up; the stack grows DOWN from
       ;; +ARM32-CL-STACK-TOP+, and the L1 table sits above it.  Everything
@@ -5155,6 +5393,8 @@
             (cond
               (cl-user::*cl-repl-mac68k-p*
                 (format nil "sbcl --script scripts/mac68k-disk.lisp ~A DISK, then Basilisk II with it (serial port A is the console)" path))
+              (cl-user::*cl-repl-ppcmac-p*
+                (format nil "sbcl --script scripts/ppcmac-disk.lisp ~A DISK, then qemu-system-ppc -M mac99 -m 1024 -nographic -drive file=DISK,format=raw,media=disk (the console is serial port A)" path))
               (cl-user::*cl-repl-arm32-p*
                 (format nil "qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 -kernel ~A -display none -serial stdio -no-reboot" path))
               (cl-user::*cl-repl-x64-p*

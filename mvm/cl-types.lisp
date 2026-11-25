@@ -86,16 +86,21 @@
 (defun %f-one ()  (%fl 1))
 (defun %f-half () (%float-div (%fl 1) (%fl 2)))
 
+;;; THE FLOAT PREDICATES READ THE FOUR 16-BIT CHUNKS, each a fixnum on every
+;;; tower -- not %FLOAT-HI32's 32-bit word, a bignum on the 30-bit one for most
+;;; floats (as %FLOAT-ZERO-P found).  Measured on ppc32: (< x y) of two doubles
+;;; 25 us, (plusp x) 62 us, through bignum logand/ash in these.
 (defun %float-nan-p (x)
   "X (a boxed float) is a NaN, by its IEEE bits: exponent all ones, mantissa
    non-zero."
-  (let ((h (%float-hi32 x)))
-    (and (= (logand h #x7FF00000) #x7FF00000)
-         (or (/= (logand h #xFFFFF) 0) (/= (%float-lo32 x) 0)))))
+  (let ((c0 (%prim-aref x 0)))
+    (and (= (logand c0 #x7FF0) #x7FF0)
+         (or (/= (logand c0 15) 0) (/= (%prim-aref x 1) 0)
+             (/= (%prim-aref x 2) 0) (/= (%prim-aref x 3) 0)))))
 
 (defun %float-nonfinite-p (x)
   "X (a boxed float) is +-inf or a NaN: exponent all ones."
-  (= (logand (%float-hi32 x) #x7FF00000) #x7FF00000))
+  (= (logand (%prim-aref x 0) #x7FF0) #x7FF0))
 
 (defun %float-mag-lt (h1 l1 h2 l2)
   (or (< h1 h2) (and (= h1 h2) (< l1 l2))))
@@ -110,35 +115,38 @@
   (let ((st (obj-subtag x)))
     (and (or (eq st #x60) (eq st #x64)) (eq (%prim-array-length x) 4))))
 
+;; On the 16-bit chunks (see %FLOAT-NAN-P): c0 = sign | 11 exponent bits | 4
+;; significand bits, c1..c3 the rest; magnitudes compare as (c0 & #x7FFF, c1,
+;; c2, c3) lexicographically.
+(defun %float-chunks-nan-p (c0 c1 c2 c3)
+  (and (= (logand c0 #x7FF0) #x7FF0)
+       (or (/= (logand c0 15) 0) (/= c1 0) (/= c2 0) (/= c3 0))))
+
+(defun %float-chunks-mag-lt (a0 a1 a2 a3 b0 b1 b2 b3)
+  (cond ((/= a0 b0) (< a0 b0)) ((/= a1 b1) (< a1 b1)) ((/= a2 b2) (< a2 b2)) (t (< a3 b3))))
+
 (defun %float-bits-eq (a b)
-  (let ((ah (logior (ash (%slot-ref a 0) 16) (%slot-ref a 1)))
-        (al (logior (ash (%slot-ref a 2) 16) (%slot-ref a 3)))
-        (bh (logior (ash (%slot-ref b 0) 16) (%slot-ref b 1)))
-        (bl (logior (ash (%slot-ref b 2) 16) (%slot-ref b 3))))
-    (if (and (= ah bh) (= al bl))
-        (not (and (= (logand ah #x7FF00000) #x7FF00000)
-                  (or (/= (logand ah #xFFFFF) 0) (/= al 0))))
-        (and (= (logand ah #x7FFFFFFF) 0) (= al 0)
-             (= (logand bh #x7FFFFFFF) 0) (= bl 0)))))
+  (let ((a0 (%slot-ref a 0)) (a1 (%slot-ref a 1)) (a2 (%slot-ref a 2)) (a3 (%slot-ref a 3))
+        (b0 (%slot-ref b 0)) (b1 (%slot-ref b 1)) (b2 (%slot-ref b 2)) (b3 (%slot-ref b 3)))
+    (if (and (= a0 b0) (= a1 b1) (= a2 b2) (= a3 b3))
+        (not (%float-chunks-nan-p a0 a1 a2 a3))
+        (and (= (logand a0 #x7FFF) 0) (= a1 0) (= a2 0) (= a3 0)          ; +0 = -0
+             (= (logand b0 #x7FFF) 0) (= b1 0) (= b2 0) (= b3 0)))))
 
 (defun %float-bits-lt (a b)
-  (let ((ah (logior (ash (%slot-ref a 0) 16) (%slot-ref a 1)))
-        (al (logior (ash (%slot-ref a 2) 16) (%slot-ref a 3)))
-        (bh (logior (ash (%slot-ref b 0) 16) (%slot-ref b 1)))
-        (bl (logior (ash (%slot-ref b 2) 16) (%slot-ref b 3))))
-    (if (or (and (= (logand ah #x7FF00000) #x7FF00000)
-                 (or (/= (logand ah #xFFFFF) 0) (/= al 0)))
-            (and (= (logand bh #x7FF00000) #x7FF00000)
-                 (or (/= (logand bh #xFFFFF) 0) (/= bl 0))))
+  (let ((a0 (%slot-ref a 0)) (a1 (%slot-ref a 1)) (a2 (%slot-ref a 2)) (a3 (%slot-ref a 3))
+        (b0 (%slot-ref b 0)) (b1 (%slot-ref b 1)) (b2 (%slot-ref b 2)) (b3 (%slot-ref b 3)))
+    (if (or (%float-chunks-nan-p a0 a1 a2 a3) (%float-chunks-nan-p b0 b1 b2 b3))
         nil
-        (let ((am (logand ah #x7FFFFFFF)) (bm (logand bh #x7FFFFFFF)))
-          (cond ((and (= am 0) (= al 0) (= bm 0) (= bl 0)) nil)
-                ((>= ah #x80000000)
-                 (if (>= bh #x80000000)
-                     (or (> am bm) (and (= am bm) (> al bl)))
+        (let ((am (logand a0 #x7FFF)) (bm (logand b0 #x7FFF)))
+          (cond ((and (= am 0) (= a1 0) (= a2 0) (= a3 0)
+                      (= bm 0) (= b1 0) (= b2 0) (= b3 0)) nil)
+                ((>= a0 #x8000)
+                 (if (>= b0 #x8000)
+                     (%float-chunks-mag-lt bm b1 b2 b3 am a1 a2 a3)
                      t))
-                ((>= bh #x80000000) nil)
-                (t (or (< am bm) (and (= am bm) (< al bl)))))))))
+                ((>= b0 #x8000) nil)
+                (t (%float-chunks-mag-lt am a1 a2 a3 bm b1 b2 b3)))))))
 
 (defun %float-lt-p (a b)
   "True if float A < float B, by IEEE ordering on the BITS: a NaN is unordered
@@ -2056,14 +2064,18 @@
    fixnum on every tower -- take the primop; above it, decode the IEEE bits
    (every double that large is an integer, significand * 2^exponent).
    Infinity and NaN have no integer value: signal, never guess."
-  (let* ((hi (%float-hi32 x))
-         (e  (logand (ash hi -20) 2047)))
+  ;; The exponent from the top 16-bit chunk (sign, 11 exponent bits, 4 of the
+  ;; significand), a fixnum on every tower -- %FLOAT-HI32 builds a 32-bit
+  ;; word, a bignum on the 30-bit tower for most floats (as %FLOAT-ZERO-P
+  ;; found): 5 us of a 6 us FLOOR on ppc32.
+  (let ((e (logand (ash (%prim-aref x 0) -4) 2047)))
     (cond
       ((< e (+ 1023 29)) (%float-to-int x))
       ((= e 2047) (error "Cannot convert ~S to an integer" x))
-      (t (let ((m (ash (logior (ash (logior (logand hi 1048575) 1048576) 32)
-                               (%float-lo32 x))
-                       (- e 1075))))
+      (t (let* ((hi (%float-hi32 x))
+                (m (ash (logior (ash (logior (logand hi 1048575) 1048576) 32)
+                                (%float-lo32 x))
+                        (- e 1075))))
            (if (>= hi 2147483648) (- m) m))))))
 
 (defun %trunc1-generic (n)
@@ -2099,11 +2111,18 @@
                          (values q (- n q))))
            ;; Float: q = ⌊n⌋ (toward -inf), r = n - q (a FLOAT in [0,1)).
            ((%ieee-float-p n)
-            (let* ((tz (%float-to-integer n))      ; toward zero
-                   (q (if (and (float-negative-p n)
-                               (not (numeric-equal-p (%bignum-to-float tz) n)))
-                          (- tz 1) tz)))
-              (values q (generic-subtract n q))))
+            (let ((tz (%float-to-integer n)))       ; toward zero
+              (if (fixnump tz)
+                  ;; |n| < 2^29: n - tz is exact, and zero iff n is an integer --
+                  ;; no comparison through NUMERIC-EQUAL-P (13 us on ppc32)
+                  (let ((r (generic-subtract n tz)))
+                    (if (and (float-negative-p n) (not (%float-zero-p r)))
+                        (values (- tz 1) (generic-subtract n (- tz 1)))
+                        (values tz r)))
+                  (let ((q (if (and (float-negative-p n)
+                                    (not (numeric-equal-p (%bignum-to-float tz) n)))
+                               (- tz 1) tz)))
+                    (values q (generic-subtract n q))))))
            (t (truncate n))))
     (t (%floor2 n (car rest)))))
 
@@ -2133,11 +2152,17 @@
                          (values q (- n q))))
            ;; Float: q = ⌈n⌉ (toward +inf), r = n - q (a FLOAT in (-1,0]).
            ((%ieee-float-p n)
-            (let* ((tz (%float-to-integer n))
-                   (q (if (and (not (float-negative-p n))
-                               (not (numeric-equal-p (%bignum-to-float tz) n)))
-                          (+ tz 1) tz)))
-              (values q (generic-subtract n q))))
+            (let ((tz (%float-to-integer n)))
+              (if (fixnump tz)
+                  ;; as FLOOR's: exact remainder, zero iff n is an integer
+                  (let ((r (generic-subtract n tz)))
+                    (if (and (not (float-negative-p n)) (not (%float-zero-p r)))
+                        (values (+ tz 1) (generic-subtract n (+ tz 1)))
+                        (values tz r)))
+                  (let ((q (if (and (not (float-negative-p n))
+                                    (not (numeric-equal-p (%bignum-to-float tz) n)))
+                               (+ tz 1) tz)))
+                    (values q (generic-subtract n q))))))
            (t (truncate n))))
     (t
      (let ((d (car rest)))
@@ -3476,12 +3501,12 @@
    Used to short-circuit range comparisons against integers without
    coercing through %ieee-float-to-rat (whose denominators of the form
    ash 1 66 overflow modus's 63-bit fixnums)."
-  (let* ((hi-u32 (%float-hi32 x))
-         (sign-bit (logand (ash hi-u32 -31) 1))
-         (exponent (logand (ash hi-u32 -20) 2047)))
+  (let* ((c0 (%prim-aref x 0))                     ; chunks: see %FLOAT-NAN-P
+         (sign-bit (if (>= c0 #x8000) 1 0))
+         (exponent (logand (ash c0 -4) 2047)))
     (cond
-      ((and (= exponent 0) (= (%float-lo32 x) 0)
-            (= (logand hi-u32 1048575) 0)) 0)    ; ±zero
+      ((and (= exponent 0) (= (logand c0 15) 0) (= (%prim-aref x 1) 0)
+            (= (%prim-aref x 2) 0) (= (%prim-aref x 3) 0)) 0)    ; ±zero
       ((and (= sign-bit 1) (< exponent 1023)) -1) ; -1 < x < 0
       ((= sign-bit 1) -2)                         ; x <= -1
       ((< exponent 1023) 1)                       ; 0 < x < 1
@@ -3501,6 +3526,13 @@
   (when (or (and (%ieee-float-p a) (%float-nonfinite-p a))
             (and (%ieee-float-p b) (%float-nonfinite-p b)))
     (return-from numeric-value-less-p (%float-vs-real-lt-p a b)))
+  ;; A FINITE float against a fixnum that a double holds exactly (under 2^53:
+  ;; every fixnum on a 30-bit tower): compare as two floats.  The rational
+  ;; route below made (< 3.7d0 5) 50 us on ppc32, and (plusp x) is (> x 0).
+  (when (and (fixnump b) (%float4-p a) (< (integer-length b) 53))
+    (return-from numeric-value-less-p (%float-bits-lt a (%float-from-int b))))
+  (when (and (fixnump a) (%float4-p b) (< (integer-length a) 53))
+    (return-from numeric-value-less-p (%float-bits-lt (%float-from-int a) b)))
   ;; IEEE-float vs integer fast path — avoid %ieee-float-to-rat for
   ;; sub-unit-magnitude floats whose rational denominator would be
   ;; ash 1 66+ (overflows modus's 63-bit fixnum, breaks gcd-reduce).
@@ -3610,6 +3642,12 @@
   ;; ZEROP, which is (= x 0) -- skipped this arm: (zerop #C(0.0 0.0)) was NIL.
   (when (and (%float4-p a) (%float4-p b))
     (return-from numeric-equal-p (%float-bits-eq a b)))
+  ;; a float against a fixnum a double holds exactly (NUMERIC-VALUE-LESS-P's
+  ;; reason): ZEROP is (= x 0)
+  (when (and (fixnump b) (%float4-p a) (< (integer-length b) 53))
+    (return-from numeric-equal-p (%float-bits-eq a (%float-from-int b))))
+  (when (and (fixnump a) (%float4-p b) (< (integer-length a) 53))
+    (return-from numeric-equal-p (%float-bits-eq (%float-from-int a) b)))
   (when (or (and (not (fixnump a)) (%complex-p a))
             (and (not (fixnump b)) (%complex-p b)))
     (return-from numeric-equal-p

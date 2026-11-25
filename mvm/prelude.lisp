@@ -3023,7 +3023,10 @@
 (defun %htd-make (cap)
   "An empty dict with room for CAP entries."
   (let ((slots 64))
-    (loop (when (>= (* slots 3) (* cap 4)) (return nil)) (setq slots (+ slots slots)))
+    ;; AT MOST HALF FULL.  The index is probed linearly, and every slot a probe passes in an EQUAL
+    ;; table is a %HTD-KEY= call -- EQUAL, STRING= -- on a key that does not match.  At 3/4 full a
+    ;; hit passed ~2.5 slots and a miss ~8.5; at 1/2, ~1.5 and ~2.5.  Two index bytes more an entry.
+    (loop (when (>= slots (* cap 2)) (return nil)) (setq slots (+ slots slots)))
     ;; one allocation burst; under the runtime lock it must fit the lock-arena
     ;; slice (%RT-RESERVE, as %HT-REBUILD-INDEX)
     (%rt-reserve (+ (* 8 (+ 2 (* 2 cap))) (* 4 slots) 256))

@@ -200,7 +200,30 @@ remainder is stored and reloaded every step (store-to-load forwarding, ~15 cycle
 that latency moves with layout.  The first case where memory traffic, not branches, is the floor:
 the web allocator would keep the remainder in a register.
 
-Taken branches still on the path, for next: the IF arm's unconditional jump over the else arm,
+Then, with the loop down to two taken branches an element (one IF arm, the back edge), it was
+throughput-bound (~9 instructions a cycle), and instruction count started to matter:
+
+- **Tail duplication** (`%IR-TAIL-DUP`, an IR pass; MODUS_IR_TAILDUP=0 disables): a BR to a short
+  straight block (<= 4 instructions, ending BR / RET / TAILCALL) becomes a copy of it, so the back
+  edge's `(:safepoint) (:br top)` is inline.  No time change by itself -- branches were no longer
+  the floor -- but one taken branch fewer per iteration.
+- **Bounds checks as one unsigned compare** (aarch64 translator, A64-BOUNDS-CHECK-MATCH): the
+  compiler's `CMP-IMM idx 0 / BLT bad / ARRAY-LEN / CMP idx len / BGE bad` is translated as the
+  length load, the CMP, and `B.HS bad` -- a negative tagged index read unsigned is above any
+  length.  Translator-only: the interpreter and the IR are unchanged.
+- **Tagged index scaling folded into the address** (f32 and u8 lanes): `ADD x9, arr, idx, LSL #1`
+  / `ASR #1` in place of an ASR and an ADD.
+
+Where-shaped loop 1.76 -> 1.54 ns an element.  stave pass 1.33-1.36 s (SBCL 1.3); Where 7.7 us a call.
+
+Still to take: the IF arm's jump over the else arm (not a short block -- needs layout, or
+if-conversion of a float select into FCSEL); copies the front end leaves before uses (`MOV x19,
+x4` then x19); the tag test on an (unsigned-byte 62) counter (5 instructions; TBNZ is 1).
+Tried and reverted: skipping the tag test of an operand loaded with a fixnum literal a few
+instructions up (`%IR-RECENT-FIXNUM-P` in EMIT-ARITH-PAIR) -- no gain on stave and cl-bench
+BITVECTORS 5% slower, consistently.  Probably layout again; not worth it unmeasured.
+
+Earlier note, before these: the IF arm's unconditional jump over the else arm,
 and the jump from the loop body to the back-edge block (the front end emits `(:br L) ... (:label
 L) (:safepoint) (:br top)` -- block layout / jump threading, an IR pass).  Then the instruction-
 count items (bounds check 8 -> 3 with an unsigned branch, index scaling, tag tests).

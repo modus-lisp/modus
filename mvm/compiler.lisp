@@ -2869,12 +2869,47 @@
 (defvar *rt-ir-passes-off* nil
   "T: runtime-compiled IR skips %RT-IR-PASSES (bisecting aid).")
 
+;;; TAIL DUPLICATION.  A loop body ends (:BR L) into a block (:LABEL L) (:SAFEPOINT) (:BR TOP), so
+;;; every iteration took two branches where one does; on Apple cores taken branches, about one a
+;;; cycle, set the speed of a tight loop (docs/ir-rework.md, Step 2).  A BR to a short straight
+;;; block -- at most 4 instructions after its labels, no label among them, ending in BR / RET /
+;;; TAILCALL -- is replaced by a copy of the block.  The original stays for its other branches.
+(defun %ir-tail-dup (ir)
+  (if (equal (%ira-env "MODUS_IR_TAILDUP") "0")
+      ir
+      (let* ((v (coerce ir 'vector)) (n (length v)) (label-at (make-hash-table)) (changed nil))
+        (dotimes (k n)
+          (let ((insn (aref v k)))
+            (when (and (consp insn) (eq (car insn) :label)) (setf (gethash (second insn) label-at) k))))
+        (flet ((tail-of (j)
+                 ;; the block at label index J: its instructions after the labels, or NIL
+                 (let ((x j) (out nil))
+                   (loop while (and (< x n) (eq (car (aref v x)) :label)) do (incf x))
+                   (loop
+                     (when (or (>= x n) (> (length out) 4)) (return nil))
+                     (let ((insn (aref v x)))
+                       (when (eq (car insn) :label) (return nil))
+                       (push insn out)
+                       (when (member (car insn) '(:br :ret :tailcall))
+                         (return (and (<= (length out) 4) (reverse out)))))
+                     (incf x)))))
+          (let ((out nil))
+            (dotimes (k n)
+              (let* ((insn (aref v k))
+                     (j (and (eq (car insn) :br) (gethash (second insn) label-at)))
+                     (tl (and j (/= j (1+ k)) (tail-of j))))
+                (if (and tl (not (and (eq (car (car (last tl))) :br)
+                                      (eql (second (car (last tl))) (second insn)))))
+                    (progn (setq changed t) (dolist (c tl) (push (copy-list c) out)))
+                    (push insn out))))
+            (if changed (nreverse out) ir))))))
+
 (defun %rt-ir-passes (ir)
   "MVM-COMPILE-ALL's Phase 2b'' for one runtime-compiled function's IR:
    %IR-PEEPHOLE, %IR-DATAFLOW, %IR-PEEPHOLE; then, with MODUS_IR_ALLOC=1 (aarch64), %IR-ALLOC
    and %IR-ALLOC-LOOPS (frame slots into idle registers, docs/ir-rework.md) and, when they moved
    any, the dataflow round again to fold their moves."
-  (let* ((ir1 (%ir-peephole (%ir-dataflow (%ir-peephole ir))))
+  (let* ((ir1 (%ir-peephole (%ir-dataflow (%ir-peephole (%ir-tail-dup ir)))))
          (on (and (%ira-enabled-p) (%ira-in-range-p) (%ira-name-ok-p)))
          (dump (and on (equal (%ira-env "MODUS_IR_ALLOC_TRACE") "2")
                     (%ira-trace "ira: IR of ~a~%~{  ~s~%~}" *ira-name* ir1)))

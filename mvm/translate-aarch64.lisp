@@ -1116,6 +1116,27 @@
         nargs
         (values (+ n 1) target (format nil "~S" (reverse key)))))))
 
+(defun a64-bounds-check-match (tail mvm-to-native-label)
+  "The label of BAD when TAIL starts with the compiler's bounds check (%EMIT-INDEX-CHECK):
+     CMP-IMM idx 0 / BLT bad / ARRAY-LEN len arr / CMP idx len / BGE bad
+   with nothing but its first instruction a branch target; else NIL.  The two signed tests of
+   the tagged index compare to ONE unsigned one -- a negative index read unsigned is above any
+   length -- so the check is the length load, CMP and B.HS (A64-EMIT-BOUNDS-CHECK)."
+  (flet ((op (i) (decoded-mvm-insn-opcode i))
+         (ops (i) (decoded-mvm-insn-operands i))
+         (target (i) (+ (decoded-mvm-insn-offset i) (decoded-mvm-insn-size i) (car (decoded-mvm-insn-operands i))))
+         (inside-ok (i) (not (gethash (decoded-mvm-insn-offset i) mvm-to-native-label))))
+    (let ((i1 (first tail)) (i2 (second tail)) (i3 (third tail)) (i4 (fourth tail)) (i5 (fifth tail)))
+      (and i5
+           (= (op i1) +op-cmp-imm+) (eql (second (ops i1)) 0)
+           (= (op i2) +op-blt+) (inside-ok i2)
+           (= (op i3) +op-array-len+) (inside-ok i3)
+           (= (op i4) +op-cmp+) (inside-ok i4)
+           (eql (first (ops i4)) (first (ops i1))) (eql (second (ops i4)) (first (ops i3)))
+           (= (op i5) +op-bge+) (inside-ok i5)
+           (= (target i2) (target i5))
+           (gethash (target i5) mvm-to-native-label)))))
+
 (defun a64-emit-cold-call-site (buf tail count target key mvm-to-native-label)
   "The site of a matched cold call: ADR x15, <target>; B <the shared stub>."
   (let ((e (assoc key *a64-cold-stubs* :test (function string=))))
@@ -6275,8 +6296,8 @@
                   (parr (ensure-src (vr 1) +a64-x16+))
                   (pidx (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-asr-imm buf +a64-x9+ pidx 1)                ; x9 = real_idx
-             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)     ; x9 = Varr + 4*idx
+             (a64-add-reg buf +a64-x9+ parr pidx 0 1)
+             ;; tagged index * 2 = untagged * 4: one ADD with a shifted operand
              ;; LDUR W<pd>, [x9, #7] = 0xB8400000 | (7<<12) | (x9<<5) | pd
              (a64-emit buf (logior #xB8407000 (ash +a64-x9+ 5) pd))
              (a64-lsl-imm buf pd pd 1)                        ; tag
@@ -6288,8 +6309,8 @@
            (let* ((parr (ensure-src (vr 0) +a64-x16+))
                   (pidx (ensure-src (vr 1) +a64-x17+))
                   (pval (ensure-src (vr 2) +a64-x9+)))
-             (a64-asr-imm buf +a64-x10+ pidx 1)
-             (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 2)   ; x10 = Varr + 4*idx
+             (a64-add-reg buf +a64-x10+ parr pidx 0 1)
+             ;; tagged index * 2 = untagged * 4: one ADD with a shifted operand
              (a64-asr-imm buf +a64-x11+ pval 1)               ; untagged bits
              ;; STUR W11, [x10, #7] = 0xB8000000 | (7<<12) | (x10<<5) | 11
              (a64-emit buf (logior #xB8007000 (ash +a64-x10+ 5) +a64-x11+))))
@@ -6303,8 +6324,8 @@
              ;; Set the object-start bit for x24 FIRST — gc-set-bit clobbers
              ;; x9..x13, so it must run before the value bits land in x9.
              (emit-aarch64-gc-mark-start buf)
-             (a64-asr-imm buf +a64-x9+ pidx 1)
-             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)     ; x9 = Varr + 4*idx
+             (a64-add-reg buf +a64-x9+ parr pidx 0 1)
+             ;; tagged index * 2 = untagged * 4: one ADD with a shifted operand
              (a64-emit buf (logior #xB8407000 (ash +a64-x9+ 5) +a64-x10+)) ; LDUR W10, [x9,#7]
              (a64-emit buf (logior #x1E270000 (ash +a64-x10+ 5) 0))        ; FMOV S0, W10
              (a64-emit buf (logior #x1E22C000 0))                          ; FCVT D0, S0
@@ -6326,8 +6347,8 @@
              (a64-fmov-d-x buf 0 +a64-x9+)                    ; D0 ← bits
              (a64-emit buf (logior #x1E624000 0))              ; FCVT S0, D0
              (a64-emit buf (logior #x1E260000 (ash 0 5) +a64-x11+)) ; FMOV W11, S0
-             (a64-asr-imm buf +a64-x10+ pidx 1)
-             (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 2)   ; x10 = Varr + 4*idx
+             (a64-add-reg buf +a64-x10+ parr pidx 0 1)
+             ;; tagged index * 2 = untagged * 4: one ADD with a shifted operand
              (a64-emit buf (logior #xB8007000 (ash +a64-x10+ 5) +a64-x11+)))) ; STUR W11, [x10,#7]
 
           ;; ---- FSQRT Vd, Vs ----  payload → FSQRT D0 → boxed double (FROUND32's shape)
@@ -6404,8 +6425,8 @@
            (let* ((fd (fpp (vr 0)))
                   (parr (ensure-src (vr 1) +a64-x16+))
                   (pidx (ensure-src (vr 2) +a64-x17+)))
-             (a64-asr-imm buf +a64-x9+ pidx 1)
-             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)
+             (a64-add-reg buf +a64-x9+ parr pidx 0 1)
+             ;; tagged index * 2 = untagged * 4: one ADD with a shifted operand
              (a64-emit buf (logior #xBC407000 (ash +a64-x9+ 5) fd))))
 
           ;; ---- FP-LANE-STORE Varr, Vidx, Fs ----  STUR S(2+s), [x10,#7]
@@ -6413,8 +6434,8 @@
            (let* ((parr (ensure-src (vr 0) +a64-x16+))
                   (pidx (ensure-src (vr 1) +a64-x17+))
                   (fs (fpp (vr 2))))
-             (a64-asr-imm buf +a64-x10+ pidx 1)
-             (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 2)
+             (a64-add-reg buf +a64-x10+ parr pidx 0 1)
+             ;; tagged index * 2 = untagged * 4: one ADD with a shifted operand
              (a64-emit buf (logior #xBC007000 (ash +a64-x10+ 5) fs))))
 
           ;; ---- FP-ADD/SUB/MUL/DIV Fd, Fa, Fb ----  F<op> Sd, Sn, Sm (single)
@@ -6584,8 +6605,8 @@
            (let* ((fd (fpp (vr 0)))
                   (parr (ensure-src (vr 1) +a64-x16+))
                   (pidx (ensure-src (vr 2) +a64-x17+)))
-             (a64-asr-imm buf +a64-x9+ pidx 1)
-             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)
+             (a64-add-reg buf +a64-x9+ parr pidx 0 1)
+             ;; tagged index * 2 = untagged * 4: one ADD with a shifted operand
              (a64-emit buf (logior #x3CC07000 (ash +a64-x9+ 5) fd))))
 
           ;; ---- V4-LANE-STORE Varr, Vidx, Fs ----  STUR Qs, [x10,#7]
@@ -6593,8 +6614,8 @@
            (let* ((parr (ensure-src (vr 0) +a64-x16+))
                   (pidx (ensure-src (vr 1) +a64-x17+))
                   (fs (fpp (vr 2))))
-             (a64-asr-imm buf +a64-x10+ pidx 1)
-             (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 2)
+             (a64-add-reg buf +a64-x10+ parr pidx 0 1)
+             ;; tagged index * 2 = untagged * 4: one ADD with a shifted operand
              (a64-emit buf (logior #x3C807000 (ash +a64-x10+ 5) fs))))
 
           ;; ---- V4-DUP Fd, Fs ----  DUP Vd.4S, Vs.S[0]
@@ -6607,8 +6628,8 @@
            (let* ((fd (fpp (vr 0)))
                   (parr (ensure-src (vr 1) +a64-x16+))
                   (pidx (ensure-src (vr 2) +a64-x17+)))
-             (a64-asr-imm buf +a64-x9+ pidx 1)
-             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)
+             (a64-add-reg buf +a64-x9+ parr pidx 0 1)
+             ;; tagged index * 2 = untagged * 4: one ADD with a shifted operand
              (a64-add-imm buf +a64-x9+ +a64-x9+ 7)
              (a64-emit buf (logior #x4D40C800 (ash +a64-x9+ 5) fd))))
 
@@ -6785,8 +6806,8 @@
                   (parr (ensure-src (vr 1) +a64-x16+))
                   (pidx (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-asr-imm buf +a64-x9+ pidx 1)                ; x9 = real_idx
-             (a64-add-reg buf +a64-x9+ +a64-x9+ parr 0 0)     ; x9 = Varr + real_idx
+             (a64-add-reg buf +a64-x9+ parr pidx 2 1)
+             ;; Varr + (tagged index ASR 1): one ADD
              ;; LDRB Wpd, [x9, #7]  = 0x39401C00 | (x9<<5) | pd
              (a64-emit buf (logior #x39401C00 (ash +a64-x9+ 5) pd))
              (a64-lsl-imm buf pd pd 1)                        ; tag: byte << 1
@@ -6801,8 +6822,8 @@
            (let* ((parr (ensure-src (vr 0) +a64-x16+))
                   (pidx (ensure-src (vr 1) +a64-x17+))
                   (pval (ensure-src (vr 2) +a64-x9+)))
-             (a64-asr-imm buf +a64-x10+ pidx 1)               ; x10 = real_idx
-             (a64-add-reg buf +a64-x10+ +a64-x10+ parr 0 0)   ; x10 = Varr + real_idx
+             (a64-add-reg buf +a64-x10+ parr pidx 2 1)
+             ;; Varr + (tagged index ASR 1): one ADD
              (a64-asr-imm buf +a64-x11+ pval 1)               ; x11 = untagged value
              ;; STRB W11, [x10, #7]  = 0x39001C00 | (x10<<5) | 11
              (a64-emit buf (logior #x39001C00 (ash +a64-x10+ 5) +a64-x11+))))
@@ -11371,7 +11392,20 @@
         ;; Record MVM offset → native index mapping
         (setf (gethash mvm-off mvm-offset-to-native-index)
               (a64-current-index buf))
+        ;; A BOUNDS CHECK as one unsigned compare (A64-BOUNDS-CHECK-MATCH): the length load and the
+        ;; CMP as written -- the length register stays written, the emitter promises that -- then
+        ;; B.HS in place of BLT ... BGE.  The four instructions after this one are consumed.
+        (let ((bad (a64-bounds-check-match tail mvm-to-native-label)))
+          (when bad
+            (translate-mvm-insn (third tail) buf mvm-to-native-label)
+            (translate-mvm-insn (fourth tail) buf mvm-to-native-label)
+            (let ((idx (a64-current-index buf)))
+              (a64-bcond buf +cc-cs+ 0)
+              (a64-add-fixup buf idx bad :bcond))
+            (setq skip 4)))
         ;; Translate the instruction -- or, at a cold call, its shared stub
+        (if (> skip 0)
+            nil
         (multiple-value-bind (count target key)
             (and *a64-cold-stubs-on*
                  (gethash mvm-off mvm-to-native-label)
@@ -11380,7 +11414,7 @@
           (if count
               (progn (a64-emit-cold-call-site buf tail count target key mvm-to-native-label)
                      (setq skip (- count 1)))
-              (translate-mvm-insn insn buf mvm-to-native-label)))))
+              (translate-mvm-insn insn buf mvm-to-native-label))))))
       (setq tail (cdr tail))))
 
     ;; Any labels pointing to the end of the bytecode stream

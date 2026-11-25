@@ -1152,9 +1152,57 @@
   (a64-slot-cache-flush)
   (setq *a64-cold-stubs* nil))
 
+;;; OVERFLOW SLOW PATHS OUT OF LINE.  A checked add / subtract was ADDS; B.VC done; <the
+;;; GENERIC-ADD call>; done: -- so the common, no-overflow case TOOK a branch, five times an element
+;;; in mill's Where loop, and Apple cores retire about one taken branch a cycle: that, not the
+;;; instruction count, was the loop's floor (docs/ir-rework.md).  Now it is ADDS; B.VS slow; done:
+;;; and the call goes after the function (its slow-path block branches back to done).  At the end
+;;; of each FUNCTION, not of the unit: a conditional branch reaches +-1 MB, a whole image is far
+;;; bigger.  A function already past 512 KB of native code keeps the inline form.
+(defvar *a64-slow-tails* nil "Pending out-of-line overflow calls: (SLOW DONE VA VB KIND PAYLOAD).")
+(defvar *a64-fn-start-idx* nil "Native index where the current function began.")
+
+(defun a64-slow-tails-ok-p (buf)
+  (< (- (a64-current-index buf) (or *a64-fn-start-idx* 0)) (* 128 1024)))   ; 512 KB of code
+
+(defun a64-flush-slow-tails (buf)
+  "Emit the pending out-of-line overflow calls, behind a branch over them."
+  (when *a64-slow-tails*
+    (let ((over (incf *mvm-label-counter*)) (tails (reverse *a64-slow-tails*)))
+      (setq *a64-slow-tails* nil)
+      (a64-emit-call-label buf over t)
+      (dolist (e tails)
+        (let ((slow (first e)) (done (second e)) (va (third e)) (vb (fourth e))
+              (kind (fifth e)) (payload (sixth e)))
+          (a64-set-label buf slow)
+          (cond ((eq kind :stw) (emit-aarch64-safepoint-park buf))
+                ((eq kind :abs) (a64-emit-generic-arith-call-abs buf va vb payload))
+                (t (a64-emit-generic-arith-call buf va vb payload)))
+          (a64-emit-call-label buf done t)))
+      (a64-set-label buf over))))
+
+(defun a64-emit-checked-overflow (buf va vb kind payload &optional (ovf +cc-vs+) (ok +cc-vc+))
+  "After ADDS / SUBS into x16: branch to the overflow call when V is set.  The call is out of line
+   (A64-FLUSH-SLOW-TAILS) when the function is small enough, else inline as before.  Leaves the
+   position at DONE, where x16 holds the result on both paths."
+  (let ((done (incf *mvm-label-counter*)))
+    (if (a64-slow-tails-ok-p buf)
+        (let ((slow (incf *mvm-label-counter*)) (idx (a64-current-index buf)))
+          (a64-bcond buf ovf 0)
+          (a64-add-fixup buf idx slow :bcond)
+          (push (list slow done va vb kind payload) *a64-slow-tails*))
+        (let ((idx (a64-current-index buf)))
+          (a64-bcond buf ok 0)
+          (a64-add-fixup buf idx done :bcond)
+          (if (eq kind :abs)
+              (a64-emit-generic-arith-call-abs buf va vb payload)
+              (a64-emit-generic-arith-call buf va vb payload))))
+    (a64-set-label buf done)))
+
 (defun a64-emit-mark-subs (buf)
-  "At a unit's end: the mark subroutines its sites called, and its shared
-   cold-call stubs."
+  "At a unit's end: the last function's out-of-line overflow calls, the mark subroutines its sites
+   called, and its shared cold-call stubs."
+  (a64-flush-slow-tails buf)
   (a64-emit-cold-stubs buf)
   (when *a64-mark-start-label*
     (a64-runtime-mark buf "<runtime: gc mark start bit>")
@@ -1292,6 +1340,17 @@
                         (ash (logand imm12 #xFFF) 10)
                         (ash rn 5)
                         rd)))
+
+(defun a64-tst-mask-fields (imm)
+  "(IMMR . IMMS) of the 64-bit logical immediate IMM when it is a single bit 2^K or a run of low
+   ones 2^M - 1 (M < 64), else NIL: the masks TST takes in the instruction."
+  (cond ((and (> imm 0) (= (logand imm (- imm 1)) 0))          ; 2^K
+         (let ((k (1- (integer-length imm))))
+           (and (< k 63) (cons (mod (- 64 k) 64) 0))))
+        ((and (> imm 0) (= (logand imm (+ imm 1)) 0))          ; 2^M - 1
+         (let ((m (integer-length imm)))
+           (and (< m 64) (cons 0 (1- m)))))
+        (t nil)))
 
 (defun a64-cmp-imm (buf rn imm12)
   "CMP Xn, #imm12  →  SUBS XZR, Xn, #imm12"
@@ -5047,17 +5106,11 @@
                                 (%a64-jit-genarith-entry "GENERIC-ADD"))))
              (cond
                ((or *aarch64-genadd-bytecode-offset* ga-entry)
-                (let ((done (incf *mvm-label-counter*)))
-                  (a64-adds-reg buf +a64-x16+ pa pb 0 0)
-                  (let ((idx (a64-current-index buf)))
-                    (a64-bcond buf +cc-vc+ 0)
-                    (a64-add-fixup buf idx done :bcond))
-                  (if ga-entry
-                      (a64-emit-generic-arith-call-abs buf va vb ga-entry)
-                      (a64-emit-generic-arith-call
-                       buf va vb *aarch64-genadd-bytecode-offset*))
-                  (a64-set-label buf done)
-                  (store-dst +a64-x16+ vd)))
+                (a64-adds-reg buf +a64-x16+ pa pb 0 0)
+                (if ga-entry
+                    (a64-emit-checked-overflow buf va vb :abs ga-entry)
+                    (a64-emit-checked-overflow buf va vb :offset *aarch64-genadd-bytecode-offset*))
+                (store-dst +a64-x16+ vd))
                (t
                 ;; No GENERIC-ADD reachable at all: plain wrapping add.
                 (a64-add-reg buf +a64-x16+ pa pb 0 0)
@@ -5081,17 +5134,11 @@
                                 (%a64-jit-genarith-entry "GENERIC-SUBTRACT"))))
              (cond
                ((or *aarch64-gensub-bytecode-offset* gs-entry)
-                (let ((done (incf *mvm-label-counter*)))
-                  (a64-subs-reg buf +a64-x16+ pa pb 0 0)
-                  (let ((idx (a64-current-index buf)))
-                    (a64-bcond buf +cc-vc+ 0)
-                    (a64-add-fixup buf idx done :bcond))
-                  (if gs-entry
-                      (a64-emit-generic-arith-call-abs buf va vb gs-entry)
-                      (a64-emit-generic-arith-call
-                       buf va vb *aarch64-gensub-bytecode-offset*))
-                  (a64-set-label buf done)
-                  (store-dst +a64-x16+ vd)))
+                (a64-subs-reg buf +a64-x16+ pa pb 0 0)
+                (if gs-entry
+                    (a64-emit-checked-overflow buf va vb :abs gs-entry)
+                    (a64-emit-checked-overflow buf va vb :offset *aarch64-gensub-bytecode-offset*))
+                (store-dst +a64-x16+ vd))
                (t
                 ;; No GENERIC-SUBTRACT reachable at all: plain wrapping sub.
                 (a64-sub-reg buf +a64-x16+ pa pb 0 0)
@@ -5112,22 +5159,16 @@
                                 (%a64-jit-genarith-entry "GENERIC-MULTIPLY"))))
              (cond
                ((or *aarch64-genmul-bytecode-offset* gm-entry)
-                (let ((done (incf *mvm-label-counter*)))
-                  (a64-asr-imm buf +a64-x9+ pa 1)          ; x9 = untag(va)
-                  (a64-mov-reg buf +a64-x10+ pb)           ; x10 = vb (tagged)
-                  (a64-mul   buf +a64-x16+ +a64-x9+ +a64-x10+) ; low 64
-                  (a64-smulh buf +a64-x11+ +a64-x9+ +a64-x10+) ; high 64
-                  ;; CMP x11, x16 ASR #63 — equal means no overflow.
-                  (a64-subs-reg buf +a64-xzr+ +a64-x11+ +a64-x16+ 2 63)
-                  (let ((idx (a64-current-index buf)))
-                    (a64-bcond buf +cc-eq+ 0)
-                    (a64-add-fixup buf idx done :bcond))
-                  (if gm-entry
-                      (a64-emit-generic-arith-call-abs buf va vb gm-entry)
-                      (a64-emit-generic-arith-call
-                       buf va vb *aarch64-genmul-bytecode-offset*))
-                  (a64-set-label buf done)
-                  (store-dst +a64-x16+ vd)))
+                (a64-asr-imm buf +a64-x9+ pa 1)          ; x9 = untag(va)
+                (a64-mov-reg buf +a64-x10+ pb)           ; x10 = vb (tagged)
+                (a64-mul   buf +a64-x16+ +a64-x9+ +a64-x10+) ; low 64
+                (a64-smulh buf +a64-x11+ +a64-x9+ +a64-x10+) ; high 64
+                ;; CMP x11, x16 ASR #63 -- not equal means overflow (out of line)
+                (a64-subs-reg buf +a64-xzr+ +a64-x11+ +a64-x16+ 2 63)
+                (if gm-entry
+                    (a64-emit-checked-overflow buf va vb :abs gm-entry +cc-ne+ +cc-eq+)
+                    (a64-emit-checked-overflow buf va vb :offset *aarch64-genmul-bytecode-offset* +cc-ne+ +cc-eq+))
+                (store-dst +a64-x16+ vd))
                (t
                 ;; No GENERIC-MULTIPLY reachable at all: plain wrapping mul.
                 (a64-asr-imm buf +a64-x9+ pa 1)
@@ -5512,15 +5553,26 @@
                  (pb (ensure-src (vr 1) +a64-x17+)))
              (a64-cmp-reg buf pa pb)))
 
-          ;; ---- CMP-IMM / TEST-IMM Va, imm32 ---- the sign-extended
-          ;; immediate into x17, then CMP / TST as above
+          ;; ---- CMP-IMM / TEST-IMM Va, imm32 ---- the immediate in the instruction when it
+          ;; fits: CMP Xn, #imm12 / CMN Xn, #imm12, and TST Xn, #mask for a single bit or a run of
+          ;; low ones (the tag tests).  Same flags as the register forms.  Otherwise the
+          ;; sign-extended immediate into x17, then CMP / TST.  (Every bounds check's index >= 0
+          ;; test and every tag test was a MOVZ into x17 and a register compare.)
           ((or (= op +op-cmp-imm+) (= op +op-test-imm+))
-           (let ((pa (ensure-src (vr 0) +a64-x16+))
-                 (imm (%imm32-signed (vr 1))))
-             (a64-load-imm64 buf +a64-x17+ (if (< imm 0) (logand imm #xFFFFFFFFFFFFFFFF) imm))
-             (if (= op +op-cmp-imm+)
-                 (a64-cmp-reg buf pa +a64-x17+)
-                 (a64-tst-reg buf pa +a64-x17+))))
+           (let* ((pa (ensure-src (vr 0) +a64-x16+))
+                  (imm (%imm32-signed (vr 1)))
+                  (mask (and (= op +op-test-imm+) (> imm 0) (a64-tst-mask-fields imm))))
+             (cond ((and (= op +op-cmp-imm+) (<= 0 imm 4095)) (a64-cmp-imm buf pa imm))
+                   ((and (= op +op-cmp-imm+) (<= -4095 imm -1)) (a64-adds-imm buf +a64-xzr+ pa (- imm)))
+                   (mask
+                    ;; ANDS XZR, Xn, #bitmask (N=1)
+                    (a64-emit buf (logior #xF2000000 (ash 1 22) (ash (car mask) 16) (ash (cdr mask) 10)
+                                          (ash pa 5) +a64-xzr+)))
+                   (t
+                    (a64-load-imm64 buf +a64-x17+ (if (< imm 0) (logand imm #xFFFFFFFFFFFFFFFF) imm))
+                    (if (= op +op-cmp-imm+)
+                        (a64-cmp-reg buf pa +a64-x17+)
+                        (a64-tst-reg buf pa +a64-x17+))))))
 
           ;; ---- TEST Va, Vb ----
           ((= op +op-test+)
@@ -8375,12 +8427,29 @@
    (loop (when *flag* (return)) ...) while main waited on that collection to
    set *flag* hung the process (test/stw-spinning-worker.lisp).
    Uses x15-x17 (scratch at every YIELD)."
-  (let ((skip (incf *mvm-label-counter*))
-        (clamped (incf *mvm-label-counter*)))
-    (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
-    (a64-ldr-width buf +a64-x16+ +a64-x16+ 0 2)
-    (a64-cmp-imm buf +a64-x16+ 0)
-    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+  ;; The poll falls through when no stop is asked for -- every iteration of every loop -- and the
+  ;; parking code is out of line after the function (A64-FLUSH-SLOW-TAILS): it was inline behind a
+  ;; B.EQ the common case took, one of the taken branches that set mill's loops' speed.
+  (if (a64-slow-tails-ok-p buf)
+      (let ((slow (incf *mvm-label-counter*)) (done (incf *mvm-label-counter*)))
+        (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
+        (a64-ldr-width buf +a64-x16+ +a64-x16+ 0 2)
+        (a64-cmp-imm buf +a64-x16+ 0)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i slow :bcond))
+        (push (list slow done nil nil :stw nil) *a64-slow-tails*)
+        (a64-set-label buf done))
+      (let ((skip (incf *mvm-label-counter*)))
+        (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
+        (a64-ldr-width buf +a64-x16+ +a64-x16+ 0 2)
+        (a64-cmp-imm buf +a64-x16+ 0)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+        (emit-aarch64-safepoint-park buf)
+        (a64-set-label buf skip))))
+
+(defun emit-aarch64-safepoint-park (buf)
+  "A :SAFEPOINT's parking, the stop flag seen set: clamp x25 as YIELD does, then a gc-check of
+   nothing into the trampoline (see EMIT-AARCH64-STW-SAFEPOINT)."
+  (let ((clamped (incf *mvm-label-counter*)))
     (a64-cmp-imm buf +a64-x25+ 0)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i clamped :bcond))
     (a64-load-gc-region buf +a64-x15+ +a64-x16+)
@@ -8389,8 +8458,7 @@
     (a64-movz buf +a64-x25+ 0 0)
     (a64-set-label buf clamped)
     (a64-mov-reg buf +a64-x16+ +a64-x24+)
-    (a64-blr buf +a64-x28+)
-    (a64-set-label buf skip)))
+    (a64-blr buf +a64-x28+)))
 
 (defconstant +a64-stw-r0-count-addr+ #x10005010
   "Per-thread window word: region 0's collection count (its block's
@@ -11195,7 +11263,11 @@
                function-table))
 
     ;; Pre-pass: register labels for ALL branch targets (including backward branches),
-    ;; and note the targets of BACKWARD branches -- loop headers -- for alignment below.
+    ;; and note LOOP HEADERS for alignment below: the target of a backward BR that follows a
+    ;; SAFEPOINT or YIELD -- the front end ends every loop's back edge that way.  Not every
+    ;; backward branch: an out-of-line slow path branching back into a loop's body is one too, and
+    ;; padding its target put NOPs in the middle of the hot path.
+    (let ((prev-op nil))
     (dolist (insn insns)
       (let ((op (decoded-mvm-insn-opcode insn))
             (operands (decoded-mvm-insn-operands insn)))
@@ -11205,13 +11277,17 @@
                  (target-byte (+ (decoded-mvm-insn-offset insn)
                                  (decoded-mvm-insn-size insn)
                                  mvm-offset)))
-            (when (<= target-byte (decoded-mvm-insn-offset insn))
+            (when (and (<= target-byte (decoded-mvm-insn-offset insn))
+                       (= op +op-br+)
+                       (or (eql prev-op +op-safepoint+) (eql prev-op +op-yield+)))
               (setf (gethash target-byte loop-headers) t))
             (unless (gethash target-byte mvm-to-native-label)
               (setf (gethash target-byte mvm-to-native-label)
-                    (incf *mvm-label-counter*)))))))
+                    (incf *mvm-label-counter*)))))
+        (setq prev-op op))))
 
     ;; Pass 1: Translate all instructions
+    (setq *a64-slow-tails* nil *a64-fn-start-idx* (a64-current-index buf))
     (let ((skip 0) (tail insns))
     (dolist (insn insns)
       (if (> skip 0)
@@ -11220,6 +11296,10 @@
                  (setf (gethash (decoded-mvm-insn-offset insn) mvm-offset-to-native-index)
                        (a64-current-index buf)))
       (let ((mvm-off (decoded-mvm-insn-offset insn)))
+        ;; the previous function's out-of-line overflow calls go before this one begins
+        (when (gethash mvm-off fn-bc-offsets)
+          (a64-flush-slow-tails buf)
+          (setq *a64-fn-start-idx* (a64-current-index buf)))
         ;; Function-entry alignment.  Fn pointers are tagged with
         ;; +tag-function+ (3) at LI-FUNC patch time (see cross.lisp
         ;; apply-aarch64-fn-addr-patches), and CALL-IND strips with

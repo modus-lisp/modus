@@ -165,6 +165,46 @@ next, in order of expected payoff:
 5. The web allocator stays the long-term plan (and the front end's register decisions stay in
    the log), but it is no longer the first lever.
 
+## Step 2: what the native loop actually costs (2026-11-25)
+
+Method: warm a function past the hot-call threshold, read its JIT code (the native address as the
+profiler's JIT map computes it, words via `%GC-READ64`), wrap the words in `.word` and disassemble
+with `as` / `otool -tv`.  Where-shaped loop, one element, hot path:
+
+- ~87 native instructions against SBCL's 35 -- but cutting 10 (the alignment NOPs below, MOVZ of
+  compare immediates) changed nothing.  Moves and NOPs are nearly free on Apple cores.
+- **The floor was taken branches**: ~9 an element (each checked add's `B.VC` around its inline
+  overflow call, the IF arm's branch, the jump to the safepoint, the safepoint's `B.EQ` around its
+  inline parking code, the back edge) against SBCL's ~2; these cores retire about one taken branch
+  a cycle, and 9 of them is ~11 cycles = the measured 2.5 ns.
+
+Fixed in the aarch64 translator:
+
+- **Overflow slow paths out of line**: checked add / subtract / multiply branch to the
+  GENERIC-ADD call (not around it); the call is emitted after the function and branches back.
+  Where's loop 2.50 -> 1.89 ns an element.
+- **Safepoint parking out of line**: the poll falls through when no stop is asked for.  1.88 ->
+  1.83.
+- **Compare / test immediates in the instruction** (CMP / CMN #imm12, TST #bit-or-low-ones).
+- **Loop-header alignment only at real loop headers** (a backward BR right after SAFEPOINT /
+  YIELD): out-of-line slow paths branch back into loop bodies, and padding their targets had put
+  NOPs in hot paths.
+
+stave: pass 1.47 -> 1.37 s (SBCL 1.3).  Per call: Where 11.2 -> 8.4 us (SBCL 9.5), Add 3.8 -> 3.5,
+Transpose 5.5 -> 4.9.
+
+cl-bench geomean 2.61x -> 2.47x SBCL (2d-arrays, fft, puzzle 12-14% faster).  One regression:
+crc40 +7% (0.212 -> 0.227 s), with a loop that is strictly better code (48 instructions against 84,
+one taken branch fewer).  Its critical path is a loop-carried chain THROUGH A FRAME SLOT -- the
+remainder is stored and reloaded every step (store-to-load forwarding, ~15 cycles a step) -- and
+that latency moves with layout.  The first case where memory traffic, not branches, is the floor:
+the web allocator would keep the remainder in a register.
+
+Taken branches still on the path, for next: the IF arm's unconditional jump over the else arm,
+and the jump from the loop body to the back-edge block (the front end emits `(:br L) ... (:label
+L) (:safepoint) (:br top)` -- block layout / jump threading, an IR pass).  Then the instruction-
+count items (bounds check 8 -> 3 with an unsigned branch, index scaling, tag tests).
+
 ## Front-end constraint log
 
 Each entry: what the front end does, what it costs, what a front end without the constraint
@@ -212,7 +252,10 @@ would emit.
     it with FRAME-FREE n around their temporaries.  *Future:* a fixed frame laid out once by the
     allocator.
 12. **Loops are not visible, and are laid out rotated.**  The IR is a flat list with labels; loop structure is re-derived
-    from branches.  *Future:* blocks and edges in the IR.
+    from branches.  Also: the back edge is a
+    separate block reached by a jump (`(:br L) ... (:label L) (:safepoint) (:br top)`), so the hot
+    path takes two branches per iteration where one would do.  *Future:* blocks and edges in the
+    IR, placed by a layout pass.
 
 ## IR op inventory (2026-11-25)
 

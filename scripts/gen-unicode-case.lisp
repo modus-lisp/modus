@@ -25,8 +25,32 @@
 ;;;;                                                                 lo <= code <= hi with
 ;;;;                                                                 (code - lo) mod stride = 0
 ;;;; All tables are sorted by lo and cover code points >= 128 only; ASCII stays arithmetic.
+;;;;
+;;;; CONFORMANCE OVER SBCL, in one place.  SBCL 2.2.9 gives the four titlecase digraphs (U+01C5
+;;;; U+01C8 U+01CB U+01F2, e.g. "Dz" with a caron) BOTH-CASE-P without UPPER-CASE-P or
+;;;; LOWER-CASE-P, and case maps to two other characters (U+01C5 upcases to U+01C4 and downcases
+;;;; to U+01C6).  CLHS 13.1.4.3 makes case a one-to-one pairing and CHAR-UPCASE change only
+;;;; lower-case characters, so ansi-test's BOTH-CASE-P.2, CHAR-UPCASE.2 and CHAR-DOWNCASE.2 fail
+;;;; on SBCL there.  Any character whose SBCL answers break those rules (VIOLATES-CASE-RULES)
+;;;; is made CASELESS here: not upper, lower or both-case, and its own upcase and downcase.  It
+;;;; stays ALPHA-CHAR-P.  test/unicode-case.lisp applies the same rule to SBCL's answers.
 
 (defconstant +bias+ #x110000)
+
+(defun violates-case-rules (ch)
+  "True when SBCL's case answers for CH break CLHS 13.1.4.3 (see the header)."
+  (let ((u (char-upcase ch)) (d (char-downcase ch)))
+    (or (and (char/= u ch) (not (lower-case-p ch)))
+        (and (char/= d ch) (not (upper-case-p ch)))
+        (not (eq (not (both-case-p ch)) (not (or (upper-case-p ch) (lower-case-p ch)))))
+        (char/= u (char-upcase u)) (char/= d (char-downcase d))
+        (and (upper-case-p ch) (or (char= d ch) (char/= (char-upcase d) ch)))
+        (and (lower-case-p ch) (or (char= u ch) (char/= (char-downcase u) ch))))))
+(defvar *caseless* (loop for c below char-code-limit for ch = (code-char c)
+                         when (and ch (violates-case-rules ch)) collect c))
+(defun cased (pred) (lambda (ch) (and (not (member (char-code ch) *caseless*)) (funcall pred ch))))
+(defun case-map (f) (lambda (ch) (if (member (char-code ch) *caseless*) ch (funcall f ch))))
+(format t "~&gen-unicode-case: made caseless (CLHS 13.1.4.3): ~{U+~4,'0x~^ ~}~%" *caseless*)
 
 (defun ranges (pred)
   (let ((r '()) (lo nil))
@@ -106,12 +130,25 @@
              always (loop for c from lo to hi always (= (digit-char-p (code-char c)) (- c lo)))))
 (check "CHAR-EQUAL is equality of CHAR-DOWNCASE of CHAR-UPCASE, against each code's own case maps"
        (loop for c from 128 below char-code-limit for ch = (code-char c)
-             always (or (null ch)
+             always (or (null ch) (member c *caseless*)
                         (let ((key (char-downcase (char-upcase ch))))
                           (loop for o in (list (char-upcase ch) (char-downcase ch) key
                                                (char-upcase key) (char-downcase key))
                                 always (eq (not (char-equal ch o))
                                            (not (char= key (char-downcase (char-upcase o))))))))))
+
+;;; ---- what is written obeys CLHS 13.1.4.3 everywhere ------------------------
+(check "after the caseless rule, every character's case answers obey CLHS 13.1.4.3"
+       (let ((up (cased #'upper-case-p)) (lo (cased #'lower-case-p)) (bo (cased #'both-case-p))
+             (cu (case-map #'char-upcase)) (cd (case-map #'char-downcase)))
+         (loop for c below char-code-limit for ch = (code-char c)
+               always (or (null ch)
+                          (let ((u (funcall cu ch)) (d (funcall cd ch)))
+                            (and (or (char= u ch) (funcall lo ch)) (or (char= d ch) (funcall up ch))
+                                 (eq (not (funcall bo ch)) (not (or (funcall up ch) (funcall lo ch))))
+                                 (char= u (funcall cu u)) (char= d (funcall cd d))
+                                 (or (not (funcall up ch)) (and (char/= d ch) (char= (funcall cu d) ch)))
+                                 (or (not (funcall lo ch)) (and (char/= u ch) (char= (funcall cd u) ch)))))))))
 
 ;;; ---- write the block -------------------------------------------------------
 (defvar *begin* ";;; BEGIN GENERATED UNICODE TABLES")
@@ -131,12 +168,12 @@
                    *begin* (lisp-implementation-type) (lisp-implementation-version))
            (format o ";;; Code points >= 128 only (ASCII is arithmetic in %CODE-UPCASE and friends).~%")
            (dolist (spec `(("%UC-ALPHA-TABLE" "ALPHA-CHAR-P ranges: lo hi ..." ,(ranges #'alpha-char-p))
-                           ("%UC-UPPER-TABLE" "UPPER-CASE-P ranges: lo hi ..." ,(ranges #'upper-case-p))
-                           ("%UC-LOWER-TABLE" "LOWER-CASE-P ranges: lo hi ..." ,(ranges #'lower-case-p))
-                           ("%UC-BOTH-TABLE" "BOTH-CASE-P ranges: lo hi ..." ,(ranges #'both-case-p))
+                           ("%UC-UPPER-TABLE" "UPPER-CASE-P ranges: lo hi ..." ,(ranges (cased #'upper-case-p)))
+                           ("%UC-LOWER-TABLE" "LOWER-CASE-P ranges: lo hi ..." ,(ranges (cased #'lower-case-p)))
+                           ("%UC-BOTH-TABLE" "BOTH-CASE-P ranges: lo hi ..." ,(ranges (cased #'both-case-p)))
                            ("%UC-DIGIT-TABLE" "decimal digit ranges, value (- code lo): lo hi ..." ,*digits*)
-                           ("%UC-UPCASE-TABLE" "CHAR-UPCASE runs: lo hi delta+#x110000 stride ..." ,(runs #'char-upcase))
-                           ("%UC-DOWNCASE-TABLE" "CHAR-DOWNCASE runs: lo hi delta+#x110000 stride ..." ,(runs #'char-downcase))))
+                           ("%UC-UPCASE-TABLE" "CHAR-UPCASE runs: lo hi delta+#x110000 stride ..." ,(runs (case-map #'char-upcase)))
+                           ("%UC-DOWNCASE-TABLE" "CHAR-DOWNCASE runs: lo hi delta+#x110000 stride ..." ,(runs (case-map #'char-downcase)))))
              (destructuring-bind (name doc rows) spec
                (format o "~a" (table-defun name (format nil "~a (~d rows)" doc (length rows)) rows))))
            (format o "~a" *end*))))

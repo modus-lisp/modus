@@ -4625,9 +4625,189 @@
   (let ((*compile-safety* level))
     (declare (special *compile-safety*))
     (%mvm-compile-function-internal-2 name params body parent-env rest-slot opt-start opt-count)))
+;;; ---- SELF TAIL CALLS AS LOOPS ----------------------------------------------
+;;; The compiler emits no TAILCALL, so a function calling itself in tail position
+;;; grew the stack per call: (defun f (n) (if (= n 0) :done (f (1- n)))) died at a
+;;; few hundred thousand calls on every target (x64 silently; the web with
+;;; STACK-EXHAUSTED), and so did a LABELS loop (cl-bench WALK-LIST/MESS's 2M-deep
+;;; MERGE-LOOP).  A DEFUN or LABELS function whose parameters are all required
+;;; and lexical, and which calls itself in tail position with exactly that many
+;;; arguments, is compiled as
+;;;
+;;;   (let ((#:a a) (#:b b))                      ; the loop's state
+;;;     (block #:self
+;;;       (tagbody #:top
+;;;         (return-from #:self
+;;;           (let ((a #:a) (b #:b)) DECLS BODY')))))
+;;;
+;;; with each such call in BODY' replaced by (progn (psetq #:a e1 #:b e2) (go #:top)).
+;;; The parameters are rebound per iteration, so a closure made in one
+;;; iteration keeps that iteration's bindings.  Pure IR -- a branch -- so every
+;;; target, the interpreter and the JIT get it alike.
+;;;
+;;; TAIL POSITION is followed only through PROGN, IF, LOCALLY, THE, %%FLET-SELF,
+;;; and LET / LET* that bind nothing special, and through macros that expand to
+;;; those (COND, WHEN, UNLESS, AND, OR, CASE ...).  Not through a dynamic binding,
+;;; HANDLER-CASE, UNWIND-PROTECT, CATCH, BLOCK, a lambda or a local function: a
+;;; call there is not a tail call.  A rewritten form keeps the expansion it was
+;;; found in; every other form is left as written.  CLHS 3.2.2.3 lets a function
+;;; assume its own name refers to itself, so a redefinition, like TRACE, does not
+;;; see the calls that became the loop.
+(defvar *self-tail-loops* t "NIL: compile self tail calls as calls (bisecting).")
+
+(defun %stl-op-p (op name) (and (symbolp op) (not (%shadows-cl-p op)) (name-eq op name)))
+
+(defun %stl-body-split (body)
+  "(DOCSTRING-AND-DECLS . FORMS) of BODY."
+  (let ((head nil) (rest body))
+    (loop
+      (cond ((and (consp rest) (consp (car rest)) (%stl-op-p (car (car rest)) "DECLARE"))
+             (push (car rest) head) (setq rest (cdr rest)))
+            ((and (consp rest) (stringp (car rest)) (consp (cdr rest)))
+             (push (car rest) head) (setq rest (cdr rest)))
+            (t (return))))
+    (cons (nreverse head) rest)))
+
+(defun %stl-walk-last (forms name gvars top)
+  "FORMS with its last form walked; the same list when nothing changed."
+  (if (atom forms)
+      forms
+      (let* ((lastf (car (last forms)))
+             (new (%stl-walk lastf name gvars top)))
+        (if (eq new lastf)
+            forms
+            (append (butlast forms) (list new))))))
+
+(defun %stl-walk (form name gvars top)
+  "FORM with NAME's self calls in tail position turned into jumps to TOP; FORM
+   itself (EQ) when it holds none."
+  (cond
+    ((atom form) form)
+    ((eq (car form) name)
+     (if (and (listp (cdr form)) (null (cdr (last form)))
+              (eql (length (cdr form)) (length gvars)))
+         (let ((sets nil) (g gvars) (a (cdr form)))
+           (loop (when (null g) (return))
+                 (setq sets (append sets (list (car g) (car a))))
+                 (setq g (cdr g) a (cdr a)))
+           (list 'progn (cons 'psetq sets) (list 'go top)))
+         form))
+    ((not (symbolp (car form))) form)
+    (t
+     (let ((op (car form)))
+       (cond
+         ((or (%stl-op-p op "PROGN") (%stl-op-p op "%%FLET-SELF") (%stl-op-p op "LOCALLY"))
+          (let* ((pre (if (%stl-op-p op "%%FLET-SELF") 2 1))
+                 (head (subseq form 0 (min pre (length form))))
+                 (forms (nthcdr pre form))
+                 (new (%stl-walk-last forms name gvars top)))
+            (if (eq new forms) form (append head new))))
+         ((%stl-op-p op "IF")
+          (if (not (and (consp (cdr form)) (consp (cddr form)) (listp (cdddr form))))
+              form
+              (let* ((then (third form)) (else (fourth form))
+                     (nthen (%stl-walk then name gvars top))
+                     (nelse (if (cdddr form) (%stl-walk else name gvars top) else)))
+                (if (and (eq nthen then) (eq nelse else))
+                    form
+                    (list 'if (second form) nthen nelse)))))
+         ((%stl-op-p op "THE")
+          (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+              (let ((new (%stl-walk (third form) name gvars top)))
+                (if (eq new (third form)) form (list 'the (second form) new)))
+              form))
+         ((or (%stl-op-p op "LET") (%stl-op-p op "LET*"))
+          (if (not (and (consp (cdr form)) (listp (second form))))
+              form
+              (let* ((body (cddr form))
+                     (split (%stl-body-split body))
+                     (forms (cdr split)))
+                (if (or (null forms)
+                        (some (lambda (b)
+                                (let ((v (if (consp b) (car b) b)))
+                                  (or (not (symbolp v)) (%param-special-p v body))))
+                              (second form)))
+                    form
+                    (let ((new (%stl-walk-last forms name gvars top)))
+                      (if (eq new forms)
+                          form
+                          (append (list op (second form)) (car split) new)))))))
+         ;; any other operator: a macro is looked through, anything else stops
+         (t (let ((r (%quiet-macroexpand-1 form)))
+              (if (and r (cdr r) (not (equal (car r) form)))
+                  (let ((new (%stl-walk (car r) name gvars top)))
+                    (if (eq new (car r)) form new))
+                  form))))))))
+
+(defun %stl-calls-name-p (tree name)
+  "True when TREE holds a form (NAME ...) anywhere -- the cheap test that keeps
+   the rest of %SELF-TAIL-LOOP-BODY (macroexpansion) off every function that
+   never names itself: run on each runtime compile, it made a short benchmark
+   whose hot functions are built during its runs (DDERIV) 40% slower."
+  (let ((stack (list tree)) (budget 20000))
+    (loop
+      (when (or (null stack) (<= budget 0)) (return (<= budget 0)))
+      (let ((x (car stack)))
+        (setq stack (cdr stack) budget (- budget 1))
+        (when (consp x)
+          (when (eq (car x) name) (return t))
+          (setq stack (cons (car x) stack))
+          (when (consp (cdr x)) (setq stack (cons (cdr x) stack))))))))
+
+(defun %stl-real-call-p (name nparams)
+  "True when (NAME ARGS...) compiles as a CALL to the function NAME.  Not when
+   the compiler compiles that form itself (COMPILE-COMPOUND's dispatch: CAR, EQ,
+   CHAR-CODE ... -- whose image DEFUNs are wrappers round the primitive, so
+   CHAR-CODE's `(char-code c)' is the instruction, and looping on it hung boot),
+   when it is a macro to the compiler (LOGNOT), or when COMPILE-CALL rewrites it."
+  (and (not (%compound-dispatch-op-p (normalize-name name)))
+       (not (%vil-op-p name))
+       (not (member (symbol-name name) '("REPLACE" "FILL" "FBOUNDP" "NAME-EQ" "%SIGNAL-TYPE-ERROR")
+                    :test #'string=))
+       (let ((r (%quiet-macroexpand-1 (cons name (make-list nparams)))))
+         (not (and r (cdr r))))))
+
+(defun %self-tail-loop-body (name params body)
+  "BODY of function NAME (PARAMS) with its self tail calls as a loop, or BODY."
+  (if (not (and *self-tail-loops* name (symbolp name) (consp body)
+                (%stl-calls-name-p body name)
+                (listp params) (consp params) (null (cdr (last params)))
+                (every (lambda (p)
+                         (and p (symbolp p) (not (eq p t))
+                              (let ((n (symbol-name p)))
+                                (not (and (> (length n) 0) (char= (char n 0) #\&))))
+                              (not (%param-special-p p body))))
+                       params)
+                (%stl-real-call-p name (length params))))
+      body
+      (let* ((split (%stl-body-split body))
+             (forms (cdr split))
+             (gvars (mapcar (lambda (p) (%mvm-gensym (symbol-name p))) params))
+             (top (%mvm-gensym "STL-TOP"))
+             (blk (%mvm-gensym "STL-SELF"))
+             (new (handler-case (%stl-walk-last forms name gvars top)
+                    (t (c) (progn c forms)))))
+        (if (eq new forms)
+            body
+            (let ((docs (remove-if-not #'stringp (car split)))
+                  (decls (remove-if #'stringp (car split))))
+              (append docs
+                      ;; OPTIMIZE stays at the head too: %BODY-SAFETY reads it there
+                      (remove-if-not (lambda (d) (some (lambda (x) (and (consp x) (%stl-op-p (car x) "OPTIMIZE")))
+                                                       (cdr d)))
+                                     decls)
+                      (list (list 'let (mapcar #'list gvars params)
+                                  (list 'block blk
+                                        (list 'tagbody top
+                                              (list 'return-from blk
+                                                    (append (list 'let (mapcar #'list params gvars))
+                                                            decls new))))))))))))
+
 (defun mvm-compile-function-internal-1 (name params body &optional parent-env rest-slot opt-start opt-count)
   "Compile a single function into IR (%MVM-COMPILE-FUNCTION-INTERNAL-2), at
    the SAFETY level its body declares, if any."
+  (when (and (null rest-slot) (null opt-start))
+    (setq body (%self-tail-loop-body name params body)))
   (let ((level (%body-safety body)))
     (if level
         (%mvm-compile-function-at-safety level name params body parent-env rest-slot opt-start opt-count)
@@ -18549,6 +18729,16 @@
   ;; vars) via the normal compile-lambda closure path; intra-FLET
   ;; mutual recursion still works because the cell pointer is constant
   ;; while its car is mutated.
+  ;; LABELS: a local function's self tail calls as a loop (%SELF-TAIL-LOOP-BODY),
+  ;; before the capture transform below rewrites its calls into FUNCALLs.  Not
+  ;; FLET: there the name in the body is the OUTER function.
+  (when (and labels-p (consp defs))
+    (setq defs (mapcar (lambda (d)
+                         (if (and (consp d) (symbolp (car d)) (consp (cdr d)) (listp (cadr d)))
+                             (let ((nb (%self-tail-loop-body (car d) (cadr d) (cddr d))))
+                               (if (eq nb (cddr d)) d (cons (car d) (cons (cadr d) nb))))
+                             d))
+                       defs)))
   (when (consp defs)
     (setq defs (mapcar #'%flet-def-mark-self defs)))
   (when (and (consp defs)
@@ -23024,7 +23214,12 @@
           ;; arms 0.06 us.
           ((or (= hash #.(compute-name-hash "QUOTE")) (= hash #.(compute-name-hash "FUNCTION"))
               (= hash #.(compute-name-hash "SETQ")) (= hash #.(compute-name-hash "PSETQ"))
-              (= hash #.(compute-name-hash "TAGBODY")) (= hash #.(compute-name-hash "LAMBDA")))
+              (= hash #.(compute-name-hash "TAGBODY")) (= hash #.(compute-name-hash "LAMBDA"))
+              ;; GO never returns, so it adds no values: a self tail call made a
+              ;; loop (%SELF-TAIL-LOOP-BODY) ends its branch in one, and read as
+              ;; "possibly multi-valued" it stopped the epilogue's clamp, so a
+              ;; :TEST's second value leaked out of TREE-EQUAL (TREE-EQUAL.6)
+              (= hash #.(compute-name-hash "GO")))
            nil)
           ;; RETURN-FROM / RETURN carry their VALUE form's values.  As a named
           ;; operator they read "possibly multi-valued", so a body like

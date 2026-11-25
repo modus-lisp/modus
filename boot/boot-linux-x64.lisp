@@ -526,90 +526,100 @@
 (defun %x64-stub-le32 (v) (loop for i below 4 collect (ldb (byte 8 (* 8 i)) v)))
 (defun %x64-stub-le64 (v) (loop for i below 8 collect (ldb (byte 8 (* 8 i)) v)))
 
+(defun x64-choose-heap-items (find more default-midpoint)
+  "The heap chooser's instructions, around FIND: code that leaves RDX = 0 and either
+   jumps to :DONE (no --dynamic-space-size) or falls through with RSI at the size's
+   first character.  MORE goes after the parser, out of its path (FIND's loop, if it
+   has one).  Then: N in MB, or with a KB / MB / GB suffix, as SBCL takes it, sets the
+   semispaces to N/2, rounded down to 1 MB and kept within +LINUX-X64-MIN/MAX-
+   MIDPOINT+; with none, DEFAULT-MIDPOINT.  Stores the midpoint, data size and
+   cons-kind delta (X64-HEAP-LAYOUT's arithmetic) in their words and leaves the
+   mapping's size in R12.  Clobbers RAX RCX RDX RSI RDI R8-R12."
+  `(,@find
+    (#x45 #x31 #xC0)                            ; xor r8d, r8d
+    (:label :digits)
+    (#x0F #xB6 #x06)                            ; movzx eax, byte [rsi]
+    (#x48 #xFF #xC6)                            ; inc rsi
+    (#x8D #x78 #xD0)                            ; lea edi, [rax-48]
+    (#x83 #xFF #x09)                            ; cmp edi, 9
+    (:jcc #x7 :suffix)                          ; ja
+    (#x4D #x6B #xC0 #x0A)                       ; imul r8, r8, 10
+    (#x49 #x01 #xF8)                            ; add r8, rdi
+    (#x49 #x81 #xF8 ,@(%x64-stub-le32 #x100000))         ; cmp r8, 2^20 units
+    (:jcc #x6 :digits)                          ; jbe
+    (#x41 #xB8 ,@(%x64-stub-le32 #x100000))              ; mov r8d, 2^20 (saturate)
+    (:jmp :digits)
+    (:label :suffix)
+    (#x25 #xDF 0 0 0)                           ; and eax, 0xDF  (upper case)
+    (#x83 #xF8 #x4B) (:jcc #x5 :not-k)          ; cmp eax, 'K'
+    (#x49 #xC1 #xE0 10) (:jmp :have)            ; shl r8, 10
+    (:label :not-k)
+    (#x83 #xF8 #x47) (:jcc #x5 :mb)             ; cmp eax, 'G'
+    (#x49 #xC1 #xE0 30) (:jmp :have)            ; shl r8, 30
+    (:label :mb)
+    (#x49 #xC1 #xE0 20)                         ; shl r8, 20   (MB, the default unit)
+    (:label :have)
+    (#x4C #x89 #xC2)                            ; mov rdx, r8
+    (:jmp :done)
+    ,@more
+    (:label :done)
+    (#x48 #x85 #xD2) (:jcc #x5 :sized)          ; test rdx, rdx ; jnz
+    (#x48 #xBA ,@(%x64-stub-le64 default-midpoint)) ; movabs rdx, default midpoint
+    (:jmp :mid)
+    (:label :sized)
+    (#x48 #xD1 #xEA)                            ; shr rdx, 1   (two semispaces)
+    (#x48 #xB8 ,@(%x64-stub-le64 +linux-x64-min-midpoint+))
+    (#x48 #x39 #xC2) (:jcc #x3 :ge-min)         ; cmp rdx, rax ; jae
+    (#x48 #x89 #xC2)                            ; mov rdx, rax
+    (:label :ge-min)
+    (#x48 #xB8 ,@(%x64-stub-le64 +linux-x64-max-midpoint+))
+    (#x48 #x39 #xC2) (:jcc #x6 :le-max)         ; cmp rdx, rax ; jbe
+    (#x48 #x89 #xC2)                            ; mov rdx, rax
+    (:label :le-max)
+    (#x48 #x81 #xE2 ,@(%x64-stub-le32 #xFFF00000))       ; and rdx, -1 MB
+    (:label :mid)
+    ;; X64-HEAP-LAYOUT, instruction for instruction
+    (#x48 #x89 #x14 #x25 ,@(%x64-stub-le32 #x10000F88))  ; mov [midpoint], rdx
+    (#x48 #x8D #x3C #x12)                       ; lea rdi, [rdx+rdx]
+    (#x48 #x81 #xC7 ,@(%x64-stub-le32 +linux-x64-gc-guard+)) ; add rdi, guard    = data
+    (#x48 #x89 #x3C #x25 ,@(%x64-stub-le32 #x10000F90))  ; mov [data size], rdi
+    (#x49 #x89 #xF8) (#x49 #xC1 #xE8 12)        ; r8 = data >> 12   = pages
+    (#x4E #x8D #x4C #x07 #x3F)                  ; lea r9, [rdi+r8+63]
+    (#x49 #x83 #xE1 #xC0)                       ; and r9, -64       = bitmap offset
+    (#x49 #x89 #xFA) (#x49 #xC1 #xEA 7)         ; r10 = data >> 7   = bitmap bytes
+    (#x4F #x8D #x5C #x11 #x3F)                  ; lea r11, [r9+r10+63]
+    (#x49 #x83 #xE3 #xC0)                       ; and r11, -64      = free list
+    (#x4B #x8D #x44 #x83 #x3F)                  ; lea rax, [r11+r8*4+63]
+    (#x48 #x83 #xE0 #xC0)                       ; and rax, -64      = kind bitmap
+    (#x48 #x89 #xC1) (#x4C #x29 #xC9)           ; rcx = rax - r9
+    (#x48 #x89 #x0C #x25 ,@(%x64-stub-le32 #x10000F98))  ; mov [kind delta], rcx
+    (#x4E #x8D #xA4 #x10 ,@(%x64-stub-le32 #xFFF))       ; lea r12, [rax+r10+0xFFF]
+    (#x49 #x81 #xE4 ,@(%x64-stub-le32 #xFFFFF000))))   ; and r12, -4096   = map size
+
 (defun emit-linux-x64-choose-heap (buf)
-  "Choose the heap's size and lay it out, before it is mapped.  RSP is the
-   kernel's argv block; RBX argc; RBX, R13-R15 are preserved.  The first
-   --dynamic-space-size N (N in MB, or with a KB / MB / GB suffix, as SBCL takes
-   it) sets the semispaces to N/2, rounded down to 1 MB and kept within
-   +LINUX-X64-MIN/MAX-MIDPOINT+; with none, +LINUX-X64-GC-MIDPOINT+.  Stores the
-   midpoint, data size and cons-kind delta (X64-HEAP-LAYOUT's arithmetic) in
-   their words and leaves the mapping's size in R12."
+  "Choose the heap's size and lay it out, before it is mapped (X64-CHOOSE-HEAP-ITEMS):
+   the first argv word that is --dynamic-space-size, followed by the size.  RSP is the
+   kernel's argv block; RBX argc; RBX, R13-R15 are preserved."
   (let ((flag "--dynamic-space-size"))
     (dolist (b (x64-stub-assemble
-                `((#x31 #xD2)                                 ; xor edx, edx   (no size yet)
-                  (#xB9 1 0 0 0)                              ; mov ecx, 1
-                  (:label :top)
-                  (#x48 #x39 #xD9)                            ; cmp rcx, rbx
-                  (:jcc #xD :done)                            ; jge
-                  (#x48 #x8B #x74 #xCC #x08)                  ; mov rsi, [rsp+rcx*8+8]
-                  ,@(loop for c across flag for k from 0
-                          append `((#x80 #x7E ,k ,(char-code c)) (:jcc #x5 :next)))
-                  (#x80 #x7E ,(length flag) 0) (:jcc #x5 :next)
-                  (#x48 #x8D #x41 #x01)                       ; lea rax, [rcx+1]
-                  (#x48 #x39 #xD8)                            ; cmp rax, rbx
-                  (:jcc #xD :done)
-                  (#x48 #x8B #x74 #xC4 #x08)                  ; mov rsi, [rsp+rax*8+8]
-                  (#x45 #x31 #xC0)                            ; xor r8d, r8d
-                  (:label :digits)
-                  (#x0F #xB6 #x06)                            ; movzx eax, byte [rsi]
-                  (#x48 #xFF #xC6)                            ; inc rsi
-                  (#x8D #x78 #xD0)                            ; lea edi, [rax-48]
-                  (#x83 #xFF #x09)                            ; cmp edi, 9
-                  (:jcc #x7 :suffix)                          ; ja
-                  (#x4D #x6B #xC0 #x0A)                       ; imul r8, r8, 10
-                  (#x49 #x01 #xF8)                            ; add r8, rdi
-                  (#x49 #x81 #xF8 ,@(%x64-stub-le32 #x100000))         ; cmp r8, 2^20 units
-                  (:jcc #x6 :digits)                          ; jbe
-                  (#x41 #xB8 ,@(%x64-stub-le32 #x100000))              ; mov r8d, 2^20 (saturate)
-                  (:jmp :digits)
-                  (:label :suffix)
-                  (#x25 #xDF 0 0 0)                           ; and eax, 0xDF  (upper case)
-                  (#x83 #xF8 #x4B) (:jcc #x5 :not-k)          ; cmp eax, 'K'
-                  (#x49 #xC1 #xE0 10) (:jmp :have)            ; shl r8, 10
-                  (:label :not-k)
-                  (#x83 #xF8 #x47) (:jcc #x5 :mb)             ; cmp eax, 'G'
-                  (#x49 #xC1 #xE0 30) (:jmp :have)            ; shl r8, 30
-                  (:label :mb)
-                  (#x49 #xC1 #xE0 20)                         ; shl r8, 20   (MB, the default unit)
-                  (:label :have)
-                  (#x4C #x89 #xC2)                            ; mov rdx, r8
-                  (:jmp :done)
-                  (:label :next)
-                  (#x48 #xFF #xC1)                            ; inc rcx
-                  (:jmp :top)
-                  (:label :done)
-                  (#x48 #x85 #xD2) (:jcc #x5 :sized)          ; test rdx, rdx ; jnz
-                  (#x48 #xBA ,@(%x64-stub-le64 +linux-x64-gc-midpoint+)) ; movabs rdx, default midpoint
-                  (:jmp :mid)
-                  (:label :sized)
-                  (#x48 #xD1 #xEA)                            ; shr rdx, 1   (two semispaces)
-                  (#x48 #xB8 ,@(%x64-stub-le64 +linux-x64-min-midpoint+))
-                  (#x48 #x39 #xC2) (:jcc #x3 :ge-min)         ; cmp rdx, rax ; jae
-                  (#x48 #x89 #xC2)                            ; mov rdx, rax
-                  (:label :ge-min)
-                  (#x48 #xB8 ,@(%x64-stub-le64 +linux-x64-max-midpoint+))
-                  (#x48 #x39 #xC2) (:jcc #x6 :le-max)         ; cmp rdx, rax ; jbe
-                  (#x48 #x89 #xC2)                            ; mov rdx, rax
-                  (:label :le-max)
-                  (#x48 #x81 #xE2 ,@(%x64-stub-le32 #xFFF00000))       ; and rdx, -1 MB
-                  (:label :mid)
-                  ;; X64-HEAP-LAYOUT, instruction for instruction
-                  (#x48 #x89 #x14 #x25 ,@(%x64-stub-le32 #x10000F88))  ; mov [midpoint], rdx
-                  (#x48 #x8D #x3C #x12)                       ; lea rdi, [rdx+rdx]
-                  (#x48 #x81 #xC7 ,@(%x64-stub-le32 +linux-x64-gc-guard+)) ; add rdi, guard    = data
-                  (#x48 #x89 #x3C #x25 ,@(%x64-stub-le32 #x10000F90))  ; mov [data size], rdi
-                  (#x49 #x89 #xF8) (#x49 #xC1 #xE8 12)        ; r8 = data >> 12   = pages
-                  (#x4E #x8D #x4C #x07 #x3F)                  ; lea r9, [rdi+r8+63]
-                  (#x49 #x83 #xE1 #xC0)                       ; and r9, -64       = bitmap offset
-                  (#x49 #x89 #xFA) (#x49 #xC1 #xEA 7)         ; r10 = data >> 7   = bitmap bytes
-                  (#x4F #x8D #x5C #x11 #x3F)                  ; lea r11, [r9+r10+63]
-                  (#x49 #x83 #xE3 #xC0)                       ; and r11, -64      = free list
-                  (#x4B #x8D #x44 #x83 #x3F)                  ; lea rax, [r11+r8*4+63]
-                  (#x48 #x83 #xE0 #xC0)                       ; and rax, -64      = kind bitmap
-                  (#x48 #x89 #xC1) (#x4C #x29 #xC9)           ; rcx = rax - r9
-                  (#x48 #x89 #x0C #x25 ,@(%x64-stub-le32 #x10000F98))  ; mov [kind delta], rcx
-                  (#x4E #x8D #xA4 #x10 ,@(%x64-stub-le32 #xFFF))       ; lea r12, [rax+r10+0xFFF]
-                  (#x49 #x81 #xE4 ,@(%x64-stub-le32 #xFFFFF000)))))   ; and r12, -4096   = map size
+                (x64-choose-heap-items
+                 `((#x31 #xD2)                                 ; xor edx, edx   (no size yet)
+                   (#xB9 1 0 0 0)                              ; mov ecx, 1
+                   (:label :top)
+                   (#x48 #x39 #xD9)                            ; cmp rcx, rbx
+                   (:jcc #xD :done)                            ; jge
+                   (#x48 #x8B #x74 #xCC #x08)                  ; mov rsi, [rsp+rcx*8+8]
+                   ,@(loop for c across flag for k from 0
+                           append `((#x80 #x7E ,k ,(char-code c)) (:jcc #x5 :next)))
+                   (#x80 #x7E ,(length flag) 0) (:jcc #x5 :next)
+                   (#x48 #x8D #x41 #x01)                       ; lea rax, [rcx+1]
+                   (#x48 #x39 #xD8)                            ; cmp rax, rbx
+                   (:jcc #xD :done)
+                   (#x48 #x8B #x74 #xC4 #x08))                 ; mov rsi, [rsp+rax*8+8]
+                 `((:label :next)
+                   (#x48 #xFF #xC1)                            ; inc rcx
+                   (:jmp :top))
+                 +linux-x64-gc-midpoint+)))
       (emit-bytes buf b))))
 
 ;;; A heap-geometry value that does not fit a sign-extended imm32 (a MODUS_X64_MIDPOINT

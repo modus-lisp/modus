@@ -31209,6 +31209,27 @@
             d)
            (t nil)))))
 
+(defun %make-array-fill-kwargs (kwargs)
+  "(X) when KWARGS is exactly :INITIAL-ELEMENT X, optionally with an :ELEMENT-TYPE the inline 1-D
+   path accepts, each once, on a JIT target; else NIL."
+  (and (boundp (quote *jit-target-arch*))
+       (let ((a (symbol-value (quote *jit-target-arch*))))
+         (or (eq a :x64) (eq a :aarch64)))
+       (let ((ie nil) (seen-ie nil) (seen-et nil) (ok t) (k kwargs))
+         (loop
+           (when (or (not ok) (null k)) (return))
+           (if (not (and (consp k) (consp (cdr k))))
+               (setq ok nil)
+               (progn
+                 (cond ((and (eq (car k) :initial-element) (not seen-ie))
+                        (setq seen-ie t ie (cadr k)))
+                       ((and (eq (car k) :element-type) (not seen-et)
+                             (%inline-generic-element-type-p (cadr k)))
+                        (setq seen-et t))
+                       (t (setq ok nil)))
+                 (setq k (cddr k)))))
+         (and ok seen-ie (list ie)))))
+
 (defun %make-array-zero-kwargs-p (kwargs)
   "KWARGS is exactly :INITIAL-ELEMENT 0, optionally with an :ELEMENT-TYPE the
    inline 1-D path already accepts (%INLINE-GENERIC-ELEMENT-TYPE-P), each at
@@ -31294,6 +31315,29 @@
             (%cg-on-p (quote *cg-make-array-zero*))
             (%make-array-zero-kwargs-p kwargs))
        (compile-make-array-1d dim-form env dest))
+      ;; ANY OTHER :INITIAL-ELEMENT of a word vector: the inline array, then the fill.  The runtime
+      ;; call parsed the keywords and expanded the type through the DEFTYPE table per call -- 72 ns for
+      ;; (make-array 4 :initial-element 1) where SBCL takes 7; mill's stride vectors are this.  A
+      ;; dimension that is a non-negative fixnum when it runs; anything else (a list of dimensions, an
+      ;; error to signal) calls MAKE-ARRAY as before -- through FUNCALL of the name, so this rule does not
+      ;; see its own fallback.  Arguments are evaluated once, in order (the element type is a constant).
+      ((and (not multi) *mvm-eval-runtime-p*
+            (%cg-on-p (quote *cg-make-array-zero*))
+            (%make-array-fill-kwargs kwargs))
+       (let* ((gd (%mvm-gensym "MAD")) (gx (%mvm-gensym "MAX")) (gv (%mvm-gensym "MAV")) (gi (%mvm-gensym "MAI"))
+              (slow-kwargs (let ((acc nil) (k kwargs))
+                             (loop (when (null k) (return (reverse acc)))
+                               (setq acc (cons (if (eq (car k) :initial-element) gx (cadr k))
+                                               (cons (car k) acc)))
+                               (setq k (cddr k))))))
+         (compile-form
+          (list 'let* (list (list gd dim-form) (list gx (car (%make-array-fill-kwargs kwargs))))
+                (list 'if (list 'and (list 'fixnump gd) (list '>= gd 0))
+                      (list 'let (list (list gv (list 'make-array gd)))
+                            (list 'dotimes (list gi (list 'length gv)) (list 'setf (list 'svref gv gi) gx))
+                            gv)
+                      (cons 'funcall (cons (list 'quote 'make-array) (cons gd slow-kwargs)))))
+          env dest)))
       ((or multi kwargs)
        (compile-call 'make-array (cons dim-form kwargs) env dest))
       ;; Plain dim, no kwargs — emit the fast inline path.
@@ -33116,11 +33160,14 @@
                (symbolp arr-form) (%leaf-operand-p arr-form env)
                (or (integerp idx-form) (and (symbolp idx-form) (%leaf-operand-p idx-form env)))
                (%fp-tree-fits-p (caddr val-form) env) (%fp-tree-fits-p (cadddr val-form) env))
-      (return-from compile-aset-1
-        (compile-form (list 'if (cadr val-form)
-                            (list 'setf (list 'aref arr-form idx-form) (caddr val-form))
-                            (list 'setf (list 'aref arr-form idx-form) (cadddr val-form)))
-                      env dest)))
+      (let ((split (list 'if (cadr val-form)
+                         (list 'setf (list 'aref arr-form idx-form) (caddr val-form))
+                         (list 'setf (list 'aref arr-form idx-form) (cadddr val-form)))))
+        ;; a discarded store's arms are discarded too: no box of the stored float
+        (return-from compile-aset-1
+          (if unused
+              (compile-if-unused (cdr split) env dest)
+              (compile-form split env dest)))))
     (return-from compile-aset-1
       (compile-form (list '%f32-aset arr-form idx-form val-form) env dest)))
   ;; DECLARED (simple-array (unsigned-byte 32) …) in a packing build: the raw lane -- the

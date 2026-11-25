@@ -106,6 +106,25 @@
 (check "coerce float" (list (coerce 3 (opaque 'single-float)) (coerce 2.5 (opaque 'single-float)) (coerce 2.5 (opaque 'double-float))
                             (coerce 2.5d0 (opaque 'double-float)) (coerce 1/2 (opaque 'double-float)))
        '(3.0 2.5 2.5d0 2.5d0 0.5d0))
+;; MAKE-ARRAY with an :INITIAL-ELEMENT of a word vector: inline, then filled; a dimension that is not a
+;; non-negative fixnum still takes MAKE-ARRAY's own path
+(defun mk-fill (d x) (make-array d :initial-element x))
+(defun mk-fill-et (d) (make-array d :element-type 'fixnum :initial-element 1))
+(check "make-array fill" (list (coerce (mk-fill 3 'q) 'list) (coerce (mk-fill-et 4) 'list) (length (mk-fill 0 1))
+                               (array-dimensions (mk-fill '(2 3) 5)) (aref (mk-fill '(2 3) 5) 1 2)
+                               (handler-case (mk-fill -1 0) (error () :err)))
+       '((q q q) (1 1 1 1) 0 (2 3) 5 :err))
+;; a discarded (setf (aref f32 i) (if ...)) in a loop: both arms store, nothing else changes
+(defun pick-stmt (r a b c)
+  (let ((r (the (simple-array single-float (*)) r)) (a (the (simple-array single-float (*)) a))
+        (b (the (simple-array single-float (*)) b)) (n 0))
+    (dotimes (i (length r)) (setf (aref r i) (if (zerop (aref c i)) (aref b i) (aref a i))) (incf n))
+    (list n (coerce r 'list))))
+(check "pick-stmt" (pick-stmt (make-array 4 :element-type 'single-float)
+                              (make-array 4 :element-type 'single-float :initial-element 1.5)
+                              (make-array 4 :element-type 'single-float :initial-element -2.0)
+                              (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 0 0 1)))
+       '(4 (1.5 -2.0 -2.0 1.5)))
 (check "functionp numbers" (mapcar #'functionp (list 1.5 1.5d0 (expt 2 80) 1/3 #'car (lambda (x) x))) '(nil nil nil nil t t))
 
 (format t "~&TYPEP-INLINE-FLOATS ~A~%" (if (zerop *fails*) "PASS" "FAIL"))

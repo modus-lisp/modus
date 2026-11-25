@@ -1801,7 +1801,12 @@
           (#.+op-set-nargs+
            (multiple-value-bind (n npc) (%ifetch-byte bc pc)
              (setf (mvm-nargs state) n) (setf pc npc)))
-          (#.+op-call+
+          ;; TAILCALL is CALL without the frame record: an in-module callee
+          ;; jumps, and its RET returns to OUR caller; a runtime callee runs
+          ;; (as from CALL), then this function returns.  The compiler emits a
+          ;; TAILCALL only with nothing pushed (stack = this function's entry
+          ;; stack), so the jump leaves the state a fresh CALL would.
+          ((#.+op-call+ #.+op-tailcall+)
            ;; a runtime stub's target is not formed (a bignum on a 30-bit tower):
            ;; %MVM-RT-ENTRY reads its number from the bytes
            (multiple-value-bind (target npc)
@@ -1876,7 +1881,17 @@
                        ;; "PKG::SYM" or a bare name.
                        (error (quote undefined-function)
                               :name (%runtime-fn-name-symbol name)))
-                   (setf pc npc))
+                   (setf pc npc)
+                   (when (eql opcode +op-tailcall+)
+                     ;; ... and return, as +OP-RET+
+                     (if (mvm-call-stack state)
+                         (let ((frame (pop (mvm-call-stack state))))
+                           (setf pc (first frame))
+                           (setf (mvm-stack state) (second frame))
+                           (setf (svref regs +vreg-vfp+) (third frame))
+                           (when (fourth frame)
+                             (replace regs (fourth frame) :start1 +vreg-v4+)))
+                         (progn (setq %halted t) (setf (mvm-halted state) t)))))
                  ;; In-module call: push return frame, jump to the bytecode.
                  ;; SAVE VFP (the caller's frame array) in the frame: the
                  ;; callee's frame-enter overwrites VFP with a fresh array and
@@ -1894,9 +1909,12 @@
                    ;; restore them at RET so the interpreter is faithful to the
                    ;; ISA (found by the promotion probe: recursion clobbered the
                    ;; caller's promoted locals under MODUS_NO_JIT).
-                   (push (list npc (mvm-stack state) (svref regs +vreg-vfp+)
-                               (subseq regs +vreg-v4+ (+ +vreg-v13+ 1)))
-                         (mvm-call-stack state))
+                   ;; A TAILCALL pushes nothing: the callee's RET pops OUR
+                   ;; caller's record, which restores what that caller saved.
+                   (unless (eql opcode +op-tailcall+)
+                     (push (list npc (mvm-stack state) (svref regs +vreg-vfp+)
+                                 (subseq regs +vreg-v4+ (+ +vreg-v13+ 1)))
+                           (mvm-call-stack state)))
                    (setf pc (if (< target (length ftab)) (aref ftab target) target))))))
           (#.+op-obj-set+
            (multiple-value-bind (vobj npc) (%ifetch-reg bc pc)
@@ -2705,10 +2723,6 @@
                          (reg-set-nil regs vd)))
                    (setf (svref regs vd) target))
                (setf pc npc2))))
-          (#.+op-tailcall+
-           (multiple-value-bind (target npc) (%ifetch-u32 bc pc)
-             (declare (ignore npc))
-             (setf pc (if (< target (length ftab)) (aref ftab target) target))))
           ;; ADD/SUB: tag-preserving since (a<<1)+(b<<1) = (a+b)<<1
           (#.+op-add+
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)

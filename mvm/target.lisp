@@ -597,6 +597,14 @@
    running-on twin an image's own compiler folds, as +TARGET-BIG-ENDIAN+ is.
    An integer for the same reason.  docs/w32.md.")
 
+(defparameter +target-tail-calls+ 0
+  "1 when the compiler emits TAILCALL on the target (COMPILE-TARGET-TAIL-CALLS):
+   a call in tail position tears its frame down and jumps.  Only back ends
+   whose TAILCALL is exercised by test/tail-calls.lisp are listed in
+   MAKE-COMPILE-TARGET-FOR; every other target compiles a tail call as a CALL
+   and a RET, as all of them always did.  Folded like +TARGET-W32+, so an
+   image's own compiler does the same; an integer for the same reason.")
+
 (defparameter +target-big-endian+ 0
   "1 on a big-endian target, else 0: *TARGET-BIG-ENDIAN-P* as a FOLDED constant, for code that must know the
    target's byte order AFTER the image is built -- the in-image compiler.
@@ -805,6 +813,8 @@
        ;; W32 (docs/w32.md): the 32-bit ports whose translators implement every
        ;; W32 opcode.  ppc32 is not one (spec 5.3); no 64-bit target ever is (C1).
        :w32-capable (and (member (target-name target) '(:i386 :riscv32 :arm32 :armv7 :armv7-rpi :68k)) t)
+       ;; TAILCALL (+TARGET-TAIL-CALLS+): the back ends whose tail call is tested
+       :tail-calls (and (member (target-name target) '(:x86-64)) t)
        :mv-count-addr mvc :mv-values-addr mvv
        :tag-cons 1 :tag-function 3 :tag-object otag :tag-immediate 5
        :tag-forward 15 :t-value (+ page #x1000 otag) :nil-value (+ page 1)))))
@@ -895,6 +905,7 @@
     ;; BAKED code too, not just in code it compiles at runtime.
     (setf *target-has-fpd-p* (compile-target-has-fpd ct))
     (setf +target-w32+ (if (compile-target-w32-capable ct) 1 0))
+    (setf +target-tail-calls+ (if (compile-target-tail-calls ct) 1 0))
     (setf +mv-count-addr+  (compile-target-mv-count-addr ct)
           +mv-values-addr+ (compile-target-mv-values-addr ct))
     (set-target-fixnum-bits (compile-target-fixnum-bits ct))
@@ -1030,6 +1041,7 @@
      (defconstant +target-big-endian+ ~D)~%~
      (defconstant +target-soft-float+ ~D)~%~
      (defconstant +target-w32+ ~D)~%~
+     (defconstant +target-tail-calls+ ~D)~%~
      (defconstant +tag-cons+ ~D)~%(defconstant +tag-function+ ~D)~%~
      (defconstant +tag-object+ ~D)~%(defconstant +tag-immediate+ ~D)~%~
      (defconstant +tag-forward+ ~D)~%(defconstant +t-value+ ~D)~%~
@@ -1047,5 +1059,6 @@
     29 14 32767 16383
     (ct-mv-count-addr) (ct-mv-values-addr) (ct-target-big-endian) (ct-target-soft-float)
     (if (ct-w32-capable-p) 1 0)
+    (if (ct-tail-calls-p) 1 0)
     (ct-tag-cons) (ct-tag-function) (ct-tag-object) (ct-tag-immediate) (ct-tag-forward)
     (ct-t-value) (ct-nil-value)))

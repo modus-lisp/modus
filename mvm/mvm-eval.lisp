@@ -4631,7 +4631,7 @@
       ;; Pass 1.5: out-of-module CALL / LI-FUNC names → synthetic runtime stubs.
       (dolist (e all-ir)
         (dolist (insn (cdr e))
-          (let ((name (cond ((eq (car insn) :call) (cadr insn))
+          (let ((name (cond ((or (eq (car insn) :call) (eq (car insn) :tailcall)) (cadr insn))
                             ((eq (car insn) :li-func) (caddr insn))
                             (t nil))))
             (when (and name (stringp name) (not (gethash name *functions*)))
@@ -5476,7 +5476,7 @@
       (dolist (insn (cdr e))
         ;; The fn NAME is operand 1 for :call ((:call name nargs)) but operand 2
         ;; for :li-func ((:li-func dest name)) — pick the right slot per op.
-        (let ((name (cond ((eq (car insn) :call) (cadr insn))
+        (let ((name (cond ((or (eq (car insn) :call) (eq (car insn) :tailcall)) (cadr insn))
                           ((eq (car insn) :li-func) (caddr insn))
                           (t nil))))
           (when (and name (stringp name) (not (gethash name *functions*)))

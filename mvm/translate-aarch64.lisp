@@ -1114,7 +1114,10 @@
         (unless (gethash target mvm-to-native-label)
           (return-from a64-cold-call-match nil))
         nargs
-        (values (+ n 1) target (format nil "~S" (reverse key)))))))
+        ;; the key is the sequence itself, compared by EQUAL: printing it with FORMAT ~S for a
+        ;; string= lookup was most of the warm load of a cached library (every bounds check's cold
+        ;; call is a candidate)
+        (values (+ n 1) target (reverse key))))))
 
 (defun a64-bounds-check-match (tail mvm-to-native-label)
   "The label of BAD when TAIL starts with the compiler's bounds check (%EMIT-INDEX-CHECK):
@@ -1139,7 +1142,7 @@
 
 (defun a64-emit-cold-call-site (buf tail count target key mvm-to-native-label)
   "The site of a matched cold call: ADR x15, <target>; B <the shared stub>."
-  (let ((e (assoc key *a64-cold-stubs* :test (function string=))))
+  (let ((e (assoc key *a64-cold-stubs* :test (function equal))))
     (unless e
       (let ((insns nil) (l tail))
         (dotimes (i (- count 1)) (push (car l) insns) (setq l (cdr l)))

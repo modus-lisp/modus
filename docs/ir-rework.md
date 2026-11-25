@@ -254,6 +254,13 @@ weight: a field-by-field Lisp conversion with checked shifts and bignum ASH), ~2
 
 Model load 3.3 -> 0.6 s (SBCL 0.4).  test/model-load-paths.lisp.
 
+System load (ASDF loading stave + mill, compiling them): 5.35 -> ~4.5 s, all in the compiler's own
+work.  `(member x '(...))` of a short constant list is inlined as an EQL chain returning the
+list's own tails (it parsed keyword arguments per call -- a third of the load, in the IR passes);
+FUNCTIONP answers T for a closure / native function object before walking the generic-function
+registry; bignum limbs read with %PRIM-AREF (the dataflow sets of functions with many slots are
+bignums).
+
 Found, not fixed: `(logand (+ 3 7) 255)` -- a LOGAND / LOGIOR of a literal-arithmetic argument --
 fails to compile at run time ("interp-closure compile failed"), on builds back to at least g17.
 `(mod (* 3 7) 256)` hits it through %MOD-POW2-REWRITE.  The inner error is swallowed by the

@@ -3413,8 +3413,11 @@
   "Allocate a SMALL bignum from (lo, hi) two's-complement parts."
   (let ((b (%make-bignum))) (aset b 0 lo) (aset b 1 hi) b))
 
-(defun bignum-lo (b) (aref b 0))
-(defun bignum-hi (b) (aref b 1))
+;; Limbs by %PRIM-AREF: a bignum's (AREF b i) fell through %AREF-SLOW's whole chain of array
+;; shapes to its last arm, which is this -- in every bignum compare, LOGAND and LOGIOR (the
+;; compiler's dataflow sets are bignums in a function with many frame slots).
+(defun bignum-lo (b) (%prim-aref b 0))
+(defun bignum-hi (b) (%prim-aref b 1))
 
 ;;; --- Big-bignum (arbitrary-precision N-limb) infrastructure ---
 
@@ -3423,7 +3426,7 @@
 (defun big-bignum-p (x)
   "True if X is a big-bignum (slot 0 sentinel).  Caller is expected to
    have already verified X is a bignum via `bignump`."
-  (= (aref x 0) +bn-sentinel+))
+  (= (%prim-aref x 0) +bn-sentinel+))
 
 (defun %bb-data (b) (aref b 1))                     ; the limbs array
 (defun %bb-sign (b) (aref (%bb-data b) 0))           ; +1 / -1
@@ -4883,12 +4886,12 @@
    and inline fixnum ops, no helper calls): it is every u64 logxor."
   (let ((alo nil) (ahi 0) (blo nil) (bhi 0))
     (cond ((not (integerp a)) nil)
-          ((bignump a) (unless (= (aref a 0) +bn-sentinel+)
-                         (setq alo (aref a 0)) (setq ahi (aref a 1))))
+          ((bignump a) (unless (= (%prim-aref a 0) +bn-sentinel+)
+                         (setq alo (%prim-aref a 0)) (setq ahi (%prim-aref a 1))))
           (t (setq alo (logand a +fixnum-max+)) (setq ahi (if (< a 0) -1 0))))
     (cond ((not (integerp b)) nil)
-          ((bignump b) (unless (= (aref b 0) +bn-sentinel+)
-                         (setq blo (aref b 0)) (setq bhi (aref b 1))))
+          ((bignump b) (unless (= (%prim-aref b 0) +bn-sentinel+)
+                         (setq blo (%prim-aref b 0)) (setq bhi (%prim-aref b 1))))
           (t (setq blo (logand b +fixnum-max+)) (setq bhi (if (< b 0) -1 0))))
     (let ((hi (and alo blo
                    (cond ((= op 0) (logand ahi bhi)) ((= op 1) (logior ahi bhi)) (t (logxor ahi bhi))))))
@@ -5378,6 +5381,10 @@
     ;; (typep 1.5 'single-float) walked the whole registry -- 400 ns in a world with
     ;; a few hundred generic functions, and FILL asks it of every float it stores.
     ((and (not (fixnump x)) (numberp x)) nil)
+    ;; A CLOSURE or native function object (#x52 / #x51) is a function whether or not it is a
+    ;; registered generic-function stub: the registry walk below could only say T too.  The macro
+    ;; expander's FUNCTIONP of every expander walked it (MEMBER over every GF, a tenth of a load).
+    ((let ((st (obj-subtag x))) (or (eql st #x51) (eql st #x52))) t)
     ((%generic-function-p x) t)
     ;; A BIGNUM is a tagged object (tag 9), so it slips past the tagged-fn
     ;; (nibble 3) and code-range checks and used to hit the `(t t)' fallback →

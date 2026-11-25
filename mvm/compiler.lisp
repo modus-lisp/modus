@@ -11311,6 +11311,34 @@
     ;; PSETQ of a symbol macro is PSETF of its expansion (CLHS PSETQ).
     (and changed (cons (if psetq-p 'psetf (car form)) (nreverse out)))))
 
+(defun %member-constant-rewrite (form)
+  "(LET ((G X)) (COND ((EQL G 'A) <the tail at A>) ...)) when FORM is (CL:MEMBER X 'LIST) -- no
+   keyword arguments, LIST a proper list of at most 12 atoms (symbols, numbers, characters).  It
+   returns the list's own tails, as MEMBER does.  The call parsed its keyword arguments
+   (%SUBST-CHECK-KWARGS) every time: (member op '(:mov :li ...)) in the compiler's own IR passes was
+   a third of loading stave.  NIL otherwise."
+  (and (consp form) (symbolp (car form))
+       (eq (symbol-package (car form)) (find-package "COMMON-LISP"))
+       (string= (symbol-name (car form)) "MEMBER")
+       (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+       (let ((q (caddr form)))
+         (and (consp q) (symbolp (car q)) (eq (car q) 'quote) (consp (cdr q)) (null (cddr q))
+              (let ((lst (cadr q)))
+                (and (listp lst) (consp lst)
+                     (let ((n 0) (ok t) (l lst))
+                       (loop (cond ((null l) (return nil))
+                                   ((not (consp l)) (setq ok nil) (return nil))
+                                   ((not (or (symbolp (car l)) (numberp (car l)) (characterp (car l))))
+                                    (setq ok nil) (return nil)))
+                             (setq n (+ n 1) l (cdr l)))
+                       (and ok (<= n 12)))
+                     (let ((g (%mvm-gensym "MEM")) (clauses nil) (l lst))
+                       (loop (when (null l) (return nil))
+                             (setq clauses (cons (list (list 'eql g (list 'quote (car l))) (list 'quote l)) clauses))
+                             (setq l (cdr l)))
+                       (list 'let (list (list g (cadr form)))
+                             (cons 'cond (reverse (cons (list t nil) clauses)))))))))))
+
 (defun %mod-pow2-rewrite (form env)
   "(LOGAND X (1- D)) when FORM is (CL:MOD X D) with D a positive power of two -- a literal, or a constant whose
    value is one (mill's +F32-LANES+) -- and X provably a fixnum: the same value for every integer X, negatives
@@ -11373,6 +11401,8 @@
       ;; (MOD X 2^k) of a fixnum: LOGAND (%MOD-POW2-REWRITE)
       ((and (symbolp op) (%mod-pow2-rewrite form env))
        (compile-form (%mod-pow2-rewrite form env) env dest))
+      ((and (symbolp op) (%member-constant-rewrite form))
+       (compile-form (%member-constant-rewrite form) env dest))
       ;; NOT A NAME ANY CLAUSE BELOW TESTS FOR -- a call to a function, which
       ;; is most compound forms.  Every clause from here to the last tests
       ;; OP-NAME against name hashes (or is %VIL-OP-P), in a chain 300 long

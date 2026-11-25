@@ -419,8 +419,10 @@
                      (%fasl-walk-bc bc2
                        (lambda (op operands np)
                          (cond
-                           ((or (eql op +op-li-addr+) (eql op +op-li-taddr+))
-                            (%fasl-reject "layout address"))
+                           ;; LI-ADDR / LI-TADDR are kept: their operands are LINK-TIME addresses (mvm.lisp,
+                           ;; LAYOUT ADDRESSES IN BYTECODE) that every consumer slides into its own process,
+                           ;; and the key's build record (%FASL-BUILD-KEY) fixes the layout they name.  Kept
+                           ;; as source they were recompiled at every load: 136 of stave's forms.
                            ((eql op +op-li-const+)
                             (let* ((idx (cadr operands)) (hit (assoc idx idxs)))
                               (unless hit

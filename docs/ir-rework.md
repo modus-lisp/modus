@@ -261,6 +261,19 @@ FUNCTIONP answers T for a closure / native function object before walking the ge
 registry; bignum limbs read with %PRIM-AREF (the dataflow sets of functions with many slots are
 bignums).
 
+**The FASL cache now keeps modules with layout addresses.**  It rejected any module with LI-ADDR /
+LI-TADDR, so 136 of stave's forms (every function touching a special variable's fixed cell, among
+others) were recompiled at every load even with the cache warm.  Their operands are link-time
+addresses every consumer slides into its own process (mvm.lisp), and the key's build record fixes
+the layout: replay is sound.  Checked: recorded at slide 0x300000000, replayed at 0x200000000,
+transcript unchanged.  Warm load 4.4 -> 1.2 s (441 modules replayed, 67 forms source).
+
+Cost, still open: a replayed module's functions start in the interpreter (promoted at 64 calls or
+10 ms), where a freshly compiled one is native sooner, so very short runs pay warm-up -- cl-bench
+DIV2-TEST-1 70 -> 83 ms, DERIV 66 -> 72 ms, MANDELBROT 3 -> 4 ms (geomean 2.44x -> 2.53x).  The
+replay should follow the fresh path's JIT policy; the place to look is how %FASL-EVAL's
+%FASL-MODULE-MARKER run reaches %MVM-EVAL-RUN-TUPLE compared with a fresh form.
+
 Found, not fixed: `(logand (+ 3 7) 255)` -- a LOGAND / LOGIOR of a literal-arithmetic argument --
 fails to compile at run time ("interp-closure compile failed"), on builds back to at least g17.
 `(mod (* 3 7) 256)` hits it through %MOD-POW2-REWRITE.  The inner error is swallowed by the

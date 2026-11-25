@@ -30532,7 +30532,12 @@
     (compile-form
      `(let ((,g-arg ,arg))
         (if (%raw-consp ,g-arg)
-            (%wrapper-stringp ,g-arg)
+            ;; every wrapper's car is a marker fixnum or a cons (%WRAPPER-STRINGP's clauses all
+            ;; ask that first): an ordinary list -- an EQUAL table's (:F32 . 6144) key, asked at
+            ;; each layer of a lookup -- is NIL without the call
+            (if (or (fixnump (car ,g-arg)) (%raw-consp (car ,g-arg)))
+                (%wrapper-stringp ,g-arg)
+                nil)
             (if (%prim-simple-string-p ,g-arg)
                 t
                 ;; narrow (#x13) and 32-bit (#x15) strings are simple strings

@@ -878,30 +878,35 @@
 (defun equal (a b)
   "Structural equality: EQL for atoms, recursive for conses,
    case-SENSITIVE element-wise for strings.  ANSI: EQUAL on strings
-   is case-sensitive; STRING-EQUAL is the case-insensitive variant."
-  (if (eql a b)
-      t
-      (if (consp a)
-          (if (consp b)
-              (if (equal (car a) (car b))
-                  (equal (cdr a) (cdr b))
-                  nil)
-              nil)
-          ;; A NUMBER, SYMBOL OR CHARACTER is EQUAL only to what it is EQL to, and EQL just said no:
-          ;; NIL here, not after every string predicate and %EQUAL-OTHER's bit-vector and pathname
-          ;; tests -- what an EQUAL table's probe paid for each key it passed ((:f32 . 6144) against
-          ;; (:i64 . 4), mill's tensor pool, a few percent of a stave pass).
-          (if (or (fixnump a) (symbolp a) (characterp a) (numberp a))
-              nil
-          (if (and (%prim-simple-string-p a) (%prim-simple-string-p b))
-              (%simple-string= a b)
-              (if (and (%plain-base-string-p a) (%plain-base-string-p b))
-                  (%base-string= a b)
-              (if (stringp a)
-                  (if (stringp b)
-                      (string= a b)
-                      nil)
-                  (%equal-other a b))))))))
+   is case-sensitive; STRING-EQUAL is the case-insensitive variant.
+   EQ, then a CONS before anything else: EQL's inline number tests (both operands' subtags) ran
+   first at every level, and the CDR was a recursive call -- (:F32 . 64) against an EQUAL
+   table's entry took three calls and ~150 instructions.  The CDR is walked in a loop."
+  (loop
+    (cond
+      ((eq a b) (return t))
+      ((consp a)
+       (if (and (consp b) (equal (car a) (car b)))
+           (setq a (cdr a) b (cdr b))
+           (return nil)))
+      (t
+       (return
+         (if (eql a b)
+             t
+             ;; A NUMBER, SYMBOL OR CHARACTER is EQUAL only to what it is EQL to, and EQL just said
+             ;; no: NIL here, not after every string predicate and %EQUAL-OTHER's bit-vector and
+             ;; pathname tests.
+             (if (or (fixnump a) (symbolp a) (characterp a) (numberp a))
+                 nil
+                 (if (and (%prim-simple-string-p a) (%prim-simple-string-p b))
+                     (%simple-string= a b)
+                     (if (and (%plain-base-string-p a) (%plain-base-string-p b))
+                         (%base-string= a b)
+                         (if (stringp a)
+                             (if (stringp b)
+                                 (string= a b)
+                                 nil)
+                             (%equal-other a b)))))))))))
 
 (defun %equal-other (a b)
   "EQUAL's remaining CLHS cases, off the cons/string fast path: BIT VECTORS
@@ -2546,6 +2551,11 @@
     ((eq key t) 19)
     ((%cl-sym-p key) (logand (%cl-sym-hash key) mask))
     ((%native-mvm-sym-p key) (logand (%native-mvm-sym-hash key) mask))
+    ;; A KEYWORD (a #x53 object, interned by its name hash, which is slot 0) by that hash.  It
+    ;; was neither predicate above's: :NOHASH -- the linear path for a keyword key of any table,
+    ;; and inside a list key the constant 11, so (:F32 . 6144) and (:I64 . 6144) collided, after
+    ;; a PATHNAMEP of each keyword.
+    ((and (not (consp key)) (= (obj-subtag key) #x53)) (logand (%word-aref key 0) mask))
     ;; A LIST key in an EQUAL table hashes by structure.  Without this every
     ;; cons key was :NOHASH, and one of them sent the whole table down the
     ;; linear path for good: 4000 (list i j) inserts took 0.9 s (SBCL 1 ms).
@@ -2598,6 +2608,7 @@
     ((numberp x) (%ht-equalp-real-hash (realpart x)))
     ((%cl-sym-p x) (logand (%cl-sym-hash x) #x3FFFFF))
     ((%native-mvm-sym-p x) (logand (%native-mvm-sym-hash x) #x3FFFFF))
+    ((and (not (consp x)) (= (obj-subtag x) #x53)) (logand (%word-aref x 0) #x3FFFFF))   ; a keyword (%HT-HASH)
     ;; Bit vectors too: #*101 is EQUALP to #(1 0 1).
     ((vectorp x) (%ht-equalp-vec-hash x depth))
     (t 41)))

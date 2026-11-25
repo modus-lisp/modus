@@ -715,7 +715,15 @@
       }
     }
   }
-  for (const [k, v] of parseParams(location.search.slice(1))) if (k === 'eval') { argv.push('--eval', v); quit = true; }
+  // ?wasm=0 / ?wasm=1: the 32-bit machine's WebAssembly translation off / on
+  //   (default: on where the engine supports it; see worker.js).  ?MVM_X=v sets
+  //   the VM's MVM_X debug setting, as the environment variable does under node.
+  const mvmEnv = {};
+  for (const [k, v] of parseParams(location.search.slice(1))) {
+    if (k === 'eval') { argv.push('--eval', v); quit = true; }
+    else if (k === 'wasm') mvmEnv.wasm = v;
+    else if (/^MVM_[A-Z0-9_]+$/.test(k)) mvmEnv[k] = v || '1';
+  }
   for (const [k, v] of parseParams(location.hash.slice(1))) {
     if (k === 'eval') argv.push('--eval', v);
     else if (k === 'load') {
@@ -745,7 +753,7 @@
   }
   if (quit) argv.push('--quit');
   worker.postMessage({ type: 'start', mvmw, core, stdin: sab, http: httpSab, inbox: inboxSab, query: querySab, gui: guiSab, argv, env: ['HOME=/home/web'],
-                       semispace: 256 << 20, files }, [mvmw].concat(core ? [core] : []).concat(files.map((f) => f.bytes)));
+                       semispace: 256 << 20, files, mvmEnv }, [mvmw].concat(core ? [core] : []).concat(files.map((f) => f.bytes)));
 })();
 </script>
 </body>

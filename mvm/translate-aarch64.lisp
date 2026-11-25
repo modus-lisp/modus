@@ -11174,7 +11174,11 @@
          (mvm-offset-to-native-index (make-hash-table :test 'eql))
          ;; Track function entry positions: bytecode-offset → native-byte-offset
          (fn-entry-offsets (make-hash-table :test 'eql))
-         (fn-bc-offsets (make-hash-table :test 'eql)))
+         (fn-bc-offsets (make-hash-table :test 'eql))
+         ;; targets of backward branches (loop headers), aligned to 16 bytes in pass 1
+         (loop-headers (make-hash-table :test 'eql))
+         (align-loops (not (equal (and (fboundp (quote %ira-env)) (funcall (quote %ira-env) "MODUS_ALIGN_LOOPS"))
+                                  "0"))))
 
     ;; Expose to trap-time code (op-fn-addr patch-site recorder) via a global
     ;; SETQ, not a LET* binding — see the note at translated-start-idx above.
@@ -11190,7 +11194,8 @@
                    (setf (gethash mvm-offset fn-bc-offsets) t)))
                function-table))
 
-    ;; Pre-pass: register labels for ALL branch targets (including backward branches)
+    ;; Pre-pass: register labels for ALL branch targets (including backward branches),
+    ;; and note the targets of BACKWARD branches -- loop headers -- for alignment below.
     (dolist (insn insns)
       (let ((op (decoded-mvm-insn-opcode insn))
             (operands (decoded-mvm-insn-operands insn)))
@@ -11200,6 +11205,8 @@
                  (target-byte (+ (decoded-mvm-insn-offset insn)
                                  (decoded-mvm-insn-size insn)
                                  mvm-offset)))
+            (when (<= target-byte (decoded-mvm-insn-offset insn))
+              (setf (gethash target-byte loop-headers) t))
             (unless (gethash target-byte mvm-to-native-label)
               (setf (gethash target-byte mvm-to-native-label)
                     (incf *mvm-label-counter*)))))))
@@ -11239,6 +11246,15 @@
           (loop while (/= 0 (mod (+ (* (a64-current-index buf) 4)
                                     *aarch64-fn-align-offset*)
                                  16))
+                do (a64-emit buf #xD503201F)))  ; NOP
+        ;; LOOP HEADERS ON 16 BYTES.  Apple cores fetch and predict in aligned blocks: mill's
+        ;; broadcast-add loop ran 1.41 or 1.85 ns an element depending only on whether its first
+        ;; instruction sat on an 8-byte boundary -- each NOP of code added anywhere before it
+        ;; flipped it (docs/ir-rework.md).  The padding runs once, on the way in; the back edge
+        ;; lands after it.  MODUS_ALIGN_LOOPS=0 turns it off.
+        (when (and align-loops (gethash mvm-off loop-headers) (not (gethash mvm-off fn-bc-offsets)))
+          (a64-slot-cache-flush)
+          (loop while (/= 0 (mod (+ (* (a64-current-index buf) 4) *aarch64-fn-align-offset*) 16))
                 do (a64-emit buf #xD503201F)))  ; NOP
         ;; If this MVM offset has a label assigned (branch target),
         ;; record the native position for it now

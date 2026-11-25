@@ -625,8 +625,13 @@
            ;; parked for a collection: a worker spinning in a LOADed function
            ;; held every region-0 collection up again.  Unset leaves the key
            ;; as it was.
-           (if (and (boundp (quote *park-safepoints*)) (symbol-value (quote *park-safepoints*)))
-               "+park" "")
+(concatenate 'string
+             (if (and (boundp (quote *park-safepoints*)) (symbol-value (quote *park-safepoints*)))
+                 "+park" "")
+             ;; MODUS_IR_ALLOC=1 (compiler.lisp %IR-ALLOC) changes the bytecode a form compiles to:
+             ;; a cache written with it on must not replay with it off, or bisecting it would lie
+             (if (equal (and (fboundp (quote %ira-env)) (funcall (quote %ira-env) "MODUS_IR_ALLOC")) "1")
+                 "+ira" ""))
            (%fasl-hash-string (%fasl-features-string))
            (if *package* (package-name *package*) "")
            (or *fasl-chain* "")

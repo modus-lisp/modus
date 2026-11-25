@@ -3540,8 +3540,39 @@
   "(label . depth) for each BLOCK / LOOP exit and TAGBODY tag of this
    function: the stack depth control must be at when it arrives there.")
 
+(defvar *fp-spill-live* nil
+  "The FP-resident scalar locals live at this point of the compile, innermost
+   first: (FREG KIND SLOT), KIND 0 single, 1 double.  See FP LOCALS ACROSS CALLS.")
+
+(defun %fp-spill-capable-p ()
+  "Scalar FP locals may live across calls (spilled around each one): a run-time
+   compile for aarch64.  Elsewhere a scope holding them must be call-free."
+  (and *mvm-eval-runtime-p*
+       (boundp (quote *jit-target-arch*))
+       (eq (symbol-value (quote *jit-target-arch*)) :aarch64)))
+
+;;; FP LOCALS ACROSS CALLS.  Every FP register is caller-saved, so a scope kept
+;;; its float locals in them only when it called nothing at all -- and one call
+;;; anywhere in it, even a generic compare's never-taken slow path or a DOTIMES
+;;; over an undeclared count, boxed every float local in the scope: each SETQ a
+;;; fresh box, each use an unbox (a declared-double loop calling EXP ran 8x
+;;; SBCL).  Now, on a target that can (%FP-SPILL-CAPABLE-P), every call emitted
+;;; while such locals are live stores their bits in frame slots before it
+;;; (FP-SPILL: tagged 32-bit halves, so the frame stays scannable) and reloads
+;;; them after; a slow path's call pays it, the straight line pays nothing.
+(defun %fp-call-op-p (op args)
+  (or (eq op :call) (eq op :call-indirect) (eq op :call-native)
+      ;; a trap that runs host code (I/O, syscalls: the Mac shim is C, which
+      ;; clobbers FP registers); the setjmp family never sits in such a scope
+      (and (eq op :trap) (integerp (car args)) (>= (car args) #x0300))))
+
 (defun emit-ir (op &rest args)
   "Emit an IR instruction to the current buffer"
+  (when (and *fp-spill-live* (%fp-call-op-p op args))
+    (dolist (e *fp-spill-live*) (push (list :fp-spill (first e) (third e) (second e)) *ir-buffer*))
+    (push (cons op args) *ir-buffer*)
+    (dolist (e *fp-spill-live*) (push (list :fp-reload (first e) (third e) (second e)) *ir-buffer*))
+    (return-from emit-ir nil))
   (when (and *ddc-trace-nil-callee* (eq op :call) (equal (car args) "NIL"))
     (format t "~&  NIL-CALL built in ~A (nargs ~A)~%" *current-function-name* (cadr args)))
   (cond ((eq op :push) (setq *ir-push-depth* (+ *ir-push-depth* 1)))
@@ -16439,7 +16470,16 @@
                      ;; any failure in the analysis = not eligible (always safe)
                      (handler-case
                          (let ((scope (%fp-scope-extend-let env bindings decl-body sequential)))
-                           (every (lambda (f) (%fp-scope-call-free-p f scope 0)) body))
+                           (or (every (lambda (f) (%fp-scope-call-free-p f scope 0)) body)
+                               ;; calls, but the locals can be spilled around them (FP LOCALS
+                               ;; ACROSS CALLS): scalars only, and nothing that re-enters the
+                               ;; scope by a non-local exit (a CATCH or handler landing in it
+                               ;; would find the registers clobbered) or closes over a local
+                               (and (%fp-spill-capable-p)
+                                    (every (lambda (k) (or (null k) (eq k :scalar) (eq k :dscalar)))
+                                           kinds)
+                                    (let ((*promote-walk-loop-seen* nil))
+                                      (%promote-walk (cons 'progn body) 0)))))
                        (error (e) (list :error e))))))
         (and (eq ok t) kinds)))))
 
@@ -16456,16 +16496,47 @@
         ((eq kind :dscalar) :fpdreg)
         (t :fpreg)))
 
+(defun %compile-double-hoisted (val env f)
+  "VAL, a double tree with conversion calls in it, into FP vreg F: the
+   conversions first, left to right, into GPR temps (%COMPILE-DOUBLE-FLOAT-ARITH's
+   hoisting), then the tree.  Only where FP locals survive calls
+   (%FP-SPILL-CAPABLE-P): the conversions' calls spill them.  T when done."
+  (when (%fp-spill-capable-p)
+    (let* ((convs (%fpd-collect-conversions val env))
+           (saved *fpd-hoisted*)
+           (hoisted (and (consp convs) (<= (length convs) 3)
+                         (mapcar (lambda (c) (cons c nil)) convs)))
+           (done nil))
+      (when hoisted
+        (setq *fpd-hoisted* hoisted)
+        (unwind-protect
+             (let ((need (%fpd-tree-need val env)))
+               (when (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))
+                 (dolist (h *fpd-hoisted*)
+                   (let ((r (alloc-temp-reg)) (g (%mvm-gensym "CONV")))
+                     (compile-form `(let ((,g ,(%double-conversion-arg (car h))))
+                                      (if (fixnump ,g) ,g (%to-double ,g)))
+                                   env r)
+                     (setf (cdr h) r)))
+                 (compile-double-unboxed val env f)
+                 (dolist (h *fpd-hoisted*) (declare (ignore h)) (free-temp-reg))
+                 (setq done t)))
+          (setq *fpd-hoisted* saved)))
+      done)))
+
 (defun %compile-double-into-fpreg (val env f)
   "Land the double VAL in FP vreg F: a pure double tree (no conversion calls,
-   which would clobber FP registers) directly, anything else boxed by the
-   generic path and unboxed."
-  (if (%fpd-pure-need val env)
-      (compile-double-unboxed val env f)
-      (let ((tmp (alloc-temp-reg)))
-        (compile-form val env tmp)
-        (emit-ir :fpd-unbox f tmp)
-        (free-temp-reg))))
+   which would clobber FP registers) directly, one with conversions hoisted
+   where FP locals survive calls, anything else boxed by the generic path and
+   unboxed."
+  (cond ((%fpd-pure-need val env)
+         (compile-double-unboxed val env f))
+        ((%compile-double-hoisted val env f))
+        (t
+         (let ((tmp (alloc-temp-reg)))
+           (compile-form val env tmp)
+           (emit-ir :fpd-unbox f tmp)
+           (free-temp-reg)))))
 
 (defun %compile-init-into-fpreg (val env f kind)
   "Land VAL (evaluated in ENV) in FP vreg F as an unboxed KIND value."
@@ -16567,12 +16638,18 @@
          ;; FP-register-resident float/vector locals (layer 2c)
          (fp-kinds (and (> n-bindings 0) (%let-fp-kinds bindings decl-body body env)))
          (fp-regs (make-array (max n-bindings 1) :initial-element nil))
-         (n-fp 0))
+         (n-fp 0)
+         ;; FP LOCALS ACROSS CALLS: a single spills to its own (unused) slot, a
+         ;; double to two consecutive slots past the bindings
+         (spill-p (and fp-kinds (%fp-spill-capable-p)))
+         (n-extra (if spill-p (* 2 (count :dscalar fp-kinds)) 0))
+         (next-extra (+ (compile-env-stack-depth env) n-bindings))
+         (*fp-spill-live* *fp-spill-live*))
     ;; Phase 1: Evaluate all values in original env, store to temp regs
     ;; We use a set of temp regs (or stack slots for > 5 bindings)
     (when (> n-bindings 0)
       ;; Allocate stack frame space for local variables
-      (emit-ir :frame-alloc n-bindings))
+      (emit-ir :frame-alloc (+ n-bindings n-extra)))
     ;; Create a reservation env: same bindings as outer env (no new names
     ;; visible, correct for let semantics) but with stack-depth bumped by
     ;; n-bindings.  This reserves slots D..D+n-1 so that nested let/let*
@@ -16580,7 +16657,7 @@
     ;; range, preventing frame-slot overlap.
     (let ((reserve-env (make-compile-env
                         :bindings (compile-env-bindings env)
-                        :stack-depth (+ (compile-env-stack-depth env) n-bindings)
+                        :stack-depth (+ (compile-env-stack-depth env) n-bindings n-extra)
                         :parent (compile-env-parent env)
                         :fn-names (compile-env-fn-names env))))
       ;; Evaluate each binding value and store it to a stack slot.
@@ -16609,7 +16686,13 @@
                (let ((f (alloc-fp-reg)))
                  (%compile-init-into-fpreg val reserve-env f (aref fp-kinds i))
                  (setf (aref fp-regs i) f)
-                 (setq n-fp (+ n-fp 1))))
+                 (setq n-fp (+ n-fp 1))
+                 ;; live from here: a later init's call spills it too
+                 (when spill-p
+                   (if (eq (aref fp-kinds i) :dscalar)
+                       (progn (push (list f 1 next-extra) *fp-spill-live*)
+                              (setq next-extra (+ next-extra 2)))
+                       (push (list f 0 (+ (compile-env-stack-depth env) i)) *fp-spill-live*)))))
               ;; Register promotion into a DEDICATED local register (V9/V10):
               ;; the init lands in the register, which holds the variable
               ;; for the whole body and is returned to the free list below.
@@ -16653,13 +16736,13 @@
                                      :location :stack
                                      :stack-slot (+ (compile-env-stack-depth env) i))))
                                 (compile-env-bindings new-env))
-                 :stack-depth (+ (compile-env-stack-depth env) n-bindings)
+                 :stack-depth (+ (compile-env-stack-depth env) n-bindings n-extra)
                  :parent (compile-env-parent new-env)
                  :fn-names (compile-env-fn-names new-env)))
           (setq i (+ i 1)))))
     ;; Fix stack-depth in the final env
     (setf (compile-env-stack-depth new-env)
-          (+ (compile-env-stack-depth env) n-bindings))
+          (+ (compile-env-stack-depth env) n-bindings n-extra))
     ;; (declare (type …)) forms at the head of BODY scope over these bindings
     ;; (and a free one over the body alone).
     (setq new-env (%apply-declared-types new-env decl-body n-bindings))
@@ -16673,7 +16756,7 @@
     (dotimes (k n-fp) (free-fp-reg))
     ;; Deallocate frame space
     (when (> n-bindings 0)
-      (emit-ir :frame-free n-bindings))))
+      (emit-ir :frame-free (+ n-bindings n-extra)))))
 
 (defun %compile-let*-1 (bindings body env dest)
   "Compile (let* ((var val)*) body*).
@@ -16724,6 +16807,11 @@
          ;; env for the later init's vector-tree recognition to see it.
          (fp-kinds (and (> n-bindings 0) (%let-fp-kinds bindings decl-body body env t)))
          (n-fp 0)
+         ;; FP LOCALS ACROSS CALLS, as in compile-let
+         (spill-p (and fp-kinds (%fp-spill-capable-p)))
+         (n-extra (if spill-p (* 2 (count :dscalar fp-kinds)) 0))
+         (next-extra (+ (compile-env-stack-depth env) n-bindings))
+         (*fp-spill-live* *fp-spill-live*)
          (new-env env)
          ;; Declared types of THIS let*'s variables, scanned once up front so
          ;; each binding is stamped as soon as it exists: a later init that
@@ -16743,7 +16831,7 @@
                             (length *local-vregs-free*))))
          (promoted-list nil))
     (when (> n-bindings 0)
-      (emit-ir :frame-alloc n-bindings))
+      (emit-ir :frame-alloc (+ n-bindings n-extra)))
     ;; Evaluate sequentially, extending env each time
     (let ((i 0))
       (dolist (binding bindings)
@@ -16758,6 +16846,11 @@
                     (dty (%fp-kind-dtype kind)))
                (%compile-init-into-fpreg val new-env f kind)
                (setq n-fp (+ n-fp 1))
+               (when spill-p
+                 (if (eq kind :dscalar)
+                     (progn (push (list f 1 next-extra) *fp-spill-live*)
+                            (setq next-extra (+ next-extra 2)))
+                     (push (list f 0 slot) *fp-spill-live*)))
                (setq new-env
                      (make-compile-env
                       :bindings (cons (make-binding
@@ -16765,7 +16858,12 @@
                                        :location (%fp-kind-location kind)
                                        :reg f :dtype dty)
                                       (compile-env-bindings new-env))
-                      :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
+                      :stack-depth (if spill-p
+                                       ;; the spill slots past the bindings are live
+                                       ;; from here: a later init's nested LET must
+                                       ;; allocate above all of them
+                                       (+ (compile-env-stack-depth env) n-bindings n-extra)
+                                       (+ (compile-env-stack-depth env) (+ i 1)))
                       :parent (compile-env-parent new-env)
                       :fn-names (compile-env-fn-names new-env)))))
             (t
@@ -16796,7 +16894,9 @@
                                          :location :stack
                                          :stack-slot slot))
                                     (compile-env-bindings new-env))
-                    :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
+                    :stack-depth (if spill-p
+                                     (+ (compile-env-stack-depth env) n-bindings n-extra)
+                                     (+ (compile-env-stack-depth env) (+ i 1)))
                     :parent (compile-env-parent new-env)
                     :fn-names (compile-env-fn-names new-env)))
              ;; Eager dtype for the binding just made (see decl-types above):
@@ -16816,7 +16916,7 @@
           (setq i (+ i 1)))))
     ;; Final env has correct stack depth
     (setf (compile-env-stack-depth new-env)
-          (+ (compile-env-stack-depth env) n-bindings))
+          (+ (compile-env-stack-depth env) n-bindings n-extra))
     ;; (declare (type …)) forms at the head of BODY scope over these bindings
     ;; (and a free one over the body alone).
     (setq new-env (%apply-declared-types new-env decl-body n-bindings))
@@ -16830,7 +16930,7 @@
     (dolist (r promoted-list) (push r *local-vregs-free*))
     (dotimes (k n-fp) (free-fp-reg))
     (when (> n-bindings 0)
-      (emit-ir :frame-free n-bindings))))
+      (emit-ir :frame-free (+ n-bindings n-extra)))))
 
 ;;; ============================================================
 ;;; Setq
@@ -16962,6 +17062,15 @@
                    (t (compile-float-unboxed val env tf)))
                  (emit-ir :fp-mov (binding-reg fb) tf)
                  (free-fp-reg)))
+              ;; a double tree with conversion calls in it, where FP locals
+              ;; survive calls: the conversions hoisted, the tree in a fresh
+              ;; register, then moved (%COMPILE-DOUBLE-HOISTED)
+              ((and (eq kind :dscalar) (< *fp-reg-counter* +fp-reg-max+)
+                    (%fp-spill-capable-p)
+                    (let ((tf (alloc-fp-reg)))
+                      (if (%compile-double-hoisted val env tf)
+                          (progn (emit-ir :fp-mov (binding-reg fb) tf) (free-fp-reg) t)
+                          (progn (free-fp-reg) nil)))))
               ;; else through a box, straight into the variable's register: the
               ;; whole value is computed before the register is written.  (A
               ;; double goes through the box explicitly: %COMPILE-DOUBLE-INTO-
@@ -25147,6 +25256,8 @@
      (%fp-tree-need (%double-conversion-arg form) env))
     ;; a fixnum variable widened in register (FPD-ITOF)
     ((%fpd-int-conversion-var form env) 1)
+    ;; an element of a declared double-float array (%FPD-ARRAY-LEAF)
+    ((%fpd-array-leaf form env) 1)
     ;; (EXP d) of a double tree: %EMIT-EXP-DOUBLE-FULL, no call.  Its peak is 8
     ;; with the result: x held beside the core's 7.  An over-estimate costs
     ;; real code: ten made (/ 1d0 (+ 1d0 (exp ...))) -- a sigmoid -- not fit
@@ -25154,6 +25265,11 @@
     ((and (%fp-exp-arg form) (or *mvm-eval-runtime-p* (ct-has-fpd-p)))
      (let ((n (%fpd-tree-need (%fp-exp-arg form) env)))
        (and n (max n 8))))
+    ;; (LOG d) of a double tree: %EMIT-LOG-DOUBLE.  The kernel tree's peak with
+    ;; m, k and the constant beside it; scratch slots from the frame top up
+    ((and (%fp-log-arg form) (< (compile-env-stack-depth env) 220))
+     (let ((n (%fpd-tree-need (%fp-log-arg form) env)))
+       (and n (max n 9))))
     ;; an inlined call: (let ((p arg) ...) body).  Pure inits only: a hoisted
     ;; conversion is evaluated before the tree, outside the LET's scope
     ((%fp-tree-let-parts form)
@@ -25161,6 +25277,21 @@
     ((%tree-inline form env)
      (%with-tree-inline form (function %fpd-tree-need) env))
     (t nil)))
+
+(defun %fpd-array-leaf (form env)
+  "FORM when it is (AREF V I) or (SVREF V I) of a variable V declared a
+   double-float array -- a word vector of boxed doubles here -- with a pure
+   index: a double-tree leaf, read (bounds-checked: a failed check signals and
+   never comes back to the tree) and unboxed in place.  It was a hoisted boxed
+   value at best, and stopped an enclosing EXP or LOG from being a tree at all."
+  (and (consp form) (symbolp (car form))
+       (or (name-eq (car form) "AREF") (name-eq (car form) "SVREF"))
+       (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+       (symbolp (cadr form)) (cadr form) (env-lookup env (cadr form))
+       (%f64-simple-array-decl-p (%expr-dtype (cadr form) env))
+       (%declared-generic-array-var-p (cadr form) env)
+       (%pure-simple-expr-p (caddr form) env)
+       form))
 
 (defun %fpd-arith-op (name)
   (cond ((string= name "+") :fpd-add)
@@ -25180,7 +25311,7 @@
                         (push f acc)))
                      ((and (consp f) (symbolp (car f))
                            (or (member (symbol-name (car f)) '("+" "-" "*" "/") :test #'string=)
-                               (%fp-abs-p f) (%fp-minmax-op f) (%fp-exp-arg f)))
+                               (%fp-abs-p f) (%fp-minmax-op f) (%fp-exp-arg f) (%fp-log-arg f)))
                       (dolist (a (cdr f)) (walk a))))))
       (walk form))
     (nreverse acc)))
@@ -25221,6 +25352,21 @@
            (emit-ir :fpd-itof fd tmp)
            (free-temp-reg))
          (return-from compile-double-unboxed nil))
+        ((%fpd-array-leaf form env)
+         ;; the boxed element, unboxed; a fixnum (MAKE-ARRAY's default fill
+         ;; here is 0, not 0d0) converts, as a hoisted value does
+         (let ((tmp (alloc-temp-reg))
+               (boxed (make-compiler-label)) (done (make-compiler-label)))
+           (compile-form form env tmp)
+           (emit-ir :test-imm tmp 1)
+           (emit-ir :bne boxed)
+           (emit-ir :fpd-itof fd tmp)
+           (emit-ir :br done)
+           (emit-ir-label boxed)
+           (emit-ir :fpd-unbox fd tmp)
+           (emit-ir-label done)
+           (free-temp-reg))
+         (return-from compile-double-unboxed nil))
         ((and (%double-conversion-arg form) (%fp-tree-need (%double-conversion-arg form) env))
          (compile-float-unboxed (%double-conversion-arg form) env fd)
          (emit-ir :fp-op1 fd fd 2)                               ; fcvt d<-s
@@ -25228,6 +25374,10 @@
         ((%fp-exp-arg form)
          (compile-double-unboxed (%fp-exp-arg form) env fd)
          (%emit-exp-double-full env fd)
+         (return-from compile-double-unboxed nil))
+        ((%fp-log-arg form)
+         (compile-double-unboxed (%fp-log-arg form) env fd)
+         (%emit-log-double env fd)
          (return-from compile-double-unboxed nil))
         ((%fp-tree-let-parts form)
          (%compile-fp-tree-let form env fd (function compile-double-unboxed))
@@ -25492,6 +25642,11 @@
           (let ((n (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
                         (%fp-tree-need (%fp-tanh-arg form) env))))
             ;; the second EXP's peak with ep and xd held beside it
+            (and n (max n 9))))
+         ;; (LOG s) of a single tree: widened, %EMIT-LOG-DOUBLE, narrowed -- the
+         ;; double kernel rounded to single is SBCL's single LOG
+         ((and (%fp-log-arg form) (< (compile-env-stack-depth env) 220))
+          (let ((n (%fp-tree-need (%fp-log-arg form) env)))
             (and n (max n 9))))
          ;; an inlined call: (let ((p arg) ...) body)
          ((%fp-tree-let-parts form)
@@ -25819,6 +25974,140 @@
       (free-temp-reg) (free-temp-reg))
     (free-fp-reg)))
 
+;;; LOG IN REGISTERS.  (LOG x) of a double tree, as EXP is: the high word read
+;;; out of a scratch frame slot (FP-SPILL, then a STACK-LOAD of the tagged half),
+;;; a positive normal x reduced to m in [1, 2) by rewriting that word's exponent
+;;; and reloading, and fdlibm's __ieee754_log over m and k as a tree -- the
+;;; steps of %LOG-KERNEL-D in its order, so the result is its bits.  Anything
+;;; else (zero, subnormal, inf, NaN, negative) is %LOG-DOUBLE-REAL's, parked
+;;; after the RET: the live FP registers spilled around the call.  A negative x,
+;;; whose log is complex, signals there that the value is not a DOUBLE-FLOAT --
+;;; as SBCL does where that value meets declared-double arithmetic.  Only where
+;;; FP registers can be spilled (%FP-SPILL-CAPABLE-P).
+(defun %fp-log-arg (form)
+  "X when FORM is (LOG X) and LOG can be a tree node here."
+  (and (consp form) (symbolp (car form)) (name-eq (car form) "LOG")
+       (consp (cdr form)) (null (cddr form))
+       (%fp-spill-capable-p)
+       (cadr form)))
+
+(defun %log-kernel-tree (m k)
+  "fdlibm's log(M 2^K) for M in [sqrt 1/2, sqrt 2), as a double tree over the
+   FP-resident name M and the fixnum name K (widened in register where used):
+   %LOG-KERNEL-D's operations, each as it does it.  Shaped for the FP pool
+   (twelve registers, the enclosing tree's included): only F and HFSQ live to
+   the end -- S, Z, W and R are made inside the init that uses them -- and a
+   commutative operation's leaf operand on the right (A*B is B*A exactly)."
+  (let ((f (%mvm-gensym "LF")) (sv (%mvm-gensym "LS")) (z (%mvm-gensym "LZ"))
+        (w (%mvm-gensym "LW")) (r (%mvm-gensym "LR")) (h (%mvm-gensym "LH"))
+        (q (%mvm-gensym "LQ")) (kd (list 'float k 1d0)))
+    (list 'let (list (list f (list '- m 1d0)))
+     (list 'let (list (list h (list '* (list '* f f) 0.5d0)))       ; hfsq = f^2/2
+      (list 'let
+            (list (list q
+                        (list 'let (list (list sv (list '/ f (list '+ f 2d0))))   ; s = f/(2+f)
+                         (list 'let
+                               (list (list r
+                                           (list 'let (list (list z (list '* sv sv)))
+                                            (list 'let (list (list w (list '* z z)))
+                                             ;; t2 = z(Lg1 + w(Lg3 + w(Lg5 + w Lg7))), t1 = w(Lg2 + w(Lg4 + w Lg6))
+                                             (list '+
+                                                   (list '* (list '+ (list '* (list '+ (list '* (list '+ (list '* w 1.479819860511658591d-01)
+                                                                                                    1.818357216161805012d-01)
+                                                                                          w)
+                                                                                    2.857142874366239149d-01)
+                                                                          w)
+                                                                    6.666666666666735130d-01)
+                                                         z)
+                                                   (list '* (list '+ (list '* (list '+ (list '* w 1.531383769920937332d-01)
+                                                                                    2.222219843214978396d-01)
+                                                                          w)
+                                                                    3.999999999940941908d-01)
+                                                         w))))))
+                          ;; s (hfsq + R) + k ln2_lo
+                          (list '+ (list '* (list '+ h r) sv) (list '* kd 1.90821492927058770002d-10))))))
+            ;; k ln2_hi - ((hfsq - q) - f)
+            (list '- (list '* kd 6.93147180369123816490d-01)
+                  (list '- (list '- h q) f)))))))
+
+(defun %emit-log-double (env fd)
+  "FD <- log(FD) (see LOG IN REGISTERS)."
+  (let* ((s0 (compile-env-stack-depth env))
+         (th (alloc-temp-reg)) (tc (alloc-temp-reg)) (tk (alloc-temp-reg))
+         (slow (make-compiler-label)) (done (make-compiler-label)))
+    ;; the high word, tagged: SLOT S0 holds hi << 1
+    (emit-ir :fp-spill fd s0 1)
+    (emit-ir :stack-load th s0)
+    (compile-integer #x00100000 tc)
+    (emit-ir :cmp th tc)
+    (emit-ir :blt slow)
+    (compile-integer #x7FF00000 tc)
+    (emit-ir :cmp th tc)
+    (emit-ir :bge slow)
+    ;; k = (hi >> 20) - 1023
+    (emit-ir :shr tk th 21)
+    (emit-ir :shl tk tk +fixnum-shift+)
+    (compile-integer 1023 tc)
+    (emit-ir :sub tk tk tc)
+    ;; m: the same bits with the exponent of 1.0
+    (compile-integer #xFFFFF tc)
+    (emit-ir :and th th tc)
+    (compile-integer #x3FF00000 tc)
+    (emit-ir :or th th tc)
+    (emit-ir :stack-store th s0)
+    (emit-ir :fp-reload fd s0 1)
+    ;; m > sqrt 2: m/2, k+1
+    (let ((fc (alloc-fp-reg)) (b (alloc-temp-reg)) (keep (make-compiler-label)))
+      (compile-double-unboxed 1.4142135623730951d0 env fc)
+      (emit-ir :fpd-lt b fc fd)
+      (emit-ir :li tc 0)
+      (emit-ir :cmp b tc)
+      (emit-ir :beq keep)
+      (compile-double-unboxed 0.5d0 env fc)
+      (emit-ir :fpd-mul fd fd fc)
+      (compile-integer 1 tc)
+      (emit-ir :add tk tk tc)
+      (emit-ir-label keep)
+      (free-temp-reg)
+      (free-fp-reg))
+    ;; the kernel into FD itself: M is read once, first
+    (let* ((m (%mvm-gensym "LM")) (k (%mvm-gensym "LK"))
+           (e1 (%fp-env-with-fpd env (list m) (list fd)))
+           (e2 (make-compile-env
+                :bindings (cons (make-binding :name k :location :reg :reg tk
+                                              :dtype '(signed-byte 12))
+                                (compile-env-bindings e1))
+                :stack-depth (compile-env-stack-depth e1)
+                :parent (compile-env-parent e1)
+                :fn-names (compile-env-fn-names e1))))
+      (compile-double-unboxed (%log-kernel-tree m k) e2 fd))
+    (emit-ir-label done)
+    ;; the rest, after the RET: every live FP register kept across the call
+    (let ((nfp *fp-reg-counter*)
+          (save-count (%call-save-count *temp-reg-counter*)))
+      (emit-deferred-tail
+       (lambda ()
+         (emit-ir-label slow)
+         (when (> save-count 1)
+           (let ((r (+ +vreg-v4+ 1)))
+             (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+               (emit-ir :push r) (setq r (+ r 1)))))
+         (dotimes (j nfp)
+           (unless (= j fd) (emit-ir :fp-spill j (+ s0 2 (* 2 j)) 1)))
+         (emit-ir :gc-check)
+         (emit-ir :fpd-box +vreg-v0+ fd)
+         (when *mvm-emit-halves* (emit-ir :set-nargs 1))
+         (emit-ir :call "%LOG-DOUBLE-REAL" 1)
+         (dotimes (j nfp)
+           (unless (= j fd) (emit-ir :fp-reload j (+ s0 2 (* 2 j)) 1)))
+         (emit-ir :fpd-unbox fd +vreg-vr+)
+         (when (> save-count 1)
+           (let ((r (+ +vreg-v4+ save-count -1)))
+             (loop (when (< r (+ +vreg-v4+ 1)) (return))
+               (emit-ir :pop r) (setq r (- r 1)))))
+         (emit-ir :br done))))
+    (free-temp-reg) (free-temp-reg) (free-temp-reg)))
+
 (defun %fp-tanh-arg (form)
   "X when FORM is (TANH X)."
   (and (consp form) (symbolp (car form)) (name-eq (car form) "TANH")
@@ -25931,6 +26220,11 @@
        (%compile-exp-single (%fp-exp-arg form) env fd))
       ((%fp-tanh-arg form)
        (%compile-tanh-single (%fp-tanh-arg form) env fd))
+      ((%fp-log-arg form)
+       (compile-float-unboxed (%fp-log-arg form) env fd)
+       (emit-ir :fp-op1 fd fd 2)                                 ; fcvt d<-s
+       (%emit-log-double env fd)
+       (emit-ir :fp-op1 fd fd 3))                                ; fcvt s<-d
       ((%fp-tree-let-parts form)
        (%compile-fp-tree-let form env fd (function compile-float-unboxed)))
       ((%tree-inline form env)
@@ -30882,7 +31176,12 @@
            (or (name-eq (car ty) "SIMPLE-VECTOR")
                (and (name-eq (car ty) "SIMPLE-ARRAY")
                     (consp (cdr ty))
-                    (%generic-element-type-p (cadr ty)))))))
+                    (or (%generic-element-type-p (cadr ty))
+                        ;; any type the running image stores as plain words --
+                        ;; DOUBLE-FLOAT among them: its arrays are simple-vectors
+                        ;; of boxed doubles, and AREF of a declared one took the
+                        ;; whole generic dispatch (every subtag tested)
+                        (%word-element-type-p (cadr ty))))))))
 
 (defun %leading-declares (body)
   "The (DECLARE ...) forms at the head of BODY."
@@ -34418,6 +34717,7 @@
                                       (string name)))
          (*temp-reg-counter* 0)
          (*fp-reg-counter* 0)
+         (*fp-spill-live* nil)            ; this function's FP locals only (see FP LOCALS ACROSS CALLS)
          ;; The two local registers are per function (see *local-vregs*).
          (*local-vregs-free* (if (%local-vregs-active-p) (copy-list *local-vregs*) nil))
          (return-label (make-compiler-label))
@@ -34825,6 +35125,7 @@
       (:fp-toi 4)
       (:fpd-scale 3)
       (:fpd-li 10)
+      ((:fp-spill :fp-reload) 4)
       (:fp-li 10)
       (:fpd-add 4)
       (:fpd-sub 4)
@@ -34994,6 +35295,8 @@
         (:frame-enter (%ir-frame-enter-finish codes fe top floor)
                       (setq fe insn top 0 floor 0))
         ((:stack-load :stack-store) (setq top (max top (1+ (third insn)))))
+        ;; a double's bits take its slot and the next
+        ((:fp-spill :fp-reload) (setq top (max top (+ (third insn) 1 (fourth insn)))))
         (:aref (when (eql (third insn) +vreg-vfp+)
                  (setq floor +frame-legacy-slots+)))
         (:trap (when (eql (second insn) #x0530)
@@ -35312,6 +35615,8 @@
           (:fp-toi (mvm-fp-toi buf (second insn) (third insn) (fourth insn)))
           (:fpd-scale (mvm-fpd-scale buf (second insn) (third insn)))
           (:fpd-li (mvm-fpd-li buf (second insn) (third insn) (fourth insn)))
+          (:fp-spill (mvm-fp-spill buf (second insn) (third insn) (fourth insn)))
+          (:fp-reload (mvm-fp-reload buf (second insn) (third insn) (fourth insn)))
           (:fp-li (mvm-fp-li buf (second insn) (third insn) (fourth insn)))
           (:fpd-add (mvm-fpd-add buf (second insn) (third insn) (fourth insn)))
           (:fpd-sub (mvm-fpd-sub buf (second insn) (third insn) (fourth insn)))

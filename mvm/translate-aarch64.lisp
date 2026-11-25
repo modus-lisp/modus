@@ -6442,6 +6442,44 @@
              (when (= op +op-fp-li+)
                (a64-emit buf (logior #x1E624000 (ash fd 5) fd)))))          ; fcvt Sd, Dd
 
+;; ---- FP-SPILL Fs, slot, kind / FP-RELOAD Fd, slot, kind ----  An FP-resident
+          ;; local's bits in its frame slot(s) across a call (every FP register is
+          ;; caller-saved): a single's 32 bits in SLOT, a double's high and low
+          ;; halves in SLOT and SLOT+1, each shifted left one -- a fixnum, so the
+          ;; frame stays a set of tagged words the collector may scan.
+          ((= op +op-fp-spill+)
+           (let ((fs (fpp (vr 0))) (slot (vr 1)) (kind (vr 2)))
+             (if (= kind 0)
+                 (progn
+                   (a64-emit buf (logior #x1E260000 (ash fs 5) +a64-x9+))          ; fmov w9, Ss
+                   (a64-lsl-imm buf +a64-x9+ +a64-x9+ 1)
+                   (a64-fp-store buf +a64-x9+ (a64-frame-slot-offset slot)))
+                 (progn
+                   (a64-fmov-x-d buf +a64-x9+ fs)                                   ; fmov x9, Ds
+                   (a64-lsr-imm buf +a64-x10+ +a64-x9+ 32)                          ; hi
+                   (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
+                   (a64-fp-store buf +a64-x10+ (a64-frame-slot-offset slot))
+                   (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)                           ; lo << 1
+                   (a64-lsr-imm buf +a64-x9+ +a64-x9+ 31)
+                   (a64-fp-store buf +a64-x9+ (a64-frame-slot-offset (+ slot 1)))
+                   (a64-slot-cache-drop (+ slot 1) nil)))
+             (a64-slot-cache-drop slot nil)))
+          ((= op +op-fp-reload+)
+           (let ((fd (fpp (vr 0))) (slot (vr 1)) (kind (vr 2)))
+             (if (= kind 0)
+                 (progn
+                   (a64-fp-load buf +a64-x9+ (a64-frame-slot-offset slot))
+                   (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
+                   (a64-emit buf (logior #x1E270000 (ash +a64-x9+ 5) fd)))         ; fmov Sd, w9
+                 (progn
+                   (a64-fp-load buf +a64-x10+ (a64-frame-slot-offset slot))
+                   (a64-fp-load buf +a64-x9+ (a64-frame-slot-offset (+ slot 1)))
+                   (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
+                   (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
+                   ;; orr x9, x9, x10, lsl #32
+                   (a64-emit buf (logior #xAA000000 (ash +a64-x10+ 16) (ash 32 10) (ash +a64-x9+ 5) +a64-x9+))
+                   (a64-fmov-d-x buf fd +a64-x9+)))))
+
           ;; ---- FPD-SCALE Fd, Vk ----  Fd *= 2^k: the double 2^k from its
           ;; exponent bits (k + 1023) << 52 in D0 (FP scratch), then FMUL.
           ((= op +op-fpd-scale+)

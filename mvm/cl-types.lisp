@@ -529,6 +529,16 @@
     (setq vz (- vz vf))                                ; ... - f
     (- (* (float kk 1d0) 6.93147180369123816490d-01) vz)))
 
+(defun %log-double-real (x)
+  "LOG of the double X where its value must be a double: the out-of-line arm
+   of a LOG compiled in FP registers (compiler.lisp LOG IN REGISTERS) -- zero,
+   a subnormal, an infinity, a NaN, or a negative X, whose complex log is not
+   a DOUBLE-FLOAT."
+  (let ((r (log x)))
+    (if (double-float-p r)
+        r
+        (error 'type-error :datum r :expected-type 'double-float))))
+
 (defun log (x &optional base)
   "Natural log (or log to BASE if supplied).  CLHS: (log z) for a complex
    z (or a NEGATIVE real, whose principal log is complex) is

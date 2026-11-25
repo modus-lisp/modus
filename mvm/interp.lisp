@@ -3408,6 +3408,23 @@
                  (let ((d (%dbl hi lo)))
                    (setf (svref fregs fd) (if (= opcode +op-fp-li+) (coerce d 'single-float) d)))
                  (setf pc npc3)))))
+          ;; FP-SPILL / FP-RELOAD: the interpreter's frame holds objects, so
+          ;; the float itself goes in the slot (the native form's tagged
+          ;; halves exist for the collector; here the slot is a Lisp value).
+          (#.+op-fp-spill+
+           (multiple-value-bind (fs npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (slot npc2) (%ifetch-byte bc npc)
+               (multiple-value-bind (kind npc3) (%ifetch-byte bc npc2)
+                 (declare (ignore kind))
+                 (%obj-elt-set (svref regs +vreg-vfp+) slot (svref fregs fs))
+                 (setf pc npc3)))))
+          (#.+op-fp-reload+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (slot npc2) (%ifetch-byte bc npc)
+               (multiple-value-bind (kind npc3) (%ifetch-byte bc npc2)
+                 (declare (ignore kind))
+                 (setf (svref fregs fd) (%obj-elt-ref (svref regs +vreg-vfp+) slot))
+                 (setf pc npc3)))))
           (#.+op-fpd-scale+
            (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vk npc2) (%ifetch-reg bc npc)

@@ -113,7 +113,7 @@
    #:mvm-alloc-f32 #:mvm-f32-ref #:mvm-f32-set
    #:+op-f32-load+ #:+op-f32-store+ #:+op-fround32+ #:+op-fsqrt+ #:mvm-fsqrt
    #:+op-fp-op1+ #:+op-fp-op2+ #:+op-fp-cmp+ #:+op-fp-toi+
-   #:mvm-fp-op1 #:mvm-fp-op2 #:mvm-fp-cmp #:mvm-fp-toi #:+op-fpd-scale+ #:mvm-fpd-scale #:+op-fpd-li+ #:+op-fp-li+ #:mvm-fpd-li #:mvm-fp-li
+   #:mvm-fp-op1 #:mvm-fp-op2 #:mvm-fp-cmp #:mvm-fp-toi #:+op-fpd-scale+ #:mvm-fpd-scale #:+op-fpd-li+ #:+op-fp-li+ #:mvm-fpd-li #:mvm-fp-li #:+op-fp-spill+ #:+op-fp-reload+ #:mvm-fp-spill #:mvm-fp-reload
    #:mvm-f32-load #:mvm-f32-store #:mvm-fround32
    #:+op-fp-unbox+ #:+op-fp-box+ #:+op-fp-lane-load+ #:+op-fp-lane-store+
    #:+op-fp-add+ #:+op-fp-sub+ #:+op-fp-mul+ #:+op-fp-div+
@@ -595,6 +595,8 @@
 (defconstant +op-fp-cmp+    #xF7) ; (fp-cmp Vd Fa Fb sub)  fixnum 1 when 0: Fa < Fb  1: Fa <= Fb (singles; NaN -> 0)
 (defconstant +op-fpd-li+    #xFA) ; (fpd-li Fd hi lo)    Fd <- the double with IEEE bits hi:lo
 (defconstant +op-fp-li+     #xFB) ; (fp-li Fd hi lo)     Fd <- that double (exactly a single) as a single
+(defconstant +op-fp-spill+  #xFC) ; (fp-spill Fs slot kind)  frame slot(s) <- Fs's bits as tagged 32-bit halves
+(defconstant +op-fp-reload+ #xFD) ; (fp-reload Fd slot kind) Fd <- the bits FP-SPILL left; kind 0 single, 1 double
 (defconstant +op-fpd-scale+ #xF9) ; (fpd-scale Fd Vk)    Fd <- Fd * 2^k, k a fixnum in [-1022, 1023]
 (defconstant +op-fp-toi+    #xF8) ; (fp-toi Vd Fs sub)     -> fixnum: 0 round-even 1 truncate 2 floor 3 ceiling (single); +4 double
 ;; INTEGER LANE class (SIMD plan, layer 2b — reel's kernels): the same F vregs
@@ -863,6 +865,8 @@
 (defopcode :fp-cmp    #xF7 (:reg :reg :reg :imm8)  "single compare -> fixnum 1/0 (lt, le; NaN unordered)")
 (defopcode :fp-toi    #xF8 (:reg :reg :imm8)       "FP -> tagged fixnum: round-even / truncate / floor / ceiling")
 (defopcode :fpd-scale #xF9 (:reg :reg)             "Double times 2^k, k a fixnum in the normal exponent range")
+(defopcode :fp-spill  #xFC (:reg :imm8 :imm8)      "Frame slot(s) <- FP vreg bits, tagged halves: kind 0 single (one slot), 1 double (two)")
+(defopcode :fp-reload #xFD (:reg :imm8 :imm8)      "FP vreg <- the bits FP-SPILL left in frame slot(s)")
 (defopcode :fpd-li    #xFA (:reg :imm32 :imm32)    "FP vreg <- double literal from its IEEE bits (hi, lo)")
 (defopcode :fp-li     #xFB (:reg :imm32 :imm32)    "FP vreg <- single literal, given as its (exact) double's bits")
 (defopcode :fp-unbox      #xD1 (:reg :reg)      "Boxed float → unboxed single in FP vreg")
@@ -1623,6 +1627,8 @@
 (defun mvm-fp-toi (buf vd fs sub) (encode-instruction buf +op-fp-toi+ vd fs sub))
 (defun mvm-fpd-scale (buf fd vk) (encode-instruction buf +op-fpd-scale+ fd vk))
 (defun mvm-fpd-li (buf fd hi lo) (encode-instruction buf +op-fpd-li+ fd hi lo))
+(defun mvm-fp-spill (buf fs slot kind) (encode-instruction buf +op-fp-spill+ fs slot kind))
+(defun mvm-fp-reload (buf fd slot kind) (encode-instruction buf +op-fp-reload+ fd slot kind))
 (defun mvm-fp-li (buf fd hi lo) (encode-instruction buf +op-fp-li+ fd hi lo))
 
 (defun mvm-v4-lane-load (buf fd varr vidx) (encode-instruction buf +op-v4-lane-load+ fd varr vidx))

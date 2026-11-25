@@ -2157,11 +2157,14 @@
             ;; adapter does), and only an SSH build's address map did, so every x64
             ;; network image built WITHOUT SSH died in RUN-NET-PIPELINE's first step
             ;; (an UNDEFINED-FUNCTION, surfacing as a TYPE-ERROR).  The SSH map's
-            ;; addresses, which an SSH build restates.
-            "
+            ;; addresses; an SSH build has them from that map (a second DEFUN would
+            ;; be an undeclared redefinition).
+            (if *ssh-build-p*
+                ""
+                "
 (defun e1000-state-base ()   #x0C320000)
 (defun fe-scratch-base ()    #x0C320900)
-")
+"))
       (if *cl-repl-virt-p*
           (concatenate 'string
             ;; QEMU virt: PCI ECAM + E1000.  arch-aarch64-cl.lisp also carries

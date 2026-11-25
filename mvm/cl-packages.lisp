@@ -1113,10 +1113,24 @@
          (e (and g (gethash (%symbol-pkg-key (compute-name-hash name-str)
                                              (compute-name-hash (%pkg-name pkg)))
                             g))))
-    (if (and e (symbolp e) (string= (symbol-name e) name-str)
-             (eq (symbol-package e) pkg))
-        (values e :internal)
-        (values nil nil))))
+    (cond
+      ((and e (symbolp e) (string= (symbol-name e) name-str)
+            (eq (symbol-package e) pkg))
+       (values e :internal))
+      ;; A KERNEL DEFINITION NOTHING QUOTED has no symbol object at all: the image
+      ;; keys its functions and globals by name (bare, for MODUS-INT), and a symbol
+      ;; is made only when something reads or interns the name.  So
+      ;; (find-symbol "W32-CALL*" "MODUS-INT") answered NIL in an image that has
+      ;; W32-CALL*, until the reader had seen modus-int::w32-call* -- and code that
+      ;; finds an optional kernel function by name (seal's Windows trust store) never
+      ;; found it.  MODUS-INT is the internals' home (SB-INT's role), so a name the
+      ;; kernel defines is present there: intern it, which is the symbol the reader
+      ;; would have made, and answer :INTERNAL.
+      ((and (string= (%pkg-name pkg) "MODUS-INT")
+            (or (and *kernel-fn-names* (gethash name-str *kernel-fn-names*))
+                (and *kernel-global-names* (gethash name-str *kernel-global-names*))))
+       (values (intern name-str pkg) :internal))
+      (t (values nil nil)))))
 
 (defun find-symbol (name &rest pkg-arg)
   "Find symbol named NAME in package PKG.

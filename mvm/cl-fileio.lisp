@@ -2814,8 +2814,17 @@
              (out nil))
         (dolist (e ents (nreverse out))
           (push (if (consp e) (car e) e) out)))))
+  (%os-dir-entries path))
+
+;;; THE OS SEAMS UNDER DIRECTORY.  Linux lists a directory with open + getdents64 and
+;;; tells one from a file by getdents64 answering at all.  Windows cannot open a
+;;; directory with CreateFile's plain flags, so its runtime (boot/boot-win64.lisp)
+;;; replaces these three with FindFirstFile / GetFileAttributes.
+(declaim (overridable %os-dir-entries %os-path-openable-p %os-directory-p))
+(defun %os-dir-entries (path)
+  "The bare entry names of directory PATH (no . / ..), or NIL."
   (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
-    (when (or (null fd) (< fd 0)) (return-from %dir-entries-raw nil))
+    (when (or (null fd) (< fd 0)) (return-from %os-dir-entries nil))
     (let ((acc nil) (done nil))
       (loop
         (when done (return nil))
@@ -2825,6 +2834,23 @@
             (t (setq acc (%parse-dirents *%dirent-buf-addr* n acc))))))
       (handler-case (%sys-close fd) (t (c) nil))
       (nreverse acc))))
+
+(defun %os-path-openable-p (path)
+  "T when PATH (a file, or a directory with or without its slash) exists and opens."
+  (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
+    (if (and fd (>= fd 0))
+        (progn (handler-case (%sys-close fd) (t (c) nil)) t)
+        nil)))
+
+(defun %os-directory-p (p)
+  "T when P (no trailing slash) names a directory.  GETDENTS64 answers >= 0 on a
+   directory -- 0 for an empty one -- and a negative errno (ENOTDIR) on anything else."
+  (let ((fd (handler-case (%sys-open-rdonly p) (t (c) -1))))
+    (when (and fd (>= fd 0))
+      (let ((r (handler-case (%sys-getdents64 fd *%dirent-buf-addr* *%dirent-buf-size*)
+                 (t (c) -1))))
+        (handler-case (%sys-close fd) (t (c) nil))
+        (and r (>= r 0))))))
 
 (defun %path-openable-p (path)
   ;; CABINET (#279): existence through the seam — cabinet EXISTS-P answers
@@ -2841,10 +2867,7 @@
              (dirp (and (> n 1) (char= (char path (- n 1)) #\/)))
              (p (if dirp (subseq path 0 (- n 1)) path)))
         (if (handler-case (%cab (if dirp :dir-p :exists) p) (t (c) nil)) t nil))))
-  (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
-    (if (and fd (>= fd 0))
-        (progn (handler-case (%sys-close fd) (t (c) nil)) t)
-        nil)))
+  (%os-path-openable-p path))
 
 (defun %glob-match-p (pat str)
   "Shell-style match: * in PAT matches any run of characters."
@@ -2923,12 +2946,7 @@
          (p (if (and (> n 1) (char= (char path (- n 1)) #\/)) (subseq path 0 (- n 1)) path)))
     (if (%cab-on)
         (handler-case (progn (%cab :readdir p) t) (t (c) nil))
-        (let ((fd (handler-case (%sys-open-rdonly p) (t (c) -1))))
-          (when (and fd (>= fd 0))
-            (let ((r (handler-case (%sys-getdents64 fd *%dirent-buf-addr* *%dirent-buf-size*)
-                       (t (c) -1))))
-              (handler-case (%sys-close fd) (t (c) nil))
-              (and r (>= r 0))))))))
+        (%os-directory-p p))))
 
 (defun %glob-result-pathname (s)
   "One wild DIRECTORY match as a pathname, CLHS-fashion: a subdirectory in

@@ -77,7 +77,7 @@
      "TlsAlloc" "CreateThread" "ResumeThread" "ExitThread" "GetCurrentThreadId"
      "SwitchToThread" "AddVectoredExceptionHandler" "GetProcessTimes"
      "GetThreadTimes" "GetSystemTimePreciseAsFileTime" "GetModuleHandleA"
-     "LoadLibraryA" "GetProcAddress")
+     "LoadLibraryA" "GetProcAddress" "FindFirstFileA" "FindNextFileA" "FindClose")
     ("KERNELBASE.dll"
      "WaitOnAddress" "WakeByAddressSingle" "WakeByAddressAll")
     ("WS2_32.dll"
@@ -1808,6 +1808,45 @@
                 116444736000000000)
              10000000)
       0))
+;; DIRECTORIES.  CreateFile opens a directory only with FILE_FLAG_BACKUP_SEMANTICS, so
+;; the Linux seams under DIRECTORY (open + getdents64, mvm/cl-fileio.lisp) found nothing
+;; here at all: every DIRECTORY was NIL, so ASDF's :TREE, UIOP:DIRECTORY-FILES and
+;; cairn's pack lookup saw empty directories.  FindFirstFileA lists, GetFileAttributesA
+;; tells a directory (FILE_ATTRIBUTE_DIRECTORY, 16) from a file.  WIN32_FIND_DATAA is
+;; 320 bytes with cFileName at +44; INVALID_HANDLE_VALUE is -1.
+(defun %w32-attributes (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall6 +w32-getfileattributesa+ *cstr-scratch* 0 0 0 0 0))
+(defun %w32-strip-slash (p)
+  (let ((n (length p)))
+    (if (and (> n 1) (= (char-code (char p (- n 1))) 47)) (subseq p 0 (- n 1)) p)))
+(defun %os-dir-entries (path)
+  (let* ((dir (%w32-strip-slash path))
+         (pat (concatenate 'string (if (string= dir \"./\") \".\" dir) \"/*\")))
+    (%string-to-cstr pat *cstr-scratch*)
+    (let ((h (syscall6 +w32-findfirstfilea+ *cstr-scratch* *io-buf-addr* 0 0 0 0))
+          (acc nil))
+      (if (or (< h 0) (eql h 4294967295) (eql h 18446744073709551615))
+          nil
+          (progn
+            (loop
+              (let ((name (%c-string-at (+ *io-buf-addr* 44))))
+                (unless (or (null name) (string= name \".\") (string= name \"..\"))
+                  (setq acc (cons name acc))))
+              (when (eql (syscall6 +w32-findnextfilea+ h *io-buf-addr* 0 0 0 0) 0) (return nil)))
+            (syscall6 +w32-findclose+ h 0 0 0 0 0)
+            (nreverse acc))))))
+(defun %os-path-openable-p (path)
+  (let ((a (%w32-attributes (%w32-strip-slash path))))
+    (if (eql a 4294967295)
+        nil
+        (let ((n (length path)))
+          ;; \"dir/\" asks for a directory; a bare name may be either.
+          (if (and (> n 1) (= (char-code (char path (- n 1))) 47)) (not (eql (logand a 16) 0)) t)))))
+(defun %os-directory-p (p)
+  (let ((a (%w32-attributes p)))
+    (and (not (eql a 4294967295)) (not (eql (logand a 16) 0)))))
+
 ;; DRIVES: \"C:/a/b\" is absolute here (mvm/cl-fileio.lisp, %DRIVE-NAMESTRING-P).
 (defun %drive-namestring-p (s)
   (and (>= (length s) 2)

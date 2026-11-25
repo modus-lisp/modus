@@ -85,7 +85,8 @@
            "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE" "QUIT"
            "SUBPROCESS-ERROR" "SUBPROCESS-ERROR-CODE" "SUBPROCESS-ERROR-COMMAND"
            "SUBPROCESS-ERROR-PROCESS" "PROCESS-INFO" "PROCESS-INFO-PID"
-           "FILE-EXISTS-P" "DIRECTORY-EXISTS-P" "TRUENAMIZE" "ENSURE-PATHNAME"))
+           "FILE-EXISTS-P" "DIRECTORY-EXISTS-P" "TRUENAMIZE" "ENSURE-PATHNAME"
+           "DELETE-FILE-IF-EXISTS"))
 
 (defpackage "ASDF"
   (:use "COMMON-LISP" "UIOP")
@@ -276,12 +277,18 @@
   (directory (concatenate 'string (namestring (uiop::ensure-directory-pathname dir)) "*/")))
 
 (defun uiop::directory-files (dir &optional (pattern "*.*"))
-  "The FILES directly inside DIR matching PATTERN -- not its subdirectories,
-   which modus's DIRECTORY lists among *.* without their trailing /."
+  "The FILES directly inside DIR matching PATTERN -- not its subdirectories.
+   DIRECTORY returns a wild match that is a directory in directory form (name NIL,
+   as SBCL does: %GLOB-RESULT-PATHNAME), so those go; a name SUBDIRECTORIES also
+   finds goes too, for a listing that gave one without its trailing /.  Before the
+   first test every subdirectory came back as a file whose FILE-NAMESTRING is \"\"
+   (cairn's STATUS saw 71 untracked \"\" in a clean clone of modus)."
   (let* ((d (namestring (uiop::ensure-directory-pathname dir)))
          (subs (mapcar (lambda (s) (string-right-trim "/" (namestring s)))
                        (uiop::subdirectories d))))
-    (remove-if (lambda (f) (member (namestring f) subs :test (function string=)))
+    (remove-if (lambda (f) (or (null (pathname-name f))
+                               (member (string-right-trim "/" (namestring f)) subs
+                                       :test (function string=))))
                (directory (concatenate 'string d pattern)))))
 
 ;;; Four more programs reach for (operandi's SendFile and its chat deletion, loom's file pages):
@@ -297,6 +304,11 @@
   "X's truename (in directory form) when it names a directory, else NIL."
   (and x (ignore-errors
           (probe-file (concatenate 'string (string-right-trim "/" (namestring x)) "/")))))
+(defun uiop::delete-file-if-exists (x)
+  "Delete the file X if there is one (cairn's partial files and stale refs); T if it did."
+  (when (and x (uiop::file-exists-p x))
+    (delete-file x)
+    t))
 (defun uiop::truenamize (x)
   "X's truename when it exists, else X merged with *DEFAULT-PATHNAME-DEFAULTS*."
   (or (ignore-errors (truename x)) (merge-pathnames x)))

@@ -88,7 +88,7 @@
            "SEED-RANDOM-STATE" "SPIN-LOOP-HINT"
            ;; the browser stack (weft, shuttle, loom) reaches for these
            "FLOAT-NAN-P" "FLOAT-INFINITY-P" "GET-TIME-OF-DAY"
-           "MAKE-WEAK-POINTER" "WEAK-POINTER-VALUE" "PARSE-NATIVE-NAMESTRING"
+           "MAKE-WEAK-POINTER" "WEAK-POINTER-VALUE" "PARSE-NATIVE-NAMESTRING" "NATIVE-NAMESTRING"
            "WITH-TIMEOUT" "TIMEOUT" "GET-BYTES-CONSED"
            "WORD" "ATOMIC-INCF" "ATOMIC-DECF"))
 
@@ -1004,6 +1004,12 @@
 (defun sb-ext:make-weak-pointer (object) (list :weak-pointer object))
 (defun sb-ext:weak-pointer-value (wp)
   (if (and (consp wp) (eq (car wp) :weak-pointer)) (values (second wp) t) (values nil nil)))
+
+;;; A namestring needs no escaping on modus (its reader of pathnames treats no character
+;;; specially), so the native form is the namestring.  cairn passes it to sb-posix.
+(defun sb-ext:native-namestring (pathname &key as-file)
+  (declare (ignore as-file))
+  (namestring pathname))
 
 (defun sb-ext:parse-native-namestring (string &optional host defaults &key as-directory)
   (declare (ignore host))

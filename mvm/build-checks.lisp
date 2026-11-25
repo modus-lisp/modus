@@ -2050,10 +2050,11 @@ that no list has ***~%" (length missing))
 ;;; names are folded constants (see the comment in SET-TARGET-FIXNUM-BITS-FOR).
 ;;; The host's parameters are put back afterwards.
 (defun %gck-ct-w32-01 (ct) (if (compile-target-w32-capable ct) 1 0))
+(defun %gck-ct-tc-01 (ct) (if (compile-target-tail-calls ct) 1 0))
 (defun check-host-widths-match-descriptor ()
   (let ((problems nil)
         (saved (list +fixnum-bits+ +tag-object+ +nil-value+ +t-value+ +target-big-endian+
-                     +mv-count-addr+ +mv-values-addr+ *target-has-fpd-p* +target-w32+))
+                     +mv-count-addr+ +mv-values-addr+ *target-has-fpd-p* +target-w32+ +target-tail-calls+))
         (fields '((+fixnum-bits+ . compile-target-fixnum-bits) (+fixnum-max+ . compile-target-fixnum-max)
                   (+fixnum-min+ . compile-target-fixnum-min) (+fixnum-limit+ . compile-target-fixnum-limit)
                   (+fixnum-neg-limit+ . compile-target-fixnum-neg-limit)
@@ -2074,7 +2075,8 @@ that no list has ***~%" (length missing))
                   (+tag-object+ . compile-target-tag-object) (+tag-immediate+ . compile-target-tag-immediate)
                   (+tag-forward+ . compile-target-tag-forward) (+t-value+ . compile-target-t-value)
                   (+nil-value+ . compile-target-nil-value)
-                  (+target-w32+ . %gck-ct-w32-01))))
+                  (+target-w32+ . %gck-ct-w32-01)
+                  (+target-tail-calls+ . %gck-ct-tc-01))))
     (unwind-protect
          (loop for target being the hash-values of *targets*
                do (let ((ct (set-target-fixnum-bits-for target)))
@@ -2084,8 +2086,8 @@ that no list has ***~%" (length missing))
                                       (car f) (symbol-value (car f)) (funcall (cdr f) ct))
                               problems)))))
       ;; put the host back where it was (the build sets it again per image)
-      (destructuring-bind (fb to nv tv be mvc mvv fpd w32) saved
-        (setf +target-w32+ w32)
+      (destructuring-bind (fb to nv tv be mvc mvv fpd w32 tc) saved
+        (setf +target-w32+ w32 +target-tail-calls+ tc)
         (set-target-fixnum-bits fb)
         (setf +tag-object+ to +nil-value+ nv +t-value+ tv +target-big-endian+ be
               *target-big-endian-p* (= be 1)

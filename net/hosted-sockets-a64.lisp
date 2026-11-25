@@ -200,17 +200,8 @@
 
 (defun %sbs-poll-in (fd ms) (socket-wait-readable fd ms))
 
-;;; LISTEN's question, asked of the kernel: mvm/cl-fileio.lisp's %FD-INPUT-READY-P is the
-;;; conservative T, and hosted-sockets-post.lisp overrides it with poll(2) -- on x86-64 only.
-;;; So on every AArch64 image (Linux, and macOS through the Darwin shim) LISTEN on a DRAINED
-;;; socket said T, and a reader that loops "while LISTEN, read a message" blocked in the
-;;; next read forever: glass's one-thread RFB server read a viewer's SetPixelFormat,
-;;; SetEncodings and FramebufferUpdateRequest, then hung in READ-BYTE and never sent a
-;;; frame (`modus.com desk' on a Mac: a black screen).  ppoll with a zero timeout; an error
-;;; (a descriptor ppoll cannot ask) keeps the conservative answer.  Named in MODUS-INT, the
-;;; runtime's home for it, whatever package this text is read in.
-(defun modus-int::%fd-input-ready-p (fd)
-  (/= (socket-wait-readable fd 0) 0))
+;;; LISTEN's readiness check (%FD-INPUT-READY-P) on AArch64 is net/hosted-fd-ready-a64.lisp,
+;;; compiled into the image: a DEFUN here, evaluated at boot, would not reach LISTEN on macOS.
 
 (defun %sbs-bind-un (fd path)
   (let ((len (%sbs-addr-un path)))

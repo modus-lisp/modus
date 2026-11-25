@@ -1700,7 +1700,9 @@
                  (mvm-text "net/term.lisp") (string #\Newline)
                  (mvm-text "net/actors.lisp") (string #\Newline)
                  (mvm-text "net/hosted-actors-post.lisp") (string #\Newline)
-                 (mvm-text "net/hosted-sync.lisp") (string #\Newline)))
+                 (mvm-text "net/hosted-sync.lisp") (string #\Newline)
+                 ;; LISTEN asks ppoll (after hosted-sync: it uses its socket scratch)
+                 (mvm-text "net/hosted-fd-ready-a64.lisp") (string #\Newline)))
    (*cli-hosted-actor-runtime-p*
       (concatenate 'string (string #\Newline)
                    (mvm-text "net/hosted-actors.lisp")

@@ -4789,7 +4789,12 @@
 ;;; function whose name is a cross-unit RETURN-FROM target (its body runs
 ;;; under a catch frame).  A form that occurs twice in the body (a macro that
 ;;; duplicated it) is never marked: one copy might not be in tail position.
-(defvar *tail-calls* t "NIL: compile every call in tail position as a CALL (bisecting).")
+;; OFF FOR NOW (2026-11-25): SBCL and a modus builder disagree on which calls get marked --
+;; 8 closures / local functions of the x64 CLI (tail calls to PUTHASH, FIND, SORT, NTH) came
+;; out as TAILCALL under one host and CALL under the other, so the release images were no
+;; longer byte-identical across hosts.  Self tail calls (*SELF-TAIL-LOOPS*) are unaffected.
+;; Back to T once the walk decides the same on every host (scripts/fndiff.py over both builds).
+(defvar *tail-calls* nil "NIL: compile every call in tail position as a CALL (bisecting).")
 (defvar *tail-call-mark* nil "T while %STL-WALK marks tail calls.")
 (defvar *tail-call-forms* nil
   "The call forms of the function being compiled that are in tail position (EQ).")

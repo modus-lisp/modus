@@ -31,7 +31,8 @@
          (tc-check ,name r ,want))))
 
 (defvar modus-int::*tc-target*
-  (handler-case (modus-int::ct-tail-calls-p) (error () nil)))
+  ;; the target's TAILCALL and the compiler's switch for it (*TAIL-CALLS*: off for now)
+  (handler-case (modus-int::%tail-call-mark-p) (error () nil)))
 (format t "~&tail calls on this target: ~a~%" modus-int::*tc-target*)
 
 ;;; --- mutual recursion -------------------------------------------------------

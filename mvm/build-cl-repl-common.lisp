@@ -206,6 +206,12 @@
    output, PS/2 keyboard input, beside COM1.  MODUS_PC_CONSOLE=1 / =0
    overrides the default (on for bare i386, and for UEFI unless SEV-SNP).")
 
+(defparameter *pc-vbe-entry-points*
+  '(vbe-init vbe-test-pattern vbe-fill vbe-on-p vbe-base vbe-pitch vbe-width vbe-height
+    %vbe-edid-size %vbe-mode-list %vbe-mode-info %vbe-choose %pcbios-int %pcbios-out)
+  "net/pc-vbe.lisp's entry points: their names, here in code, keep them through MODUS_SHAKE
+   (which keeps every name the build scripts spell) until the image calls them itself.")
+
 (defun %pc-console-text ()
   "net/pc-console.lisp with the data it reads: boot/boot-uefi-x64.lisp's 8x8
    font and PS/2 scancode tables, and whether a GOP framebuffer may be used
@@ -220,7 +226,13 @@
             (coerce (symbol-value (find-symbol "*PS2-SCANCODE-NORMAL*" :modus.mvm)) 'list)
             (coerce (symbol-value (find-symbol "*PS2-SCANCODE-SHIFTED*" :modus.mvm)) 'list)
             (if *cl-repl-uefi-p* "t" "nil")
-            (%rpi-net-text "pc-console.lisp"))))
+            (concatenate 'string (%rpi-net-text "pc-console.lisp")
+                         ;; bare i386: a VBE framebuffer, chosen in Lisp through the pcboot
+                         ;; shim's PM_BIOS (net/pc-vbe.lisp); MODUS_PC_VBE=0 leaves it out
+                         (if (and *cl-repl-i386-p*
+                                  (not (equal (sb-ext:posix-getenv "MODUS_PC_VBE") "0")))
+                             (%rpi-net-text "pc-vbe.lisp")
+                             "")))))
 
 (defun %mac-console-text ()
   "mac/mac-console.lisp (vessel) with the 8x8 font it draws in: the bare Mac's
@@ -383,13 +395,23 @@
 ;;; allocator's own range check re-initialises a garbage bump pointer to base —
 ;;; see the #x0531 arm.
 (defvar *cl-repl-jit-region-source*
-  (if *cl-repl-virt-p*
-      "
+  (cond (*cl-repl-virt-p*
+         "
 (defun %jit-exec-bump () 67108848)
 (defun %jit-exec-lo   () 67108864)
 (defun %jit-exec-hi   () 83886080)
-"
-      ""))
+")
+        ;; bare x64 with the JIT: translate-x64's #x0531 bare arm bumps the word at
+        ;; 0x10000FB8 through [#x30000000, #x38000000) (%X64-BARE-JIT-LO / -HI), and the
+        ;; arena bookkeeping (%CORE-JIT-ARENA-*, %JIT-DATA-PAGE, %JIT-ARENA-ROOM-P) must
+        ;; see the same region
+        ((and *cl-repl-x64-p* *jit-on*)
+         "
+(defun %jit-exec-bump () 268439480)
+(defun %jit-exec-lo   () 805306368)
+(defun %jit-exec-hi   () 939524096)
+")
+        (t "")))
 
 ;;; ------------------------------------------------------------
 ;;; BRING-UP CULLS (#209 rung 4).  Chain-loading a 20MB image over a 9600-baud
@@ -485,6 +507,23 @@
   nil)
 (defun %monotonic-ns ()
   (floor (* (rdtsc) 1000000000) (cntfrq)))
+;; net/bare-sync.lisp's mutex arena: 32 KB of low RAM nothing else uses (the pcboot shim and
+;; MODUS.COM keep to segments #x1000-#x4000 and #x7000; the stub to #x8000-#x8300, #x1B000-
+;; #x2AFFF and #x90000), identity-mapped by the stub: 511 cells.  The prologue zeroes its
+;; count on every boot, a restored core's included (the arena is not in the core).
+(declaim (overridable %bare-sync-arena))
+(defun %bare-sync-arena () (values #x50000 #x58000))
+;; ... and its cells are handed out round-robin, never exhausted.  bare-sync never reclaims a
+;; cell, and a desk makes framebuffers (two mutexes each) as windows open, so a fixed pool
+;; would run out mid-session.  With one thread a mutex is a flag store and nothing waits, so
+;; two objects sharing a cell cannot block each other.  A cell is zeroed on its first use only.
+(declaim (overridable %sync-cell))
+(defun %sync-cell ()
+  (let* ((n (mem-ref #x50000 :u32))
+         (a (+ #x50000 64 (* (mod n 511) 64))))
+    (when (< n 511) (dotimes (i 8) (%gc-write64 (+ a (* i 8)) 0)))
+    (setf (mem-ref #x50000 :u32) (+ n 1))
+    a))
 "
         "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
@@ -957,7 +996,52 @@
 ;; Back to lib/save-image.lisp's defaults.  Last definition wins.
 (defun %core-progress (k) k)
 (defun %core-pre-restore () t)
-")
+"
+       (if (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)
+           ""
+           "
+;;; THE CLOCK ON A BARE PC.  Trap #x0311 (CNTFRQ) answers 0 on bare x64 -- no
+;;; OS clock to measure the TSC against -- and cl-fileio's defaults are a Linux
+;;; syscall, so GET-INTERNAL-REAL-TIME read 0 and the hot-function JIT's 10 ms
+;;; budget never fired: one expensive call never promoted its DEFUN.  The
+;;; reference is the 8254's channel 2, as in Linux's pit_calibrate_tsc: gate on
+;;; and speaker off (port #x61), mode 0 with a 10 ms count, and OUT2 (#x61 bit
+;;; 5) rises at zero.  Measured once, kept in a global SET at run time (a
+;;; DEFVAR initform does not run here).  No PIT answering within ~5 s of TSC
+;;; (a chipset that gates it off) leaves 0, \"no clock\", the old answer.  Not
+;;; under SEV-SNP: that guest must not touch legacy ports.
+(defun %pc-tsc-hz ()
+  (let ((hz (if (boundp '*pc-tsc-hz*) (symbol-value '*pc-tsc-hz*) nil)))
+    (if (integerp hz)
+        hz
+        (let ((latch 11932))
+          (io-out-byte #x61 (logior (logand (io-in-byte #x61) #xFC) 1))
+          (io-out-byte #x43 #xB0)
+          (io-out-byte #x42 (logand latch #xFF))
+          (io-out-byte #x42 (ash latch -8))
+          (let ((t0 (rdtsc)) (cap 17179869184))
+            (loop while (and (zerop (logand (io-in-byte #x61) #x20))
+                             (< (- (rdtsc) t0) cap)))
+            (let* ((dt (- (rdtsc) t0))
+                   (v (if (< dt cap) (floor (* dt 1193182) latch) 0)))
+              (setf (symbol-value '*pc-tsc-hz*) v)
+              v))))))
+(defun get-internal-real-time ()
+  (let ((hz (%pc-tsc-hz)))
+    (if (> hz 0)
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000)
+             (floor (* (mod ticks hz) 1000000) hz)))
+        0)))
+(defun %irt-ns ()
+  (let ((hz (%pc-tsc-hz)))
+    (if (> hz 0)
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000000)
+             (floor (* (mod ticks hz) 1000000000) hz)))
+        0)))
+(defun %irun-ns () (%irt-ns))
+"))
       (concatenate 'string
         (string #\Newline)
         (mvm-text "lib/fdt.lisp")
@@ -1990,9 +2074,13 @@
       ""
       (if *cl-repl-i386-p*
           (concatenate 'string
-            ;; NE2000 ISA (port I/O).  The adapter comes AFTER the driver: it
-            ;; moves the driver's host buffers out of the image (see its header).
+            ;; NE2000 ISA (port I/O) and the E1000 family on PCI (QEMU's e1000,
+            ;; a ThinkPad T420's 82579LM), picked when NIC-PROBE runs.  The
+            ;; adapter comes AFTER both drivers: it moves the NE2000's host
+            ;; buffers out of the image and overrides e1000.lisp's two seams
+            ;; (E1000-MAP-BAR, E1000-DMA-ADDR) -- see its header.
             (%rpi-net-text "ne2000.lisp")          (string #\Newline)
+            (%rpi-net-text "e1000.lisp")           (string #\Newline)
             (%rpi-net-text "arch-i386-cl.lisp")    (string #\Newline))
       (if *cl-repl-x64-p*
           (concatenate 'string
@@ -2092,11 +2180,22 @@
                    send receive rx-buf probe read-reg)))
     (cond
       (*cl-repl-i386-p*
-       (format nil "~%(defun %bind-nic-seams ()
+       ;; an E1000 on PCI if there is one (and a net block to DMA from), else
+       ;; the NE2000: NIC-PROBE rebinds the interface to whichever answered
+       (format nil "~%(defun %pick-e1000-or-ne2k ()
+  (if (and (modus.board::pc-net-block-p) (= (modus.net.e1000:e1000-hw-probe) 1))
+      (progn
+        (setf (fdefinition 'modus.net:nic-send) (function modus.net.e1000:e1000-hw-send))
+        (setf (fdefinition 'modus.net:nic-receive) (function modus.net.e1000:e1000-hw-receive))
+        (setf (fdefinition 'modus.net:nic-rx-buf) (function modus.net.e1000:e1000-hw-rx-buf))
+        (setf (fdefinition 'modus.net:nic-read-reg) (function modus.net.e1000:e1000-read-reg))
+        1)
+      (modus.net.ne2000:ne2k-probe)))
+(defun %bind-nic-seams ()
   (modus.net::%define-nic-seams)
 ~A)~%"
                (bind "modus.net.ne2000:ne2k-send" "modus.net.ne2000:ne2k-receive"
-                     "modus.net.ne2000:ne2k-rx-buf" "modus.net.ne2000:ne2k-probe"
+                     "modus.net.ne2000:ne2k-rx-buf" "%pick-e1000-or-ne2k"
                      "modus.net::no-read-reg")))
       (*cl-repl-x64-p*
        ;; virtio or E1000, decided when NIC-PROBE runs: it probes virtio, and
@@ -2674,8 +2773,10 @@
 ;; An autostart SSH image is a server: it has no library to fetch, and on a
 ;; real network the slirp address the fetch targets does not exist, so the
 ;; attempt only delays the SSH server.
+;; ... nor does an image that only wants the network up (MODUS_NET_NOFETCH=1: kiln t420's desk,
+;; whose pipeline otherwise spent two TCP timeouts on a slirp address at every boot).
 (defvar *net-x64-fetch-block*
-  (if *ssh-autostart-p*
+  (if (or *ssh-autostart-p* (equal (sb-ext:posix-getenv "MODUS_NET_NOFETCH") "1"))
       "          (write-string-serial \"NET-FETCH-SKIPPED\") (write-char-serial 10))))"
       "          (handler-case (ql-net-setup) (t (c) nil))
           (net-install-and-call (%net-fetch-url)))))"))
@@ -3393,6 +3494,28 @@
       (format t "~&;; split-dispatch: COMPILE-COMPOUND -> ~D handlers over ~D keys~%"
               handlers keys))))
 
+;;; Bare i386 + MODUS_I386_JIT=1: the native tier (mvm/jit-i386-native.lisp) in
+;;; build-cli-common's late arch slot, its code area the one the boot stub maps
+;;; (a bare PC has no mmap): %N386-AREA, by last-defun-wins.
+(when (and *cl-repl-i386-p* (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1"))
+  (defvar cl-user::*cli-arch-late-source*
+    (concatenate 'string (mvm-text "mvm/jit-i386-native.lisp") "
+(defun %n386-area ()
+  \"Bare metal: the code area boot/boot-i386-cl.lisp mapped at +N386-AREA-ADDR+,
+   its size in the stub's word at #x80A8 (0: none, and runtime code stays
+   interpreted).\"
+  (let ((n (mem-ref #x80A8 :u32)))
+    (when (zerop n) (error \"jit-i386-native: the boot stub mapped no code area\"))
+    (setq *n386-ptr* +n386-area-addr+ *n386-end* (+ +n386-area-addr+ n))))
+(defun %n386-allowed-p ()
+  \"Not while booting to be saved as a core (SAVECORE, scripts/dos386-core.py):
+   the core holds the heap, not the code area, so a function translated now
+   would be a pointer into an empty area after the restore -- measured: every
+   form boot had run natively jumped into zeros.  The restored image starts
+   the tier at its first DEFUN.  SAVELATER the same: the save comes after an install.\"
+  (not (or (%i386-core-save-requested-p) (%i386-core-save-later-p))))
+")))
+
 ;;; :MAC68K + MODUS_68K_JIT=1: the runtime threaded JIT (mvm/jit-68k.lisp) in
 ;;; build-cli-common's late arch slot, with the layout's :JIT-AREA as its code
 ;;; area (a Mac has no mmap).  Layouts without one get no JIT.
@@ -3774,29 +3897,47 @@
   ;; stub zeroed the whole block on a cold one)
   (let ((at (search "  (write-string-serial \"MODUS-CL\")" *cli-arch-kernel-prologue*)))
     (unless at (error "i386 core: the prologue's banner moved"))
+    ;; THE MUTEX ARENA (net/bare-sync.lisp, %BARE-SYNC-ARENA below) is low RAM, not heap:
+    ;; a core does not carry it, so its cell count is reset on EVERY boot, a restored one
+    ;; included -- a count left in RAM by the firmware would make every MAKE-MUTEX (two per
+    ;; glass framebuffer) answer "arena exhausted".  A restored mutex and a new one may then
+    ;; share a cell; with one thread a lock is a flag store, so that is harmless.
     (setq *cli-arch-kernel-prologue*
-          (concatenate 'string "  (unless (eql (mem-ref #x8024 :u32) 1)
+          (concatenate 'string "  (setf (mem-ref #x50000 :u32) 0)
+  (setf (mem-ref #x50004 :u32) 0)
+  (unless (eql (mem-ref #x8024 :u32) 1)
 " (subseq *cli-arch-kernel-prologue* 0 at) "  )
 " (subseq *cli-arch-kernel-prologue* at))))
   (setq *cli-arch-override-source*
         (concatenate 'string *cli-arch-override-source* "
 (defun %core-requested-p () (eql (mem-ref #x8024 :u32) 1))
+;; What a restored core runs before the REPL: a function designator, set before the save
+;; (kiln t420: (setq modus-int::*core-restart-hook* 'kiln-t420-main)), carried by the heap.
+(defvar *core-restart-hook* nil)
 (defun %core-pre-restore () t)
 (defun %restore-image () nil)
 (defun %core-post-restore () nil)
-(defun %i386-core-save-requested-p ()
-  ;; SAVECORE in the Multiboot command line (QEMU -append), which the entry
-  ;; stub copied to #x8200 (boot-i386-cl.lisp +I386-CL-CMDLINE+).
-  (let ((i 0) (hit nil))
+(defun %i386-cmdline-has-p (word)
+  ;; WORD in the Multiboot command line (QEMU -append), which the entry stub
+  ;; copied to #x8200 (boot-i386-cl.lisp +I386-CL-CMDLINE+).
+  (let ((i 0) (hit nil) (n (length word)))
     (loop
       (when (or hit (>= i 248) (eql (mem-ref (+ #x8200 i) :u8) 0)) (return nil))
-      (when (and (eql (mem-ref (+ #x8200 i) :u8) 83) (eql (mem-ref (+ #x8201 i) :u8) 65)
-                 (eql (mem-ref (+ #x8202 i) :u8) 86) (eql (mem-ref (+ #x8203 i) :u8) 69)
-                 (eql (mem-ref (+ #x8204 i) :u8) 67) (eql (mem-ref (+ #x8205 i) :u8) 79)
-                 (eql (mem-ref (+ #x8206 i) :u8) 82) (eql (mem-ref (+ #x8207 i) :u8) 69))
-        (setq hit t))
+      (let ((k 0))
+        (loop
+          (when (>= k n) (setq hit t) (return nil))
+          (unless (eql (mem-ref (+ #x8200 i k) :u8) (char-code (char word k))) (return nil))
+          (setq k (+ k 1))))
       (setq i (+ i 1)))
     hit))
+(defun %i386-core-save-requested-p ()
+  ;; SAVECORE: save the core as boot init ends, before the REPL
+  (%i386-cmdline-has-p \"SAVECORE\"))
+(defun %i386-core-save-later-p ()
+  ;; SAVELATER: this boot will be saved, but later -- by whoever drives the REPL
+  ;; (kiln t420: install the desk, then (%I386-CORE-SAVE)) -- so the native tier
+  ;; stays off as for SAVECORE, and nothing saves at boot
+  (%i386-cmdline-has-p \"SAVELATER\"))
 (defun %i386-core-save ()
   \"Collect until the live data is at the bottom of the lower semispace, say
    where it ends, and stop: scripts/dos386-core.py reads the guest from here.
@@ -3813,6 +3954,12 @@
     (print-dec (mem-ref #x10000E00 :u32))
     (write-string-serial \" handlers=\")
     (print-dec (mem-ref #x10000400 :u32))
+    ;; the native tier's code in use, from the area's base (#x12000000): a core saved
+    ;; after it ran carries this too, and the stub puts it back where it was
+    (write-string-serial \" jit=\")
+    (print-dec (if (and (boundp (quote *n386-ptr*)) (integerp *n386-ptr*))
+                   (- *n386-ptr* #x12000000)
+                   0))
     (write-char-serial 10)
     (halt)))
 "))
@@ -3826,8 +3973,17 @@
                        "  (when (%i386-core-save-requested-p) (%i386-core-save))
 "
                        (subseq *cli-arch-kernel-epilogue* at))))
+  ;; A restored core runs its restart hook (kiln t420's desk) when it was saved with one, as
+  ;; the Pi's does; the REPL when the hook returns, or when there is none.
   (setq *cli-arch-core-resume* "    (write-string-serial \"MODUS-CORE\")
     (write-char-serial 10)
+    (when (and (boundp (quote *core-restart-hook*)) *core-restart-hook*)
+      (write-string-serial \"CORE-RESTART-HOOK\")
+      (write-char-serial 10)
+      (handler-case (funcall *core-restart-hook*)
+        (t (c) (write-string-serial \"RESTART-HOOK-DIED: \")
+               (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+               (write-char-serial 10))))
     (handler-case (cl-serial-repl)
       (t (c) (write-string-serial \"REPL-DIED: \")
              (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
@@ -3945,11 +4101,21 @@
   (cl-user::mvm-load "boot/boot-linux-i386.lisp")
   (cl-user::mvm-load "boot/boot-i386-cl.lisp")
   (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
+  ;; MODUS_SYMMAP=FILE: the image's symbol map (cross.lisp WRITE-SYMMAP), so a fault
+  ;; address in the image can be named.
+  (let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
+    (when (and sm (plusp (length sm)))
+      (setf (symbol-value (intern "*WRITE-SYMMAP-PATH*" "MODUS.MVM")) sm)))
   (funcall (intern "I386-SET-CL-BARE-MODE" "MODUS.MVM.I386")
            (symbol-value (intern "+LINUX-I386-GLOBALS+" "MODUS.MVM"))
            (symbol-value (intern "+LINUX-I386-HEAP-MARGIN-ADDR+" "MODUS.MVM"))
            ;; the clock: the PIT's ticks (a 486 has no RDTSC)
            (symbol-value (intern "+I386-CL-TICK-ADDR+" "MODUS.MVM")))
+  ;; MODUS_I386_JIT=1: the native tier (mvm/jit-i386-native.lisp), as on the
+  ;; hosted CLI -- the image carries the export table and the constant root,
+  ;; and the boot stub maps its code area (boot-i386-cl.lisp +I386-CL-V-JITSZ+)
+  (setf (symbol-value (intern "*I386-NATIVE-TIER*" "MODUS.MVM.I386"))
+        (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1"))
   ;; MODUS_I386_FP=x87: floats on the x87 (a 486DX has no SSE2, nor a CR4 to
   ;; enable it with), as build-i386-cli.lisp reads it
   (let ((v (sb-ext:posix-getenv "MODUS_I386_FP")))
@@ -4160,6 +4326,16 @@
   (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
   (setf modus.mvm.x64::*x64-linux-mode* nil)
   (setf modus.mvm.x64::*x64-gc-enabled* t)
+  ;; THE JIT CONSTANT VECTOR IS A ROOT OF THIS IMAGE'S COLLECTOR (build-generic-cli's
+  ;; rule).  The in-image co-init (%INIT-X64-TRANSLATOR) sets the flag, so JIT
+  ;; pages load their thunk constants through the vector at 0x10000F00 -- but
+  ;; without the host-side half the collector never forwarded it, the vector
+  ;; dangled at the first collection, and %JIT-CONSTVEC-COVERS-P's intactness
+  ;; check then refused every page: measured on the UEFI image, no hot DEFUN
+  ;; built after one collection.  The page at 0x10000000 is zeroed by the boot
+  ;; stub, so the root starts out "no vector".
+  (when cl-user::*jit-on*
+    (setf modus.mvm.x64::*x64-jit-constvec-p* t))
   ;; THE CONS-KIND scan_word REJECT IS ON, ON BARE x64 TOO (MODUS_X64_KINDCHECK=0
   ;; turns it off for an A/B).  It used to be forced OFF here on the argument
   ;; that the kind bitmap's address, [bitmap_base]+delta, is a Linux layout
@@ -4633,6 +4809,18 @@
 ;; integer-literal DEFCONSTANT found in the text.  DEFCONSTANT emits no code, so
 ;; the SBCL artifact must be byte-identical with this block (verified by
 ;; test/run-uefi-ddc.sh's md5 of the SBCL image before/after).
+(defun %ddc-in-mvm-package-p (text p)
+  "NIL when position P of TEXT is in a baked TRANSLATOR's package (MODUS.MVM.<arch>,
+   by the nearest (in-package ...) before it).  The forward block hoists into
+   MODUS.MVM, so the i386 translator's constants -- baked under MODUS_I386_JIT=1 --
+   came out defined twice (GLOBAL-COLLISION +I386-EAX+ in MODUS.MVM.I386 and
+   MODUS-INT).  Every other package hoists as it always did."
+  (let ((ip (search "(in-package " text :from-end t :end2 p)))
+    (or (null ip)
+        (let* ((end (position #\) text :start ip))
+               (name (string-downcase (string-trim " :#'" (subseq text (+ ip 12) end)))))
+          (not (and (> (length name) 10) (string= "modus.mvm." name :end2 10)))))))
+
 (defun %ddc-constants-forward-block (text)
   (let ((out (make-string-output-stream)) (n 0) (pos 0))
     (format out "(in-package :modus.mvm)~%;; DDC constants forward block (auto)~%")
@@ -4649,7 +4837,7 @@
         (let* ((close (position #\) text :start p))
                (form (and close (subseq text p (1+ close)))))
           ;; only the simple shape "(defconstant +NAME+ <integer>)" on one line
-          (when (and form (not (find #\Newline form)))
+          (when (and form (not (find #\Newline form)) (%ddc-in-mvm-package-p text p))
             (let* ((sp1 (position #\Space form :start 13))
                    (name (and sp1 (subseq form 13 sp1)))
                    (rest (and sp1 (string-trim " " (subseq form (1+ sp1) (1- (length form)))))))

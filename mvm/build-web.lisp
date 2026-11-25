@@ -186,6 +186,20 @@
 
 ;; No BULK-MOVE / BULK-FILL: web/mvm.js models the x64 machine but does not
 ;; implement those two opcodes, so REPLACE and FILL keep their Lisp loops here.
+;; NARROW STRINGS on the 32-bit module (the 68k image's MODUS_NARROW_STRINGS):
+;; a byte per character (#x13) instead of a word, which web/mvm32.js's
+;; collector sizes as bytes; no #x15 strings (their accessors assume 64-bit
+;; words, compiler.lisp *STRING32-P*).  Pooled literals follow below
+;; (*POOL-NARROW-STRINGS*).  MODUS_WEB_NARROW=0 keeps word strings.
+(defvar cl-user::*web-narrow*
+  (and (not (equal (sb-ext:posix-getenv "MODUS_WEB_WORD") "8"))     ; *WEB-WORD-SIZE*'s rule
+       (let ((v (sb-ext:posix-getenv "MODUS_WEB_NARROW"))) (not (and v (string= v "0"))))))
+(when cl-user::*web-narrow*
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source*
+                     (string #\Newline) "(defun %narrow-strings-p () t)"
+                     (string #\Newline) "(defun %string32-strings-p () nil)" (string #\Newline))))
+
 ;; Bound before build-cli-common's DEFVAR, which then leaves it alone.
 (defvar *cli-native-bulk-source* "")
 
@@ -296,6 +310,75 @@
             (setq i (+ i 1))))
     (setq *web-jit-consts-synced* n)
     (setf (mem-ref #x10000D40 :u64) vec)))
+;; LATE-BINDING THUNKS.  32 bytes of bytecode per callee NAME, in a JIT page:
+;;   +0  FENCE FENCE                 mvm.js never translates a fn opening so
+;;   +2  LI V5, #x10000178           \
+;;   +12 LI V6, idx                   > the bridge index, out of band
+;;   +22 STORE [V5], V6, :u32        /
+;;   +26 TAILCALL %JIT-BRIDGE-ANY    funcalls NAME's current definition
+;; A tail call keeps V0-V4, the stack arguments and the nargs slot, so any
+;; arity passes through.  When NAME is installed native, +2 becomes a direct
+;; TAILCALL to it (%WEB-THUNK-POINT); the thunk stays interpreted so the
+;; rewrite reaches callers whose translated call sites cached it.
+(defvar *web-thunks* nil)
+(defvar *web-thunk-page* nil)
+(defvar *web-thunk-bump* 4096)
+(defun %web-thunk-word (addr) (logior (* (- addr #x10000000) 16) 3))
+(defun %web-put-u32 (at v)
+  (setf (mem-ref at :u8) (logand v 255))
+  (setf (mem-ref (+ at 1) :u8) (logand (ash v -8) 255))
+  (setf (mem-ref (+ at 2) :u8) (logand (ash v -16) 255))
+  (setf (mem-ref (+ at 3) :u8) (logand (ash v -24) 255)))
+(defun %web-put-tailcall (at word)
+  (%web-put-u32 (+ at 1) (ash word -4))
+  (setf (mem-ref at :u8) #x83))
+(defun %web-late-thunk (key)
+  (unless (hash-table-p *web-thunks*)
+    (setq *web-thunks* (make-hash-table :test (function equal))))
+  (or (gethash key *web-thunks*)
+      (when (and key (%jit-bridge-ensure) (< *jit-bridge-count* (%jit-bridge-cap)))
+        (when (> (+ *web-thunk-bump* 32) 4096)
+          (let ((b (sap-address (make-sap (%mmap-exec-page 4096)))))
+            (when (< b 4096)
+              (return-from %web-late-thunk nil))
+            (setq *web-thunk-page* b *web-thunk-bump* 0)))
+        (let ((a (+ *web-thunk-page* *web-thunk-bump*))
+              (idx *jit-bridge-count*))
+          (setq *web-thunk-bump* (+ *web-thunk-bump* 32))
+          (setf (aref *jit-bridge-names* idx) key)
+          (setq *jit-bridge-count* (+ idx 1))
+          (setf (mem-ref a :u8) #x72)
+          (setf (mem-ref (+ a 1) :u8) #x72)
+          (setf (mem-ref (+ a 2) :u8) #x11)
+          (setf (mem-ref (+ a 3) :u8) 5)
+          (%web-put-u32 (+ a 4) #x10000178)
+          (%web-put-u32 (+ a 8) 0)
+          (setf (mem-ref (+ a 12) :u8) #x11)
+          (setf (mem-ref (+ a 13) :u8) 6)
+          (%web-put-u32 (+ a 14) idx)
+          (%web-put-u32 (+ a 18) 0)
+          (setf (mem-ref (+ a 22) :u8) #x71)
+          (setf (mem-ref (+ a 23) :u8) 5)
+          (setf (mem-ref (+ a 24) :u8) 6)
+          (setf (mem-ref (+ a 25) :u8) 2)
+          (%web-put-tailcall (+ a 26) (%val->word (symbol-function (quote %jit-bridge-any))))
+          (setf (gethash key *web-thunks*) a)
+          a))))
+;; NAME just went native as FN: send its thunk, if it has one, straight there.
+(defun %web-thunk-point (key fn)
+  (let ((a (and (hash-table-p *web-thunks*) (gethash key *web-thunks*))))
+    (when a (%web-put-tailcall (+ a 2) (%val->word fn)))))
+;; NAME was (re)defined or unbound (mvm-eval's redefinition hook and FMAKUNBOUND
+;; call this with ADDR NIL; x64's version retargets a linkage stub): put its
+;; thunk back to late binding -- +2 is LI V5 again, so a call funcalls whatever
+;; NAME is now -- until the new definition goes native and %WEB-THUNK-POINT
+;; sends it there.  Without it a translated caller kept calling the OLD code.
+(defun %jit-x64-stub-retarget (name addr)
+  (let ((a (and (null addr) (hash-table-p *web-thunks*) (gethash name *web-thunks*))))
+    (when a
+      (%web-put-u32 (+ a 4) #x10000178)
+      (setf (mem-ref (+ a 3) :u8) 5)
+      (setf (mem-ref (+ a 2) :u8) #x11))))
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   (let* ((nlen (length bc))
          (psize (+ nlen 4096))
@@ -311,11 +394,50 @@
             (setq k (+ k 1))))
     (let* ((n (%rt-stub-count rt-table))
            (tab (make-array (if (< n 1) 1 n)))
-           (ok t) (k 0))
+           (ok t) (k 0) (native0 nil))
       (loop (when (>= k n) (return nil))
             (let* ((name (gethash (+ #x40000000 k) rt-table))
                    (fn (and name (%mvm-resolve-runtime-fn name)))
                    (word (if fn (%val->word fn) 0)))
+              ;; A callee that is a runtime DEFUN not yet native (its
+              ;; interpreter trampoline, tag 9): build its module now, as a hot
+              ;; promotion would, and look again.  The native arms bridge such
+              ;; a callee through a per-name thunk instead; this page holds
+              ;; plain bytecode calls, so without this a lambda or method body
+              ;; made before its callees went hot was refused and stayed
+              ;; interpreted for good (82 us a call, measured).
+              (when (and fn (not (eql (logand word 15) 3)) (not *jit-hot-busy*))
+                (setq *jit-hot-busy* t)
+                (unwind-protect
+                     (%jit-hot-build (%mvm-runtime-key name) (%jit-skip-list) (cons nil 64))
+                  (setq *jit-hot-busy* nil))
+                (setq fn (%mvm-resolve-runtime-fn name)
+                      word (if fn (%val->word fn) 0)))
+              ;; Still not native (a heap closure: a trampoline, a GF): call it
+              ;; late-bound through NAME's thunk, which funcalls whatever NAME
+              ;; is at call time.  Without this, mutually recursive DEFUNs
+              ;; (FRPOLY's PTIMES/PPLUS, BOYER's REWRITE/APPLY-SUBST) each
+              ;; waited for the other to go native and all stayed interpreted.
+              (setq native0 (and fn (eql (logand word 15) 3)))
+              (when (and fn (not (eql (logand word 15) 3)))
+                (let ((th (%web-late-thunk (%mvm-runtime-key name))))
+                  (when th
+                    (setq fn (%word->val (%web-thunk-word th))
+                          word (%val->word fn)))))
+              ;; A runtime DEFUN that IS native (a JIT page, at or above the web
+              ;; VM's JIT_ADDR #x12400000; image functions are below): through its
+              ;; thunk too, pointed straight at the code, so that redefining it
+              ;; reaches this caller (%JIT-X64-STUB-RETARGET resets the thunk).
+              ;; Baking the address here was the web's runtime-redefinition bug.
+              ;; NATIVE0, not the tag now: a callee just swapped for its thunk is
+              ;; a JIT-page function too, and pointing a thunk at itself loops.
+              (when (and native0
+                         (>= (+ (ash word -4) #x10000000) #x12400000))
+                (let* ((key (%mvm-runtime-key name)) (th (%web-late-thunk key)))
+                  (when th
+                    (%web-thunk-point key fn)
+                    (setq fn (%word->val (%web-thunk-word th))
+                          word (%val->word fn)))))
               (if (eql (logand word 15) 3)
                   (aset tab k fn)
                   (progn
@@ -354,16 +476,19 @@
 ;; looks the name up (FUNCALL, the REPL, translated pages); the image's own direct
 ;; callers keep the original, as on a read-only native image.
 (defun %kernel-redirect-hook (name) nil)
+(defun %jit-native-fn-at (addr)
+  (%word->val (logior (* (- addr #x10000000) 16) 3)))
 (defun %jit-install-native-fns (base fnoffs names)
   (let ((n 0))
     (dolist (e fnoffs)
       (let ((nm (car e)))
         (when (member nm names :test (function string=))
-          (let ((fn (%word->val (logior (* (- (+ base (cdr e)) #x10000000) 16) 3))))
+          (let ((fn (%jit-native-fn-at (+ base (cdr e)))))
             (when (boundp (quote *symbol-function-table*))
               (puthash nm *symbol-function-table* fn))
             (when (boundp (quote *native-sym-function-table*))
               (puthash (compute-name-hash nm) *native-sym-function-table* fn))
+            (%web-thunk-point nm fn)
             (setq n (+ n 1))))))
     (setq *jit-native-defun-count*
           (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))
@@ -420,15 +545,56 @@
 (defun %web-rpc () (when *web-rpc-fn* (funcall *web-rpc-fn*)))
 "))
 
-(format t "~%Compiling web (x86-64 word) module (~D chars)...~%"
-        (length cl-user::*full-source*))
-(let ((target (find-target :x86-64)))
-  (set-target-fixnum-bits-for target)
+;;; The web module is compiled with the i386 TARGET -- 4-byte words, 30-bit
+;;; fixnums, W32 opcodes -- for web/mvm32.js, which keeps one value in one int32
+;;; instead of a (lo, hi) pair: runtime compile / FORMAT / consing ~2.3x faster
+;;; than the x86-64 module on web/mvm.js.  MODUS_WEB_WORD=8 builds that one.  Only the compile target changes: the
+;;; arch slots above (the host ABI: x86-64 syscall numbers, argv on the stack,
+;;; stat/timespec layouts) stay, because the image reads those through
+;;; promoting :u32 loads, which are exact on a 32-bit word.
+(defvar *web-word-size*
+  (let ((v (sb-ext:posix-getenv "MODUS_WEB_WORD")))
+    (if (and v (string= v "8")) 8 4)))
+(format t "~%Compiling web (~D-byte word) module (~D chars)...~%"
+        *web-word-size* (length cl-user::*full-source*))
+(let* ((target (find-target (if (= *web-word-size* 4) :i386 :x86-64)))
+       (saved-ct *compile-target*))
+  ;; BUILD-IMAGE binds the compile target the same way; the x86-64 module got
+  ;; away without it because x86-64 is the default.
+  (setq *compile-target* (set-target-fixnum-bits-for target))
   ;; The x86-64 TARGET turns on *TARGET-HAS-FPD-P* (unboxed double trees in
   ;; baked code), but this module runs on web/mvm.js, which has no FP register
   ;; file: the first FPD-UNBOX stopped module relocation and the image did not
   ;; boot.  The JS engine models x86-64's words and syscalls, not its FPU.
   (setf *target-has-fpd-p* nil)
+  ;; The 68k builds' compiler-side options (build-68k-cli.lisp), each sound here:
+  ;; - *CALL-TEMPS-SURVIVE*: every vreg mvm.js keeps is a slot in its own
+  ;;   activation's frame (ROFF), so a callee cannot clobber the caller's live
+  ;;   temps; no PUSH/POP around calls.  MODUS_WEB_CALL_SAVES=1 keeps them.
+  ;; - *ELIDE-FIXED-NARGS*: a fixed-arity callee never reads the count, and a
+  ;;   runtime redefinition does not reach the image's own callers here (the
+  ;;   web %KERNEL-REDIRECT-HOOK).  MODUS_WEB_FIXED_NARGS=1 stores every count.
+  ;; - *SHALLOW-THREAD-GATE* NIL: no threads on this target (%SPAWN-THREAD is
+  ;;   unsupported), so the gate always fell through.  MODUS_WEB_THREAD_GATE=1.
+  ;; - *TYPE-ERROR-CODES*, *STATIC-SYMBOL-SHORT-MISS*: smaller cold arms
+  ;;   (MODUS_TYPE_ERROR_CODES=0 / MODUS_STATIC_SYMBOL_SHORT_MISS=0, as there).
+  (flet ((env= (n v) (equal (sb-ext:posix-getenv n) v)))
+    (setf *call-temps-survive* (not (env= "MODUS_WEB_CALL_SAVES" "1"))
+          *elide-fixed-nargs* (not (env= "MODUS_WEB_FIXED_NARGS" "1"))
+          *shallow-thread-gate* (env= "MODUS_WEB_THREAD_GATE" "1"))
+    (unless (env= "MODUS_TYPE_ERROR_CODES" "0")
+      (setf *type-error-codes* (make-hash-table :test 'equal)))
+    (unless (env= "MODUS_STATIC_SYMBOL_SHORT_MISS" "0")
+      (setf *static-symbol-short-miss* t))
+    ;; - *ARITH-RANGE-BY-SHIFT* (the small 68k image's, build-cli-common): the
+    ;;   30-bit range guard as SHL / SAR / CMP / BNE, not two immediates, two
+    ;;   compares and two branches.  Sound only where a shift is 32 bits wide,
+    ;;   which it is in web/mvm32.js, interpreted and translated alike; it is
+    ;;   a build-time setting, so the image's own (Lisp-interpreted) runtime
+    ;;   compiles keep the immediate form.  MODUS_WEB_RANGE_SHIFT=0 turns it off.
+    (when (and (= *web-word-size* 4) (not (env= "MODUS_WEB_RANGE_SHIFT" "0")))
+      (setf *arith-range-by-shift* t))
+    (when cl-user::*web-narrow* (setf *pool-narrow-strings* t)))
   ;; The web image never calls BUILD-IMAGE, so build-checks' wrapper does not
   ;; see it: run the redefinition check around the compile directly.
   (setf *undeclared-redefinitions* nil)
@@ -440,4 +606,5 @@
     (check-undeclared-redefinitions)
     (check-cross-package-calls)
     (check-cross-package-globals)
-    (web-write-module module target *web-image-path*)))
+    (web-write-module module target *web-image-path*))
+  (setq *compile-target* saved-ct))

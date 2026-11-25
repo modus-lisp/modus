@@ -59,6 +59,72 @@ generates `(defconstant +w32-createfilea+ ...)` for every import
 `(syscall6 +w32-getfileattributesexa+ path 0 buf 0 0 0)`.  Imports are grouped by
 DLL in `*WIN64-IMPORTS*`.
 
+**Calling the rest of Windows** (`net/win32-api.lisp`).  Everything that is not one of
+those 58 imports is found at run time and called through `W32-CALL`:
+
+```lisp
+(w32-call* :s32 "user32.dll!MessageBoxW" 0 "Hello from modus" "modus" 0)
+(w32-call* :u32 "kernel32.dll!GetEnvironmentVariableW" "SystemRoot" '(:wbuf 260) 260)
+  ;=> 10, 0, "C:\WINDOWS"          (RESULT, LAST-ERROR, then each out argument)
+(w32-call* :double "ucrtbase.dll!pow" '(:double 2d0) '(:double 10d0))   ;=> 1024.0d0
+```
+
+FN is an address, `"dll!Name"` or `("dll" "Name")`.  An argument is an integer, NIL / T, a
+string (passed as UTF-16, for the W functions), `(:a STRING)` (8-bit, for the A functions),
+`(:guid TEXT)`, `(:double X)` / `(:float X)`, or an out argument: `(:out TYPE)` (an 8-byte
+cell), `(:buf N)` (an octet vector), `(:wbuf N)` (a string), `(:bytes OCTETS)` (a struct,
+copied in and back).  The result is read as TYPE: `:u8`..`:s64`, `:ptr`, `:bool`,
+`:hresult`, `:double`, `:float`, `:raw` (W32-CALL's default) or `:void`.  LAST-ERROR is
+GetLastError right after the call; `W32-ERROR-TEXT` gives Windows' own words for it (or for
+an HRESULT).  Up to 20 arguments.  Around that:
+
+- raw memory: `W32-ALLOC` / `W32-FREE` / `WITH-W32-MEMORY`, `W32-PEEK` / `W32-POKE`,
+  `W32-WSTR` / `W32-PUT-WSTR` (UTF-16, surrogate pairs), `W32-ASTR` / `W32-PUT-ASTR`,
+  `W32-GUID` / `W32-PUT-GUID`, and `W32-OCTETS-GET` / `-PUT` for structs held in octet
+  vectors (`:buf` and `:bytes`);
+- lookup: `W32-MODULE` (GetModuleHandleA, else LoadLibraryA), `W32-PROC`, `W32-PROCS`;
+- COM: `W32-CO-INITIALIZE`, `W32-CO-CREATE CLSID IID`, `W32-COM-QUERY`, `W32-COM-CALL OBJ
+  SLOT ARGS...` (vtable slot; 0-2 are IUnknown's), `W32-COM-RELEASE`;
+- callbacks: `W32-MAKE-CALLBACK :returns V` is native code Windows can call with up to four
+  arguments.  It records each call in a ring and returns V.  Read the ring with
+  `W32-CALLBACK-TAKE` after the call that made the callbacks (EnumWindows, EnumFonts and
+  their kind).  No Lisp runs on Windows' thread.
+
+Two things in this were not obvious:
+
+- **Nothing is kept between calls.**  A worker thread may not store into a global, so each
+  call maps its own frame: the argument vector, every string and cell Windows touches, and
+  the thunk.  The frame is unmapped afterwards.  A hot loop should look its functions up
+  once with `W32-PROCS` and pass the addresses.
+- **Every call goes through a 57-byte thunk in its frame.**  Win64 passes floating-point
+  arguments in XMM0-3 and returns them in XMM0, and the stub fills only the integer
+  registers.  The stub's answer is also RAX as a fixnum, which loses the top bit: 1024.0's
+  pattern `#x4090...` came back as -1024.0.  So the thunk does three things:
+  - copies RCX..R9 into XMM0..3 (the same bits, which also handles varargs, where Win64
+    wants a double in both);
+  - calls the function;
+  - stores RAX and XMM0 in the frame, where they are read back whole.
+
+`test/win64/win32-api.lisp` (28 checks, 2026-11-22 on Windows 11 26200, 28/28) checks
+these against Windows itself:
+
+- `GetCurrentProcessId` looked up by name against the same import through the IAT;
+- `lstrlenW` counting a surrogate pair;
+- `CloseHandle` failing with error 6, and its text;
+- `sqrt`, `pow`, `sqrtf`, `lround`, `ldexp`, and `_byteswap_uint64` with bit 63 set;
+- `_snwprintf` with a double on the stack;
+- a GUID parsed by `CLSIDFromString` and compared byte for byte;
+- a ShellLink created, queried for IShellLinkW, and a string round-tripped through two of
+  its methods;
+- EnumWindows through a callback (300 windows, every one recording the 4242 passed), and a
+  callback returning FALSE stopping it after one;
+- `W32-UTC-OFFSET`.
+
+`MODUS_W32_API_FILE=net/win32-api.lisp` loads a newer copy (and `win32-time.lisp` beside
+it) over an image that predates it.  The test defines the call numbers that copy needs
+(GetLastError `#x100B`, GetModuleHandleA `#x1021`, LoadLibraryA `#x1022`, GetProcAddress
+`#x1023`: `#x1000` + the slot in `*WIN64-IMPORTS*`).
+
 **Files.**  The file primitives cl-fileio calls (`%sys-open-*`, `%sys-stat-*`,
 `%sys-fstat-size`, `%sys-unlink`, `%sys-rename`, `%sys-mkdir`, `%sys-rmdir`) are
 overridden in the Windows runtime source on top of that call path; a HANDLE is
@@ -225,13 +291,11 @@ BCryptGenRandom (system-preferred RNG), the name natrium's DRBG looks for when t
 is no `/dev/urandom` -- without it no key could be made on Windows.
 
 **The time zone** (`net/win32-time.lisp`): `W32-UTC-OFFSET` is seconds east of UTC now,
-from GetTimeZoneInformation (the bias plus the standard or daylight bias in effect), or 0.
+from GetTimeZoneInformation (the bias plus the standard or daylight bias in effect, read with
+`W32-CALL*` and a `:buf`), or 0.
 modus has no zone database (`DECODE-UNIVERSAL-TIME` with no zone is GMT), so an app with a
 clock asks for this by name and adds it itself; chirp's Bitchat window does.  Checked on a
-PC set to Eastern time in November: -18000.  To try a change without a rebuild, define the
-two folded call numbers first -- `(defconstant +w32-loadlibrarya+ #x1022)` and
-`(defconstant +w32-getprocaddress+ #x1023)` in MODUS-INT (KERNEL32 slots 34 and 35 of
-`*WIN64-IMPORTS*`, + `#x1000`) -- then `load` the file.
+PC set to Eastern time in November: -18000.
 
 ## Testing
 

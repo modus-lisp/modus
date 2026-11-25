@@ -1073,14 +1073,23 @@ because every syscall address travels as a tagged fixnum. i386 has no x64-style
 JIT (`*JIT-ON*` is x64-only), but it has a **native tier**: `mvm/jit-i386-native.lisp`.
 The image carries `translate-i386.lisp`, and a runtime DEFUN is translated at its
 first call, `(compile 'f)` at once, and closure-building top-level forms natively.
-It is OFF by default: build with `MODUS_I386_JIT=1` to get it; without it
-`mvm-eval` interprets all runtime code. Whatever the tier refuses stays
-interpreted, with the reason in `*N386-REFUSED*`. Not yet default-safe: the i386
-ANSI sweep with it on, 2026-11-23, was 21653/21681. The 28 lost tests are 20
+It is ON by default in the CLI since 2026-11-24 (`MODUS_I386_JIT=0` builds it off; the
+bare i386 images still opt in with `MODUS_I386_JIT=1`); without it `mvm-eval` interprets
+all runtime code. Whatever the tier refuses stays
+interpreted, with the reason in `*N386-REFUSED*`. The i386 ANSI sweep with it on:
+2026-11-23, 21653/21681; **2026-11-24, 21681/21681** (dos386 38d896fa, main merged:
+the variable-count ASH guard and the 32-bit collector fix cleared all 28 below).
+On 2026-11-23 the 28 lost were 20
 `OPEN.*` (the `(unsigned-byte 1)`/`(unsigned-byte 2)` generator gives 0..3),
 `MISC.461`/`509`/`569` (integer arithmetic at the fixnum/bignum boundary),
 `DEFUN.5`-`7` (a DEFUN in a LET with special/optional defaults calls NIL), and
 `TRACE.9` and `DOCUMENTATION.NEW-METHOD.1` (native direct calls bypass TRACE).
+On the bare PC image the boot stub maps the code area at `#x12000000` (a
+sixteenth of the RAM, 256 KB up to all the VA below the stack, ~103 MB) and
+the build overrides `%N386-AREA`.  The tier stays off while the image boots to
+be saved (`%N386-ALLOWED-P`, SAVECORE); once a core is being built it runs, and
+the saved core carries the code area (header +44, copied back at restore) --
+`kiln t420` translates every module before the save (17 MB, 1857 modules).
 
 **THE i386 CL IMAGE USED TO DIE AT ITS FIRST COLLECTION — three defects, all
 fixed (2026-09-26).**  Any `--script` of ~1300 toplevel forms (each allocates
@@ -1199,6 +1208,34 @@ into free RAM from gdb at the kernel entry (`0x100020` — the multiboot ROM
 copies the kernel after reset, so patch there, not at `0xfff0`) and patch the
 function to jump to it.
 
+### The modern PC matrix: `scripts/pc-matrix.py` (2026-11-20)
+
+```bash
+scripts/pcboot.sh /tmp/pc.img CORE.bin        # a disk that boots modus with no DOS
+scripts/pc-matrix.py /tmp/pc.img              # 45 cells, about a minute
+scripts/pc-matrix.py /tmp/pc.img 't420' 'bochs-*' --keep    # some; transcripts in /dev/shm
+```
+
+The 86Box matrix (`scripts/dos386-86box/`) runs real 1990s BIOSes; nothing emulates a
+later machine's own firmware (a T420's Lenovo UEFI + CSM, its chipset, its EC), so this
+covers what an emulator can after them.  **QEMU**: i440FX and q35; CPUs n270 Atom, Core 2,
+Nehalem .. Sandy Bridge (the T420) .. Ice Lake, Athlon .. EPYC-Milan; SeaBIOS booting off
+IDE, AHCI, NVMe, virtio, SCSI and a USB stick on UHCI/EHCI/xHCI; 6 MB .. 8 GB; 4 CPUs --
+typed on the PS/2 keyboard (QMP send-key) and read out of VGA text memory, a laptop's own
+console.  **Bochs** (2.7): its own models, Pentium II .. Tiger Lake and Ryzen, under its own
+BIOS -- typed through its VNC server (key events, so its 8042 model is in the loop), read
+on COM1.  Every cell must ANSWER seven forms correctly (bignum, double float, 100 x 10000
+conses, a hash table), and reports the RAM, semispace and code pool the stub chose.
+**It refuses to report unless a control cell, expecting `(+ 1 2)` to be 4, FAILs on that
+form**; a disk with its image zeroed fails every cell (QEMU: the guest resets; Bochs: no
+prompt).  Bochs's build here has its debugger compiled in and stops at the first
+instruction (`-rc` a file holding `c`); it has no headless display but `rfb`, and no rfb
+port option (it takes the first free one from 5900, found with `ss`).
+
+Above 4 GB the stub sees what is below the PCI hole: 2 GB on q35, 3 GB on i440FX (32-bit
+paging, no PAE).  What none of this exercises: a real CSM's quirks, SMM, an EC-routed
+keyboard and USB legacy emulation -- one boot on the real machine.
+
 ### QEMU arm32 (virt) — the bare-metal CL image (2026-10-24)
 
 ```bash
@@ -1291,7 +1328,9 @@ early copy baked the default allocation limit and the collector never ran.  **Wi
 callable** (`net/win32-winrt.lisp`; slots and IIDs generated from Windows' metadata by
 `scripts/gen-winrt-ids.py`, event handlers are native COM objects that ring events), and on it
 `net/win32-ble.lisp`, a Bluetooth LE mesh radio in `Bluetooth.swift`'s shape (`W32-BLE-START` /
-`-POLL` / `-SEND` / `-STOP`) for chirp.  natrium's entropy there is `%MODUS-HARDWARE-ENTROPY`
+`-POLL` / `-SEND` / `-STOP`) for chirp.  Any other Windows function is `W32-CALL` (`net/win32-api.lisp`: by name, UTF-16
+strings, out cells, structs, floats, COM, recording callbacks; `test/win64/win32-api.lisp`).
+natrium's entropy there is `%MODUS-HARDWARE-ENTROPY`
 (BCryptGenRandom, `net/win32-entropy.lisp`).
 
 ### Pi Zero 2 W (real hardware)

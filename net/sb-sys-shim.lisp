@@ -611,8 +611,9 @@
   0)
 
 (defvar sb-ext:*invoke-debugger-hook* nil
-  "PARTIAL: the variable exists and NOTHING CONSULTS IT.  modus\'s toplevel has
-   its own error path.  Only McCLIM sets it, and McCLIM is not part of :GLASS.")
+  "Run by INVOKE-DEBUGGER ahead of *DEBUGGER-HOOK*, and by BREAK (which binds
+   *DEBUGGER-HOOK* to NIL), with this bound to NIL while it runs -- as SBCL does.
+   PARTIAL: an error nobody handles does not reach it; modus\'s toplevel has its own path.")
 
 (defun sb-ext:exit (&key (code 0) abort timeout)
   "exit_group(2).  :ABORT and :TIMEOUT are accepted and ignored — modus has no

@@ -88,6 +88,8 @@
           "%SERIAL-BYTE" "IO-DELAY" "PCI-CONFIG-READ" "PCI-CONFIG-WRITE"
           "E1000-STATE-BASE" "E1000-RX-DESC-BASE" "E1000-RX-BUF-BASE"
           "E1000-TX-DESC-BASE" "E1000-TX-BUF-BASE" "NE2K-RX-HOST"
+          ;; e1000.lisp's two seams, which a board overrides (arch-i386-cl.lisp)
+          "E1000-MAP-BAR" "E1000-DMA-ADDR" "%MMIO-READ32" "%MMIO-WRITE32"
           "VIRTIO-NET-RING-BASE" "VIRTIO-NET-STATE-BASE" "VIRTIO-NET-PT-PAGE"
           "SNP-MMIO-P" "SNP-MMIO-REAL-P" "SNP-MMIO-READ" "SNP-MMIO-WRITE"
           ;; for MODUS.CRYPTO: byte-buffer access, its scratch, and the

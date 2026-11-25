@@ -880,7 +880,9 @@
     ((= tag 9)
      (let ((hdr-lo (%gc-word-lo raw-addr))
            (hdr-hi (%gc-word-hi raw-addr)))
-       (if (%gc-is-forward-lo hdr-lo)
+       ;; a forward only if it names a copy made THIS collection, as for a cons (above): no
+       ;; subtag ends in #xF today, so the nibble alone is right only by that coincidence
+       (if (if (%gc-is-forward-lo hdr-lo) (%gc-fwd-target-ok hdr-lo hdr-hi sc free-ptr) nil)
            ;; Already forwarded
            (progn
              (%gc-set-halves sc

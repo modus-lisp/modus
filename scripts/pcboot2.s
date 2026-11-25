@@ -48,6 +48,7 @@
         .equ    BSECS,  64              # its size in sectors
         .equ    NHANDLE, 4
         .equ    BOOTREC, 0x0580
+        .equ    BIOSBLK, 0x05C0         # PM_BIOS's register block, 44 bytes
 
 _start:
         xor     %ax, %ax
@@ -83,6 +84,7 @@ _start:
 
         movl    $0x54424350, BOOTREC    # "PCBT"
         movl    $pm_read, BOOTREC+4
+        movl    $pm_bios, BOOTREC+16
         movl    $0, BOOTREC+8
         movzbl  drive, %eax
         mov     %eax, BOOTREC+12
@@ -523,11 +525,26 @@ rs_err: pop     %di
         ret
 
 # --- PM_READ: the image's disk reads (see THE BOOT RECORD above) ------------
+# --- PM_BIOS: any BIOS interrupt, for the image (BOOTREC+16) ----------------
+# The same trip as PM_READ, with the call described by the block at 05C0h:
+#   +0 the interrupt   +4 EAX  +8 EBX  +12 ECX  +16 EDX  +20 ESI  +24 EDI
+#   +28 EBP   +32 DS   +36 ES   (in)        the same, and +40 FLAGS (out)
+# so the image's own Lisp asks the BIOS for VBE modes, EDID, the memory map:
+# this routine knows nothing about any of them.  Every register is kept.
         .code32
+        .p2align 2                      # an even address: call-native's value is a fixnum
+pm_bios:
+        pushal
+        pushfl
+        cli
+        movb    $1, rd_op
+        jmp     pm_common
 pm_read:
         pushal
         pushfl
         cli
+        movb    $0, rd_op
+pm_common:
         mov     %eax, rd_lba
         mov     %ecx, rd_cnt
         mov     %esp, rd_esp
@@ -567,6 +584,8 @@ rm:     xor     %ax, %ax
         mov     $0x3F, %ch              # IRQ 14, 15 (the disks)
         call    pic_map
         sti
+        cmpb    $1, rd_op
+        je      rm_bios
         mov     rd_lba, %eax
         mov     %eax, rlba
         mov     rd_cnt, %ecx
@@ -574,6 +593,13 @@ rm:     xor     %ax, %ax
         cli
         setc    rd_err
         mov     %cx, rd_got
+        jmp     rm_back
+rm_bios:
+        call    bios_call
+        cli
+        movw    $0, rd_err
+        movw    $0, rd_got
+rm_back:
         mov     $0x20, %bl              # the image's
         mov     $0x28, %bh
         mov     $0xFA, %cl
@@ -603,6 +629,44 @@ pm32back:
         btw     $0, rd_err              # CF = the error
         ret
         .code16
+
+# bios_call: the interrupt the block at BIOSBLK describes, its registers in
+# and out (real mode, DS = ES = 0 on entry and on return)
+bios_call:
+        mov     BIOSBLK, %al
+        mov     %al, bc_int+1           # INT imm8: the interrupt's number
+        jmp     1f                      # (a 386/486 has prefetched past it)
+1:      mov     BIOSBLK+36, %ax
+        mov     %ax, %es
+        mov     BIOSBLK+4, %eax
+        mov     BIOSBLK+8, %ebx
+        mov     BIOSBLK+12, %ecx
+        mov     BIOSBLK+16, %edx
+        mov     BIOSBLK+20, %esi
+        mov     BIOSBLK+24, %edi
+        mov     BIOSBLK+28, %ebp
+        pushw   BIOSBLK+32
+        pop     %ds
+bc_int: int     $0x10
+        pushfl
+        push    %ds
+        push    %ax
+        xor     %ax, %ax
+        mov     %ax, %ds
+        pop     %ax
+        mov     %eax, BIOSBLK+4
+        mov     %ebx, BIOSBLK+8
+        mov     %ecx, BIOSBLK+12
+        mov     %edx, BIOSBLK+16
+        mov     %esi, BIOSBLK+20
+        mov     %edi, BIOSBLK+24
+        mov     %ebp, BIOSBLK+28
+        popw    BIOSBLK+32
+        mov     %es, BIOSBLK+36
+        popl    BIOSBLK+40
+        xor     %ax, %ax
+        mov     %ax, %es
+        ret
 
 # pic_map: both 8259s initialised, master at BL, slave at BH, masks CL / CH
 pic_map:
@@ -709,3 +773,4 @@ rd_back: .long  pm32back
 rd_ds:  .word   0
 rd_got: .word   0
 rd_err: .word   0
+rd_op:  .byte   0                       # 0 PM_READ, 1 PM_BIOS

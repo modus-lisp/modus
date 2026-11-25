@@ -911,8 +911,28 @@
                                                 :operation nil :operands nil))
                    ((eql sig 4) (make-condition 'illegal-instruction-error))
                    (t (make-condition 'memory-fault-error
-                                      :datum nil :expected-type t))))))
+                                      :datum nil :expected-type t)))))
+      (%maybe-note-caught-fault *current-condition*))
     nil))
+
+;;; MODUS_FAULT_NOTE=1: say where every fault a HANDLER-CASE catches happened.  A fault lands
+;;; in the innermost HANDLER-CASE, wherever that is, and a clause that handles it and goes on
+;;; leaves nothing behind -- so a SIGSEGV sent to a process that is looping (to ask where) is
+;;; swallowed by whatever code it hits, and the answer was lost.  Off unless asked: some
+;;; programs fault and recover as routine.  Both helpers are found by name because they are
+;;; the hosted runtime's (lib/cli-toplevel.lisp, net/hosted-backtrace.lisp).
+(defvar *%fault-note-busy*)
+(defun %maybe-note-caught-fault (c)
+  (when (and (not *%fault-note-busy*)
+             (fboundp '%cli-getenv) (fboundp '%print-fault-backtrace)
+             (funcall (symbol-function '%cli-getenv) "MODUS_FAULT_NOTE"))
+    (setq *%fault-note-busy* t)
+    (unwind-protect
+         (progn
+           (format *error-output* "~&;; MODUS_FAULT_NOTE: a HANDLER-CASE caught ~a; the fault's frames:~%"
+                   (%condition-type-name c))
+           (funcall (symbol-function '%print-fault-backtrace) *error-output* c))
+      (setq *%fault-note-busy* nil))))
 
 (defun %attach-fault-frames (c)
   "C, carrying the frames the signal stub recorded for the fault it stands for (hosted
@@ -1456,6 +1476,15 @@
         (frame-idx 0)
         (skip *handler-bind-effective-skip*))
     (declare (ignore type-name))
+    ;; *BREAK-ON-SIGNALS* (CLHS 9.1.4.1): a condition of that type enters BREAK before any
+    ;; handler is consulted, with the variable bound to NIL so BREAK's own signals do not
+    ;; re-enter it.  Not for the restart transfers above: they are control flow, not conditions
+    ;; anybody signalled.
+    (let ((bos (if (boundp '*break-on-signals*) (symbol-value '*break-on-signals*) nil)))
+      (when (and bos (not internal) (%type-matches-condition-p bos cond-obj))
+        (let ((*break-on-signals* nil))
+          (declare (special *break-on-signals*))
+          (break "~A~%BREAK was entered because of *BREAK-ON-SIGNALS* (now NIL)." cond-obj))))
     ;; Skip the inhibited leading frames.
     (loop
       (when (or (null cur) (>= frame-idx skip)) (return nil))
@@ -2631,12 +2660,30 @@
     style-warning type-error unbound-slot unbound-variable
     undefined-function warning))
 
+;;; SB-EXT:*INVOKE-DEBUGGER-HOOK*, when the SB-EXT shim is loaded: the hook SBCL runs ahead of
+;;; *DEBUGGER-HOOK*, and the one BREAK runs, since BREAK binds *DEBUGGER-HOOK* to NIL.  Found by
+;;; name at the call because the kernel is built without the shim.
+(defun %invoke-debugger-hook ()
+  (let* ((p (find-package "SB-EXT"))
+         (s (and p (find-symbol "*INVOKE-DEBUGGER-HOOK*" p))))
+    (and s (boundp s) (symbol-value s))))
+
+(defun %call-invoke-debugger-hook (condition)
+  "Run SB-EXT:*INVOKE-DEBUGGER-HOOK* on CONDITION, bound to NIL while it runs, as SBCL does.
+   True when there was one (it returned); NIL when there is none."
+  (let ((hook (%invoke-debugger-hook)))
+    (when hook
+      (progv (list (find-symbol "*INVOKE-DEBUGGER-HOOK*" (find-package "SB-EXT"))) (list nil)
+        (funcall hook condition hook))
+      t)))
+
 ;;; invoke-debugger stub
 (defun invoke-debugger (condition)
   "Calls *DEBUGGER-HOOK* first, with it bound to NIL (CLHS; INVOKE-DEBUGGER.1);
    then, as there is no debugger, signals.  Publishes CONDITION first: the
    longjmp's landing handler-case dispatches on *CURRENT-CONDITION*, and
    leaving the previous one there reported (and matched) a stale condition."
+  (%call-invoke-debugger-hook condition)
   (let ((hook (if (boundp '*debugger-hook*) (symbol-value '*debugger-hook*) nil)))
     (when hook
       (let ((*debugger-hook* nil))

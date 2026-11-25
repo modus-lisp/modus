@@ -118,6 +118,9 @@
             (setf (aref v i) (+ found (if (>= off #x80000000) (- off #x100000000) off))))))
       (setq *n386-exports* v))))
 
+;; A seam: the bare PC image's code area is the one its boot stub maps
+;; (build-cl-repl-common.lisp, MODUS_I386_JIT=1).
+(declaim (overridable %n386-area))
 (defun %n386-area ()
   "The code area: anonymous RWX memory at +N386-AREA-ADDR+ exactly
    (MAP_FIXED_NOREPLACE).  old_mmap (90), whose one argument is a block of six
@@ -466,10 +469,17 @@
                   (setq *n386-done* (cons (first m) *n386-done*)))
               nil))))))
 
+;; A seam: may the tier start now?  The bare PC image says no while it boots
+;; to be saved as a core (SAVECORE): the core holds the heap but not the code
+;; area, so nothing in it may point there (build-cl-repl-common.lisp).
+(declaim (overridable %n386-allowed-p))
+(defun %n386-allowed-p () t)
+
 (defun %n386-ready ()
   "Is the native tier ready?  Readies it if not; one that cannot start turns
    itself off (*N386-OFF*, *N386-WHY*)."
-  (unless (and (boundp (quote *n386-ready*)) *n386-ready*)
+  (unless (or (and (boundp (quote *n386-ready*)) *n386-ready*)
+              (not (%n386-allowed-p)))
     (handler-case (%n386-init)
       (error (c) (setq *n386-off* t *n386-why* (list :init (princ-to-string c))))))
   (and (boundp (quote *n386-ready*)) *n386-ready* t))

@@ -887,6 +887,12 @@
                   (equal (cdr a) (cdr b))
                   nil)
               nil)
+          ;; A NUMBER, SYMBOL OR CHARACTER is EQUAL only to what it is EQL to, and EQL just said no:
+          ;; NIL here, not after every string predicate and %EQUAL-OTHER's bit-vector and pathname
+          ;; tests -- what an EQUAL table's probe paid for each key it passed ((:f32 . 6144) against
+          ;; (:i64 . 4), mill's tensor pool, a few percent of a stave pass).
+          (if (or (fixnump a) (symbolp a) (characterp a) (numberp a))
+              nil
           (if (and (%prim-simple-string-p a) (%prim-simple-string-p b))
               (%simple-string= a b)
               (if (and (%plain-base-string-p a) (%plain-base-string-p b))
@@ -895,7 +901,7 @@
                   (if (stringp b)
                       (string= a b)
                       nil)
-                  (%equal-other a b)))))))
+                  (%equal-other a b))))))))
 
 (defun %equal-other (a b)
   "EQUAL's remaining CLHS cases, off the cons/string fast path: BIT VECTORS

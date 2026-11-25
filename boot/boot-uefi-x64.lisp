@@ -454,6 +454,132 @@
   (uefi-emit-add-rsp buf 56))
 
 ;;; ============================================================
+;;; The saved core — \CORE.BIN on the boot volume, read to 0x20000000
+;;; ============================================================
+;;; A bare x64 image restores a RAM-range core from %CORE-ADDR (0x20000000,
+;;; build-cl-repl-common's x64 arm; lib/save-image.lisp) when the core magic is
+;;; there.  On the Pi the firmware puts it there; on a PC this does, before
+;;; ExitBootServices, through the firmware's own file system on the volume the
+;;; application was loaded from: LoadedImage -> DeviceHandle -> SimpleFileSystem
+;;; -> OpenVolume -> Open("\CORE.BIN") -> its size (SetPosition(-1),
+;;; GetPosition) -> AllocatePages(AllocateAddress, 0x20000000) -> Read.  Any
+;;; failure leaves no core (a plain boot); a short or failed read clears the
+;;; magic word, so a partial core is never restored.  R12 = ImageHandle,
+;;; R14 = BootServices, as the entry stub leaves them.
+
+(defconstant +efi-bs-allocate-pages+   #x28)
+(defconstant +efi-bs-handle-protocol+  #x98)
+(defconstant +uefi-core-addr+ #x20000000)
+;; {5B1B31A1-9562-11D2-8E3F-00A0C969723B}, {964E5B22-6459-11D2-8E39-00A0C969723B}
+(defconstant +loaded-image-guid-qw0+ #x11D295625B1B31A1)
+(defconstant +loaded-image-guid-qw1+ #x3B7269C9A0003F8E)
+(defconstant +sfs-guid-qw0+ #x11D26459964E5B22)
+(defconstant +sfs-guid-qw1+ #x3B7269C9A000398E)
+
+(defun emit-uefi-core-load (buf)
+  (let ((fails nil)
+        ;; 8 pushes leave RSP = 8 mod 16; 152 makes it 0 for every call below
+        (frame 152)
+        (guid 48) (li 64) (sfs 72) (root 80) (file 88) (size 96) (mem 104) (name 120))
+    (flet ((test-fail ()                  ; test rax, rax ; jnz <fail>
+             (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x85) (mvm-emit-byte buf #xC0)
+             (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x85)
+             (push (mvm-buffer-position buf) fails)
+             (mvm-emit-u32 buf 0))
+           (guid! (q0 q1)
+             (uefi-emit-mov-reg-imm64 buf +rax+ q0) (uefi-emit-mov-mem-reg buf +rsp+ guid +rax+)
+             (uefi-emit-mov-reg-imm64 buf +rax+ q1) (uefi-emit-mov-mem-reg buf +rsp+ (+ guid 8) +rax+))
+           (patch (positions target)
+             (dolist (p positions)
+               (let ((rel (- target (+ p 4))) (bytes (mvm-buffer-bytes buf)))
+                 (dotimes (k 4) (setf (aref bytes (+ p k)) (ldb (byte 8 (* 8 k)) rel)))))))
+      (uefi-emit-sub-rsp buf frame)
+      ;; the name, UTF-16: \CORE.BIN and a NUL, padded to 3 qwords
+      (let ((units (append (map 'list #'char-code "\\CORE.BIN") (list 0 0 0))))
+        (dotimes (q 3)
+          (let ((v 0))
+            (dotimes (k 4) (setq v (logior v (ash (nth (+ (* q 4) k) units) (* 16 k)))))
+            (uefi-emit-mov-reg-imm64 buf +rax+ v)
+            (uefi-emit-mov-mem-reg buf +rsp+ (+ name (* 8 q)) +rax+))))
+      ;; HandleProtocol(ImageHandle, &LoadedImage, &li)
+      (guid! +loaded-image-guid-qw0+ +loaded-image-guid-qw1+)
+      (uefi-emit-mov-reg-reg buf +rcx+ +r12+)
+      (uefi-emit-lea-rsp buf +rdx+ guid)
+      (uefi-emit-lea-rsp buf +r8+ li)
+      (uefi-emit-call-mem buf +r14+ +efi-bs-handle-protocol+)
+      (test-fail)
+      ;; HandleProtocol(li->DeviceHandle, &SimpleFileSystem, &sfs)
+      (guid! +sfs-guid-qw0+ +sfs-guid-qw1+)
+      (uefi-emit-mov-reg-mem buf +rax+ +rsp+ li)
+      (uefi-emit-mov-reg-mem buf +rcx+ +rax+ #x18)
+      (uefi-emit-lea-rsp buf +rdx+ guid)
+      (uefi-emit-lea-rsp buf +r8+ sfs)
+      (uefi-emit-call-mem buf +r14+ +efi-bs-handle-protocol+)
+      (test-fail)
+      ;; sfs->OpenVolume(sfs, &root)
+      (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ sfs)
+      (uefi-emit-lea-rsp buf +rdx+ root)
+      (uefi-emit-call-mem buf +rcx+ #x08)
+      (test-fail)
+      ;; root->Open(root, &file, name, EFI_FILE_MODE_READ, 0)
+      (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)          ; xor eax, eax
+      (uefi-emit-mov-mem-reg buf +rsp+ 32 +rax+)
+      (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ root)
+      (uefi-emit-lea-rsp buf +rdx+ file)
+      (uefi-emit-lea-rsp buf +r8+ name)
+      (uefi-emit-mov-reg-imm64 buf +r9+ 1)
+      (uefi-emit-call-mem buf +rcx+ #x08)
+      (test-fail)
+      ;; the size: file->SetPosition(file, -1), GetPosition(file, &size), SetPosition(file, 0)
+      (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
+      (uefi-emit-mov-reg-imm64 buf +rdx+ #xFFFFFFFFFFFFFFFF)
+      (uefi-emit-call-mem buf +rcx+ #x38)
+      (let ((close-fails nil))
+        (flet ((test-close ()
+                 (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x85) (mvm-emit-byte buf #xC0)
+                 (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x85)
+                 (push (mvm-buffer-position buf) close-fails)
+                 (mvm-emit-u32 buf 0)))
+          (test-close)
+          (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
+          (uefi-emit-lea-rsp buf +rdx+ size)
+          (uefi-emit-call-mem buf +rcx+ #x30)
+          (test-close)
+          (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
+          (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xD2)       ; xor edx, edx
+          (uefi-emit-call-mem buf +rcx+ #x38)
+          (test-close)
+          ;; AllocatePages(AllocateAddress, EfiLoaderData, (size + 4095) >> 12, &mem = 0x20000000)
+          (uefi-emit-mov-reg-imm64 buf +rax+ +uefi-core-addr+)
+          (uefi-emit-mov-mem-reg buf +rsp+ mem +rax+)
+          (uefi-emit-mov-reg-mem buf +r8+ +rsp+ size)
+          (mvm-emit-byte buf #x49) (mvm-emit-byte buf #x81) (mvm-emit-byte buf #xC0)
+          (mvm-emit-u32 buf 4095)                                  ; add r8, 4095
+          (mvm-emit-byte buf #x49) (mvm-emit-byte buf #xC1) (mvm-emit-byte buf #xE8)
+          (mvm-emit-byte buf 12)                                   ; shr r8, 12
+          (uefi-emit-mov-reg-imm64 buf +rcx+ 2)
+          (uefi-emit-mov-reg-imm64 buf +rdx+ 2)
+          (uefi-emit-lea-rsp buf +r9+ mem)
+          (uefi-emit-call-mem buf +r14+ +efi-bs-allocate-pages+)
+          (test-close)
+          ;; file->Read(file, &size, 0x20000000); a failure clears the magic
+          (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
+          (uefi-emit-lea-rsp buf +rdx+ size)
+          (uefi-emit-mov-reg-imm64 buf +r8+ +uefi-core-addr+)
+          (uefi-emit-call-mem buf +rcx+ #x20)
+          (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x85) (mvm-emit-byte buf #xC0)
+          (mvm-emit-byte buf #x74) (mvm-emit-byte buf 17)          ; jz +17: read ok
+          (uefi-emit-mov-reg-imm64 buf +rdi+ +uefi-core-addr+)     ; 10 bytes
+          (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x07)
+          (mvm-emit-u32 buf 0))                                    ; mov qword [rdi], 0: 7 bytes
+        ;; close: file->Close(file)
+        (patch close-fails (mvm-buffer-position buf))
+        (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
+        (uefi-emit-call-mem buf +rcx+ #x10))
+      (patch fails (mvm-buffer-position buf))
+      (uefi-emit-add-rsp buf frame))))
+
+;;; ============================================================
 ;;; Font Data — 8×8 bitmap font, ASCII 32–126 (95 glyphs)
 ;;; ============================================================
 
@@ -916,6 +1042,9 @@
 
   ;; ---- Diagnostic: print "2" via ConOut (GOP query survived) ----
   (emit-uefi-conout-char buf (char-code #\2))
+
+  ;; ---- \CORE.BIN, if the boot volume has one, to 0x20000000 ----
+  (unless *x64-snp-mode* (emit-uefi-core-load buf))
 
   ;; ---- SEV-SNP: locate the secrets page while the system table is live ----
   (when *x64-snp-mode* (emit-snp-find-secrets buf))

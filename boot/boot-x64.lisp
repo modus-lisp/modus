@@ -442,6 +442,14 @@
     (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)
     (mvm-emit-byte buf #xFC)
     (mvm-emit-byte buf #xF3) (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)
+    ;; ... and net/bare-sync.lisp's mutex arena [0x50000, 0x58000) (the CL image's
+    ;; %BARE-SYNC-ARENA, build-cl-repl-common): its cells are not in a saved core,
+    ;; so every boot, a restored one's included, starts them unlocked.
+    ;; mov rdi, 0x50000 ; mov ecx, 4096 ; rep stosq  (EAX still 0, DF clear)
+    (unless (and (boundp '*x64-snp-mode*) *x64-snp-mode*)
+      (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF) (mvm-emit-u32 buf #x50000) (mvm-emit-u32 buf 0)
+      (mvm-emit-byte buf #xB9) (mvm-emit-u32 buf 4096)
+      (mvm-emit-byte buf #xF3) (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB))
 
     ;; Initialize serial console (COM1 = 0x3F8)
     ;; Disable interrupts
@@ -1104,6 +1112,17 @@
               ;; halt (byte 346):
               #xF4
               #xEB #xFD)))
+      ;; THE FRAME BASE of the inline pop (byte 90's add r11, imm32: its imm32 is
+      ;; bytes 93..96): translate-x64's X64-BARE-HSTACK-BASE, whose rule is decided
+      ;; here again because this file is read before the translator's package exists.
+      ;; This entry is bare metal by construction, so the rule is: an SNP guest keeps
+      ;; 0x10000408, every other image the larger stack at 0x0FD00000.
+      (let ((base (if (and (boundp '*x64-snp-mode*) (symbol-value '*x64-snp-mode*))
+                      #x10000408 #x0FD00000)))
+        (assert (and (= (aref sg-bytes 90) #x49) (= (aref sg-bytes 91) #x81) (= (aref sg-bytes 92) #xC3)))
+        (unless (= base #x10000408)
+          (setq sg-bytes (copy-seq sg-bytes))
+          (dotimes (k 4) (setf (aref sg-bytes (+ 93 k)) (ldb (byte 8 (* 8 k)) base)))))
       ;; mov rdi, sigsegv-isr-addr
       (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
       (mvm-emit-u32 buf sigsegv-isr-addr) (mvm-emit-u32 buf 0)

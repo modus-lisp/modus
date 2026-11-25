@@ -526,6 +526,33 @@
     a))
 "
         "")
+    ;; x64 (multiboot and UEFI): the same two, on the clock %PC-TSC-HZ calibrates (the x64 arm
+    ;; of *CLI-ARCH-OVERRIDE-SOURCE*), and the same arena, which boot-x64's entry zeroes on
+    ;; every boot -- low RAM below the stub's page tables' neighbours (0x10000..0x1BFFF) and
+    ;; clear of everything a bare x64 image places.  Without it %BARE-SYNC-ARENA is (0 0) and
+    ;; every mutex a glass desk makes is cell 0.
+    (if (and *cl-repl-x64-p*
+             (not (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)))
+        "
+(defun %sleep-ms (ms)
+  (let ((hz (%pc-tsc-hz)))
+    (if (> hz 0)
+        (let ((end (+ (rdtsc) (ceiling (* (max ms 0) hz) 1000))))
+          (loop (when (>= (rdtsc) end) (return nil))))
+        (let ((i 0) (n (* ms 20000)))
+          (loop (when (>= i n) (return nil)) (setq i (+ i 1))))))
+  nil)
+(declaim (overridable %bare-sync-arena))
+(defun %bare-sync-arena () (values #x50000 #x58000))
+(declaim (overridable %sync-cell))
+(defun %sync-cell ()
+  (let* ((n (mem-ref #x50000 :u32))
+         (a (+ #x50000 64 (* (mod n 511) 64))))
+    (when (< n 511) (dotimes (i 8) (%gc-write64 (+ a (* i 8)) 0)))
+    (setf (mem-ref #x50000 :u32) (+ n 1))
+    a))
+"
+        "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
     ;; HDMI console's state and font.  Zeroed by the kernel prologue.
     ;; The Pi's log: 384 KB of the same window, which a board reset does not
@@ -996,6 +1023,42 @@
 ;; Back to lib/save-image.lisp's defaults.  Last definition wins.
 (defun %core-progress (k) k)
 (defun %core-pre-restore () t)
+;; THE GEOMETRY, READ EXACTLY.  boot-x64's stub stores the GC control block and
+;; the MCGC config words RAW (as hosted x64's does), so lib/save-image.lisp's
+;; mem-ref :u64 defaults HALVE them: a core saved with them claimed its heap
+;; started at #x08000800 and saved 136 MB of RAM below the real heap
+;; (#x10001000), then refused to restore.  Hosted x64's overrides
+;; (build-generic-cli), with the bare kind bitmap: [bitmap base] + the delta
+;; word at #x10000F98, which the bare stub stores.
+(defun %core-from-start () (%gc-read64 #x10000040))
+(defun %core-to-start () (%gc-read64 #x10000048))
+(defun %core-space-size () (%gc-read64 #x10000050))
+(defun %core-page-base () (%gc-read64 #x10000E00))
+(defun %core-bitmap-base () (%gc-read64 #x10000E18))
+(defun %core-cons-bitmap-base () (+ (%core-bitmap-base) (%gc-read64 #x10000F98)))
+;; %RESTORE-IMAGE reads the header to (+ (%CORE-HEAP-BASE from) 256): from - 512
+;; there is the metadata page itself on this layout.  A free page under the
+;; io-buf page instead.
+(defun %core-heap-base (from) #x0FEFF000)
+;; The metadata window, with the JIT constant-vector root (0x10000F00) restored
+;; IN PLACE: JIT code in the arena reads its constants through it (hosted x64's).
+(defun %core-restore-window (fd stage)
+  (%core-slice fd stage #x60)
+  (%core-slice fd #x10000060 8)
+  (%core-slice fd stage #x18)
+  (%core-slice fd #x10000080 16)
+  (%core-slice fd stage #xB8)
+  (%core-slice fd #x10000148 8)
+  (%core-slice fd stage #x20)
+  (%core-slice fd #x10000170 8)
+  (%core-slice fd stage #xD88)
+  (%core-slice fd #x10000F00 8)
+  (%core-slice fd stage #x98)
+  (%core-slice fd #x10000FA0 16)
+  (%core-slice fd #x10000FB0 8)
+  (%core-slice fd stage #x18)
+  (%core-slice fd #x10000FD0 8)
+  (%core-slice fd stage #x28))
 "
        (if (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)
            ""
@@ -2089,7 +2152,16 @@
             ;; virtio-net AFTER e1000: its e1000-probe/send/receive/rx-buf
             ;; wrappers win (last-defun-wins) and pick virtio when the PCI scan
             ;; finds one, the E1000 otherwise.
-            (%rpi-net-text "virtio-net.lisp")      (string #\Newline))
+            (%rpi-net-text "virtio-net.lisp")      (string #\Newline)
+            ;; THE NIC/DHCP STATE BLOCK: arch-x86-cl.lisp does not place it (i386's
+            ;; adapter does), and only an SSH build's address map did, so every x64
+            ;; network image built WITHOUT SSH died in RUN-NET-PIPELINE's first step
+            ;; (an UNDEFINED-FUNCTION, surfacing as a TYPE-ERROR).  The SSH map's
+            ;; addresses, which an SSH build restates.
+            "
+(defun e1000-state-base ()   #x0C320000)
+(defun fe-scratch-base ()    #x0C320900)
+")
       (if *cl-repl-virt-p*
           (concatenate 'string
             ;; QEMU virt: PCI ECAM + E1000.  arch-aarch64-cl.lisp also carries

@@ -842,7 +842,9 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
 
 (define-fixed-words (:space :window)
   (:hstack-frames-x64-bare #x10000408 #x800 :kind :range :images (:x64-bare :web)
-   :owner "mvm/translate-x64.lisp" :doc "Bare x86-64: 64 frames x 32 bytes (to #x10000C08).")
+   :owner "mvm/translate-x64.lisp"
+   :doc "Bare x86-64 under SEV-SNP: 64 frames x 32 bytes (to #x10000C08).  Every other bare x64
+         image keeps 1024 frames at #x0FD00000 instead (translate-x64 X64-BARE-HSTACK-BASE).")
   (:hstack-frames-i386-bare #x10000408 #x5E8 :kind :range :images (:i386-bare)
    :owner "mvm/translate-i386.lisp" :doc "Bare i386: 63 frames x 24 bytes.")
   (:hstack-frames-46 #x10000408 #x5C0 :kind :range :images (:ppc-hosted :68k-hosted :68k-bare)

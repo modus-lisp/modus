@@ -8017,6 +8017,22 @@
     (emit-bytes buf #x58)                            ; pop rax
     (emit-bytes buf #xC3)))                          ; ret
 
+;;; THE BARE FRAME STACK'S SIZE.  64 frames in the low block (0x10000408..0x10000C08, against
+;;; the heap at 0x10001000) is less than an ordinary library install nests: compiling a
+;;; defmacro under INSTALL-TARBALL's per-file and per-form HANDLER-CASEs ran the UEFI image out
+;;; (measured: sb-gray's %GRAY-WRAP, then three of the T420 desk's DEFUNs, then the reader of the
+;;; next file -- HANDLER-STACK-EXHAUSTED, the loud overflow doing its job).  So a bare image that
+;;; is not an SEV-SNP guest keeps 1024 frames (32 KB) in RAM below the I/O pages instead, at
+;;; 0x0FD00000; an SNP guest keeps the old 64 (that RAM's state there is the SNP stub's
+;;; business).  Keyed off flags every bare x64 build already sets (the UEFI DDC replays them),
+;;; so no new build knob.  The push/pop helpers below and boot-x64's #PF rescue (which pops inline) ask these; they
+;;; live HERE because the bare JIT emits the helpers again at run time, in the image.
+(defun x64-bare-hstack-big-p ()
+  (and (not *x64-linux-mode*)
+       (not (and (boundp 'modus.mvm::*x64-snp-mode*) (symbol-value 'modus.mvm::*x64-snp-mode*)))))
+(defun x64-bare-hstack-base () (if (x64-bare-hstack-big-p) #x0FD00000 #x10000408))
+(defun x64-bare-hstack-frames () (if (x64-bare-hstack-big-p) 1024 64))
+
 (defun emit-handler-helpers-bare (buf push-label pop-label)
   "Bare-metal push/pop: 64 frames at 0x10000408, diagnostics at
    0x10000D00.., and a LOUD 65th push (EMIT-HSTACK-OVERFLOW).
@@ -8032,12 +8048,15 @@
     (emit-label buf push-label)
     (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
-    (emit-bytes buf #x49 #x83 #xFA #x40)             ; cmp r10, 64
+    (if (= (x64-bare-hstack-frames) 64)
+        (emit-bytes buf #x49 #x83 #xFA #x40)         ; cmp r10, 64
+        (progn (emit-bytes buf #x49 #x81 #xFA)       ; cmp r10, imm32
+               (emit-u32 buf (x64-bare-hstack-frames))))
     (emit-jcc buf :ge capped)
-    ;; r11 = depth*32 + 0x10000408
+    ;; r11 = depth*32 + the frame base
     (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
-    (emit-u32 buf #x10000408)
+    (emit-u32 buf (x64-bare-hstack-base))
     (emit-hstack-copy-armed-to-frame buf t)
     ;; depth++ ; [0x10000400] = r10
     (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
@@ -8093,10 +8112,10 @@
     (emit-bytes buf #x49 #xFF #xCA)                  ; dec r10
     (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000400)
-    ;; r11 = depth*32 + 0x10000408
+    ;; r11 = depth*32 + the frame base
     (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
-    (emit-u32 buf #x10000408)
+    (emit-u32 buf (x64-bare-hstack-base))
     (emit-hstack-copy-frame-to-armed buf t)
     (emit-jmp buf done)
     (emit-label buf empty)

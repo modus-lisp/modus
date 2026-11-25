@@ -1182,8 +1182,14 @@
 ;; interpreter arm and the reference the probe cross-checks against.
 (defun %f32-aref (a i) (%f32-load a i))
 (defun %f32-aset (a i x)
-  "Store float X into lane I of the packed vector A; returns X."
-  (%f32-store a i (if (floatp x) x (float x 1.0f0)))
+  "Store float X into lane I of the packed vector A; returns X.  The float test
+   is the boxed-float subtag check written in place (#x60, #x64..#x66, as
+   FLOATP-IMPL): FLOATP is defined after this file and was two calls per store."
+  (%f32-store a i (if (and (not (fixnump x)) (not (consp x)) x
+                           (let ((st (obj-subtag x)))
+                             (or (= st #x60) (and (>= st #x64) (<= st #x66)))))
+                      x
+                      (float x 1.0f0)))
   x)
 ;;; ---- f32x4 vectors (SIMD plan, layer 2a) -----------------------------
 ;;; The VALUE form of a 4-lane vector is a packed single-float vector of

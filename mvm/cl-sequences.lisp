@@ -870,6 +870,7 @@
       (setq n (+ n 1))
       (setq cur (cdr cur)))))
 
+(declaim (inline floatp-impl))    ; every FLOATP, and float-store checks
 (defun floatp-impl (x)
   "Check if x is a boxed float — any of the four float subtags
    #x60..#x63 (double/single/short/long; numeric tower N1).  Means
@@ -5310,7 +5311,27 @@
             (setq type (%expand-deftype type) n (+ n 1))
             (return type))))))
 
+(defvar *uaet-memo* nil
+  "Alist: a COMMON-LISP type symbol -> what it upgrades to.  Such a symbol
+   cannot be a user DEFTYPE, so its answer never changes.")
+
 (defun upgraded-array-element-type (type &optional environment)
+  "The memoised answer for a COMMON-LISP symbol (MAKE-ARRAY asks on every call:
+   mill's (make-array r :element-type 'fixnum) expanded FIXNUM each time), else
+   %UPGRADED-ARRAY-ELEMENT-TYPE-1."
+  (declare (ignore environment))
+  (let ((e (and type (symbolp type) (assoc type *uaet-memo* :test (function eq)))))
+    (if e
+        (cdr e)
+        (let ((r (%upgraded-array-element-type-1 type)))
+          ;; only a COMMON-LISP symbol is remembered (asked on the miss alone);
+          ;; main thread only: a worker may not store into a global
+          (when (and type (symbolp type) (%mvm-on-main-thread-p)
+                     (eq (symbol-package type) (find-package "COMMON-LISP")))
+            (setq *uaet-memo* (cons (cons type r) *uaet-memo*)))
+          r))))
+
+(defun %upgraded-array-element-type-1 (type &optional environment)
   "Return the upgraded element type Modus actually uses for arrays of TYPE.
    Per CLHS 15.1.2.1: BIT upgrades to BIT, CHARACTER/BASE-CHAR upgrade to
    CHARACTER (Modus stores all chars uniformly), NIL upgrades to NIL, and

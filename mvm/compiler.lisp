@@ -28939,13 +28939,17 @@
        (let ((anf (anf-normalize-arith-args 'logand flat-args env)))
          (if anf
              (compile-form anf env dest)
-             (progn
-               (compile-form (car flat-args) env dest)
+             (let ((src1 (%first-operand-reg (car flat-args) env dest (cdr flat-args))))
+               ;; a promoted-local left operand is read in place (as COMPILE-ADD does):
+               ;; copying it into DEST meant a PUSH / POP of DEST around every right
+               ;; operand that calls -- a string hash's (logxor a (%word-aref key i))
+               (unless src1 (compile-form (car flat-args) env dest))
                (dolist (arg (cdr flat-args))
                  (check-arith-nesting 'logand arg) ; backstop — ANF handles the hit
                  (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                      (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                       (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND" trust))
+                       (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND" trust (or src1 dest))
+                       (setq src1 nil))
                      (let ((temp (alloc-temp-reg))
                            (*arith-push-depth* (1+ *arith-push-depth*)))
                        (let ((keep (and (%image-aarch64-p) (%arg-preserves-dest-p arg env dest))))
@@ -28975,13 +28979,17 @@
        (let ((anf (anf-normalize-arith-args 'logior flat-args env)))
          (if anf
              (compile-form anf env dest)
-             (progn
-               (compile-form (car flat-args) env dest)
+             (let ((src1 (%first-operand-reg (car flat-args) env dest (cdr flat-args))))
+               ;; a promoted-local left operand is read in place (as COMPILE-ADD does):
+               ;; copying it into DEST meant a PUSH / POP of DEST around every right
+               ;; operand that calls -- a string hash's (logxor a (%word-aref key i))
+               (unless src1 (compile-form (car flat-args) env dest))
                (dolist (arg (cdr flat-args))
                  (check-arith-nesting 'logior arg) ; backstop — ANF handles the hit
                  (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                      (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                       (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR" trust))
+                       (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR" trust (or src1 dest))
+                       (setq src1 nil))
                      (let ((temp (alloc-temp-reg))
                            (*arith-push-depth* (1+ *arith-push-depth*)))
                        (let ((keep (and (%image-aarch64-p) (%arg-preserves-dest-p arg env dest))))
@@ -29007,13 +29015,17 @@
        (let ((anf (anf-normalize-arith-args 'logxor flat-args env)))
          (if anf
              (compile-form anf env dest)
-             (progn
-               (compile-form (car flat-args) env dest)
+             (let ((src1 (%first-operand-reg (car flat-args) env dest (cdr flat-args))))
+               ;; a promoted-local left operand is read in place (as COMPILE-ADD does):
+               ;; copying it into DEST meant a PUSH / POP of DEST around every right
+               ;; operand that calls -- a string hash's (logxor a (%word-aref key i))
+               (unless src1 (compile-form (car flat-args) env dest))
                (dolist (arg (cdr flat-args))
                  (check-arith-nesting 'logxor arg) ; backstop — ANF handles the hit
                  (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                      (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                       (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR" trust))
+                       (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR" trust (or src1 dest))
+                       (setq src1 nil))
                      (let ((temp (alloc-temp-reg))
                            (*arith-push-depth* (1+ *arith-push-depth*)))
                        (let ((keep (and (%image-aarch64-p) (%arg-preserves-dest-p arg env dest))))
@@ -31644,6 +31656,15 @@
                      (and (eql *compile-safety* 0) (%call-free-operand-p (cadr args) env)))
                     ((or (string= op "%WORD-AREF") (string= op "%U8-REF") (string= op "%C32-REF"))
                      (and (%leaf-operand-p (car args) env) (%call-free-operand-p (cadr args) env)))
+                    ;; an index sum the compiler proves a fixnum -- (+ i 3) of a declared
+                    ;; counter -- is a plain ADD with no overflow path (%ARITH-TRUST-FOR's
+                    ;; rule): the 4-way string compares' (%word-aref b (+ i 2)) pushed and
+                    ;; popped the left character around every one
+                    ((or (string= op "+") (string= op "-"))
+                     (let ((w (%expr-width form env)))
+                       (and w (<= w 61)
+                            (%call-free-operand-p (car args) env)
+                            (%call-free-operand-p (cadr args) env))))
                     ((string= op "AREF")
                      (and (symbolp (car args))
                           (or (%declared-generic-array-var-p (car args) env)

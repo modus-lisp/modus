@@ -5173,6 +5173,52 @@
    length compound spec doesn't match the produced length.  Per CLHS
    15.5: at least one sequence argument is required — zero seqs
    signals program-error."
+  ;; ONE LIST OR SIMPLE-VECTOR into NIL / LIST / VECTOR / SIMPLE-VECTOR -- nearly
+  ;; every MAP -- walked directly.  The general path below coerced the input to
+  ;; a list (COERCE expanding its type through the DEFTYPE table), APPLYed
+  ;; MAPCAR over a consed argument list and copied the result: a mill graph
+  ;; runner MAPs every node's input names, and that was a quarter of a stave pass.
+  (when (and seqs (null (cdr seqs))
+             (or (null result-type) (eq result-type 'list)
+                 (eq result-type 'vector) (eq result-type 'simple-vector)))
+    (let ((s (car seqs)))
+      (cond
+        ((or (null s) (consp s))
+         (return-from map
+           (cond ((null result-type)
+                  (let ((cur s)) (loop (unless (consp cur) (return nil))
+                                   (funcall fn (car cur)) (setq cur (cdr cur)))
+                    (when cur (error 'type-error :datum cur :expected-type 'list))
+                    nil))
+                 (t (let ((head nil) (tail nil) (cur s) (n 0))
+                      (loop (unless (consp cur) (return nil))
+                        (let ((c (cons (funcall fn (car cur)) nil)))
+                          (if tail (rplacd tail c) (setq head c))
+                          (setq tail c n (+ n 1)))
+                        (setq cur (cdr cur)))
+                      (when cur (error 'type-error :datum cur :expected-type 'list))
+                      (if (eq result-type 'list)
+                          head
+                          (let ((v (make-array n)) (i 0))
+                            (loop (when (null head) (return v))
+                              (aset v i (car head))
+                              (setq head (cdr head) i (+ i 1))))))))))
+        ((simple-vector-p s)
+         (let ((n (length s)) (i 0))
+           (return-from map
+             (cond ((null result-type)
+                    (loop (when (>= i n) (return nil)) (funcall fn (svref s i)) (setq i (+ i 1))))
+                   ((eq result-type 'list)
+                    (let ((head nil) (tail nil))
+                      (loop (when (>= i n) (return head))
+                        (let ((c (cons (funcall fn (svref s i)) nil)))
+                          (if tail (rplacd tail c) (setq head c))
+                          (setq tail c))
+                        (setq i (+ i 1)))))
+                   (t (let ((v (make-array n)))
+                        (loop (when (>= i n) (return v))
+                          (aset v i (funcall fn (svref s i)))
+                          (setq i (+ i 1))))))))))))
   (when (%seq-type-u8-p result-type)
     (return-from map (%seq-u8-copy (apply (function map) 'vector fn seqs))))
   ;; a bit-vector result: map into a general vector, then the packed array

@@ -2824,6 +2824,7 @@
 ;;; rather than a re-encoded IEEE float — modus's float type is
 ;;; effectively a rational with limited precision anyway.
 
+(declaim (inline %ieee-float-p))  ; gates every float arithmetic path
 (defun %ieee-float-p (x)
   "True if X is an IEEE-bits boxed float, 2 slots.  Numeric tower N1
    (approach B+): all four CL float types share the 64-bit IEEE payload
@@ -4763,6 +4764,25 @@
    (vector *), (vector * 2), (simple-string 5) — uses the head symbol
    for dispatch (per CLHS, compound array/string subtypes are still
    the same family of result-type)."
+  ;; A LIST OR A SIMPLE-VECTOR TO LIST / VECTOR / SIMPLE-VECTOR, the shape and
+  ;; argument conversions every caller does, without %COERCE-EXPAND-TYPE (a
+  ;; DEFTYPE-table lookup per call).  An object already of the type is itself.
+  (when (or (eq result-type 'list) (eq result-type 'vector) (eq result-type 'simple-vector))
+    (cond ((or (null object) (consp object))
+           (when (eq result-type 'list) (return-from coerce object))
+           (let ((n 0) (cur object))
+             (loop (unless (consp cur) (return nil)) (setq n (+ n 1) cur (cdr cur)))
+             (when cur (error 'type-error :datum cur :expected-type 'list))
+             (let ((v (make-array n)) (i 0) (cur object))
+               (loop (unless (consp cur) (return-from coerce v))
+                 (aset v i (car cur))
+                 (setq i (+ i 1) cur (cdr cur))))))
+          ((simple-vector-p object)
+           (if (eq result-type 'list)
+               (let ((acc nil) (i (- (length object) 1)))
+                 (loop (when (< i 0) (return-from coerce acc))
+                   (setq acc (cons (svref object i) acc) i (- i 1))))
+               (return-from coerce object)))))
   ;; Already of that type: OBJECT itself (CLHS COERCE; COERCE.1).  Only on an
   ;; EXACT match with TYPE-OF -- TYPEP ignores element types here, so a general
   ;; vector would pass for a byte vector and come back uncopied.

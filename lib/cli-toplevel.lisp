@@ -365,7 +365,8 @@
              (unless m
                (%cli-line "Modus: this modus carries no kiln (dist's modus.exe does)")
                (%cli-exit 2))
-             (load (make-string-input-stream (map 'string #'code-char m)))))
+             ;; as a --script file loads: the first toplevel error aborts, and exits 1
+             (%cli-load-file (make-string-input-stream (map 'string #'code-char m)))))
           ((or (null path) (string= path "-"))
             ;; stdin: read+eval every form from fd 0 until EOF.  Errors
             ;; propagate to the handler-case below (this loop has no swallow),

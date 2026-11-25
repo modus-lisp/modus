@@ -1268,6 +1268,20 @@
              (floor (* (mod ticks hz) 1000000000) hz)))
         0)))
 (defun %irun-ns () (%irt-ns))
+;;; THE DATE, as the boards have it: seconds since boot on the same clock, plus an offset
+;;; SET-UNIVERSAL-TIME stores once something knows the date (the T420 desk: SNTP, or the
+;;; CMOS clock).  cl-fileio's GET-UNIVERSAL-TIME is a Linux syscall, which answers ~0 here,
+;;; and without a SET-UNIVERSAL-TIME the desk redefined GET-UNIVERSAL-TIME with a closure --
+;;; which late-bound callers saw and its own native code did not (the Clock read 19:00:00).
+(defun %pc-uptime-s ()
+  (let ((hz (%pc-tsc-hz))) (if (> hz 0) (floor (rdtsc) hz) 0)))
+(defun get-universal-time ()
+  (+ (%pc-uptime-s)
+     (if (boundp '*universal-time-offset*) (symbol-value '*universal-time-offset*) 0)))
+(defun set-universal-time (ut)
+  \"Tell this PC what time it is: UT (seconds since 1900) now.  UT.\"
+  (setf (symbol-value '*universal-time-offset*) (- ut (%pc-uptime-s)))
+  ut)
 "))
       (concatenate 'string
         (string #\Newline)

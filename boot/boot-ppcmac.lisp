@@ -733,6 +733,44 @@
       (ppc-emit-ori buf +ppc-r3+ +ppc-r3+ #x2030)                ; FP | IR | DR
       (ppc-emit-word buf #x7C600124)                             ; mtmsr r3
       (ppc-emit-word buf #x4C00012C)                             ; isync
+      ;; ---- 3a. the clocks QUIESCE took: Uni-N's UNI_N_CLOCK_CNTL (#xF8000020,
+      ;; big-endian) gates the internal PCI bus (bit 0) and the GMAC on it (bit
+      ;; 1); Apple's firmware stops them, and the first GMAC register read then
+      ;; faults (the PowerBook6,4 died reading GREG_SWRST; the USB cells the
+      ;; same way at its first boot).  Linux's core99_gmac_enable sets bit 1 and
+      ;; waits 20 us.  A G4e borrows DBAT7 (every BAT is spoken for on a
+      ;; PowerBook) for 128 KB at +PPCMAC-ENET-VA+, then gives it back to the
+      ;; Ethernet's window (boot info +64/+68) or turns it off.
+      (let ((not-g4e (mvm-make-label)) (wait (mvm-make-label)) (off (mvm-make-label)))
+        (ppc-emit-rlwinm buf +ppc-r3+ +ppc-r16+ 16 16 31)
+        (ppc-emit-addi buf +ppc-r3+ +ppc-r3+ (logand (- #x8000) #xFFFF))
+        (li +ppc-r4+ 5)
+        (ppc-emit-cmpl-word buf +ppc-r3+ +ppc-r4+) (ppc-emit-bge buf not-g4e)
+        (li +ppc-r4+ 0) (ppcmac-mtspr buf 574 +ppc-r4+)
+        (ppc-emit-word buf #x4C00012C)
+        (li +ppc-r4+ #xF800002A) (ppcmac-mtspr buf 575 +ppc-r4+)          ; DBAT7L: Uni-N, I+G
+        (li +ppc-r4+ (logior +ppcmac-enet-va+ 3)) (ppcmac-mtspr buf 574 +ppc-r4+) ; 128 KB
+        (ppc-emit-word buf #x4C00012C)
+        (li +ppc-r5+ (+ +ppcmac-enet-va+ #x20))
+        (ppc-emit-lwz buf +ppc-r6+ +ppc-r5+ 0)
+        (ppc-emit-ori buf +ppc-r6+ +ppc-r6+ 3)
+        (ppc-emit-stw buf +ppc-r6+ +ppc-r5+ 0)
+        (ppc-emit-sync buf)
+        (ppc-emit-lwz buf +ppc-r6+ +ppc-r5+ 0)                             ; as Linux: read back
+        (li +ppc-r7+ 200000) (ppc-emit-mtctr buf +ppc-r7+)                ; and wait (>20 us)
+        (ppc-emit-label buf wait)
+        (ppc-emit-bc buf 16 0 wait)                                        ; bdnz
+        (li +ppc-r4+ 0) (ppcmac-mtspr buf 574 +ppc-r4+)
+        (ppc-emit-word buf #x4C00012C)
+        (li +ppc-r3+ +ppcmac-boot-info+)
+        (ppc-emit-lwz buf +ppc-r4+ +ppc-r3+ 68)
+        (ppc-emit-cmpwi buf +ppc-r4+ 0) (ppc-emit-beq buf off)
+        (ppc-emit-lwz buf +ppc-r14+ +ppc-r3+ 64)
+        (ppc-emit-ori buf +ppc-r4+ +ppc-r14+ #x2A) (ppcmac-mtspr buf 575 +ppc-r4+)
+        (li +ppc-r4+ (logior +ppcmac-enet-va+ #x1FF)) (ppcmac-mtspr buf 574 +ppc-r4+)
+        (ppc-emit-label buf off)
+        (ppc-emit-word buf #x4C00012C)
+        (ppc-emit-label buf not-g4e))
       ;; ---- 3b. what the firmware said, where Lisp reads it (+PPCMAC-BOOT-INFO+)
       (li +ppc-r11+ +ppcmac-boot-info+)
       (li +ppc-r12+ #x5050434D) (ppc-emit-stw buf +ppc-r12+ +ppc-r11+ 0)   ; "PPCM"

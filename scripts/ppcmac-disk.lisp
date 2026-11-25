@@ -24,6 +24,8 @@
 ;;;; %PPCMAC-BOOT-PAYLOAD).  LIST has a line per entry, NAME<tab>PATH, in order;
 ;;;; a .lisp entry is evaluated at boot, any other kept as bytes by NAME.
 ;;;;
+;;;; --elf-out FILE also writes that ELF alone, for a network boot (TFTP).
+;;;;
 ;;;; --fasl-record makes a disk whose boot records the payload's fasls and sends
 ;;;; them on the serial port; --fasls DIR puts DIR's KEY.mfasl files in the
 ;;;; payload, ahead of the sources, so a boot replays them instead of compiling
@@ -112,7 +114,7 @@
 (defun ascii-bytes (s)
   (map '(vector (unsigned-byte 8)) #'char-code s))
 
-(defun main (image out &key (size-mb nil) payload loader fasl-record fasls)
+(defun main (image out &key (size-mb nil) payload loader fasl-record fasls elf-out)
   (let* ((loader (or loader (let ((b (concatenate 'string image ".boot"))) (and (probe-file b) b))))
          (boot (and loader (read-bytes loader)))
          (elf (if payload (elf-with-payload (read-bytes image) (payload-bytes payload :fasl-record fasl-record :fasls fasls)) (read-bytes image)))
@@ -143,6 +145,11 @@
          (total (+ *base* volblocks))
          (disk (make-array (* total 512) :element-type '(unsigned-byte 8) :initial-element 0)))
     (bless-system-folder vol)
+    ;; --elf-out FILE: the image as the disk holds it (payload and fasls in), for
+    ;; a network boot: Open Firmware's TFTP serves it, modus-boot.elf loads it
+    (when elf-out
+      (write-bytes elf-out elf)
+      (format t "ppcmac-disk: ~A: the image alone (~D bytes)~%" elf-out (length elf)))
     (fs-apple:apm-write-ddm disk total nil)
     (fs-apple:apm-write-map
      disk (list (list :start 1 :count 2 :name "Apple" :type "Apple_partition_map")
@@ -176,6 +183,9 @@
         (loader (let ((p (position "--loader" args :test #'string=)))
                   (and p (nth (1+ p) args))))
         (fasls (let ((p (position "--fasls" args :test #'string=)))
-                 (and p (nth (1+ p) args)))))
+                 (and p (nth (1+ p) args))))
+        (elf-out (let ((p (position "--elf-out" args :test #'string=)))
+                   (and p (nth (1+ p) args)))))
     (main (first args) (second args) :size-mb size :payload payload :loader loader
-          :fasl-record (and (member "--fasl-record" args :test #'string=) t) :fasls fasls)))
+          :fasl-record (and (member "--fasl-record" args :test #'string=) t) :fasls fasls
+          :elf-out elf-out)))

@@ -161,14 +161,28 @@
   ;; bignum here, which MEM-REF builds and a fixnum multiply would wrap
   (mem-ref (+ #x07F80000 off) :u32))
 
+(defvar *usb-models* '("PowerBook5,6" "PowerBook5,7" "PowerBook5,8" "PowerBook5,9"
+                        "PowerBook6,7" "PowerBook6,8")
+  "PMU machines whose keyboard and trackpad are on USB (2005): USB at boot.")
+(defvar *usb-at-boot* :auto "T, NIL, or :AUTO (USB-AT-BOOT-P decides).")
+
+(defun usb-at-boot-p ()
+  (if (eq *usb-at-boot* :auto)
+      (or (/= *mac-via-kind* 2)
+          (let ((m (ignore-errors (funcall 'dt-string (funcall 'dt) "model"))))
+            (and m (member m *usb-models* :test #'string=) t)))
+      *usb-at-boot*))
+
 (defun mac-input-init ()
   (setq *mac-via-kind* (if (and (= (mem-ref #x07F80000 :u16) #x5050) (= (mac-boot-info 28) 2)) 2 1))
   (if (= *mac-via-kind* 2)
       (progn (pmu-init) (pmu-adb-reset) (pmu-autopoll))
       (progn (cuda-init) (adb-reset) (cuda-autopoll t)))
   (mac-set-clock)
-  ;; USB keyboards and mice (ppcmac-usb.lisp, when the payload has it)
-  (when (fboundp 'usb-init)
+  ;; USB keyboards and mice (ppcmac-usb.lisp, when the payload has it): at boot
+  ;; where the machine's own keyboard is USB, or there is no PMU; elsewhere
+  ;; (USB-INIT) from the listener starts it
+  (when (and (fboundp 'usb-init) (usb-at-boot-p))
     (handler-case (funcall 'usb-init)
       (error (c) (ignore-errors (modus-int::write-string-serial "usb: ") (princ c)))))
   *mac-via-kind*)

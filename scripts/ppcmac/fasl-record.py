@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Make a PowerPC Mac disk whose boot replays its payload's fasls.
 
-  fasl-record.py IMAGE.elf PAYLOAD.list OUT.dsk [--dir FASLDIR]
+  fasl-record.py IMAGE.elf PAYLOAD.list OUT.dsk [--dir FASLDIR] [--elf-out NET.elf]
 
 A fasl replays only in the image that recorded it (mvm/fasl.lisp: the key
 holds the build), so the image records them itself, once, under QEMU:
@@ -49,7 +49,8 @@ def main():
             f.write(data)
         n += 1
     print(f'fasl-record: {n} fasls in {fdir}')
-    subprocess.run(['sbcl', '--script', disk_lisp, image, out, '--payload', payload, '--fasls', fdir], check=True)
+    extra = ['--elf-out', sys.argv[sys.argv.index('--elf-out') + 1]] if '--elf-out' in sys.argv else []
+    subprocess.run(['sbcl', '--script', disk_lisp, image, out, '--payload', payload, '--fasls', fdir] + extra, check=True)
 
 if __name__ == '__main__':
     main()

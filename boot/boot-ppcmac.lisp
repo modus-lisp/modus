@@ -110,7 +110,7 @@
   '("finddevice" "getprop" "child" "peer" "open" "call-method" "screen" "address"
     "assigned-addresses" "width" "height" "linebytes" "depth" "mac-io" "name"
     "/memory" "reg" "color!" "/chosen" "stdout" "instance-to-package" "device_type"
-    "nextprop" "getproplen" "claim" "/cpus" "timebase-frequency"))
+    "nextprop" "getproplen" "claim" "/cpus" "timebase-frequency" "quiesce"))
 
 (defconstant +ppcmac-dt+ #x07B00000
   "Open Firmware's device tree, copied by the stub for Lisp (PPCMAC-EMIT-DT-DUMP):
@@ -400,6 +400,15 @@
         (ppc-emit-label buf none)
         (li +ppc-r28+ 100000000)
         (ppc-emit-label buf have))
+      ;; ---- the last word with the firmware: QUIESCE.  A real Mac's Open
+      ;; Firmware leaves its devices running -- an OHCI writes its frame number
+      ;; into OF's HCCA every millisecond, Ethernet after a network boot keeps
+      ;; receiving -- and that memory becomes the heap (on a PowerBook6,4 a Lisp
+      ;; object was overwritten under BIGNUM-ASH).  Linux's prom_init does the
+      ;; same; a firmware without the service returns -1, harmless.  r28 kept.
+      (ppc-emit-mr buf +ppc-r14+ +ppc-r28+)
+      (cif "quiesce" nil 0)
+      (ppc-emit-mr buf +ppc-r28+ +ppc-r14+)
       (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 2048))))
 
 (defun ppcmac-emit-device-bats (buf)
@@ -678,6 +687,16 @@
 ;;; scripts/ppcmac-disk.lisp puts both files on the disk; bootinfo.txt boots
 ;;; the loader with the image's path as its argument.
 
+(defconstant +ppcmac-netboot-buf+ #x08000000
+  "Where a network boot's image lands whole (Open Firmware's TFTP only LOADs a
+   file): 128 MB, above everything the image puts below it, and free until the
+   heap moves in (PPCMAC-EMIT-HEAP-BATS).  Booting from the network:
+     boot enet:SERVER,modus-boot.elf,CLIENT enet:SERVER,modus.elf,CLIENT")
+(defconstant +ppcmac-netboot-max+ #x03000000
+  "48 MB: room for the image a network boot takes.  (TFTP's 512-byte blocks
+   number at most 65535: a file past 32 MB needs a server and firmware that
+   roll the block number over.)")
+
 (defconstant +ppcmac-loader-base+ #x07A00000
   "Where modus-boot.elf runs: above the handler-frame extension and NIL's block
    (#x07800000..), below the mutex arena (#x07D00000).  64 KB: its code, then a
@@ -688,7 +707,8 @@
   (let* ((*ppc-64-bit* nil)
          (buf (make-ppc-buffer))
          (strs '("finddevice" "getprop" "open" "read" "seek" "close" "claim" "write" "exit"
-                 "/chosen" "bootargs" "stdout" "." "hd:,\\modus.elf"))
+                 "/chosen" "bootargs" "stdout" "." "hd:,\\modus.elf"
+                 "instance-to-package" "device_type" "call-method" "load" " tftp "))
          (msgs `(("boot" . ,(format nil "~C~Cmodus: loading " #\Return #\Newline))
                  ("fail" . ,(format nil "~C~Cmodus: cannot read the image~C~C" #\Return #\Newline #\Return #\Newline))
                  ("go" . ,(format nil " ok~C~C" #\Return #\Newline))))
@@ -699,6 +719,8 @@
                    (incf o (* 4 (ceiling (1+ (length s)) 4))))))
          (hdr (+ +ppcmac-loader-base+ #x8000))
          (path (+ +ppcmac-loader-base+ #x9000))
+         (netf (+ path #x200))            ; 1: the image came whole, over the network, to NETBUF
+         (netbuf +ppcmac-netboot-buf+)
          (past (mvm-make-label)) (fail (mvm-make-label)))
     (labels ((off (s) (cdr (assoc s offs :test #'string=)))
              (msg (k) (cdr (assoc k msgs :test #'string=)))
@@ -763,10 +785,36 @@
       ;; open the image; read its ELF header and program headers
       (cif "open" (list (list :imm path)) 1 +ppc-r28+)
       (ppc-emit-cmpwi buf +ppc-r28+ 0) (ppc-emit-beq buf fail)
-      (cif "seek" (list +ppc-r28+ (list :imm 0) (list :imm 0)) 1)
-      (cif "read" (list +ppc-r28+ (list :imm hdr) (list :imm 4096)) 1 +ppc-r15+)
-      (ppc-emit-cmpwi buf +ppc-r15+ 52) (ppc-emit-blt buf fail)
-      (li +ppc-r26+ hdr)
+      ;; a network device (device_type "network": enet:SERVER,FILE,CLIENT) cannot
+      ;; seek or read a file -- its TFTP package only LOADs one whole: so into
+      ;; NETBUF, and the segments are copied from there (NETF = 1)
+      (let ((disk (mvm-make-label)) (have-hdr (mvm-make-label)))
+        (li +ppc-r3+ 0) (li +ppc-r4+ netf) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 0)
+        (li +ppc-r4+ (+ path #x100)) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 0)
+        (cif "instance-to-package" (list +ppc-r28+) 1 +ppc-r15+)
+        (cif "getprop" (list +ppc-r15+ (list :str "device_type") (list :imm (+ path #x100)) (list :imm 16)) 1)
+        (li +ppc-r4+ (+ path #x100)) (ppc-emit-lwz buf +ppc-r3+ +ppc-r4+ 0)
+        (li +ppc-r5+ #x6E657477)                                   ; "netw"
+        (ppc-emit-cmpw buf +ppc-r3+ +ppc-r5+) (ppc-emit-bne buf disk)
+        (say " tftp ")
+        (cif "claim" (list (list :imm netbuf) (list :imm +ppcmac-netboot-max+) (list :imm 0)) 1 +ppc-r15+)
+        (li +ppc-r5+ netbuf)
+        (ppc-emit-cmpw buf +ppc-r15+ +ppc-r5+) (ppc-emit-bne buf fail)
+        ;; call-method load ( addr -- len ): catch-result at +88, len at +92
+        (cif "call-method" (list (list :str "load") +ppc-r28+ (list :imm netbuf)) 2)
+        (ppc-emit-lwz buf +ppc-r3+ +ppc-r1+ 88)
+        (ppc-emit-cmpwi buf +ppc-r3+ 0) (ppc-emit-bne buf fail)
+        (ppc-emit-lwz buf +ppc-r15+ +ppc-r1+ 92)
+        (ppc-emit-cmpwi buf +ppc-r15+ 52) (ppc-emit-blt buf fail)
+        (li +ppc-r3+ 1) (li +ppc-r4+ netf) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 0)
+        (li +ppc-r26+ netbuf)
+        (ppc-emit-b buf have-hdr)
+        (ppc-emit-label buf disk)
+        (cif "seek" (list +ppc-r28+ (list :imm 0) (list :imm 0)) 1)
+        (cif "read" (list +ppc-r28+ (list :imm hdr) (list :imm 4096)) 1 +ppc-r15+)
+        (ppc-emit-cmpwi buf +ppc-r15+ 52) (ppc-emit-blt buf fail)
+        (li +ppc-r26+ hdr)
+        (ppc-emit-label buf have-hdr))
       (ppc-emit-lwz buf +ppc-r20+ +ppc-r26+ 24)                 ; e_entry
       (ppc-emit-lwz buf +ppc-r22+ +ppc-r26+ 28)                 ; e_phoff
       (ppc-emit-lhz buf +ppc-r23+ +ppc-r26+ 44)                 ; e_phnum
@@ -781,10 +829,23 @@
         (ppc-emit-lwz buf +ppc-r18+ +ppc-r21+ 16)               ; p_filesz
         (ppc-emit-lwz buf +ppc-r19+ +ppc-r21+ 20)               ; p_memsz
         (cif "claim" (list +ppc-r17+ +ppc-r19+ (list :imm 0)) 1)
-        (cif "seek" (list +ppc-r28+ (list :imm 0) +ppc-r16+) 1)
-        ;; read in megabytes: r14 = where, r15 = left
-        (ppc-emit-mr buf +ppc-r14+ +ppc-r17+) (ppc-emit-mr buf +ppc-r15+ +ppc-r18+)
-        (let ((chunk (mvm-make-label)) (small (mvm-make-label)) (rd (mvm-make-label)) (rdone (mvm-make-label)))
+        (let ((chunk (mvm-make-label)) (small (mvm-make-label)) (rd (mvm-make-label)) (rdone (mvm-make-label))
+              (from-disk (mvm-make-label)) (copy (mvm-make-label)))
+          ;; loaded whole: copy FILESZ bytes from NETBUF + p_offset
+          (li +ppc-r4+ netf) (ppc-emit-lwz buf +ppc-r3+ +ppc-r4+ 0)
+          (ppc-emit-cmpwi buf +ppc-r3+ 0) (ppc-emit-beq buf from-disk)
+          (li +ppc-r5+ netbuf) (ppc-emit-add buf +ppc-r5+ +ppc-r5+ +ppc-r16+)
+          (ppc-emit-mr buf +ppc-r14+ +ppc-r17+) (ppc-emit-mr buf +ppc-r15+ +ppc-r18+)
+          (ppc-emit-label buf copy)
+          (ppc-emit-cmpwi buf +ppc-r15+ 0) (ppc-emit-ble buf rdone)
+          (ppc-emit-lbz buf +ppc-r3+ +ppc-r5+ 0) (ppc-emit-stb buf +ppc-r3+ +ppc-r14+ 0)
+          (ppc-emit-addi buf +ppc-r5+ +ppc-r5+ 1) (ppc-emit-addi buf +ppc-r14+ +ppc-r14+ 1)
+          (ppc-emit-addi buf +ppc-r15+ +ppc-r15+ -1)
+          (ppc-emit-b buf copy)
+          (ppc-emit-label buf from-disk)
+          (cif "seek" (list +ppc-r28+ (list :imm 0) +ppc-r16+) 1)
+          ;; read in megabytes: r14 = where, r15 = left
+          (ppc-emit-mr buf +ppc-r14+ +ppc-r17+) (ppc-emit-mr buf +ppc-r15+ +ppc-r18+)
           (ppc-emit-label buf chunk)
           (ppc-emit-cmpwi buf +ppc-r15+ 0) (ppc-emit-ble buf rdone)
           (li +ppc-r24+ #x100000)

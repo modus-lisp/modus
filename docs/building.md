@@ -12,7 +12,8 @@ Released binaries live in the dist repository, `modus-lisp/dist`, under `bin/REL
 | `modus-windows-x64.exe` | the same image as a Windows PE32+ console program (`mvm/build-win64-cli.lisp`) |
 | `modus-builder-linux-x64` | the CLI with the image-building tooling in it (`MODUS_BUILDER=1`): this one runs builds |
 | `modus-builder-windows-x64.exe` | the same, for Windows |
-| `modus.com` | both CLIs in one file (`scripts/make-ape.lisp`): an Actually Portable Executable that Windows runs as the PE, and a Unix shell runs as a script that copies the Linux image to `~/.cache/modus/` once and executes it.  It is *derived* from the two files above, not compiled: the copy it runs on Unix has `modus-linux-x64`'s SHA-256, and make-ape gives the same bytes on every host |
+| `modus-macos-arm64` | the CLI for macOS on Apple silicon: the Darwin image (`mvm/build-aarch64-cli.lisp`, `MODUS_DARWIN=1`) in a signed Mach-O that `mvm/build-macos-cli.lisp` writes, with no Apple toolchain (docs/macos-hosting.md) |
+| `modus.com` | all three CLIs in one file (`scripts/make-ape.lisp`), each gzip'd: an Actually Portable Executable.  Windows runs its PE, a small launcher (`mvm/build-ape-stub.lisp`) that inflates the Windows CLI to `%LOCALAPPDATA%\modus\` once and runs it; a Unix shell runs it as a script that picks the Linux or macOS image by `uname -sm`, inflates it to `~/.cache/modus/` once and executes it.  It is *derived*, not compiled: each cached copy has its release file's SHA-256, and make-ape gives the same bytes on every host |
 | `SHA256SUMS` | every file's SHA-256 |
 | `RELEASE.md` | the source commit, the build ID, and the commands that made each file |
 
@@ -39,10 +40,23 @@ MODUS_WIN64_OUT=modus.exe ./modus-builder-linux-x64 --dynamic-space-size 16384 \
 MODUS_BUILDER=1 MODUS_NARROW_STRINGS=1 MODUS_CLI_OUT=modus-builder \
   ./modus-builder-linux-x64 --dynamic-space-size 16384 --script mvm/build-generic-cli.lisp
 
-MODUS_APE_PE=modus.exe MODUS_APE_ELF=modus MODUS_APE_OUT=modus.com \
+# macOS: the Darwin image, then the Mach-O around it (MODUS_NATRIUM: a natrium checkout,
+# for the code signature's SHA-256)
+MODUS_DARWIN=1 MODUS_CODE_BASE=7000010000 MODUS_CONV_DELTA=7040000000 \
+  MODUS_HEAP_BASE=7080000000 MODUS_JIT_ARENA_BASE=7100000000 MODUS_CLI_OUT=modus-darwin.elf \
+  ./modus-builder-linux-x64 --dynamic-space-size 16384 --script mvm/build-aarch64-cli.lisp
+MODUS_NATRIUM=../natrium MODUS_MACOS_IMAGE=modus-darwin.elf MODUS_MACOS_OUT=modus-macos \
+  ./modus-builder-linux-x64 --dynamic-space-size 16384 --script mvm/build-macos-cli.lisp
+# modus.com's Windows launcher
+MODUS_APE_STUB_OUT=modus-ape-stub.exe \
+  ./modus-builder-linux-x64 --dynamic-space-size 16384 --script mvm/build-ape-stub.lisp
+
+# modus.com (MODUS_APE_CRAM: cram's source in one file; MODUS_APE_SEGMENTS: RELEASE.md)
+MODUS_APE_PE=modus.exe MODUS_APE_ELF=modus MODUS_APE_MACHO=modus-macos \
+  MODUS_APE_STUB=modus-ape-stub.exe MODUS_APE_CRAM=cram.lisp MODUS_APE_OUT=modus.com \
   ./modus-builder-linux-x64 --script scripts/make-ape.lisp
 
-sha256sum modus modus.exe modus-builder modus.com   # compare with SHA256SUMS
+sha256sum modus modus.exe modus-builder modus-macos modus.com   # compare with SHA256SUMS
 ```
 
 On Windows, run the same scripts with `modus-builder-windows-x64.exe` (`set NAME=value` in
@@ -76,9 +90,8 @@ The hosted CLIs need nothing from `modus-lisp/vessel`; the bare-metal images do,
 
 ## What is not here yet
 
-- **macOS.**  The Darwin image (`mvm/build-aarch64-cli.lisp` with `MODUS_DARWIN=1`) is built
-  by modus, but the native wrapper around it (`host/macos/`) is C and needs Apple's `clang`
-  and `ld`.  A Mach-O writer in Lisp, with an ad-hoc code signature, is the next step.
+- **The macOS GUI.**  The CLI's Mach-O is written by modus (`mvm/build-macos-cli.lisp`); the
+  windowed `.app` (`host/macos/build-macos.sh IMAGE OUT gui`) still needs Apple's toolchain.
 - **AArch64 builders.**  The builders are x86-64; an AArch64 one (Linux, then macOS) follows
   the same recipe with `mvm/build-aarch64-cli.lisp`.
 

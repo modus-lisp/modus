@@ -6182,8 +6182,19 @@
 ;;; collects.  It goes in the thread's own pool (*E2-THREAD-POOL*, indices from
 ;;; %E2-THREAD-POOL-BASE).  The JIT bakes or vectors constants from the SHARED
 ;;; pool only; a worker's modules are interpreted (%MVM-EVAL-FORMS-WORKER).
+;;;
+;;; A COROUTINE IS MAIN HERE, NOT A WORKER.  It has a binding block, so the
+;;; %DYNB-BLOCK test alone took it for a worker and sent it down the locked
+;;; path, where the pool's doubled vector is made in the lock arena.  The arena
+;;; is 32 MB and a locked section must not outgrow its slice: a pool of a
+;;; million entries doubles to 16 MB, which fits only an empty arena, and the
+;;; next doubling never fits.  cortez booting TI's machine in a coroutine died
+;;; "heap exhausted" with 7 GB of region 0 free, the slice being collected again
+;;; and again.  A coroutine runs on the main OS thread and allocates in region 0
+;;; exactly as main does, so it registers exactly as main does.
 (defun %e2-const-register (value)
-  (cond ((or (eql (mem-ref #x10000DB8 :u32) 0) (eql (modus.runtime::%dynb-block) 0))
+  (cond ((or (eql (mem-ref #x10000DB8 :u32) 0) (eql (modus.runtime::%dynb-block) 0)
+             (%mvm-on-main-thread-p))
          (%e2-const-register-1 value))
         ((modus.runtime::%own-region-object-p value)
          (%e2-thread-const-register value))

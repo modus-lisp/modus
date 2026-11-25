@@ -12,7 +12,8 @@
 ;;;; Here: in the first cycle, fill the lower semispace with garbage to 400 KB short of its end,
 ;;;; aim the allocation pointer so the last 48-byte box would start 16 bytes below the end, and make
 ;;;; float boxes, each kept, until the collection comes.  With the old limit that box straddles
-;;;; and the collection crashed or corrupted it.  aarch64 only (the primitives are compiled ones);
+;;;; and the collection crashed or corrupted it.  Then the same with the limit forced AT the end:
+;;;; the box's own check is size-aware now, so it collects first.  aarch64 only (the primitives are compiled ones);
 ;;;; elsewhere it reports SKIP.
 (defvar *fails* 0)
 (defun check (name got want)
@@ -56,4 +57,22 @@
                       n)))
         (check "collected" (> (gcs) 0) t)
         (check "boxes-intact" bad 0))
+      ;; THE BOX'S OWN CHECK, with no headroom to hide behind: the lower
+      ;; semispace active again, its limit put AT its end (what the boot limit
+      ;; was), the same aimed boxes.  A float box's :gc-check is now sized
+      ;; (fuse-gc-checks), so the collection comes before the box that would
+      ;; have crossed.
+      (modus-int::%gc-collect-here)
+      (when (> (rd 0) (rd 8)) (modus-int::%gc-collect-here))
+      (let* ((end (rd 8)) (keep (make-array 100000)))
+        (modus-int::set-alloc-limit end)
+        (fill-to end 400000)
+        (aim end)
+        (let* ((n (handler-case (boxes keep 100000) (error (e) (list :error (type-of e)))))
+               (bad (if (integerp n)
+                        (let ((b 0))
+                          (dotimes (i n b)
+                            (unless (eql (svref keep i) (+ (+ 0.25d0 (float (+ i 1) 1d0)) 0.5d0)) (incf b))))
+                        n)))
+          (check "sized-check-boxes-intact" bad 0)))
       (format t "~&GC-FIRST-CYCLE-HEADROOM ~A~%" (if (zerop *fails*) "PASS" "FAIL"))))

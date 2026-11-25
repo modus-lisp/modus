@@ -2691,6 +2691,10 @@
    strict superset of :gc-check, so not fusing forgoes the improvement without
    weakening the check.")
 
+(defconstant +fp-box-bytes+ 48
+  "Bytes an :fpd-box / :fp-box advances the allocation pointer by: a 4-slot
+   float object, align16((4 + 2) * 8).")
+
 (defconstant +mvm-cons-bytes+ 16
   "Bytes an :alloc-cons / :cons advances the allocation pointer by.")
 
@@ -3166,6 +3170,19 @@
                              (let ((count (third next)))
                                (and (integerp count) (>= count 0)
                                     (%alloc-obj-bytes count))))
+                            ;; A FLOAT BOX: FPD-BOX / FP-BOX allocate 48 bytes
+                            ;; (a 4-slot object) at VA with no check of their
+                            ;; own.  Unsized, one that passed just under the
+                            ;; limit ran up to 32 bytes past it -- across the
+                            ;; boundary into the next collection's to-space
+                            ;; when the limit had no headroom (the aarch64 boot
+                            ;; limit until 5b7bcd05).  The scratch argument
+                            ;; holds as for :alloc-obj: neither reads a general
+                            ;; register, aarch64's uses x16 only as its own
+                            ;; destination scratch, and x86-64's writes RAX
+                            ;; before reading anything but its FP source, so
+                            ;; RAX cannot be live into it; i386 ignores the size.
+                            ((:fpd-box :fp-box) +fp-box-bytes+)
                             ;; :cons / :alloc-cons are deliberately NOT fused.
                             ;; A fused check needs a scratch register, and the
                             ;; only candidate on x64 is RAX (= VR).  For

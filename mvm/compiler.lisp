@@ -15388,6 +15388,79 @@
                             `(%dynbind-site ,k ,tmp (quote ,site))))
           (t `(%dynbind ,k ,tmp)))))
 
+(defun %let-special-fast (spec)
+  "How a LET of special SPEC reaches its value cell without a call: a form
+   (over the variable SH, true when this thread binds shallowly -- see
+   %SHALLOW-THREAD-FORM) yielding the cell or NIL, and the keyed fallbacks
+   for NIL: (values CELL-FN SAVE-FORM BIND-FN RESTORE-FN), CELL-FN taking
+   SH's variable, BIND-FN and RESTORE-FN the value variable.  NIL when the special has no
+   shallow cell route (read and write keys differ, or no cache at all).
+   The LET evaluates SH once and each CELL-FORM once, so a binding is a CDR
+   on entry and a SET-CDR at each end instead of three out-of-line calls,
+   each testing the thread gate again (cl-bench STAK: ~11 ns per special,
+   SBCL ~1)."
+  (let* ((k (%global-var-bind-key spec))
+         (agree (eql k (%global-name-key spec)))
+         (cell (%let-special-cell spec k))
+         (slot (and (not cell) agree (%gv-aot-slot k spec)))
+         (site (and (not cell) (not slot) (%let-special-site spec k))))
+    (cond (cell (values (lambda (sh) `(and ,sh (quote ,cell))) `(%gv-save ,k)
+                        (lambda (v) `(%dynbind ,k ,v))
+                        (lambda (v) `(%dynunbind ,k ,v))))
+          (slot (values (lambda (sh) `(and ,sh (%gv-memo-cell ,k ,slot))) `(%gv-save ,k)
+                        (lambda (v) `(%dynbind ,k ,v))
+                        (lambda (v) `(%dynunbind ,k ,v))))
+          (site (values (lambda (sh) `(and ,sh (car (quote ,site)))) `(%gv-site-ref ,k (quote ,site))
+                        (lambda (v) `(%dynbind-site ,k ,v (quote ,site)))
+                        (lambda (v) `(%dynunbind-site ,k ,v (quote ,site)))))
+          (t nil))))
+
+(defun %compile-let-specials-fast (bindings body specials routes declared env dest sequential)
+  "COMPILE-LET-WITH-SPECIALS when every special in SPECIALS has a cell route
+   (ROUTES, from %LET-SPECIAL-FAST): the same save / bind / UNWIND-PROTECT
+   restore, with the thread gate tested once and each binding inline."
+  (let* ((names (mapcar (lambda (s) (normalize-name s)) specials))
+         (sh (%mvm-gensym "SHALLOW"))
+         (cells (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "CELL-" (symbol-name s)))) specials))
+         (saves (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
+         (temps (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "SPECTMP-" (symbol-name s)))) specials))
+         (pre (append (list (list sh (%shallow-thread-form)))
+                      (mapcar (lambda (c r) (list c (funcall (first r) sh))) cells routes)
+                      (mapcar (lambda (sv c r) (list sv `(if ,c (cdr ,c) ,(second r))))
+                              saves cells routes)))
+         (binds (mapcar (lambda (c tmp r) `(if ,c (set-cdr ,c ,tmp) ,(funcall (third r) tmp)))
+                        cells temps routes))
+         ;; reverse order: an armed thread's %DYNUNBIND pops only the top entry
+         (restores (reverse (mapcar (lambda (c sv r) `(if ,c (set-cdr ,c ,sv) ,(funcall (fourth r) sv)))
+                                    cells saves routes)))
+         (stripped (or (%special-shadow-body declared env (strip-declares body)) (list nil))))
+    (flet ((pos (var)
+             (or (and (symbolp var) (position var specials :test #'eq))
+                 (position (normalize-name var) names))))
+      (if sequential
+          (let ((seq (mapcan (lambda (b)
+                               (let* ((var (if (consp b) (car b) b))
+                                      (init (if (consp b) (cadr b) nil))
+                                      (i (pos var)))
+                                 (if i
+                                     (list (list (nth i temps) init)
+                                           (list (%mvm-gensym "SPECSET") (nth i binds)))
+                                     (list b))))
+                             bindings)))
+            (compile-form `(let* ,pre
+                             (unwind-protect (let* ,seq (progn ,@stripped))
+                               ,@restores))
+                          env dest))
+          (let ((renamed (mapcar (lambda (b)
+                                   (let* ((var (if (consp b) (car b) b))
+                                          (i (pos var)))
+                                     (if i (list (nth i temps) (if (consp b) (cadr b) nil)) b)))
+                                 bindings)))
+            (compile-form `(let* (,@renamed ,@pre)
+                             (unwind-protect (progn ,@binds ,@stripped)
+                               ,@restores))
+                          env dest))))))
+
 (defun compile-let-with-specials (bindings body specials env dest &optional sequential
                                   &aux (%all-declared-specials nil))
   "Compile let/let* with (declare (special ...)) variables.
@@ -15457,6 +15530,11 @@
                                            %all-declared-specials env
                                            (or (strip-declares body) (list nil)))))
                     env dest)))
+  (let ((routes (mapcar (lambda (s) (multiple-value-list (%let-special-fast s))) specials)))
+    (when (every (lambda (r) (car r)) routes)
+      (return-from compile-let-with-specials
+        (%compile-let-specials-fast bindings body specials routes %all-declared-specials
+                                    env dest sequential))))
   (let* ((special-names (mapcar (lambda (s) (normalize-name s)) specials))
          (save-vars (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
          (special-bindings nil))

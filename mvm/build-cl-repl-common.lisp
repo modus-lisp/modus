@@ -564,7 +564,8 @@
     a))
 ;; HOW THE UEFI STUB'S LOAD OF \\CORE.BIN WENT (boot-uefi-x64.lisp EMIT-UEFI-CORE-LOAD): the
 ;; last step it tried, that call's EFI status, the file's size and where it had to be read
-;; (0: at 0x20000000 itself), under the banner.  On a machine whose screen is the only witness,
+;; (0: at 0x20000000 itself), and how many of the JIT arena's 64 pages it backed with RAM of its
+;; own (EMIT-UEFI-ARENA-ALLOC; the rest are identity-mapped), under the banner.  On a machine whose screen is the only witness,
 ;; this is how a core that did not restore says why.  Multiboot images have no such stub.
 (defun %srepl-after-banner ()
   (let ((step (mem-ref #x1B0E0 :u32)))
@@ -573,6 +574,7 @@
       (write-string-serial \" status \") (print-dec (mem-ref #x1B0E8 :u32))
       (write-string-serial \" size \") (print-dec (mem-ref #x1B0F0 :u32))
       (write-string-serial \" moved from \") (print-dec (mem-ref #x1B0F8 :u32))
+      (write-string-serial \" jit pages \") (print-dec (mem-ref #x1B0D8 :u32))
       (write-string-serial (if (%core-requested-p) \" (a core is in RAM)\" \" (no core in RAM)\"))
       (write-char-serial 10)
       ;; ... and in blocks a webcam can read, on GOP's screen: a white square per step
@@ -1174,16 +1176,27 @@
 ;; Back to lib/save-image.lisp's defaults.  Last definition wins.
 (defun %core-progress (k) k)
 ;; ENOUGH RAM FOR WHAT THE CORE COVERS.  A core restores the JIT arena at 0x30000000 and runs from
-;; it, so a machine without RAM up to the arena's top (~896 MB) wrote the code into nothing and
-;; faulted somewhere unrelated (measured under QEMU at -m 768: no desk, no reason).  Test the
-;; arena's last words: on a smaller machine say so and boot the plain REPL instead.
+;; it, and the JIT's bump runs across all of [#x30000000, #x38000000).  The UEFI stub backs each
+;; 2 MB page of it with RAM the firmware hands out (EMIT-UEFI-ARENA-ALLOC; the count at #x1B0D8),
+;; and a page it could not back stays identity-mapped -- on a machine without RAM there the code
+;; went into nothing and faulted somewhere unrelated (measured under QEMU at -m 768 before the
+;; remap: no desk, no reason).  So test the last words of every page; if one is not RAM, say so
+;; and boot the plain REPL instead.
 (defun %core-pre-restore ()
-  (let ((a #x37FFFFF0))
-    (setf (mem-ref a :u32) #x1234567 (mem-ref (+ a 4) :u32) #x7654321)
-    (if (and (= (mem-ref a :u32) #x1234567) (= (mem-ref (+ a 4) :u32) #x7654321))
+  (let ((bad nil))
+    (dotimes (i 64)
+      (let ((a (+ #x30000000 (* i #x200000) #x1FFFF0)))
+        (setf (mem-ref a :u32) #x1234567 (mem-ref (+ a 4) :u32) #x7654321)
+        (unless (and (= (mem-ref a :u32) #x1234567) (= (mem-ref (+ a 4) :u32) #x7654321))
+          (setq bad i) (return))))
+    (if (null bad)
         t
         (progn
-          (write-string-serial \"core: not restored -- this machine has less than 1 GB of RAM, and the core's JIT code lives at 0x30000000\")
+          (write-string-serial \"core: not restored -- the JIT arena's 2 MB page \")
+          (print-dec bad)
+          (write-string-serial \" at 0x30000000 has no RAM behind it (the firmware gave \")
+          (print-dec (mem-ref #x1B0D8 :u32))
+          (write-string-serial \" of 64 pages above the core)\")
           (write-char-serial 10)
           nil))))
 ;; THE GEOMETRY, READ EXACTLY.  boot-x64's stub stores the GC control block and

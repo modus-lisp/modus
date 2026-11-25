@@ -45,6 +45,7 @@
    #:+op-and+ #:+op-or+ #:+op-xor+
    #:+op-shl+ #:+op-shr+ #:+op-sar+ #:+op-shlv+ #:+op-sarv+ #:+op-ldb+
    #:+op-cmp+ #:+op-test+ #:+op-cmp-imm+ #:+op-test-imm+
+   #:+op-add-imm+ #:+op-and-imm+ #:+op-or-imm+ #:+op-xor-imm+
    #:+op-br+ #:+op-beq+ #:+op-bne+ #:+op-blt+ #:+op-bge+
    #:+op-ble+ #:+op-bgt+ #:+op-bnull+ #:+op-bnnull+
    #:+op-adds+ #:+op-subs+ #:+op-bvs+
@@ -329,6 +330,13 @@
 ;; a stack store, a reload through RAX and a push/pop around it.
 (defconstant +op-cmp-imm+  #x33)  ; (cmp-imm Va imm32) - sets flags as CMP
 (defconstant +op-test-imm+ #x34)  ; (test-imm Va imm32) - sets flags as TEST
+;; IMMEDIATE OPERANDS (%IR-FOLD-IMMEDIATES): the word of an even (fixnum-tagged)
+;; constant in place of a register an LI filled -- the constant was
+;; rematerialized at every use, two to four instructions each (aarch64 only).
+(defconstant +op-add-imm+ #x35)   ; (add-imm Vd Va imm32) - Va + sign-extended imm32
+(defconstant +op-and-imm+ #x36)   ; (and-imm Vd Va imm64) - Va AND imm64
+(defconstant +op-or-imm+  #x37)   ; (or-imm Vd Va imm64)
+(defconstant +op-xor-imm+ #x38)   ; (xor-imm Vd Va imm64)
 
 ;; Branch
 (defconstant +op-br+     #x40)  ; (br off32) - unconditional
@@ -715,6 +723,10 @@
 (defopcode :test   #x31 (:reg :reg)           "Test (AND without storing)")
 (defopcode :cmp-imm  #x33 (:reg :imm32)       "Compare a tagged value with a sign-extended imm32")
 (defopcode :test-imm #x34 (:reg :imm32)       "Test (AND) with a sign-extended imm32")
+(defopcode :add-imm #x35 (:reg :reg :imm32)    "Add a sign-extended imm32 word")
+(defopcode :and-imm #x36 (:reg :reg :imm64)    "AND with an imm64 word")
+(defopcode :or-imm  #x37 (:reg :reg :imm64)    "OR with an imm64 word")
+(defopcode :xor-imm #x38 (:reg :reg :imm64)    "XOR with an imm64 word")
 
 ;; Branch
 (defopcode :br     #x40 (:off32)              "Unconditional branch")
@@ -1483,6 +1495,15 @@
 
 (defun mvm-cmp-imm (buf va imm)
   (encode-instruction buf +op-cmp-imm+ va (logand imm #xFFFFFFFF)))
+
+(defun mvm-add-imm (buf vd va imm)
+  (encode-instruction buf +op-add-imm+ vd va (logand imm #xFFFFFFFF)))
+(defun mvm-and-imm (buf vd va imm)
+  (encode-instruction buf +op-and-imm+ vd va imm))   ; bytes of a negative word as MVM-LI
+(defun mvm-or-imm (buf vd va imm)
+  (encode-instruction buf +op-or-imm+ vd va imm))   ; bytes of a negative word as MVM-LI
+(defun mvm-xor-imm (buf vd va imm)
+  (encode-instruction buf +op-xor-imm+ vd va imm))   ; bytes of a negative word as MVM-LI
 
 (defun mvm-test-imm (buf va imm)
   (encode-instruction buf +op-test-imm+ va (logand imm #xFFFFFFFF)))

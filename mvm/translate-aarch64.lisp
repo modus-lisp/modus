@@ -1377,6 +1377,29 @@
            (and (< m 64) (cons 0 (1- m)))))
         (t nil)))
 
+(defun a64-logical-imm-fields (imm)
+  "(N IMMR IMMS) encoding the 64-bit pattern IMM as an AND / ORR / EOR immediate -- a run of
+   ones, rotated, repeated in elements of 2..64 bits -- or NIL (all zeros and all ones are not)."
+  (let ((v (logand imm #xFFFFFFFFFFFFFFFF)))
+    (unless (or (= v 0) (= v #xFFFFFFFFFFFFFFFF))
+      (let ((size 64))
+        ;; the smallest element the pattern repeats in
+        (loop (when (<= size 2) (return nil))
+              (let* ((half (ash size -1)) (m (1- (ash 1 half))))
+                (if (= (logand v m) (logand (ash v (- half)) m)) (setq size half) (return nil))))
+        (let* ((m (1- (ash 1 size))) (e (logand v m)) (ones (logcount e)) (run (1- (ash 1 ones))))
+          ;; E rotated right by R is the low run: E = the run rotated right by SIZE - R
+          (dotimes (r size nil)
+            (when (= run (logand m (logior (ash e (- r)) (ash e (- size r)))))
+              (return (list (if (= size 64) 1 0)
+                            (mod (- size r) size)
+                            (logior (logand #x3F (lognot (1- (* 2 size)))) (1- ones)))))))))))
+
+(defun a64-logical-imm (buf base rd rn fields)
+  "AND / ORR / EOR (immediate) Xd, Xn: BASE #x92000000 / #xB2000000 / #xD2000000."
+  (a64-emit buf (logior base (ash (first fields) 22) (ash (second fields) 16) (ash (third fields) 10)
+                        (ash rn 5) rd)))
+
 (defun a64-cmp-imm (buf rn imm12)
   "CMP Xn, #imm12  →  SUBS XZR, Xn, #imm12"
   (a64-subs-imm buf +a64-xzr+ rn imm12))
@@ -3285,6 +3308,7 @@
   (list +op-mov+ +op-li+ +op-li-const+ +op-li-addr+ +op-li-taddr+
         +op-add+ +op-sub+ +op-adds+ +op-subs+
         +op-and+ +op-or+ +op-xor+
+        +op-add-imm+ +op-and-imm+ +op-or-imm+ +op-xor-imm+
         +op-shl+ +op-shr+ +op-sar+ +op-shlv+ +op-sarv+ +op-ldb+
         +op-car+ +op-cdr+ +op-obj-tag+ +op-array-len+
         +op-pop+ +op-obj-ref+ +op-obj-set+)
@@ -5481,6 +5505,43 @@
                   (pb (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              (a64-and-reg buf pd pa pb)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- ADD-IMM / AND-IMM / OR-IMM / XOR-IMM Vd, Va, #W (%IR-FOLD-IMMEDIATES) ----
+          ;; The instruction's own immediate when it encodes (ADD/SUB imm12, optionally <<12; a
+          ;; logical bitmask), else the word in x17 and the register form.
+          ((= op +op-add-imm+)
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (k (%imm32-signed (vr 2)))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (cond ((<= 0 k 4095) (a64-add-imm buf pd pa k))
+                   ((<= -4095 k -1) (a64-sub-imm buf pd pa (- k)))
+                   ((and (> k 0) (= (logand k #xFFF) 0) (< k (ash 1 24)))
+                    (a64-emit buf (logior #x91400000 (ash (ash k -12) 10) (ash pa 5) pd)))    ; ADD #imm, LSL 12
+                   ((and (< k 0) (= (logand (- k) #xFFF) 0) (< (- k) (ash 1 24)))
+                    (a64-emit buf (logior #xD1400000 (ash (ash (- k) -12) 10) (ash pa 5) pd)))  ; SUB #imm, LSL 12
+                   (t (a64-load-imm64 buf +a64-x17+ (logand k #xFFFFFFFFFFFFFFFF))
+                      (a64-add-reg buf pd pa +a64-x17+ 0 0)))
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+          ((or (= op +op-and-imm+) (= op +op-or-imm+) (= op +op-xor-imm+))
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (w (vr 2))                  ; the decoded u64 bit pattern
+                  (pd (or (a64-phys-reg vd) +a64-x16+))
+                  (f (a64-logical-imm-fields w)))
+             (if f
+                 (a64-logical-imm buf (cond ((= op +op-and-imm+) #x92000000)
+                                            ((= op +op-or-imm+) #xB2000000)
+                                            (t #xD2000000))
+                                  pd pa f)
+                 (progn
+                   (a64-load-imm64 buf +a64-x17+ w)
+                   (cond ((= op +op-and-imm+) (a64-and-reg buf pd pa +a64-x17+))
+                         ((= op +op-or-imm+) (a64-orr-reg buf pd pa +a64-x17+))
+                         (t (a64-eor-reg buf pd pa +a64-x17+)))))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 

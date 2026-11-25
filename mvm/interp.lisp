@@ -2994,6 +2994,22 @@
              (setf pc npc)))
 
           ;; --- Bitwise ---
+          ;; IMMEDIATE FORMS (%IR-FOLD-IMMEDIATES): the immediate is an EVEN word W, so the LI it
+          ;; replaces left exactly W/2 in its register; the same helpers on that value.
+          (#.+op-add-imm+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (w npc3) (%ifetch-s32 bc npc2)
+                 (setf (svref regs vd) (%mvm-wrap-tagword-add (svref regs va) (ash w -1)))
+                 (setf pc npc3)))))
+          ((#.+op-and-imm+ #.+op-or-imm+ #.+op-xor-imm+)
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (k npc3) (%ifetch-li-value bc npc2)   ; floor(W/2) = W/2
+                 (setf (svref regs vd)
+                       (%mvm-bitop-words (cond ((= opcode +op-and-imm+) 0) ((= opcode +op-or-imm+) 1) (t 2))
+                                         (svref regs va) k))
+                 (setf pc npc3)))))
           (#.+op-and+
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (va npc2) (%ifetch-reg bc npc)

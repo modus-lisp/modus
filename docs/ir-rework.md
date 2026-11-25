@@ -336,6 +336,19 @@ would emit.
     separate block reached by a jump (`(:br L) ... (:label L) (:safepoint) (:br top)`), so the hot
     path takes two branches per iteration where one would do.  *Future:* blocks and edges in the
     IR, placed by a layout pass.
+    *Done meanwhile:* %IR-TAIL-DUP copies the back-edge block, and rotates a top-tested loop by
+    copying its short header test onto the back edge (b7f3161e).
+13. **Every constant is a register operand.**  The front end loads each constant into a temp --
+    `(:li T W) (:and D A T)` -- and the IR had no immediate forms but CMP-IMM / TEST-IMM, so the
+    translator rematerialized the constant at every use: the string hash's `#xFFFFFFFF` mask was
+    three instructions a character a lane, each `(+ i k)` index two.  *Done meanwhile:* ADD-IMM /
+    AND-IMM / OR-IMM / XOR-IMM, folded from an LI of an even word by %IR-FOLD-IMMEDIATES on
+    aarch64 (interpreter and aarch64 translator only), the LI left for %IRDF-DSE.  Not yet: odd
+    words (tag masks: the interpreter's LI of one is not W/2), multiply by a constant (no
+    immediate form; wants a constant hoisted out of the loop, i.e. allocation), and a constant
+    INDEX offset on AREF (`(%word-aref a (+ i 3))`: address arithmetic the load could carry).
+    *Future:* the new front end emits operands as constants or registers, and instruction
+    selection, not the front end, decides which constants live in registers.
 
 ## IR op inventory (2026-11-25)
 

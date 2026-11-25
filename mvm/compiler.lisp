@@ -2997,7 +2997,7 @@
    :UNKNOWN."
   (case op
     (:mov '((2) (1)))
-    ((:li :li-const :li-func :get-cenv :get-nargs :alloc-obj :pop :stack-load) '(() (1)))
+    ((:li :li-halves :li-const :li-func :get-cenv :get-nargs :alloc-obj :pop :stack-load) '(() (1)))
     ((:stack-store :push :bnull :bnnull :cmp-imm :test-imm :write-barrier :set-cenv)
      '((1) ()))
     ((:label :br :beq :bne :blt :bge :ble :bgt :bvs :gc-check :gc-check-n
@@ -3005,7 +3005,8 @@
      '(() ()))
     ((:cmp :test :setcar :setcdr :store) '((1 2) ()))
     ((:obj-tag :obj-subtag :array-len :car :cdr :consp :atom :neg :shl :sar :shr
-      :load :alloc-array :alloc-string :alloc-u8 :obj-ref)
+      :load :alloc-array :alloc-string :alloc-u8 :obj-ref
+      :add-imm :and-imm :or-imm :xor-imm)
      '((2) (1)))
     ((:add :sub :and :or :xor :mul :add-checked :sub-checked :mul-checked :div :mod
       :cons :aref :u8-ref)
@@ -3097,7 +3098,7 @@
           (values gen (logandc2 kill gen))))))
 
 (defun %irdf-pure-p (insn)
-  (and (member (car insn) '(:mov :li :li-const :li-func :get-cenv :stack-load))
+  (and (member (car insn) '(:mov :li :li-halves :li-const :li-func :get-cenv :stack-load))
        (%irdf-reg-p (second insn))))
 
 (defun %irdf-dse (v)
@@ -3205,12 +3206,59 @@
                            ((:br :ret) (reset))))))))))
       (values (coerce (nreverse out) 'vector) changed))))
 
+;;; IMMEDIATE OPERANDS.  The front end loads every constant operand into a temp -- (:LI T W)
+;;; (:AND D A T) -- and the translator materializes it there at each use: the string hash's
+;;; #xFFFFFFFF mask was three instructions per character per lane, every (+ I K) index two.
+;;; (:LI T W) followed by (:ADD/:SUB/:AND/:OR/:XOR D A T) [or T first, commutative ops], with W
+;;; an EVEN word (a fixnum's: the interpreter's LI of one is exactly W/2), becomes the op's
+;;; immediate form, the LI kept: %IRDF-DSE then drops it when T is dead, as it usually is.
+;;; aarch64 only (the translator and the interpreter implement them; no other translator does).
+(defun %ir-imm-ops-p ()
+  (and (not (equal (%ira-env "MODUS_IR_IMM") "0"))
+       (if *mvm-eval-runtime-p*
+           (and (boundp (quote *jit-target-arch*))
+                (eq (symbol-value (quote *jit-target-arch*)) :aarch64))
+           (and *compile-target* (eq (compile-target-name *compile-target*) :aarch64)))))
+
+(defun %ir-li-word (insn)
+  "The even word INSN, an LI or LI-HALVES, loads, or NIL."
+  (let ((w (case (car insn)
+             (:li (third insn))
+             (:li-halves (let ((lo (third insn)) (hi (fourth insn)))
+                           (cond ((eql hi 0) lo)
+                                 ((eql hi #xFFFFFFFF) (- lo #x100000000))
+                                 (t nil))))
+             (t nil))))
+    (and (integerp w) (evenp w) w)))
+
+(defun %ir-fold-immediates (ir)
+  (let ((out nil) (prev nil))
+    (dolist (insn ir (nreverse out))
+      (let* ((w (and prev (%ir-li-word prev)))
+             (tr (and w (second prev)))
+             (op (car insn))
+             (d (second insn)) (a (third insn)) (b (fourth insn))
+             (other (and tr (member op '(:add :sub :and :or :xor))
+                         (integerp a) (integerp b) (not (eql a b))
+                         (cond ((eql b tr) a)
+                               ((and (eql a tr) (not (eq op :sub))) b)
+                               (t nil))))
+             (new (and other
+                       (case op
+                         ((:add :sub)
+                          (let ((k (if (eq op :sub) (- w) w)))
+                            (and (< (- (ash 1 31)) k (ash 1 31)) (list :add-imm d other k))))
+                         (t (and (< (- (ash 1 61)) w (ash 1 61))
+                                 (list (case op (:and :and-imm) (:or :or-imm) (t :xor-imm)) d other w)))))))
+        (push (or new insn) out)
+        (setq prev insn)))))
+
 (defun %ir-dataflow (ir)
   "%IRDF-FORWARD and %IRDF-DSE over one function's IR, to a fixed point
    (at most 6 rounds).  A function with a TRAP comes back unchanged."
   (if (find :trap ir :key #'car)
       ir
-      (let ((v (coerce ir 'vector)))
+      (let ((v (coerce (if (%ir-imm-ops-p) (%ir-fold-immediates ir) ir) 'vector)))
         (setq *irdf-vr-is-v0* (%irdf-vr-is-v0-p))
         (setq *irdf-wide* (and *mvm-eval-runtime-p* (boundp (quote *jit-target-arch*))
                                (eq (symbol-value (quote *jit-target-arch*)) :aarch64)
@@ -36000,6 +36048,11 @@
       (:bne   5)
       (:cmp   3)
       (:cmp-imm  6)
+      ;; 1 opcode + 2 regs + imm32 / imm64 (%IR-FOLD-IMMEDIATES)
+      (:add-imm  7)
+      (:and-imm 11)
+      (:or-imm  11)
+      (:xor-imm 11)
       ;; Load immediate: 1 opcode + 1 reg + 8 imm64 = 10 bytes
       (:li    10)
       (:li-const 10)
@@ -36374,6 +36427,10 @@
            (mvm-cmp buf (second insn) (third insn)))
           (:cmp-imm
            (mvm-cmp-imm buf (second insn) (third insn)))
+          (:add-imm (mvm-add-imm buf (second insn) (third insn) (fourth insn)))
+          (:and-imm (mvm-and-imm buf (second insn) (third insn) (fourth insn)))
+          (:or-imm  (mvm-or-imm buf (second insn) (third insn) (fourth insn)))
+          (:xor-imm (mvm-xor-imm buf (second insn) (third insn) (fourth insn)))
           (:li
            (mvm-li buf (second insn) (third insn)))
           (:li-const

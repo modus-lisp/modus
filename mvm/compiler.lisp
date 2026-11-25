@@ -30853,6 +30853,18 @@
 (defun compile-setf (place value-form env dest)
   "Compile (setf place value)"
   (cond
+    ;; THE MULTIPLE-VALUE COUNT set to a literal -- what every single-value return, MULTIPLE-VALUE-
+    ;; PROG1 and VALUES emits as (setf (mem-ref <mv-count-addr> :u64) N) -- is the SET-MV-COUNT op
+    ;; (every target has it): the general store pushed the value, built the address through a
+    ;; shift pair and popped it back, ~14 instructions at the return of each such function.  The
+    ;; stored word is N's either way (:u64 stores the tagged word; SET-MV-COUNT stores N << 1).
+    ((and (consp place) (name-eq (car place) "MEM-REF")
+          (eql (cadr place) (ct-mv-count-addr))
+          (eq (caddr place) :u64)
+          (null (cdr (memory-width-code :u64)))
+          (integerp value-form) (<= 0 value-form 255))
+     (emit-ir :set-mv-count value-form)
+     (compile-form value-form env dest))
     ;; (setf (mem-ref addr type) value)
     ((and (consp place) (name-eq (car place) "MEM-REF"))
      (let ((addr-form (cadr place))

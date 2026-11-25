@@ -5973,14 +5973,23 @@
          (let* ((target-offset (first operands))
                 (fn-table (translate-state-function-table state))
                 (label (when fn-table (gethash target-offset fn-table))))
-           ;; Restore RBX, tear down frame
+           ;; Restore RBX, tear down frame -- exactly +OP-RET+'s epilogue
            (emit-mov-reg-mem buf 'rbx 'rbp -8)
            (emit-mov-reg-reg buf 'rsp 'rbp)
            (emit-pop buf 'rbp)
-           ;; Jump instead of call
-           (if label
-               (emit-jmp buf label)
-               (emit-jmp buf (make-label)))))
+           ;; Jump instead of call: the callee returns to OUR caller.
+           (cond
+             (label (emit-jmp buf label))
+             ;; an out-of-module callee under the runtime JIT: +OP-CALL+'s
+             ;; patched absolute target, jumped to.  RAX is dead (RET's frame
+             ;; teardown above does not touch it) and is not an argument.
+             ((and *x64-jit-mode* target-offset (>= target-offset #x40000000))
+              (let ((imm-off (+ (code-buffer-position buf) 2)))
+                (push (cons imm-off target-offset) *x64-call-relocs*)
+                (push (cons imm-off *x64-last-set-nargs*) *x64-call-reloc-nargs*)
+                (emit-mov-reg-imm buf 'rax 0)
+                (emit-jmp-reg buf 'rax)))
+             (t (emit-jmp buf (make-label))))))
 
         ;; ============================================
         ;; GC and Allocation

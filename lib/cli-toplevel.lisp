@@ -300,6 +300,7 @@
   (%cli-line "  --eval FORM / -e FORM   read and evaluate FORM (repeatable)")
   (%cli-line "  --load FILE / -l FILE   load FILE (repeatable; interleaves with --eval)")
   (%cli-line "  --script [FILE]         run FILE (or stdin), no rc, no banner, then exit")
+  (%cli-line "  --kiln [COMMAND ...]    run the kiln this file carries (--kiln help)")
   (%cli-line "  --non-interactive       exit after --eval/--load instead of a REPL")
   (%cli-line "  --quit                  synonym for --non-interactive")
   (%cli-line "  --noinform              suppress the startup banner")
@@ -356,7 +357,16 @@
    stdin.  No rc, no banner.  An uncaught error → exit(1).  Clean → exit(0)."
   (handler-case
       (progn
-        (if (or (null path) (string= path "-"))
+        (cond
+          ;; --kiln: the script is this file's kiln/main.lisp segment (dist's modus.exe
+          ;; carries kiln and its git, cairn, appended as segments -- kiln/boot/bundle.lisp).
+          ((eq path :kiln)
+           (let ((m (ape-segment "kiln/main.lisp")))
+             (unless m
+               (%cli-line "Modus: this modus carries no kiln (dist's modus.exe does)")
+               (%cli-exit 2))
+             (load (make-string-input-stream (map 'string #'code-char m)))))
+          ((or (null path) (string= path "-"))
             ;; stdin: read+eval every form from fd 0 until EOF.  Errors
             ;; propagate to the handler-case below (this loop has no swallow),
             ;; which is already SBCL's --script behaviour: abort, exit 1.
@@ -365,12 +375,13 @@
               (loop
                 (let ((form (read in nil eof)))
                   (when (eq form eof) (return nil))
-                  (eval form))))
+                  (eval form)))))
+          (t
             ;; File: %cli-load-file turns LOAD's report-and-continue into an
             ;; abort + re-signal (WS5 #203 gap 3), so a script whose Nth form
             ;; dies stops there and exits nonzero instead of running on to the
             ;; end and exiting 0.
-            (%cli-load-file path))
+            (%cli-load-file path)))
         (%cli-exit 0))
     (t (c)
       (%cli-msg "Modus: unhandled error in --script")
@@ -481,6 +492,13 @@
            (setq rest-args args)
            (setq args nil))
           ;; --non-interactive / --quit
+          ;; --kiln [COMMAND ...]: like --script, with this file's kiln as the script and
+          ;; every later argument kiln's.
+          ((%cli-flag-p arg "--kiln")
+           (setq script-mode t banner nil load-rc nil interactive nil
+                 script-file :kiln
+                 rest-args (cdr args)
+                 args nil))
           ((or (%cli-flag-p arg "--non-interactive") (%cli-flag-p arg "--quit"))
            (setq interactive nil
                  load-rc nil)

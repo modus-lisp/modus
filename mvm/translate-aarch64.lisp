@@ -1200,6 +1200,7 @@
               (kind (fifth e)) (payload (sixth e)))
           (a64-set-label buf slow)
           (cond ((eq kind :stw) (emit-aarch64-safepoint-park buf))
+                ((eq kind :clamp) (emit-aarch64-stw-clamp-body buf))
                 ((eq kind :abs) (a64-emit-generic-arith-call-abs buf va vb payload))
                 (t (a64-emit-generic-arith-call buf va vb payload)))
           (a64-emit-call-label buf done t)))
@@ -8397,6 +8398,17 @@
    the active region's saved-limit field (unless already clamped), so this
    thread's next allocation enters the trampoline and parks there.  Uses
    x15-x17 and x9 (scratch everywhere a YIELD is emitted)."
+  ;; Hosted: the poll falls through when no stop is asked for, and the clamp is out of line after
+  ;; the function (A64-FLUSH-SLOW-TAILS) -- it was inline behind a B.EQ every iteration took.
+  (when (and *aarch64-linux-mode* (a64-slow-tails-ok-p buf))
+    (let ((slow (incf *mvm-label-counter*)) (done (incf *mvm-label-counter*)))
+      (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
+      (a64-ldr-width buf +a64-x16+ +a64-x16+ 0 2)
+      (a64-cmp-imm buf +a64-x16+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i slow :bcond))
+      (push (list slow done nil nil :clamp nil) *a64-slow-tails*)
+      (a64-set-label buf done)
+      (return-from emit-aarch64-stw-clamp nil)))
   (let ((skip (incf *mvm-label-counter*))
         (clamp (incf *mvm-label-counter*)))
     (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
@@ -8418,6 +8430,18 @@
           (a64-cmp-reg buf +a64-x17+ +a64-x15+)
           (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i skip :bcond))))
     (a64-set-label buf clamp)
+    (a64-cmp-imm buf +a64-x25+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-load-gc-region buf +a64-x15+ +a64-x16+)
+    (a64-lsl-imm buf +a64-x16+ +a64-x25+ 1)
+    (a64-str-unsigned buf +a64-x16+ +a64-x15+ +gc-off-saved-limit+)
+    (a64-movz buf +a64-x25+ 0 0)
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-stw-clamp-body (buf)
+  "EMIT-AARCH64-STW-CLAMP's clamp, the stop flag seen set (hosted): keep the real limit in the
+   active region's saved-limit unless already clamped, then clamp x25 to 0."
+  (let ((skip (incf *mvm-label-counter*)))
     (a64-cmp-imm buf +a64-x25+ 0)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
     (a64-load-gc-region buf +a64-x15+ +a64-x16+)

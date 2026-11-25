@@ -2875,14 +2875,35 @@
 ;;; block -- at most 4 instructions after its labels, no label among them, ending in BR / RET /
 ;;; TAILCALL -- is replaced by a copy of the block.  The original stays for its other branches.
 (defun %ir-tail-dup (ir)
+  "Up to three rounds of %IR-TAIL-DUP-1: a copied block may end in a BR to another short block
+   (an IF's arm (:mov VR VN) (:br L) to the back edge (:safepoint) (:br top))."
+  (let ((x ir))
+    (dotimes (k 3 x)
+      (let ((y (%ir-tail-dup-1 x)))
+        (when (eq y x) (return x))
+        (setq x y)))))
+
+(defun %ir-tail-dup-1 (ir)
+  "One round of tail duplication.  Also LOOP ROTATION: a BR to a short block that ends in a
+   CONDITIONAL branch and falls through -- a loop's header test, (:LABEL TOP) (:CMP ..) (:BGT
+   BODY), reached by the back edge (:BR TOP) -- is replaced by the block's copy and a BR to where
+   it falls (a fresh label there when none is), so the iteration takes one branch, not two."
   (if (equal (%ira-env "MODUS_IR_TAILDUP") "0")
       ir
-      (let* ((v (coerce ir 'vector)) (n (length v)) (label-at (make-hash-table)) (changed nil))
+      (let* ((v (coerce ir 'vector)) (n (length v)) (label-at (make-hash-table)) (changed nil)
+             (fall-label (make-hash-table))   ; index after a conditional block -> label minted there
+             (next-id (1+ (let ((m 0))
+                            (dotimes (k n m)
+                              (let ((insn (aref v k)))
+                                (when (and (eq (car insn) :label) (integerp (second insn)))
+                                  (setq m (max m (second insn))))))))))
         (dotimes (k n)
           (let ((insn (aref v k)))
             (when (and (consp insn) (eq (car insn) :label)) (setf (gethash (second insn) label-at) k))))
         (flet ((tail-of (j)
-                 ;; the block at label index J: its instructions after the labels, or NIL
+                 ;; the block at label index J: (INSNS . FALL-INDEX) -- its instructions after the
+                 ;; labels, and for a block ending in a conditional branch the index control falls
+                 ;; to -- or NIL
                  (let ((x j) (out nil))
                    (loop while (and (< x n) (eq (car (aref v x)) :label)) do (incf x))
                    (loop
@@ -2890,19 +2911,40 @@
                      (let ((insn (aref v x)))
                        (when (eq (car insn) :label) (return nil))
                        (push insn out)
-                       (when (member (car insn) '(:br :ret :tailcall))
-                         (return (and (<= (length out) 4) (reverse out)))))
+                       (cond ((member (car insn) '(:br :ret :tailcall))
+                              (return (and (<= (length out) 4) (cons (reverse out) nil))))
+                             ((%ir-branch-p insn)
+                              (return (and (<= (length out) 3) (< (1+ x) n) (cons (reverse out) (1+ x)))))))
                      (incf x)))))
-          (let ((out nil))
+          ;; pass 1: what replaces each BR (a list of instructions), minting fall-through labels
+          (let ((act (make-array n :initial-element nil)))
             (dotimes (k n)
               (let* ((insn (aref v k))
                      (j (and (eq (car insn) :br) (gethash (second insn) label-at)))
-                     (tl (and j (/= j (1+ k)) (tail-of j))))
-                (if (and tl (not (and (eq (car (car (last tl))) :br)
-                                      (eql (second (car (last tl))) (second insn)))))
-                    (progn (setq changed t) (dolist (c tl) (push (copy-list c) out)))
-                    (push insn out))))
-            (if changed (nreverse out) ir))))))
+                     (tl (and j (/= j (1+ k)) (tail-of j)))
+                     (body (car tl)) (fall (cdr tl)))
+                (cond ((and tl (null fall)
+                            (not (and (eq (car (car (last body))) :br)
+                                      (eql (second (car (last body))) (second insn)))))
+                       (setf (aref act k) (mapcar #'copy-list body)))
+                      ;; rotation: not when the fall-through or the branch lands just after the
+                      ;; copy (nothing gained)
+                      ((and tl fall (/= fall (1+ k))
+                            (not (eql (gethash (%ir-branch-target (car (last body))) label-at) (1+ k))))
+                       (let ((lab (if (eq (car (aref v fall)) :label)
+                                      (second (aref v fall))
+                                      (or (gethash fall fall-label)
+                                          (setf (gethash fall fall-label) (prog1 next-id (incf next-id)))))))
+                         (setf (aref act k) (append (mapcar #'copy-list body) (list (list :br lab)))))))))
+            ;; pass 2: emit, minted labels in front of their instructions
+            (let ((out nil))
+              (dotimes (k n)
+                (let ((lab (gethash k fall-label)))
+                  (when lab (push (list :label lab) out)))
+                (if (aref act k)
+                    (progn (setq changed t) (dolist (c (aref act k)) (push c out)))
+                    (push (aref v k) out)))
+              (if changed (nreverse out) ir)))))))
 
 (defun %rt-ir-passes (ir)
   "MVM-COMPILE-ALL's Phase 2b'' for one runtime-compiled function's IR:
@@ -38548,7 +38590,9 @@
     (when (and *ir-dataflow* (not *mvm-eval-runtime-p*))
       (dolist (entry all-ir)
         (when (%irdf-selected-p (function-info-name (car entry)))
-          (setf (cdr entry) (%ir-dataflow (cdr entry))))
+          ;; tail duplication first (%IR-TAIL-DUP): the image's own loops took a jump to their
+          ;; back-edge block every iteration
+          (setf (cdr entry) (%ir-dataflow (%ir-tail-dup (cdr entry)))))
         (when *ir-peephole*
           (setf (cdr entry) (%ir-peephole (cdr entry))))))
     ;; Phase 2c: drop what the image's entry points do not reach (*IR-DCE-ROOTS*).

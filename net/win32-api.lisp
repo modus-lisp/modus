@@ -81,13 +81,15 @@
   (let ((x (logand v (- (ash 1 bits) 1))))
     (if (logbitp (- bits 1) x) (- x (ash 1 bits)) x)))
 
+;; The float primitives are the runtime's (MODUS.RUNTIME), so named: read bare here they are
+;; MODUS-INT's, and the build's package check refuses the call.
 (defun %w32-double-bits (x)
   (let ((d (float x 1d0)))
     (+ (* (logand (%float-hi32 d) #xFFFFFFFF) 4294967296) (logand (%float-lo32 d) #xFFFFFFFF))))
 (defun %w32-bits-double (u)
-  (%make-typed-float (logand (ash u -32) #xFFFFFFFF) (logand u #xFFFFFFFF) 'double-float))
-(defun %w32-float-bits (x) (logand (%single->bits (float x 1.0)) #xFFFFFFFF))
-(defun %w32-bits-float (u) (%bits->single (logand u #xFFFFFFFF)))
+  (modus.runtime::%make-typed-float (logand (ash u -32) #xFFFFFFFF) (logand u #xFFFFFFFF) 'double-float))
+(defun %w32-float-bits (x) (logand (modus.runtime::%single->bits (float x 1.0)) #xFFFFFFFF))
+(defun %w32-bits-float (u) (modus.runtime::%bits->single (logand u #xFFFFFFFF)))
 
 (defun %w32-type-size (type)
   (case type

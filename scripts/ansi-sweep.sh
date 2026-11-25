@@ -83,9 +83,23 @@ cat "$out"/s*.out | grep -a "^PASS "  | awk '{print $2}' | sort -u > "$out/pass"
 cat "$out"/s*.out | grep -a "^FAILX " | awk '{print $2}' | sort -u > "$out/fail"
 {
   echo "passed=$(wc -l < "$out/pass") failed=$(wc -l < "$out/fail")"
+  # A shard is complete only if it reached ==SHARD-END, exited 0, AND reported every test of
+  # its range.  The END marker alone was not enough: a riscv64 shard whose suite LOAD faulted
+  # part way (MEMORY-FAULT-ERROR at a DEFPARAMETER) registered no tests in its range, printed
+  # ==SHARD 0 775 and ==SHARD-END around zero results, exited 1 -- and the sweep summed 775
+  # fewer passes with failed=0 and no INCOMPLETE line, so allarch-ansi.sh said PASS.
   for f in "$out"/s*.out; do
-    grep -qa "==SHARD-END" "$f" || \
-      echo "INCOMPLETE $(basename "$f" .out) $(grep -a '^rc=' "$f" | tail -1) last=$(grep -a '^>>' "$f" | tail -1)"
+    rc=$(grep -a '^rc=' "$f" | tail -1)
+    range=$(grep -a '^==SHARD [0-9]' "$f" | head -1)
+    lo=$(echo "$range" | awk '{print $2}'); hi=$(echo "$range" | awk '{print $3}')
+    ran=$(grep -ac '^PASS \|^FAILX ' "$f")
+    if ! grep -qa "==SHARD-END" "$f" || [ "$rc" != "rc=0" ]; then
+      echo "INCOMPLETE $(basename "$f" .out) $rc last=$(grep -a '^>>' "$f" | tail -1)"
+    elif [ -z "$names" ] && [ -n "$hi" ] && [ "$hi" -lt 1000000 ] && [ "$ran" -lt $((hi - lo)) ]; then
+      echo "INCOMPLETE $(basename "$f" .out) $rc short: ran $ran of $((hi - lo))"
+    elif [ "$ran" -eq 0 ]; then
+      echo "INCOMPLETE $(basename "$f" .out) $rc short: ran no tests"
+    fi
   done
 } > "$out/summary"
 rm -rf "$out/trees" "$out/fasl"

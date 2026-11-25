@@ -911,8 +911,28 @@
                                                 :operation nil :operands nil))
                    ((eql sig 4) (make-condition 'illegal-instruction-error))
                    (t (make-condition 'memory-fault-error
-                                      :datum nil :expected-type t))))))
+                                      :datum nil :expected-type t)))))
+      (%maybe-note-caught-fault *current-condition*))
     nil))
+
+;;; MODUS_FAULT_NOTE=1: say where every fault a HANDLER-CASE catches happened.  A fault lands
+;;; in the innermost HANDLER-CASE, wherever that is, and a clause that handles it and goes on
+;;; leaves nothing behind -- so a SIGSEGV sent to a process that is looping (to ask where) is
+;;; swallowed by whatever code it hits, and the answer was lost.  Off unless asked: some
+;;; programs fault and recover as routine.  Both helpers are found by name because they are
+;;; the hosted runtime's (lib/cli-toplevel.lisp, net/hosted-backtrace.lisp).
+(defvar *%fault-note-busy*)
+(defun %maybe-note-caught-fault (c)
+  (when (and (not *%fault-note-busy*)
+             (fboundp '%cli-getenv) (fboundp '%print-fault-backtrace)
+             (funcall (symbol-function '%cli-getenv) "MODUS_FAULT_NOTE"))
+    (setq *%fault-note-busy* t)
+    (unwind-protect
+         (progn
+           (format *error-output* "~&;; MODUS_FAULT_NOTE: a HANDLER-CASE caught ~a; the fault's frames:~%"
+                   (%condition-type-name c))
+           (funcall (symbol-function '%print-fault-backtrace) *error-output* c))
+      (setq *%fault-note-busy* nil))))
 
 (defun %attach-fault-frames (c)
   "C, carrying the frames the signal stub recorded for the fault it stands for (hosted

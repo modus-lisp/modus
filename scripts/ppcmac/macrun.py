@@ -18,16 +18,21 @@ def main():
     log = open(sys.argv[sys.argv.index('--log') + 1], 'w') if '--log' in sys.argv else sys.stdout
     d = tempfile.mkdtemp(prefix='macrun-')
     ser, mon = os.path.join(d, 'ser'), os.path.join(d, 'mon')
-    # MACRUN_MACHINE (mac99; mac99,via=pmu-adb is a PowerBook's input), MACRUN_CPU,
+    # MACRUN_MACHINE (mac99; mac99,via=pmu-adb is a PowerBook's input), MACRUN_CPU, MACRUN_NET,
     # MACRUN_DEPTH (32; 8 and 16 are what a real Mac's firmware may leave), MACRUN_MEM (MB)
     machine = os.environ.get('MACRUN_MACHINE', 'mac99')
     cpu = ['-cpu', os.environ['MACRUN_CPU']] if os.environ.get('MACRUN_CPU') else []
     depth = os.environ.get('MACRUN_DEPTH', '32')
     mem = os.environ.get('MACRUN_MEM', '1024')
+    # MACRUN_NET: QEMU network options, e.g. "-nic user,model=sungem,hostfwd=tcp::2222-:22"
+    net = os.environ.get('MACRUN_NET', '').split()
+    # MACRUN_SCREEN=1: the firmware's console is the screen, as on a PowerBook (no serial
+    # console: the image's desk keeps the machine; the serial port still carries its output)
+    console = [] if os.environ.get('MACRUN_SCREEN') else ['-prom-env', 'output-device=ttya', '-prom-env', 'input-device=ttya']
     q = subprocess.Popen(['qemu-system-ppc', '-M', machine] + cpu + ['-m', mem, '-g', f'1024x768x{depth}',
-                          '-display', 'none', '-prom-env', 'output-device=ttya', '-prom-env', 'input-device=ttya', '-drive', f'file={disk},format=raw,media=disk,snapshot=on',
+                          '-display', 'none'] + console + [ '-drive', f'file={disk},format=raw,media=disk,snapshot=on',
                           '-serial', f'unix:{ser},server=on,wait=on',
-                          '-monitor', f'unix:{mon},server=on,wait=off'],
+                          '-monitor', f'unix:{mon},server=on,wait=off'] + net,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(1200):                # 120 s: a loaded host starts QEMU slowly
         if os.path.exists(ser): break

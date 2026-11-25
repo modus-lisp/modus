@@ -68,6 +68,13 @@
 (defconstant +ppcmac-nil-pa+      #x07800000 "PA behind VA #xDEAC0000 (128 KB).")
 (defconstant +ppcmac-fb-va+       #x09000000
   "VA of a framebuffer that is not beside mac-io: DBAT4's 16 MB (a G4e).")
+(defconstant +ppcmac-enet-va+     #x0A000000
+  "VA of the Ethernet's 16 MB when it is not in mac-io's window: DBAT7 (a G4e).")
+(defconstant +ppcmac-enet-pa-slot+ #x07BFFF00
+  "Where the firmware query leaves the enet alias's register PA (0: none) for
+   the BAT code, and at +4 its local-mac-address (six bytes, zero when none):
+   in the device-tree page it claimed, past the walk's stack.  The GMAC driver
+   (vessel net/sungem.lisp) reads both.")
 (defconstant +ppcmac-device-va+   #x08000000
   "VA of PA #x80000000 (mac-io, then QEMU's framebuffer at +#x1000000): 32 MB.")
 (defconstant +ppcmac-hstack-ext-frames+ #x10000
@@ -82,7 +89,9 @@
    VA (0: none), width, height, bytes per row, depth; mac-io's VA; the VIA's
    kind (1 CUDA, 2 PMU, 0 unknown); RAM bytes; the framebuffer's and mac-io's PAs;
    the PVR; 1 when Open Firmware's console was a serial port; the device window
-   (VA +PPCMAC-DEVICE-VA+): its PA and size; the timebase's frequency.  A word
+   (VA +PPCMAC-DEVICE-VA+): its PA and size; the timebase's frequency; the
+   Ethernet's window (VA +PPCMAC-ENET-VA+), its PA and size (0 when the
+   Ethernet is inside the device window, or there is none).  A word
    each, from +4.")
 
 (defun ppcmac-emit-mfspr (buf rt spr)
@@ -110,7 +119,8 @@
   '("finddevice" "getprop" "child" "peer" "open" "call-method" "screen" "address"
     "assigned-addresses" "width" "height" "linebytes" "depth" "mac-io" "name"
     "/memory" "reg" "color!" "/chosen" "stdout" "instance-to-package" "device_type"
-    "nextprop" "getproplen" "claim" "/cpus" "timebase-frequency" "quiesce"))
+    "nextprop" "getproplen" "claim" "/cpus" "timebase-frequency" "quiesce" "enet" "local-mac-address" "/pci/ethernet"
+    "parent" "package-to-path" "config-w@" "config-w!" "close"))
 
 (defconstant +ppcmac-dt+ #x07B00000
   "Open Firmware's device tree, copied by the stub for Lisp (PPCMAC-EMIT-DT-DUMP):
@@ -363,6 +373,80 @@
           (cif "peer" (list +ppc-r28+) 1 +ppc-r28+)
           (ppc-emit-b buf top))
         (ppc-emit-label buf none))
+;; ---- the Ethernet's registers: the "enet" alias's first 32-bit memory
+      ;; range, its PA kept at +PPCMAC-ENET-PA-SLOT+ (in the claimed device-tree
+      ;; page) for PPCMAC-EMIT-DEVICE-BATS -- on a PowerBook the GMAC is on
+      ;; Uni-N's internal PCI bus (#xF5000000), outside mac-io's window
+      (let ((none (mvm-make-label)) (scan (mvm-make-label)) (found (mvm-make-label)))
+        (li +ppc-r3+ 0) (li +ppc-r4+ +ppcmac-enet-pa-slot+)
+        (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 0) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 4)
+        (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 8) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 12)
+        ;; Apple's firmware has the alias; QEMU's OpenBIOS has the node only
+        (let ((have (mvm-make-label)) (try2 (mvm-make-label)))
+          (cif "finddevice" (list (list :str "enet")) 1 +ppc-r28+)
+          (ppc-emit-cmpwi buf +ppc-r28+ -1) (ppc-emit-beq buf try2)
+          (ppc-emit-cmpwi buf +ppc-r28+ 0) (ppc-emit-bne buf have)
+          (ppc-emit-label buf try2)
+          (cif "finddevice" (list (list :str "/pci/ethernet")) 1 +ppc-r28+)
+          (ppc-emit-cmpwi buf +ppc-r28+ -1) (ppc-emit-beq buf none)
+          (ppc-emit-cmpwi buf +ppc-r28+ 0) (ppc-emit-beq buf none)
+          (ppc-emit-label buf have))
+        ;; its MAC address, six bytes at slot+4 (zero when the firmware has none)
+        (cif "getprop" (list +ppc-r28+ (list :str "local-mac-address")
+                             (list :imm (+ +ppcmac-enet-pa-slot+ 4)) (list :imm 6)) 1)
+        (cif "getprop" (list +ppc-r28+ (list :str "assigned-addresses") (list :buf 0) (list :imm 200)) 1 +ppc-r15+)
+        (ppc-emit-addi buf +ppc-r14+ +ppc-r1+ 512)
+        (ppc-emit-label buf scan)
+        (ppc-emit-cmpwi buf +ppc-r15+ 20) (ppc-emit-blt buf none)
+        (ppc-emit-lwz buf +ppc-r16+ +ppc-r14+ 0)
+        (ppc-emit-rlwinm buf +ppc-r16+ +ppc-r16+ 8 30 31)        ; space code
+        (ppc-emit-cmpwi buf +ppc-r16+ 2) (ppc-emit-beq buf found)
+        (ppc-emit-addi buf +ppc-r14+ +ppc-r14+ 20)
+        (ppc-emit-addi buf +ppc-r15+ +ppc-r15+ -20)
+        (ppc-emit-b buf scan)
+        (ppc-emit-label buf found)
+        (ppc-emit-lwz buf +ppc-r16+ +ppc-r14+ 8)
+        (li +ppc-r4+ +ppcmac-enet-pa-slot+) (ppc-emit-stw buf +ppc-r16+ +ppc-r4+ 0)
+        ;; its PCI command register: Memory and Bus Master on (| 6), through the
+        ;; parent bus's config-w@ / config-w! -- a GMAC the firmware never used
+        ;; (QEMU's) cannot DMA without it, and QEMU then reads its descriptors as
+        ;; zeros.  The config address: "reg"'s phys.hi bus/dev/fn, register 4.
+        ;; call-method's first stack argument is the top of the stack.
+        (let ((skip (mvm-make-label)) (shut (mvm-make-label)))
+          (cif "getprop" (list +ppc-r28+ (list :str "reg") (list :buf 0) (list :imm 20)) 1 +ppc-r15+)
+          (ppc-emit-cmpwi buf +ppc-r15+ 4) (ppc-emit-blt buf skip)
+          (ppc-emit-lwz buf +ppc-r17+ +ppc-r1+ 512)
+          (ppc-emit-rlwinm buf +ppc-r17+ +ppc-r17+ 0 8 23)            ; bus / dev / fn
+          (ppc-emit-ori buf +ppc-r17+ +ppc-r17+ 4)
+          ;; until the firmware's method has done it: the config address, marked,
+          ;; for the stub's own Uni-N config cycle (EMIT-PPCMAC-ENTRY, step 1b)
+          (ppc-emit-oris buf +ppc-r3+ +ppc-r17+ #x8000)
+          (li +ppc-r4+ +ppcmac-enet-pa-slot+) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 12)
+          (cif "parent" (list +ppc-r28+) 1 +ppc-r15+)
+          (ppc-emit-cmpwi buf +ppc-r15+ 0) (ppc-emit-beq buf skip)
+          (ppc-emit-cmpwi buf +ppc-r15+ -1) (ppc-emit-beq buf skip)
+          (cif "package-to-path" (list +ppc-r15+ (list :buf 256) (list :imm 255)) 1 +ppc-r16+)
+          (ppc-emit-cmpwi buf +ppc-r16+ 0) (ppc-emit-ble buf skip)
+          (ppc-emit-addi buf +ppc-r3+ +ppc-r1+ (+ 512 256))
+          (ppc-emit-add buf +ppc-r3+ +ppc-r3+ +ppc-r16+)
+          (li +ppc-r4+ 0) (ppc-emit-stb buf +ppc-r4+ +ppc-r3+ 0)
+          (cif "open" (list (list :buf 256)) 1 +ppc-r16+)
+          (ppc-emit-cmpwi buf +ppc-r16+ 0) (ppc-emit-beq buf skip)
+          ;; config-w@ ( addr -- w ): three arguments (+76..+84), so the
+          ;; catch-result is at +88 and w at +92
+          (cif "call-method" (list (list :str "config-w@") +ppc-r16+ +ppc-r17+) 2)
+          (ppc-emit-lwz buf +ppc-r3+ +ppc-r1+ 88)
+          (ppc-emit-cmpwi buf +ppc-r3+ 0) (ppc-emit-bne buf shut)
+          (ppc-emit-lwz buf +ppc-r18+ +ppc-r1+ 92)
+          (ppc-emit-ori buf +ppc-r18+ +ppc-r18+ 6)
+          (cif "call-method" (list (list :str "config-w!") +ppc-r16+ +ppc-r17+ +ppc-r18+) 1)
+          (ppc-emit-lwz buf +ppc-r3+ +ppc-r1+ 92)                     ; catch-result
+          (ppc-emit-cmpwi buf +ppc-r3+ 0) (ppc-emit-bne buf shut)
+          (li +ppc-r3+ 0) (li +ppc-r4+ +ppcmac-enet-pa-slot+) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 12)
+          (ppc-emit-label buf shut)
+          (cif "close" (list +ppc-r16+) 0)
+          (ppc-emit-label buf skip))
+        (ppc-emit-label buf none))
       ;; ---- is Open Firmware's console a serial port?  r19 = 1 if so: then the
       ;; image's console is too, and its REPL useful; else (a PowerBook's screen)
       ;; the desk keeps the machine
@@ -476,7 +560,28 @@
       (ppc-emit-b buf done)
       (ppc-emit-label buf no-fb)
       (li +ppc-r18+ 0)
-      (ppc-emit-label buf done))))
+      (ppc-emit-label buf done)
+      ;; the Ethernet, when it is outside that window: DBAT7, 16 MB at
+      ;; +PPCMAC-ENET-VA+ (a G4e; HIGH_BAT_EN is set by PPCMAC-EMIT-HEAP-BATS);
+      ;; boot info +64 / +68 its window's PA and size, 0 when none
+      (let ((none (mvm-make-label)))
+        (li +ppc-r3+ +ppcmac-boot-info+)
+        (li +ppc-r4+ 0) (ppc-emit-stw buf +ppc-r4+ +ppc-r3+ 64) (ppc-emit-stw buf +ppc-r4+ +ppc-r3+ 68)
+        (li +ppc-r4+ +ppcmac-enet-pa-slot+) (ppc-emit-lwz buf +ppc-r14+ +ppc-r4+ 0)
+        (ppc-emit-cmpwi buf +ppc-r14+ 0) (ppc-emit-beq buf none)
+        (ppc-emit-lwz buf +ppc-r4+ +ppc-r3+ 52) (ppc-emit-lwz buf +ppc-r5+ +ppc-r3+ 56)
+        (ppc-emit-subf buf +ppc-r6+ +ppc-r4+ +ppc-r14+)
+        (ppc-emit-cmpl-word buf +ppc-r6+ +ppc-r5+) (ppc-emit-blt buf none)   ; inside: mapped already
+        (ppc-emit-rlwinm buf +ppc-r4+ +ppc-r16+ 16 16 31)
+        (ppc-emit-addi buf +ppc-r4+ +ppc-r4+ (logand (- #x8000) #xFFFF))
+        (li +ppc-r5+ 5)
+        (ppc-emit-cmpl-word buf +ppc-r4+ +ppc-r5+) (ppc-emit-bge buf none)    ; not a G4e: no BAT
+        (ppc-emit-rlwinm buf +ppc-r14+ +ppc-r14+ 0 0 7)                    ; 16 MB-aligned
+        (ppc-emit-stw buf +ppc-r14+ +ppc-r3+ 64)
+        (li +ppc-r4+ #x01000000) (ppc-emit-stw buf +ppc-r4+ +ppc-r3+ 68)
+        (ppc-emit-ori buf +ppc-r4+ +ppc-r14+ #x2A) (ppcmac-mtspr buf 575 +ppc-r4+)   ; DBAT7L
+        (li +ppc-r4+ (logior +ppcmac-enet-va+ #x1FF)) (ppcmac-mtspr buf 574 +ppc-r4+) ; DBAT7U
+        (ppc-emit-label buf none)))))
 
 (defun ppcmac-emit-heap-bats (buf)
   "DBAT1 for VA #x10000000.., the fixed block, the heap and the kind map.  With
@@ -573,6 +678,30 @@
       (ppc-emit-rlwinm buf +ppc-r3+ +ppc-r3+ 0 17 15)            ; EE off
       (ppc-emit-word buf #x7C600124)                             ; mtmsr r3
       (ppc-emit-word buf #x4C00012C)                             ; isync
+      ;; ---- 1b. the Ethernet's PCI command register, when the firmware had no
+      ;; config-w! to set it with (OpenBIOS): Memory | Bus Master by a Uni-N
+      ;; type-0 config cycle on the main bus -- address (1 << dev) | fn << 8 |
+      ;; 4 to #xF2800000, the half-word at #xF2C00000 + (4 & 7): Uni-N takes
+      ;; the offset's low bits from the data port's address (Linux's
+      ;; macrisc_cfg_map_bus; QEMU's unin_get_config_reg).  In real mode: the stub maps nothing at #xF2.
+      (let ((done (mvm-make-label)))
+        (li +ppc-r4+ (+ +ppcmac-enet-pa-slot+ 12)) (ppc-emit-lwz buf +ppc-r14+ +ppc-r4+ 0)
+        (ppc-emit-cmpwi buf +ppc-r14+ 0) (ppc-emit-bge buf done)             ; bit 31 clear: done
+        (ppc-emit-rlwinm buf +ppc-r5+ +ppc-r14+ 21 27 31)                    ; dev
+        (li +ppc-r6+ 1)
+        (ppc-emit-word buf (logior (ash 31 26) (ash +ppc-r6+ 21) (ash +ppc-r6+ 16) (ash +ppc-r5+ 11) (ash 24 1))) ; slw r6,r6,r5
+        (ppc-emit-rlwinm buf +ppc-r7+ +ppc-r14+ 0 21 23)                     ; fn << 8
+        (ppc-emit-or buf +ppc-r6+ +ppc-r6+ +ppc-r7+)
+        (ppc-emit-ori buf +ppc-r6+ +ppc-r6+ 4)
+        (li +ppc-r8+ #xF2800000)
+        (ppc-emit-word buf (logior (ash 31 26) (ash +ppc-r6+ 21) (ash +ppc-r8+ 11) (ash 662 1)))   ; stwbrx r6,0,r8
+        (ppc-emit-sync buf)
+        (li +ppc-r9+ #xF2C00004)                             ; data + (offset & 7)
+        (ppc-emit-word buf (logior (ash 31 26) (ash +ppc-r10+ 21) (ash +ppc-r9+ 11) (ash 790 1)))  ; lhbrx r10,0,r9
+        (ppc-emit-ori buf +ppc-r10+ +ppc-r10+ 6)
+        (ppc-emit-word buf (logior (ash 31 26) (ash +ppc-r10+ 21) (ash +ppc-r9+ 11) (ash 918 1)))  ; sthbrx r10,0,r9
+        (ppc-emit-sync buf)
+        (ppc-emit-label buf done))
       ;; ---- 2. the BATs: all off, then ours (lower word first) --------------
       (ppcmac-emit-mfspr buf +ppc-r16+ 287)                      ; r16 = PVR
       (li +ppc-r0+ 0)

@@ -163,7 +163,7 @@
              (setq start (+ at (length old))))
     (get-output-stream-string out)))
 (defun %pc32-zero-loops (text)
-  (if (not *cl-repl-i386-p*)
+  (if (not (or *cl-repl-i386-p* *cl-repl-ppcmac-p*))
       text
       (%replace-all text "(setf (mem-ref (+ s (* i 8)) :u64) 0)"
                     "(progn (setf (mem-ref (+ s (* i 8)) :u32) 0) (setf (mem-ref (+ s (* i 8) 4) :u32) 0))")))
@@ -1652,7 +1652,7 @@
 ;; The SYNCHRONOUS server -- no actor scheduler, ip.lisp's poll loop serves each
 ;; connection inline, the NIC already up from the pipeline -- on the PC images and
 ;; on QEMU virt.  Only the Pi runs the actor/USB shape.
-(defvar *ssh-sync-p* (or *cl-repl-pc-p* *cl-repl-virt-p*))
+(defvar *ssh-sync-p* (or *cl-repl-pc-p* *cl-repl-virt-p* *cl-repl-ppcmac-p*))
 
 ;; THE NETWORK SERVICE: a threaded Pi SSH build serves SSH through it (net/net-service.lisp,
 ;; net/ssh-inetd.lisp) -- SSH-BOOT starts the USB I/O core, the service and the server, and
@@ -1815,6 +1815,8 @@
     ;; per-connection block and ssh-ipc in DRAM (PA 0x50260000..0x50396000,
     ;; identity-mapped by L1[1]), clear of the image, heap and DMA rings.
     (*cl-repl-virt-p* "")
+    ;; :PPCMAC: net/arch-ppcmac-cl.lisp puts them in the free DRAM at #x073..
+    (*cl-repl-ppcmac-p* "")
     (*cl-repl-pc-p*
      "
 (defun ssh-conn-base ()      #x0C200000)
@@ -1905,7 +1907,7 @@
         ;; had already given up ("#VX 51 0 0": 51 polls, buffer empty, peer
         ;; open).  Every connection after the first failed that way once the
         ;; key exchange stopped taking long enough for the ring to drain.
-        (if *cl-repl-i386-p*
+        (if (or *cl-repl-i386-p* *cl-repl-ppcmac-p*)
             "(defun %i386-ssh-clock () (get-internal-real-time))
 (defun %i386-ssh-wait-expired-p (count limit since)
   (or (modus.ssh:ssh-peer-closed-p)
@@ -2127,6 +2129,11 @@
             ;; moves the driver's host buffers out of the image (see its header).
             (%rpi-net-text "ne2000.lisp")          (string #\Newline)
             (%rpi-net-text "arch-i386-cl.lisp")    (string #\Newline))
+      (if *cl-repl-ppcmac-p*
+          (concatenate 'string
+            ;; the PowerPC Mac's GMAC (Sun GEM), and the board's adapter
+            (%rpi-net-text "arch-ppcmac-cl.lisp")  (string #\Newline)
+            (%rpi-net-text "sungem.lisp")          (string #\Newline))
       (if *cl-repl-x64-p*
           (concatenate 'string
             (%rpi-net-text "arch-x86-cl.lisp")     (string #\Newline)
@@ -2207,7 +2214,7 @@
             ;; ... and read-write through the Arasan controller, for a board the firmware
             ;; booted alone (kiln zero's cards): EMMC-INIT, EMMC-READ/WRITE-SECTORS.
             ;; Nothing calls it at boot.
-            (%rpi-net-text "emmc.lisp")          (string #\Newline)))))))
+            (%rpi-net-text "emmc.lisp")          (string #\Newline))))))))
 
 ;; THE NIC INTERFACE (builder packages step 3): net/nic.lisp's MODUS.NET
 ;; NIC-SEND / -RECEIVE / -RX-BUF / -PROBE, which ip.lisp, ssh.lisp and
@@ -2256,6 +2263,13 @@
                (bind "modus.net.e1000:e1000-hw-send" "modus.net.e1000:e1000-hw-receive"
                      "modus.net.e1000:e1000-hw-rx-buf" "modus.net.e1000:e1000-hw-probe"
                      "modus.net.e1000:e1000-read-reg")))
+      (*cl-repl-ppcmac-p*
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.sungem:gem-send" "modus.net.sungem:gem-receive"
+                     "modus.net.sungem:gem-rx-buf" "modus.net.sungem:gem-probe"
+                     "modus.net::no-read-reg")))
       ;; the boards with usb-netdev (the SSH builds): NIC-PROBE picks the
       ;; RTL8153 or CDC-ECM, as does a hot-plug edge, and the rest dispatch
       ;; on that choice
@@ -2288,7 +2302,7 @@
                          (format nil "  (modus.ssh::%bind-ssh-seams)~%~A~A~A"
                                  (if (or *cl-repl-x64-p* *cl-repl-rpi-p*)
                                      (format nil "  (modus.board::%bind-board-ssh-seams)~%") "")
-                                 (if *cl-repl-i386-p*
+                                 (if (or *cl-repl-i386-p* *cl-repl-ppcmac-p*)
                                      (format nil "  (%bind-i386-ssh-seams)~%") "")
                                  (if *ssh-isolated-p*
                                      (format nil "  (%bind-isolated-ssh-seams)~%") ""))
@@ -2374,7 +2388,7 @@
         ;; target (+7) but a 4-byte header on i386 (+4 - 9 = -5).  TCP-RX-COPY's
         ;; word copy writes there; a literal +7 put every i386 body 12 bytes
         ;; late (and 12 bytes past the vector's end).
-        (format nil "~%(defun %u8-data-delta () ~D)~%" (if *cl-repl-i386-p* -5 7))
+        (format nil "~%(defun %u8-data-delta () ~D)~%" (if (or *cl-repl-i386-p* *cl-repl-ppcmac-p*) -5 7))
         "
 (defun tcp-rx-copy (dest dest-off)
   (let ((buf (modus.net:nic-rx-buf)))
@@ -2813,7 +2827,46 @@
       "          (handler-case (ql-net-setup) (t (c) nil))
           (net-install-and-call (%net-fetch-url)))))"))
 
+;; :PPCMAC: the GMAC Open Firmware left running (no PCI work), DHCP from the
+;; other end (the Pi's dnsmasq; QEMU's slirp), else the address a network boot
+;; used: 10.0.0.9, gateway 10.0.0.1.  No library fetch: the image is a desk.
+(defvar *net-ppcmac-pipeline-source*
+  (%pc32-zero-loops "(defun dhcp-wait-tries () 250000)
+;; NET-ACTOR-MAIN's idle step, a SEAM (net/nic.lisp's mechanism): it calls through
+;; *YIELD-FN*, so a (setf fdefinition) at run time rebinds the compiled callers too.
+;; A wait by default; the desk (scripts/ppcmac/ppcmac-desk.lisp) makes it a turn of
+;; the desk, so the screen and SSH share the one thread.
+(defvar *yield-fn* nil)
+(defun yield () (funcall *yield-fn*))
+(defun %idle-wait () (io-delay))
+(defun run-net-pipeline ()
+  (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
+  (modus-int::%define-seam 'yield '*yield-fn*)
+  ;; (a kernel DEFVAR's initform does not run: the cell may be unbound)
+  (unless (and (boundp '*yield-fn*) *yield-fn*) (setf (fdefinition 'yield) (function %idle-wait)))
+  (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (if (zerop (handler-case (modus.net:nic-probe) (t (c) 0)))
+      (progn (write-string-serial \"NET-PIPELINE-ABORT\") (write-char-serial 10) nil)
+      (let ((state (e1000-state-base)))
+        (dotimes (attempt 4)
+          (when (zerop (mem-ref (+ state #x18) :u8))
+            (handler-case (dhcp-client) (t (c) nil))))
+        (when (zerop (mem-ref (+ state #x18) :u8))
+          (setf (mem-ref (+ state #x18) :u8) 10) (setf (mem-ref (+ state #x19) :u8) 0)
+          (setf (mem-ref (+ state #x1A) :u8) 0) (setf (mem-ref (+ state #x1B) :u8) 9)
+          (setf (mem-ref (+ state #x1C) :u8) 10) (setf (mem-ref (+ state #x1D) :u8) 0)
+          (setf (mem-ref (+ state #x1E) :u8) 0) (setf (mem-ref (+ state #x1F) :u8) 1))
+        (write-string-serial \"IP=\")
+        (print-dec (mem-ref (+ state #x18) :u8)) (write-char-serial 46)
+        (print-dec (mem-ref (+ state #x19) :u8)) (write-char-serial 46)
+        (print-dec (mem-ref (+ state #x1A) :u8)) (write-char-serial 46)
+        (print-dec (mem-ref (+ state #x1B) :u8)) (write-char-serial 10)
+        (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10)
+        t)))
+"))
+
 (defvar *net-pipeline-defun-source*
+  (if *cl-repl-ppcmac-p* *net-ppcmac-pipeline-source*
   (if *cl-repl-qemu-p*
       (%pc32-zero-loops (concatenate 'string ";; QEMU user-mode net: slirp answers a DISCOVER in tens of ms, which is more
 ;; than 2500 of the x86 adapter's io-delays (DHCP:F five times, then the OFFERs
@@ -2882,7 +2935,7 @@
           ;;    (rung 3) install it, load it, and call a function from it.
           (net-install-and-call (%net-fetch-url)))))
   (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
-" *net-rpi-nic-init* *net-rpi-addr-block*)))
+" *net-rpi-nic-init* *net-rpi-addr-block*))))
 
 (defvar *net-driver-source*
   (if *net-build-p*

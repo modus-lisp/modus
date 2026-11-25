@@ -219,6 +219,14 @@ Where-shaped loop 1.76 -> 1.54 ns an element.  stave pass 1.33-1.36 s (SBCL 1.3)
 Still to take: the IF arm's jump over the else arm (not a short block -- needs layout, or
 if-conversion of a float select into FCSEL); copies the front end leaves before uses (`MOV x19,
 x4` then x19); the tag test on an (unsigned-byte 62) counter (5 instructions; TBNZ is 1).
+- **Copy forwarding through float code** (`%IRDF-SHAPE*`): at aarch64 run-time compiles the
+  dataflow pass uses `%IRA-SHAPE`, so FP lane loads / stores no longer end forwarding -- the
+  index copied into a temp before every element access goes.  ADD-TILED core 1.44 -> 1.26 ns an
+  element; Add 3.6 -> 3.4 us a call.  MODUS_IRDF_WIDE=0 disables.
+- **Dataflow liveness sets as fixnums** (`+IRDF-SLOT-BIT+` 17, was 32): every set was a bignum.
+  stave's load (cache off) 5.8 -> 5.1 s, every target's compile cheaper; with the wider
+  forwarding above it is 5.8 s -- where it started.
+
 Tried and reverted: skipping the tag test of an operand loaded with a fixnum literal a few
 instructions up (`%IR-RECENT-FIXNUM-P` in EMIT-ARITH-PAIR) -- no gain on stave and cl-bench
 BITVECTORS 5% slower, consistently.  Probably layout again; not worth it unmeasured.

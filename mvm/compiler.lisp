@@ -2973,6 +2973,19 @@
     ((:call :ret) '(() ()))
     (t :unknown)))
 
+(defvar *irdf-wide* nil
+  "Set by %IR-DATAFLOW (a SETQ): this compile is an aarch64 run-time one, where %IRA-SHAPE's
+   float and lane entries -- read off the aarch64 translator -- hold.")
+
+(defun %irdf-shape* (op)
+  "%IRDF-SHAPE, or at an aarch64 run-time compile %IRA-SHAPE: the float lane ops stopped copy
+   forwarding at every element access (an index copied into a temp, then the temp used).  Not
+   CALL-INDIRECT (%IRDF-MASKS special-cases only CALL's clobbers) nor FP-SPILL / FP-RELOAD (frame
+   slots written and read outside STACK-STORE / STACK-LOAD)."
+  (if (and *irdf-wide* (not (member op '(:call-indirect :fp-spill :fp-reload))))
+      (%ira-shape op)
+      (%irdf-shape op)))
+
 (defun %irdf-reg-p (x) (and (integerp x) (<= 0 x 16)))
 
 (defvar *irdf-vr-is-v0* t
@@ -3008,14 +3021,19 @@
    STACK-LOAD / STACK-STORE slot: it names VSP or VFP as a register, or it is
    a raw LOAD / STORE (whose address could be one)."
   (or (member (car insn) '(:load :store))
-      (and (listp (%irdf-shape (car insn)))
-           (destructuring-bind (rd wr) (%irdf-shape (car insn))
+      (and (listp (%irdf-shape* (car insn)))
+           (destructuring-bind (rd wr) (%irdf-shape* (car insn))
              (loop for p in (append rd wr)
                    thereis (member (nth p insn) '(20 21)))))))
 
+;; Frame slot S is bit 17+S of a liveness set (V0..VR are bits 0..16).  It was 32+S, which made
+;; every set a bignum and every step of DSE's fixed point an allocation -- 14% of stave's load once
+;; forwarding reached through float code.  Up to ~44 slots the sets stay fixnums.
+(defconstant +irdf-slot-bit+ 17)
+
 (defun %irdf-masks (insn all-slots)
-  "(values GEN KILL) for liveness: bits 0..16 are V0..VR, bit 32+S frame slot S."
-  (let ((shape (%irdf-shape (car insn))))
+  "(values GEN KILL) for liveness: bits 0..16 are V0..VR, bit +IRDF-SLOT-BIT+ + S frame slot S."
+  (let ((shape (%irdf-shape* (car insn))))
     (if (eq shape :unknown)
         (values (logior #x1FFFF all-slots) 0)
         (let ((gen 0) (kill 0))
@@ -3025,8 +3043,8 @@
             (dolist (p wr)
               (let ((r (nth p insn))) (when (%irdf-reg-p r) (setq kill (logior kill (ash 1 r)))))))
           (case (car insn)
-            (:stack-load (setq gen (logior gen (ash 1 (+ 32 (third insn))))))
-            (:stack-store (setq kill (logior kill (ash 1 (+ 32 (third insn))))))
+            (:stack-load (setq gen (logior gen (ash 1 (+ +irdf-slot-bit+ (third insn))))))
+            (:stack-store (setq kill (logior kill (ash 1 (+ +irdf-slot-bit+ (third insn))))))
             ;; a callee takes V0..V3 (and may unwind to a landing that reads
             ;; any slot); RET hands back VR
             (:call (setq gen (logior gen #xF (%irdf-bits 0) all-slots)
@@ -3048,7 +3066,7 @@
                            when (member (car insn) '(:stack-load :stack-store))
                              maximize (third insn) into m
                            finally (return (or m -1)))))
-         (all-slots (ash (1- (ash 1 nslots)) 32))
+         (all-slots (ash (1- (ash 1 nslots)) +irdf-slot-bit+))
          (label-at (make-hash-table))
          (gen (make-array n)) (kill (make-array n))
          (live-in (make-array n :initial-element 0))
@@ -3078,7 +3096,7 @@
           (when (or (and (%irdf-pure-p insn)
                          (not (logtest (%irdf-bits (second insn)) (live-out k))))
                     (and (eq (car insn) :stack-store)
-                         (not (logbitp (+ 32 (third insn)) (live-out k)))))
+                         (not (logbitp (+ +irdf-slot-bit+ (third insn)) (live-out k)))))
             (setf (aref v k) nil changed t)))))
     (values (remove nil v) changed)))
 
@@ -3105,7 +3123,7 @@
                  (maphash (lambda (s r) (when (eql r w) (push s dead))) slot)
                  (dolist (s dead) (remhash s slot)))))
       (loop for insn across v
-            do (let* ((op (car insn)) (shape (%irdf-shape op)))
+            do (let* ((op (car insn)) (shape (%irdf-shape* op)))
                  (cond
                    ((eq op :label) (reset) (push insn out))
                    ((or (eq shape :unknown) (eq op :call))
@@ -3152,6 +3170,9 @@
       ir
       (let ((v (coerce ir 'vector)))
         (setq *irdf-vr-is-v0* (%irdf-vr-is-v0-p))
+        (setq *irdf-wide* (and *mvm-eval-runtime-p* (boundp (quote *jit-target-arch*))
+                               (eq (symbol-value (quote *jit-target-arch*)) :aarch64)
+                               (not (equal (%ira-env "MODUS_IRDF_WIDE") "0"))))
         (loop repeat 6
               do (multiple-value-bind (v1 c1) (%irdf-forward v)
                    (multiple-value-bind (v2 c2) (%irdf-dse v1)

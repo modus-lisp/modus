@@ -22740,9 +22740,22 @@
                      (and (fboundp (quote %e2-name-set-function-p))
                           (%e2-name-set-function-p fn-name)
                           (not (%e2-fn-in-module-p resolved-name)))))
-            (compile-form (list (if (fboundp name) 'symbol-function 'fdefinition)
-                                (list 'quote name))
-                          env dest)
+            (if (fboundp name)
+                (compile-form (list 'symbol-function (list 'quote name)) env dest)
+                ;; NOT DEFINED YET: the baked load, which finds the function
+                ;; once it is defined (a forward reference in the file being
+                ;; loaded -- DDERIV's #'DDERIV, three functions above DDERIV),
+                ;; and FDEFINITION -- which signals -- only while it still
+                ;; loads NIL.  FDEFINITION on every evaluation cost a full
+                ;; lookup each time: 0.7 us on x64, 15 us on the web, and
+                ;; DDERIV 0.19 -> 0.29 s there.
+                (let ((slow (make-compiler-label)) (done (make-compiler-label)))
+                  (emit-ir :li-func dest resolved-name)
+                  (emit-ir :bnull dest slow)
+                  (emit-ir :br done)
+                  (emit-ir-label slow)
+                  (compile-form (list 'fdefinition (list 'quote name)) env dest)
+                  (emit-ir-label done)))
             (if (and *mvm-eval-runtime-p*
                      (symbolp name)
                      (%e2-fn-in-module-p resolved-name))

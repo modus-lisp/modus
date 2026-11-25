@@ -390,6 +390,19 @@
   (dotimes (k 8)
     (setf (aref bc (+ (- end 8) k)) (logand (ash v (* -8 k)) 255))))
 
+(defun %fasl-layout-region (a)
+  "Which part of the layout real address A is in: :CONV (the fixed runtime-data region), :CODE
+   (the image), :HEAP, :JIT, or :OTHER -- the regions PCREL-LAYOUT-ADDR-P accepts."
+  (let ((lo (conv-real +conv-region-low+))
+        (h (hosted-layout :heap-base 0))
+        (j (hosted-layout :jit-arena-base 0))
+        (c (hosted-layout :code-base 0)))
+    (cond ((and (>= a lo) (< a (+ lo (- +conv-region-end+ +conv-region-low+)))) :conv)
+          ((and (> h 0) (>= a h) (< a (+ h (hosted-layout :heap-size #x38000000)))) :heap)
+          ((and (> j 0) (>= a j) (< a (+ j #x20000000))) :jit)
+          ((and (> c 0) (>= a (- c #x4000)) (< a (+ c #x10000000))) :code)
+          (t :other))))
+
 (defun %fasl-record (slot forms bc entry ft-list fn-table rt-table lam-offsets
                      persist-names lam-bearing taint0)
   "Encode this module into SLOT's CAR, or leave it NIL (the form stays source)."
@@ -419,10 +432,16 @@
                      (%fasl-walk-bc bc2
                        (lambda (op operands np)
                          (cond
-                           ;; LI-ADDR / LI-TADDR are kept: their operands are LINK-TIME addresses (mvm.lisp,
-                           ;; LAYOUT ADDRESSES IN BYTECODE) that every consumer slides into its own process,
-                           ;; and the key's build record (%FASL-BUILD-KEY) fixes the layout they name.  Kept
-                           ;; as source they were recompiled at every load: 136 of stave's forms.
+                           ;; LI-ADDR / LI-TADDR: their operands are LINK-TIME addresses (mvm.lisp, LAYOUT
+                           ;; ADDRESSES IN BYTECODE) that every consumer slides into its own process.  One in the
+                           ;; image's code region or the fixed runtime-data region names the same thing in every
+                           ;; process of this build (%FASL-BUILD-KEY is in the key): kept -- as source they were
+                           ;; recompiled at every load, 136 of stave's forms.  One in the HEAP or the JIT ARENA
+                           ;; names what this run happened to put there, so the module stays source.
+                           ((or (eql op +op-li-addr+) (eql op +op-li-taddr+))
+                            (let ((where (%fasl-layout-region (+ (cadr operands) (%layout-slide)))))
+                              (unless (member where '(:code :conv))
+                                (%fasl-reject (format nil "layout address in ~(~a~)" where)))))
                            ((eql op +op-li-const+)
                             (let* ((idx (cadr operands)) (hit (assoc idx idxs)))
                               (unless hit

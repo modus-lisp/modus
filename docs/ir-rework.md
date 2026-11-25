@@ -268,11 +268,16 @@ addresses every consumer slides into its own process (mvm.lisp), and the key's b
 the layout: replay is sound.  Checked: recorded at slide 0x300000000, replayed at 0x200000000,
 transcript unchanged.  Warm load 4.4 -> 1.2 s (441 modules replayed, 67 forms source).
 
-Cost, still open: a replayed module's functions start in the interpreter (promoted at 64 calls or
-10 ms), where a freshly compiled one is native sooner, so very short runs pay warm-up -- cl-bench
-DIV2-TEST-1 70 -> 83 ms, DERIV 66 -> 72 ms, MANDELBROT 3 -> 4 ms (geomean 2.44x -> 2.53x).  The
-replay should follow the fresh path's JIT policy; the place to look is how %FASL-EVAL's
-%FASL-MODULE-MARKER run reaches %MVM-EVAL-RUN-TUPLE compared with a fresh form.
+Only addresses fixed by the build are cached: the recorder classifies each LI-ADDR / LI-TADDR
+operand (%FASL-LAYOUT-REGION) and keeps a module only when they are in the image's code region or
+the fixed runtime-data region; one in the heap or the JIT arena names what that run put there,
+and the module stays source.  stave has none of the latter.
+
+The cl-bench "regressions" this seemed to cause (div2-test-1 70 -> 83 ms, deriv 66 -> 72 ms) are
+collection placement, not code: compiling from scratch churns enough garbage that a collection
+happens just before the timed batch; a warm start begins mid-semispace and takes two collections
+inside it (CLB_GCCOUNT: 0 vs 2 collections, 0.069 vs 0.079 s; the next batch 0.072 vs 0.071).
+Compare runners on the same cache state.
 
 Found, not fixed: `(logand (+ 3 7) 255)` -- a LOGAND / LOGIOR of a literal-arithmetic argument --
 fails to compile at run time ("interp-closure compile failed"), on builds back to at least g17.

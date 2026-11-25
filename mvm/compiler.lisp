@@ -2876,8 +2876,11 @@
    any, the dataflow round again to fold their moves."
   (let* ((ir1 (%ir-peephole (%ir-dataflow (%ir-peephole ir))))
          (on (and (%ira-enabled-p) (%ira-in-range-p) (%ira-name-ok-p)))
+         (dump (and on (equal (%ira-env "MODUS_IR_ALLOC_TRACE") "2")
+                    (%ira-trace "ira: IR of ~a~%~{  ~s~%~}" *ira-name* ir1)))
          (ir2 (if on (%ir-alloc ir1) ir1))
          (ir3 (if (and on (not (%ira-off-p "MODUS_IR_ALLOC_LOOPS"))) (%ir-alloc-loops ir2) ir2)))
+    (declare (ignore dump))
     (cond ((eq ir3 ir1) ir1)
           ;; MODUS_IR_ALLOC_DRYRUN=1: do all the work, keep the original (bisecting compile-time
           ;; cost apart from the code produced)
@@ -3165,6 +3168,10 @@
       :fp-spill :fp-reload)
      '(() ()))
     ((:fpd-unbox :fp-unbox :fpd-itof :fpd-scale) '((2) ()))
+    ;; a GC check sized by a register (count, kind): reads it; a collection keeps every register
+    (:gc-check-r '((1) ()))
+    ;; a call through the function object in operand 1 (masks: as CALL, plus that read)
+    (:call-indirect '((1) ()))
     ;; a SAFEPOINT parks for a collection and resumes with every register as it was (loop
     ;; counters live in V9-V13 across back-edges today)
     ((:safepoint :yield :fence :nop :raw-mark) '(() ()))
@@ -3202,8 +3209,9 @@
       ;; reached only through this function's own STACK-LOADs (%IRDF-FRAME-TOUCH-P excludes the
       ;; rest), and a callee can unwind INTO this frame only to a setjmp landing, which needs a
       ;; TRAP -- and a function with one is never here.  (%IRDF-MASKS assumes the landing.)
-      (:call (setq gen (logior gen #xF (%irdf-bits 0))
-                   kill (logior kill (ash 1 16))))
+      ((:call :call-indirect)
+       (setq gen (logior gen #xF (%irdf-bits 0))
+             kill (logior kill (ash 1 16))))
       (:ret (setq gen (logior gen (%irdf-bits 16)))))
     (values gen (logandc2 kill gen) kill)))
 
@@ -3411,95 +3419,226 @@
                             (setf (aref live-in k) in again t))))))
     (values live-in live-out def label-at all-slots nslots)))
 
-;;; PER LOOP.  A slot an innermost loop only READS -- an array, a stride, a bound: the shape of
-;;; mill's elementwise loops -- is loaded once into a register free throughout the loop, just
-;;; before the loop's label (branches from outside retargeted to the load), and the loop's reads
-;;; become MOVs from it.  Nothing at the exits: the loop never writes the slot, so the frame copy
-;;; stays right.  Single-entry loops only: no branch from outside lands inside but on the label.
+;;; ---------------------------------------------------------------------------
+;;; The IR's control-flow graph: basic blocks, dominators, natural loops.
+;;;
+;;; The front end lays loops out rotated -- the entry jumps to the test partway through, and the
+;;; back edges sit at the end of the function among the out-of-line slow paths -- so loops are
+;;; found from the graph, not from index ranges: a back edge T -> H where H dominates T, and the
+;;; loop's body is H plus every block that reaches T without passing through H.
+
+(defun %ira-cfg (v label-at)
+  "(values BLOCK-START BLOCK-END SUCCS PREDS) for the IR vector V: block B is V[START..END],
+   SUCCS / PREDS vectors of block-index lists.  Block 0 holds the entry."
+  (let* ((n (length v)) (leader (make-array (1+ n) :element-type 'bit :initial-element 0)))
+    (setf (aref leader 0) 1)
+    (dotimes (k n)
+      (let ((insn (aref v k)))
+        (when (eq (car insn) :label) (setf (aref leader k) 1))
+        (when (or (%irp-target insn) (member (car insn) '(:br :ret :tailcall)))
+          (setf (aref leader (1+ k)) 1))))
+    (let* ((starts (loop for k below n when (= (aref leader k) 1) collect k))
+           (nb (length starts))
+           (bstart (coerce starts 'vector))
+           (bend (make-array nb))
+           (block-of (make-array n))
+           (succs (make-array nb :initial-element nil))
+           (preds (make-array nb :initial-element nil)))
+      (dotimes (b nb)
+        (let ((e (if (< (1+ b) nb) (1- (aref bstart (1+ b))) (1- n))))
+          (setf (aref bend b) e)
+          (loop for k from (aref bstart b) to e do (setf (aref block-of k) b))))
+      (dotimes (b nb)
+        (let* ((last (aref v (aref bend b))) (op (car last)) (out nil))
+          (unless (or (member op '(:br :ret :tailcall)) (>= (1+ b) nb))
+            (push (1+ b) out))
+          (let* ((tg (%irp-target last)) (j (and tg (gethash tg label-at))))
+            (when j (pushnew (aref block-of j) out)))
+          (setf (aref succs b) out)
+          (dolist (c out) (push b (aref preds c)))))
+      (values bstart bend succs preds block-of))))
+
+(defun %ira-dominators (succs preds)
+  "Immediate dominators (Cooper, Harvey and Kennedy) and the reverse-postorder number of each
+   block; unreachable blocks have RPO NIL."
+  (let* ((nb (length succs)) (rpo (make-array nb :initial-element nil))
+         (order nil) (seen (make-array nb :initial-element nil))
+         (stack (list (cons 0 (copy-list (aref succs 0))))))
+    ;; iterative DFS: a block goes on ORDER when its successors are done, so ORDER ends up in
+    ;; reverse postorder
+    (setf (aref seen 0) t)
+    (loop while stack
+          do (let ((top (car stack)))
+               (if (cdr top)
+                   (let ((c (pop (cdr top))))
+                     (unless (aref seen c)
+                       (setf (aref seen c) t)
+                       (push (cons c (copy-list (aref succs c))) stack)))
+                   (progn (push (car top) order) (pop stack)))))
+    ;; ORDER is reverse postorder
+    (let ((rpov (coerce order 'vector)))
+      (dotimes (i (length rpov)) (setf (aref rpo (aref rpov i)) i))
+      (let ((idom (make-array nb :initial-element nil)))
+        (setf (aref idom 0) 0)
+        (flet ((intersect (a b)
+                 (loop until (= a b)
+                       do (loop while (> (aref rpo a) (aref rpo b)) do (setq a (aref idom a)))
+                          (loop while (> (aref rpo b) (aref rpo a)) do (setq b (aref idom b))))
+                 a))
+          (loop with changed = t
+                while changed
+                do (setq changed nil)
+                   (loop for i from 1 below (length rpov)
+                         do (let* ((b (aref rpov i))
+                                   (done (remove-if-not (lambda (p) (and (aref rpo p) (aref idom p))) (aref preds b)))
+                                   (new (and done (reduce #'intersect done))))
+                              (when (and new (not (eql new (aref idom b))))
+                                (setf (aref idom b) new changed t))))))
+        (values idom rpo)))))
+
+(defun %ira-dominates-p (idom rpo a b)
+  "Block A dominates block B."
+  (and (aref rpo b) (aref rpo a)
+       (loop (when (= a b) (return t))
+             (when (= b 0) (return nil))
+             (setq b (aref idom b)))))
+
+(defun %ira-natural-loops (succs preds idom rpo)
+  "List of (HEADER . BODY-BIT-VECTOR) per loop header (back edges into one header merged)."
+  (let ((nb (length succs)) (by-header (make-hash-table)))
+    (dotimes (t0 nb)
+      (dolist (h (aref succs t0))
+        (when (and (aref rpo t0) (%ira-dominates-p idom rpo h t0))
+          (let ((body (or (gethash h by-header)
+                          (setf (gethash h by-header) (make-array nb :element-type 'bit :initial-element 0))))
+                (work (list t0)))
+            (setf (aref body h) 1)
+            (loop while work
+                  do (let ((x (pop work)))
+                       (when (= (aref body x) 0)
+                         (setf (aref body x) 1)
+                         (dolist (p (aref preds x)) (when (aref rpo p) (push p work))))))))))
+    (let ((out nil)) (maphash (lambda (h b) (push (cons h b) out)) by-header) out)))
+
+;;; PER LOOP, BY THE GRAPH.  In each innermost natural loop, the hottest frame slots take registers
+;;; no instruction of the loop's body uses: loaded on every edge into the loop, MOVs inside, and
+;;; -- for a slot the loop writes -- stored back on every edge out.  Code for a fall-through edge
+;;; goes just before the target's label (a branch to that label skips it); a branch edge is sent
+;;; to a small block at the end of the function that does the work and branches on.
 (defun %ir-alloc-loops (ir)
   (let ((v (coerce ir 'vector)))
-    (unless (%ira-eligible-p v) (return-from %ir-alloc-loops ir))
+    (unless (and (%ira-eligible-p v) (> (length v) 0)
+                 ;; edge blocks go after the last instruction, which must not fall through
+                 (member (car (aref v (1- (length v)))) '(:br :ret :tailcall)))
+      (%ira-trace "ira: ~a loops skip: ~s, last ~s" *ira-name* (%ira-blocker v)
+                  (and (> (length v) 0) (aref v (1- (length v)))))
+      (return-from %ir-alloc-loops ir))
     (setq *irdf-vr-is-v0* (%irdf-vr-is-v0-p))
     (multiple-value-bind (live-in live-out def label-at all-slots nslots) (%ira-liveness v)
       (declare (ignore all-slots))
       (when (<= nslots 0) (return-from %ir-alloc-loops ir))
-      (let* ((n (length v))
-             (loops nil)
-             (inserts (make-hash-table))      ; label index -> (new-label . loads)
-             (rewrite (make-hash-table))      ; insn index -> register its STACK-LOAD reads instead
-             (max-label (loop for insn across v when (and (eq (car insn) :label) (integerp (second insn)))
-                                maximize (second insn) into m finally (return (or m 0)))))
-        ;; back edges -> regions [j, k]
-        (dotimes (k n)
-          (let* ((tg (%irp-target (aref v k))) (j (and tg (gethash tg label-at))))
-            (when (and j (< j k)) (push (cons j k) loops))))
-        ;; innermost: no other region strictly inside
-        (setq loops (remove-if (lambda (l) (some (lambda (m) (and (not (eq m l)) (<= (car l) (car m)) (<= (cdr m) (cdr l))
-                                                               (not (equal m l))))
-                                                 loops))
-                               loops))
-        (setq loops (remove-duplicates loops :test #'equal))
-        (dolist (l loops)
-          (let* ((j (car l)) (k (cdr l)) (label (second (aref v j)))
-                 (single (loop for x below n
-                               never (and (or (< x j) (> x k))
-                                          (let* ((tg (%irp-target (aref v x))) (y (and tg (gethash tg label-at))))
-                                            (and y (> y j) (<= y k)))))))
-            (unless (and single (> j 0))
-              (%ira-trace "ira: loop [~d ~d] of ~d not single-entry" j k n))
-            (when (and single (> j 0))
-              (let ((reads (make-array nslots :initial-element 0))
-                    (written (make-array nslots :initial-element nil))
-                    (free nil))
-                (loop for x from j to k
-                      do (let ((insn (aref v x)))
-                           (case (car insn)
-                             (:stack-load (incf (aref reads (third insn))))
-                             (:stack-store (setf (aref written (third insn)) t))
-                             (t (dolist (s (%ira-fp-slots insn)) (setf (aref written s) t))))))
-                ;; registers no point of the region (or the edge into it) uses
+      (multiple-value-bind (bstart bend succs preds block-of) (%ira-cfg v label-at)
+        (multiple-value-bind (idom rpo) (%ira-dominators succs preds)
+          (let* ((n (length v)) (nb (length succs))
+                 (loops (%ira-natural-loops succs preds idom rpo))
+                 (inner (remove-if (lambda (l)
+                                     (some (lambda (m) (and (not (eq m l)) (= (aref (cdr l) (car m)) 1)))
+                                           loops))
+                                   loops))
+                 (max-label (loop for insn across v when (and (eq (car insn) :label) (integerp (second insn)))
+                                    maximize (second insn) into m finally (return (or m 0))))
+                 (rewrite (make-hash-table))     ; insn index -> (slot . reg)
+                 ;; edge code: STORES (out of a loop) always run before LOADS (into one) -- two
+                 ;; loops may use one register number, and an edge can leave one and enter another
+                 (before-label (make-hash-table)) ; block -> (stores . loads) on the fall-through into it
+                 (retarget (make-hash-table)))   ; branch insn index -> (stores . loads) on its taken edge
+            (declare (ignore preds))
+            (%ira-trace "ira: ~a ~d insns, ~d blocks (~d reachable), ~d loops, ~d innermost, ~d slots" *ira-name*
+                        n nb (count-if #'identity rpo) (length loops) (length inner) nslots)
+            (dolist (l inner)
+              (let* ((h (car l)) (body (cdr l))
+                     (reads (make-array nslots :initial-element 0))
+                     (written (make-array nslots :initial-element nil))
+                     (fp (make-array nslots :initial-element nil))
+                     (free nil))
+                (dotimes (b nb)
+                  (when (= (aref body b) 1)
+                    (loop for x from (aref bstart b) to (aref bend b)
+                          do (let ((insn (aref v x)))
+                               (case (car insn)
+                                 (:stack-load (incf (aref reads (third insn))))
+                                 (:stack-store (incf (aref reads (third insn))) (setf (aref written (third insn)) t))
+                                 (t (dolist (s (%ira-fp-slots insn)) (setf (aref fp s) t))))))))
                 (loop for r in '(7 8 6 5 4 13 12 11 10 9)
-                      do (let ((b (%irdf-bits r)))
-                           (when (loop for x from j to k
-                                       never (logtest b (logior (aref live-in x) (aref live-out x) (aref def x))))
+                      do (let ((bit (%irdf-bits r)))
+                           (when (loop for b below nb
+                                       never (and (= (aref body b) 1)
+                                                  (loop for x from (aref bstart b) to (aref bend b)
+                                                        thereis (logtest bit (logior (aref live-in x) (aref live-out x) (aref def x))))))
                              (push r free))))
                 (setq free (nreverse free))
-                (%ira-trace "ira: loop [~d ~d] of ~d free ~s read-only ~s written ~s" j k n free
-                            (loop for s below nslots when (and (> (aref reads s) 0) (not (aref written s))) collect s)
-                            (loop for s below nslots when (aref written s) collect s))
-                (let ((loads nil))
+                (let ((chosen nil))
                   (dolist (s (sort (loop for s below nslots
-                                         when (and (> (aref reads s) 0) (not (aref written s))) collect s)
+                                         when (and (> (aref reads s) 0) (not (aref fp s)))
+                                           collect s)
                                    #'> :key (lambda (s) (aref reads s))))
-                    (when free
-                      (let ((r (pop free)))
-                        (push (list :stack-load r s) loads)
-                        (loop for x from j to k
-                              do (let ((insn (aref v x)))
-                                   (when (and (eq (car insn) :stack-load) (eql (third insn) s))
-                                     (setf (gethash x rewrite) r)))))))
-                  (when loads
-                    (setf (gethash j inserts) (cons (incf max-label) (nreverse loads)))
-                    (%ira-trace "ira: ~a loop [~d ~d] loads ~s" *ira-name* j k loads)))))))
-        (if (= (hash-table-count inserts) 0)
-            ir
-            ;; retarget branches from OUTSIDE a loop to its new pre-label, then splice
-            (let ((pre (make-hash-table)) (out nil))       ; loop label -> (new-label start end)
-              (maphash (lambda (j e) (setf (gethash (second (aref v j)) pre)
-                                           (list (car e) j (cdr (assoc j loops)))))
-                       inserts)
-              (dotimes (x n)
-                (let* ((insn (aref v x)) (tg (%irp-target insn)) (p (and tg (gethash tg pre))))
-                  (when (gethash x inserts)
-                    (let ((e (gethash x inserts)))
-                      (push (list :label (car e)) out)
-                      (dolist (ld (cdr e)) (push ld out))))
-                  (cond ((and p (or (< x (second p)) (> x (third p))))
-                         (push (%ir-retarget insn (first p)) out))
-                        ((gethash x rewrite)
-                         (push (list :mov (second insn) (gethash x rewrite)) out))
-                        (t (push insn out)))))
-              (nreverse out)))))))
+                    (when free (push (cons s (pop free)) chosen)))
+                  (%ira-trace "ira: ~a natural loop at block ~d (~d blocks): free ~s chose ~s" *ira-name* h
+                              (count 1 body) free chosen)
+                  (when chosen
+                    ;; inside: the slot's loads and stores become moves
+                    (dotimes (b nb)
+                      (when (= (aref body b) 1)
+                        (loop for x from (aref bstart b) to (aref bend b)
+                              do (let* ((insn (aref v x))
+                                        (c (and (member (car insn) '(:stack-load :stack-store))
+                                                (assoc (third insn) chosen))))
+                                   (when c (setf (gethash x rewrite) c))))))
+                    ;; edges in: load; edges out: store back the slots the loop writes
+                    (let ((loads (mapcar (lambda (c) (list :stack-load (cdr c) (car c))) chosen))
+                          (stores (loop for c in chosen when (aref written (car c))
+                                        collect (list :stack-store (cdr c) (car c)))))
+                      (flet ((edge (from to code storep)
+                               ;; FROM -> TO: by the taken branch, by the fall-through, or both
+                               (let* ((last-x (aref bend from)) (last (aref v last-x))
+                                      (tg (%irp-target last)) (j (and tg (gethash tg label-at)))
+                                      (by-branch (and j (= (aref block-of j) to)))
+                                      (by-fall (and (= to (1+ from))
+                                                    (not (member (car last) '(:br :ret :tailcall))))))
+                                 (flet ((add (table key)
+                                          (let ((e (or (gethash key table) (setf (gethash key table) (cons nil nil)))))
+                                            (if storep
+                                                (setf (car e) (append (car e) code))
+                                                (setf (cdr e) (append (cdr e) code))))))
+                                   (when by-branch (add retarget last-x))
+                                   (when by-fall (add before-label to))))))
+                        (dotimes (b nb)
+                          (when (aref rpo b)
+                            (dolist (c (aref succs b))
+                              (cond ((and (= (aref body b) 0) (= (aref body c) 1)) (edge b c loads nil))
+                                    ((and (= (aref body b) 1) (= (aref body c) 0) stores) (edge b c stores t))))))))))))
+            (if (= (hash-table-count rewrite) 0)
+                ir
+                (let ((out nil) (bi 0) (tails nil))
+                  (dotimes (x n)
+                    (when (and (< bi nb) (= x (aref bstart bi)))
+                      (let ((e (gethash bi before-label)))
+                        (when e (dolist (c (append (car e) (cdr e))) (push c out))))
+                      (incf bi))
+                    (let* ((insn (aref v x)) (c (gethash x rewrite)) (e (gethash x retarget)))
+                      (push (cond (c (if (eq (car insn) :stack-load)
+                                         (list :mov (second insn) (cdr c))
+                                         (list :mov (cdr c) (second insn))))
+                                  (e (let ((lab (make-compiler-label)))
+                                       ;; the taken edge runs its code in a block at the end
+                                       (push (append (list (list :label lab)) (car e) (cdr e)
+                                                     (list (list :br (%irp-target insn))))
+                                             tails)
+                                       (%ir-retarget insn lab)))
+                                  (t insn))
+                            out)))
+                  (dolist (tl (reverse tails)) (dolist (c tl) (push c out)))
+                  (nreverse out)))))))))
 
 (defvar *fixed-arity-params* nil
   "After an image's MVM-COMPILE-ALL with *ELIDE-FIXED-NARGS*: function key ->

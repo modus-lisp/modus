@@ -124,6 +124,47 @@ What it showed:
   CALL reads no frame slot in a function without a setjmp landing) carry over to the web
   allocator.
 
+## Step 1b: natural loops (2026-11-25) -- built, off by default
+
+`%IRA-CFG` (basic blocks), `%IRA-DOMINATORS` (Cooper-Harvey-Kennedy over reverse postorder),
+`%IRA-NATURAL-LOOPS` (back edge T -> H with H dominating T; body = H plus what reaches T without
+passing H), and `%IR-ALLOC-LOOPS` rebuilt on them: in each innermost natural loop the hottest
+slots -- read-write ones too -- take registers no instruction of the body uses, loaded on every
+edge in and stored back on every edge out (stores before loads on an edge that leaves one loop
+and enters another; fall-through edge code before the target's label, taken-branch edge code in
+a block at the end of the function).
+
+- **Correct:** the suite passes with it on (MODUS_IR_ALLOC=1 MODUS_IR_ALLOC_WHOLE=0), and stave's
+  transcript is unchanged.
+- **Finds the real loops:** mill's OP-WHERE (27,287 instructions, 6,315 blocks) has 15 loops, 10
+  innermost; each per-dtype element loop gets 2-3 of its index slots (31-34) into V7 / V8 / V13.
+- **No gain:** Where's replay stays at 11.2-11.5 us, the stave pass at ~1.5 s.  And compiling is
+  slower: stave's load goes 5.9 -> 8.5 s (dominators over thousands of blocks, per function).
+- **Why no gain -- the real finding of step 1:** on Apple cores a frame-slot load hits L1 and a
+  store forwards to the next load; they cost about what a register move does.  The gap to SBCL is
+  instruction count.  SBCL's loop for the same Where-shaped code is 35 instructions an element and
+  does the same safety work (reloads each array's length per access, tag-tests the steps,
+  overflow-checks the adds); modus's is ~60 IR operations an element, more native instructions.
+  Example: a bounds check is SBCL's LDR length / CMP / B.LS (unsigned: a negative index fails too)
+  against modus's CMP-IMM idx 0 / BLT / ARRAY-LEN / CMP / BGE.
+
+## Revised direction (2026-11-25)
+
+Allocation is not the bottleneck on this hardware; instructions per operation are.  What to do
+next, in order of expected payoff:
+
+1. **Count native instructions per IR op in hot loops** (JIT bytes disassembled) against SBCL's,
+   to rank the expansions worth fixing.
+2. **Unsigned compare-and-branch** (an IR / bytecode branch on unsigned >=): every bounds check
+   becomes length / compare / one branch.  Needs an interpreter arm and translator arms (aarch64
+   first; elsewhere the old sequence).
+3. **Leaner translator expansions** of ARRAY-LEN, ADD-CHECKED, tag tests and tagged index
+   scaling (SBCL folds the untag into the address: ADD TMP, R2, NL1, LSL #1).
+4. **Loop-invariant hoisting** of ARRAY-LEN and array loads, using the natural loops above --
+   only once each costs instructions, not memory traffic.
+5. The web allocator stays the long-term plan (and the front end's register decisions stay in
+   the log), but it is no longer the first lever.
+
 ## Front-end constraint log
 
 Each entry: what the front end does, what it costs, what a front end without the constraint

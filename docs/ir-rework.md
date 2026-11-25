@@ -279,10 +279,11 @@ happens just before the timed batch; a warm start begins mid-semispace and takes
 inside it (CLB_GCCOUNT: 0 vs 2 collections, 0.069 vs 0.079 s; the next batch 0.072 vs 0.071).
 Compare runners on the same cache state.
 
-Found, not fixed: `(logand (+ 3 7) 255)` -- a LOGAND / LOGIOR of a literal-arithmetic argument --
-fails to compile at run time ("interp-closure compile failed"), on builds back to at least g17.
-`(mod (* 3 7) 256)` hits it through %MOD-POW2-REWRITE.  The inner error is swallowed by the
-mvm-eval compile wrapper.
+Fixed (cf923dec): `(logand (+ 3 7) 255)` failing to compile.  The cause was APPLY, not LOGAND: in
+baked code `(apply #'+ list)` took COMPILE-APPLY's pre-packed &rest call, which is wrong for a
+callee with &optional parameters (CL's + and * have them), so + saw NIL -- and %CONST-INT-VALUE
+folds literal arithmetic with APPLY.  Also (48a31786): generic + - * / signal TYPE-ERROR on any
+non-number once *%ARITH-STRICT* is set (after boot); comparisons stay lenient, pending their audit.
 
 ## Front-end constraint log
 

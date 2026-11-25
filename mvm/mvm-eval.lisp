@@ -4554,7 +4554,7 @@
       ;; The image build's IR clean-ups (%RT-IR-PASSES), which runtime code
       ;; never had.
       (unless *rt-ir-passes-off*
-        (dolist (e all-ir) (setf (cdr e) (%rt-ir-passes (cdr e)))))
+        (dolist (e all-ir) (setq *ira-name* (if (function-info-p (car e)) (function-info-name (car e)) (car e))) (setf (cdr e) (%rt-ir-passes (cdr e)))))
       ;; Fresh buffer (do NOT touch *mvm-eval-buffer* — keep mvm-eval-forms's reuse
       ;; buffer pristine for the oracle interpret path that runs after us).
       ;; NOTE: reusing a persistent buffer here was tried and REVERTED — the
@@ -5359,7 +5359,7 @@
       ;; The image build's IR clean-ups (%RT-IR-PASSES), which runtime code
       ;; never had.
       (unless *rt-ir-passes-off*
-        (dolist (e all-ir) (setf (cdr e) (%rt-ir-passes (cdr e)))))
+        (dolist (e all-ir) (setq *ira-name* (if (function-info-p (car e)) (function-info-name (car e)) (car e))) (setf (cdr e) (%rt-ir-passes (cdr e)))))
       ;; Union the compiler-recorded defun names (macro-hidden defuns the
       ;; raw-forms pre-scan can't see — with-upgradability → eval-when →
       ;; defun) into persist-names for the trampoline install loop below.

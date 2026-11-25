@@ -103,9 +103,22 @@ What it showed:
   element) with every 4 bytes of code added before it.  Fixed in the aarch64 translator: loop
   headers (targets of backward branches) are padded to 16 bytes (`MODUS_ALIGN_LOOPS=0` disables).
   Measurements before this were subject to that swing.
-- **Known bug, must be found before enabling:** with MODUS_IR_ALLOC=1, test/hosted-channel.lisp
-  fails its "arena did not move" check (moved -1 MB) whenever six copies run at once; it passes
-  run alone, and always passes with the pass off.
+- **hosted-channel under load (open).**  With MODUS_IR_ALLOC=1, test/hosted-channel.lisp fails
+  its "arena did not move" check (moved -1 MB) every time six copies run at once; alone it passes,
+  and with the pass off it always passes -- also when the arena is shifted by up to 6 MB before the
+  test, so it is not where the window starts.  Bisecting by function (MODUS_IR_ALLOC_RANGE,
+  MODUS_IR_ALLOC_HASH) finds no single culprit: it takes changes in both halves of any split.  And
+  MODUS_IR_ALLOC_DRYRUN=1 (do all the work, keep the original IR) fails the same way, so it
+  follows the pass's compile-time activity, not the code it produces.  The receive loop is one
+  top-level form compiled before it runs; what compiles inside the window is not yet known.
+- **The code it produces is slower to load.**  stave's load: 5.85 s off, 6.6 s on, 5.9 s dry run.
+  Suspect: the entry loads -- every function now loads each promoted parameter slot into its
+  register at entry, though many are read once on a cold path.  The web allocator should weigh
+  entry cost against uses (loop depth) and not promote cold slots.
+- **Bisecting tools** (compiler.lisp): MODUS_IR_ALLOC_TRACE=1 names each function and what was
+  done; MODUS_IR_ALLOC_RANGE=LO,HI (by order offered), MODUS_IR_ALLOC_ONLY=TEXT (name contains),
+  MODUS_IR_ALLOC_HASH=D,V (low D bits of a hash of the name), MODUS_IR_ALLOC_DRYRUN=1.
+  Liveness sets keep frame slots at bit 17+ so they stay fixnums (they were bignums at bit 32).
 - The operand table (`%IRA-SHAPE`), liveness (`%IRA-LIVENESS`) and eligibility rules
   (`%IRA-BLOCKER`: raw LOAD / STORE are ordinary memory unless the function names VSP / VFP; a
   CALL reads no frame slot in a function without a setjmp landing) carry over to the web

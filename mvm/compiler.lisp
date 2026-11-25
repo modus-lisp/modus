@@ -2875,9 +2875,14 @@
    and %IR-ALLOC-LOOPS (frame slots into idle registers, docs/ir-rework.md) and, when they moved
    any, the dataflow round again to fold their moves."
   (let* ((ir1 (%ir-peephole (%ir-dataflow (%ir-peephole ir))))
-         (ir2 (%ir-alloc ir1))
-         (ir3 (if (and (%ira-enabled-p) (not (%ira-off-p "MODUS_IR_ALLOC_LOOPS"))) (%ir-alloc-loops ir2) ir2)))
-    (if (eq ir3 ir1) ir1 (%ir-peephole (%ir-dataflow ir3)))))
+         (on (and (%ira-enabled-p) (%ira-in-range-p) (%ira-name-ok-p)))
+         (ir2 (if on (%ir-alloc ir1) ir1))
+         (ir3 (if (and on (not (%ira-off-p "MODUS_IR_ALLOC_LOOPS"))) (%ir-alloc-loops ir2) ir2)))
+    (cond ((eq ir3 ir1) ir1)
+          ;; MODUS_IR_ALLOC_DRYRUN=1: do all the work, keep the original (bisecting compile-time
+          ;; cost apart from the code produced)
+          ((equal (%ira-env "MODUS_IR_ALLOC_DRYRUN") "1") (%ir-peephole (%ir-dataflow ir3)) ir1)
+          (t (%ir-peephole (%ir-dataflow ir3))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; %IR-DATAFLOW: liveness, copy propagation and frame-slot forwarding over one
@@ -3134,6 +3139,12 @@
 ;;; a slot live on entry or touched by FP-SPILL / FP-RELOAD.  aarch64 run-time compiles only;
 ;;; MODUS_IR_ALLOC=0 turns it off.
 
+;; Liveness sets are integers: V0..VR in bits 0..16, frame slot S at bit 17+S.  Slots used to start
+;; at 32 (as in %IRDF-MASKS), which made every set a bignum -- and every LOGIOR of the fixed-point
+;; iteration an allocation: a hot build during a channel loop then crossed a 1 MB arena block
+;; (test/hosted-channel.lisp, "arena did not move").  From 17 they stay fixnums up to ~44 slots.
+(defconstant +ira-slot-bit+ 17)
+
 ;; Environment switches are read once per process: %CLI-GETENV costs ~40 us, and these are asked
 ;; at every run-time compile and translation (a cl-bench DDERIV run paid 6% for it).
 (defvar *ira-env* nil "Alist name -> value of the MODUS_IR_* / MODUS_ALIGN_LOOPS switches read so far.")
@@ -3174,7 +3185,7 @@
            (list (third insn) (1+ (third insn))))))
 
 (defun %ira-masks (insn all-slots)
-  "(values GEN KILL DEF) over bits 0..16 (V0..VR) and 32+S (frame slot S); DEF is what INSN
+  "(values GEN KILL DEF) over bits 0..16 (V0..VR) and +IRA-SLOT-BIT+ + S (frame slot S); DEF is what INSN
    writes (KILL before a read-also-written register is removed from it)."
   (let ((shape (%ira-shape (car insn))) (gen 0) (kill 0))
     (destructuring-bind (rd wr) shape
@@ -3183,10 +3194,10 @@
       (dolist (p wr)
         (let ((r (nth p insn))) (when (%irdf-reg-p r) (setq kill (logior kill (ash 1 r)))))))
     (case (car insn)
-      (:stack-load (setq gen (logior gen (ash 1 (+ 32 (third insn))))))
-      (:stack-store (setq kill (logior kill (ash 1 (+ 32 (third insn))))))
-      (:fp-spill (dolist (s (%ira-fp-slots insn)) (setq kill (logior kill (ash 1 (+ 32 s))))))
-      (:fp-reload (dolist (s (%ira-fp-slots insn)) (setq gen (logior gen (ash 1 (+ 32 s))))))
+      (:stack-load (setq gen (logior gen (ash 1 (+ +ira-slot-bit+ (third insn))))))
+      (:stack-store (setq kill (logior kill (ash 1 (+ +ira-slot-bit+ (third insn))))))
+      (:fp-spill (dolist (s (%ira-fp-slots insn)) (setq kill (logior kill (ash 1 (+ +ira-slot-bit+ s))))))
+      (:fp-reload (dolist (s (%ira-fp-slots insn)) (setq gen (logior gen (ash 1 (+ +ira-slot-bit+ s))))))
       ;; A callee reads V0-V3 and returns VR.  It does NOT read this frame's slots: they are
       ;; reached only through this function's own STACK-LOADs (%IRDF-FRAME-TOUCH-P excludes the
       ;; rest), and a callee can unwind INTO this frame only to a setjmp landing, which needs a
@@ -3195,6 +3206,28 @@
                    kill (logior kill (ash 1 16))))
       (:ret (setq gen (logior gen (%irdf-bits 16)))))
     (values gen (logandc2 kill gen) kill)))
+
+(defvar *ira-count* nil "Functions %RT-IR-PASSES has offered %IR-ALLOC so far (MODUS_IR_ALLOC_RANGE).")
+(defvar *ira-name* nil "The function %RT-IR-PASSES is working on (set by its callers in mvm-eval.lisp).")
+(defun %ira-name-ok-p ()
+  "MODUS_IR_ALLOC_ONLY=TEXT: only functions whose name contains TEXT, for bisecting."
+  (let ((only (%ira-env "MODUS_IR_ALLOC_ONLY")) (h (%ira-env "MODUS_IR_ALLOC_HASH")))
+    (and (or (null only)
+             (and *ira-name* (search only (princ-to-string *ira-name*) :test #'char-equal) t))
+         ;; MODUS_IR_ALLOC_HASH=D,V: the low D bits of the name's hash equal V
+         (or (null h)
+             (let* ((c (position #\, h)) (d (parse-integer h :end c)) (val (parse-integer h :start (1+ c)))
+                    (str (princ-to-string *ira-name*)) (x 0))
+               (dotimes (i (length str)) (setq x (logand (+ (* x 31) (char-code (char str i))) #xFFFFFF)))
+               (= (logand x (1- (ash 1 d))) val))))))
+(defun %ira-in-range-p ()
+  "MODUS_IR_ALLOC_RANGE=LO,HI: only the LOth..HIth functions offered (0-based), for bisecting."
+  (let ((k (or *ira-count* 0)) (r (%ira-env "MODUS_IR_ALLOC_RANGE")))
+    (setq *ira-count* (+ k 1))
+    (or (null r)
+        (let* ((c (position #\, r))
+               (lo (parse-integer r :end c)) (hi (parse-integer r :start (1+ c))))
+          (and (<= lo k) (<= k hi))))))
 
 (defun %ira-enabled-p ()
   "Off by default until the web allocator replaces slot promotion (docs/ir-rework.md: on stave it
@@ -3239,7 +3272,7 @@
   (unless (and (%ira-enabled-p) (not (%ira-off-p "MODUS_IR_ALLOC_WHOLE"))) (return-from %ir-alloc ir))
   (let ((v (coerce ir 'vector)))
     (unless (%ira-eligible-p v)
-      (%ira-trace "ira: skip ~d insns, ~s" (length v) (%ira-blocker v))
+      (%ira-trace "ira: ~a skip ~d insns, ~s" *ira-name* (length v) (%ira-blocker v))
       (return-from %ir-alloc ir))
     (setq *irdf-vr-is-v0* (%irdf-vr-is-v0-p))
     (let* ((n (length v))
@@ -3247,7 +3280,7 @@
                              maximize (cond ((member (car insn) '(:stack-load :stack-store)) (third insn))
                                             ((%ira-fp-slots insn) (reduce #'max (%ira-fp-slots insn)))
                                             (t -1)))))
-           (all-slots (ash (1- (ash 1 nslots)) 32))
+           (all-slots (ash (1- (ash 1 nslots)) +ira-slot-bit+))
            (label-at (make-hash-table))
            (gen (make-array n)) (kill (make-array n)) (def (make-array n))
            (live-in (make-array n :initial-element 0))
@@ -3298,7 +3331,7 @@
         (let ((entry-ok (and (eq (car (aref v 0)) :frame-enter)
                              (not (logtest entry #x1FFF0)))) ; nothing in V4..VR is read before set
           (dotimes (s nslots)
-            (when (and (logbitp (+ 32 s) entry) (not entry-ok)) (setf (aref bad s) t))))
+            (when (and (logbitp (+ +ira-slot-bit+ s) entry) (not entry-ok)) (setf (aref bad s) t))))
         ;; OCCUPIED: per register, the points where it already holds a value -- live in or out,
         ;; or written there.  A slot takes register R when R is free wherever the slot is.
         (let ((occ (make-array 17 :initial-element nil))
@@ -3314,7 +3347,7 @@
                          (setf (aref bits k) 1)))
                      (setf (aref occ r) bits)))
           (dolist (s order)
-            (let ((sb (ash 1 (+ 32 s))))
+            (let ((sb (ash 1 (+ +ira-slot-bit+ s))))
               (loop for r in '(7 8 6 5 4 13 12 11 10 9)
                     do (let ((bits (aref occ r)))
                          (when (loop for k below n
@@ -3325,7 +3358,7 @@
                                (setf (aref bits k) 1)))
                            (setf (aref assign s) r any t)
                            (return))))))
-          (%ira-trace "ira: ~d insns, ~d slots, weights ~s, bad ~s, assigned ~s" n nslots
+          (%ira-trace "ira: ~a ~d insns, ~d slots, weights ~s, bad ~s, assigned ~s" *ira-name* n nslots
                       (coerce weight 'list) (coerce bad 'list) (coerce assign 'list))
           (if (not any)
               ir
@@ -3337,7 +3370,7 @@
                                                (t (list :mov (second insn) r)))))))
                 ;; the entry loads, right after FRAME-ENTER
                 (let ((loads (loop for s below nslots
-                                   when (and (aref assign s) (logbitp (+ 32 s) entry))
+                                   when (and (aref assign s) (logbitp (+ +ira-slot-bit+ s) entry))
                                      collect (list :stack-load (aref assign s) s))))
                   (if loads
                       (cons (car out) (append loads (cdr out)))
@@ -3350,7 +3383,7 @@
                            maximize (cond ((member (car insn) '(:stack-load :stack-store)) (third insn))
                                           ((%ira-fp-slots insn) (reduce #'max (%ira-fp-slots insn)))
                                           (t -1)))))
-         (all-slots (if (> nslots 0) (ash (1- (ash 1 nslots)) 32) 0))
+         (all-slots (if (> nslots 0) (ash (1- (ash 1 nslots)) +ira-slot-bit+) 0))
          (label-at (make-hash-table))
          (gen (make-array n)) (kill (make-array n)) (def (make-array n))
          (live-in (make-array n :initial-element 0))
@@ -3447,7 +3480,7 @@
                                      (setf (gethash x rewrite) r)))))))
                   (when loads
                     (setf (gethash j inserts) (cons (incf max-label) (nreverse loads)))
-                    (%ira-trace "ira: loop [~d ~d] loads ~s" j k loads)))))))
+                    (%ira-trace "ira: ~a loop [~d ~d] loads ~s" *ira-name* j k loads)))))))
         (if (= (hash-table-count inserts) 0)
             ir
             ;; retarget branches from OUTSIDE a loop to its new pre-label, then splice

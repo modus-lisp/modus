@@ -6124,8 +6124,12 @@
     (loop
       (when (>= i len) (return nil))
       (let ((c (%prim-aref name-string i)))
-        (when (and (>= c 97) (<= c 122))
-          (setq c (- c 32)))
+        ;; CHAR-UPCASE of the code, Unicode as the host's (SBCL's STRING-UPCASE in
+        ;; cross.lisp): ASCII inline, the rest by table.  ASCII-only here hashed a name
+        ;; holding a lower-case non-ASCII letter differently from the build host.
+        (setq c (if (< c 128)
+                    (if (and (>= c 97) (<= c 122)) (- c 32) c)
+                    (%code-upcase c)))
         (setq c (logand c 65535))
         ;; %FIXNUM-* (raw), as prelude.lisp's version: every product is below
         ;; 2^25 (16-bit state x 9-bit prime), but plain * cannot prove that, and

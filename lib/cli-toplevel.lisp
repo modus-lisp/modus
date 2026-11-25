@@ -56,21 +56,39 @@
   (sys-exit code))
 
 (defun %cli-cstr-at (addr)
-  "Read a NUL-terminated C string at raw byte ADDR into a fresh Lisp string.
-   Returns \"\" for an empty string; the caller guarantees ADDR is non-NULL."
-  (let ((len 0))
-    ;; measure
+  "Read a NUL-terminated C string at raw byte ADDR into a fresh Lisp string, decoding it
+   as UTF-8 (as SBCL decodes argv and the environment under a UTF-8 locale: `--eval
+   '\"été\"'' is three characters, not five).  A malformed sequence's lead byte stands for
+   itself.  Returns \"\" for an empty string; the caller guarantees ADDR is non-NULL."
+  (let ((len 0) (nchars 0))
+    ;; measure: bytes, and characters (every byte that is not a continuation byte)
     (let ((i 0))
       (loop
         (let ((b (mem-ref (+ addr i) :u8)))
           (when (= b 0) (return nil))
+          (unless (= (logand b #xC0) #x80) (setq nchars (+ nchars 1)))
           (setq i (+ i 1)))
         (setq len i)))
-    (let ((s (%make-string-array len)) (i 0))
+    (let ((s (%make-string-array nchars)) (i 0) (k 0))
       (loop
-        (when (>= i len) (return s))
-        (aset s i (mem-ref (+ addr i) :u8))
-        (setq i (+ i 1))))))
+        (when (or (>= i len) (>= k nchars)) (return s))
+        (let* ((b (mem-ref (+ addr i) :u8))
+               (n (cond ((< b #x80) 0) ((= (logand b #xE0) #xC0) 1)
+                        ((= (logand b #xF0) #xE0) 2) ((= (logand b #xF8) #xF0) 3) (t 0)))
+               (c (cond ((= n 1) (logand b #x1F)) ((= n 2) (logand b #x0F))
+                        ((= n 3) (logand b #x07)) (t b)))
+               (j 1))
+          (loop
+            (when (> j n) (return nil))
+            (let ((cb (if (< (+ i j) len) (mem-ref (+ addr i j) :u8) 0)))
+              (if (= (logand cb #xC0) #x80)
+                  (setq c (logior (ash c 6) (logand cb #x3F)))
+                  ;; truncated sequence: the lead byte stands for itself
+                  (progn (setq c b) (setq n (- j 1)) (return nil))))
+            (setq j (+ j 1)))
+          (aset s k c)
+          (setq k (+ k 1))
+          (setq i (+ i 1 n)))))))
 
 (defun %cli-read-ptr (slot)
   "The C pointer stored at raw byte address SLOT, as an exact integer.

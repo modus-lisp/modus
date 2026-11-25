@@ -781,7 +781,7 @@
   "Read the .asd at PATH, find NAME's DEFSYSTEM in it, register it as NOT
    loaded, and return the SYSTEM."
   (let* ((forms (%it-read-asd-forms (%it-slurp-text path) path))
-         (ds (%it-find-defsystem forms (asdf::coerce-name name))))
+         (ds (%it-find-defsystem forms (asdf::coerce-name name) t)))
     (when (null ds)
       (error 'asdf::missing-component :requires (asdf::coerce-name name)))
     (asdf::%register name ds path nil)))
@@ -813,7 +813,11 @@
       (hit hit)
       (t (let ((path (asdf::%locate-asd n)))
            (cond
-             (path (asdf::%register-from-asd n path))
+             (path (if error-p
+                       (asdf::%register-from-asd n path)
+                       ;; the .asd is there but may not define N ("foo/nonsense")
+                       (handler-case (asdf::%register-from-asd n path)
+                         (asdf::missing-component () nil))))
              (t
               ;; Registry + central-registry missed: run the runtime
               ;; search functions (quicklisp integration — see

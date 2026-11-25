@@ -565,9 +565,11 @@
           (t nil)))))
   acc)
 
-(defun %it-find-defsystem (asd-forms sysname)
+(defun %it-find-defsystem (asd-forms sysname &optional strict)
   "From the forms of an .asd, return the (defsystem ...) form for SYSNAME,
-   or the FIRST defsystem if SYSNAME is NIL."
+   or the FIRST defsystem if SYSNAME is NIL or names none of them -- unless
+   STRICT, when a SYSNAME the file does not define is NIL.  ASDF:FIND-SYSTEM
+   asks strictly: \"spool/nonsense\" is not spool.asd's first system."
   (let ((first-ds nil))
     (dolist (form asd-forms)
       (when (and (consp form)
@@ -577,7 +579,7 @@
           (when (null first-ds) (setq first-ds form))
           (when (and sysname (string= this-name sysname))
             (return-from %it-find-defsystem form)))))
-    first-ds))
+    (if (and strict sysname) nil first-ds)))
 
 ;;; --- topological sort by module-local deps ----------------------------------
 ;;;

@@ -181,13 +181,14 @@
        (%print-decimal-to-stream base stream)
        (%print-char 114 stream))))  ; #Nr
 
-;;; Char-class predicates (use char codes; alpha test is ASCII-only,
-;;; which matches the rest of the printer/reader).
-(defun %ch-upperp (c) (and (>= c 65) (<= c 90)))
-(defun %ch-lowerp (c) (and (>= c 97) (<= c 122)))
+;;; Char-class predicates on char codes: Unicode, as the reader's case conversion is
+;;; (prelude.lisp's %CODE-*), so a symbol the reader upcased prints back unescaped and one
+;;; holding a lower-case non-ASCII letter prints |escaped|, as in SBCL.
+(defun %ch-upperp (c) (%code-upper-p c))
+(defun %ch-lowerp (c) (%code-lower-p c))
 (defun %ch-alphap (c) (or (%ch-upperp c) (%ch-lowerp c)))
-(defun %ch-to-upper (c) (if (%ch-lowerp c) (- c 32) c))
-(defun %ch-to-lower (c) (if (%ch-upperp c) (+ c 32) c))
+(defun %ch-to-upper (c) (%code-upcase c))
+(defun %ch-to-lower (c) (%code-downcase c))
 
 ;;; Scan a name string and classify its case content.
 ;;; Returns one of :all-upper, :all-lower, :mixed, :no-alpha.
@@ -349,10 +350,7 @@
     (loop
       (when (or (not ok) (= i len)) (return (and ok (> digits 0))))
       (let* ((c (%prim-aref name i))
-             (v (cond ((and (>= c 48) (<= c 57)) (- c 48))
-                      ((and (>= c 65) (<= c 90)) (- c 55))
-                      ((and (>= c 97) (<= c 122)) (- c 87))
-                      (t nil))))
+             (v (%code-digit-weight c 36)))   ; any decimal digit: the reader reads them
         (cond ((and v (< v base)) (setq digits (+ digits 1)))
               ((or (= c 43) (= c 45) (= c 46) (= c 47)) nil)
               (t (setq ok nil))))
@@ -4367,7 +4365,7 @@
           ((and (= c 58) (not seen-colon)) (setq seen-colon t just-colon t))
           ((and (= c 58) just-colon) (setq just-colon nil))
           (t (setq just-colon nil)
-             (%print-char (if (and (>= c 97) (<= c 122)) (- c 32) c)
+             (%print-char (%code-upcase c)
                           (if seen-colon sym-out pkg-out)))))
       (setq k (+ k 1)))
     (let* ((first-part (get-output-stream-string pkg-out))
@@ -4873,14 +4871,14 @@
                                                         (loop
                                                           (when (= k (array-length result)) (return nil))
                                                           (let ((c (%prim-aref result k)))   ; raw code
-                                                            (let ((upper (and (>= c 65) (<= c 90)))
-                                                                  (lower (and (>= c 97) (<= c 122))))
+                                                            (let ((upper (%code-upper-p c))
+                                                                  (lower (%code-lower-p c)))
                                                               (cond
                                                                 ((and (not first-done) (or upper lower))
-                                                                 (aset r k (if lower (- c 32) c))
+                                                                 (aset r k (if lower (%code-upcase c) c))
                                                                  (setq first-done t))
                                                                 (upper
-                                                                 (aset r k (+ c 32)))
+                                                                 (aset r k (%code-downcase c)))
                                                                 (t
                                                                  (aset r k c)))))
                                                           (setq k (+ k 1))))

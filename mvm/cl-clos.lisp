@@ -7238,7 +7238,7 @@
       (when (>= i end) (return str))
       (let ((ch (%ensure-char-code (aref str i))))   ; AREF→char; want raw code
         (when (lower-case-p (code-char ch))
-          (aset str i (- ch 32))))
+          (aset str i (%code-upcase ch))))
       (setq i (+ i 1)))))
 
 (defun nstring-downcase-raw (str start end)
@@ -7248,7 +7248,7 @@
       (when (>= i end) (return str))
       (let ((ch (%ensure-char-code (aref str i))))   ; AREF→char; want raw code
         (when (upper-case-p (code-char ch))
-          (aset str i (+ ch 32))))
+          (aset str i (%code-downcase ch))))
       (setq i (+ i 1)))))
 
 (defun nstring-capitalize-raw (str start end)
@@ -7260,10 +7260,10 @@
         (if (alphanumericp (code-char ch))
             (if in-word
                 (when (upper-case-p (code-char ch))
-                  (aset str i (+ ch 32)))
+                  (aset str i (%code-downcase ch)))
                 (progn
                   (when (lower-case-p (code-char ch))
-                    (aset str i (- ch 32)))
+                    (aset str i (%code-upcase ch)))
                   (setq in-word t)))
             (setq in-word nil)))
       (setq i (+ i 1)))))

@@ -986,7 +986,7 @@
     (loop
       (when (>= i n) (return nil))
       (let ((c (%ensure-char-code (char name-str i))))
-        (when (and (>= c 97) (<= c 122)) (setq lower t)))
+        (when (/= (%code-upcase c) c) (setq lower t)))   ; the letters the hash folds
       (setq i (+ i 1)))
     (if (not lower)
         ;; Record the name here too.  A keyword carries only its key, so without it
@@ -1002,7 +1002,7 @@
           (loop
             (when (>= j n) (return nil))
             (let ((c (%ensure-char-code (char name-str j))))
-              (when (and (>= c 97) (<= c 122)) (write-char (code-char 1) out))
+              (when (/= (%code-upcase c) c) (write-char (code-char 1) out))
               (write-char (code-char c) out))
             (setq j (+ j 1)))
           (let ((key (compute-name-hash (get-output-stream-string out))))

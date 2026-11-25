@@ -96,7 +96,9 @@
     (load (concatenate 'string tree "modus/scripts/glass-desk.lisp"))))
 
 (defun cmd-repl ()
-  (funcall (find-symbol "%CLI-REPL" "MODUS-INT") t))
+  ;; INTERN, not FIND-SYMBOL: a kernel function is in the image by name, but its symbol
+  ;; exists only once something interns it (FIND-SYMBOL answered NIL: UNDEFINED-FUNCTION)
+  (funcall (intern "%CLI-REPL" "MODUS-INT") t))
 
 (defun cmd-sources ()
   (say "~A~%" (ensure-sources)))

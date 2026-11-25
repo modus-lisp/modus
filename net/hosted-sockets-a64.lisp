@@ -200,6 +200,9 @@
 
 (defun %sbs-poll-in (fd ms) (socket-wait-readable fd ms))
 
+;;; LISTEN's readiness check (%FD-INPUT-READY-P) on AArch64 is net/hosted-fd-ready-a64.lisp,
+;;; compiled into the image: a DEFUN here, evaluated at boot, would not reach LISTEN on macOS.
+
 (defun %sbs-bind-un (fd path)
   (let ((len (%sbs-addr-un path)))
     (if (< len 0) -36 (%gc-safe-block-3 200 fd (%sbs-scratch) len))))

@@ -3,6 +3,9 @@
 ;;;;   MODUS_SRC_TREE=DIR/ MODUS_SRC_OUT=src.tar.z  modus --script scripts/make-source-tar.lisp
 ;;;;   (or sbcl --script; the output is the same bytes)
 ;;;;
+;;;; MODUS_SRC_REPOS=all takes every repository in DIR instead, less MODUS_SRC_EXCLUDE
+;;;; (default "dist"), so DIR must then hold the org's repositories and nothing else.
+;;;;
 ;;;; DIR holds the modus-lisp repositories side by side, as exported (`git archive`, or the
 ;;;; release's source tarball unpacked): every file under it is a candidate, so it must be a
 ;;;; clean export, not a working checkout.  The output is a tar of DIR's repositories that
@@ -147,7 +150,24 @@
 
 ;;; --- run ----------------------------------------------------------------------------
 
-(let* ((repos (closure-repos))
+(defun words (s)
+  (let ((acc nil) (start 0))
+    (loop (let ((sp (position #\Space s :start start)))
+            (when (> (or sp (length s)) start) (push (subseq s start sp) acc))
+            (if sp (setq start (1+ sp)) (return))))
+    (nreverse acc)))
+
+(defun all-repos ()
+  "MODUS_SRC_REPOS=all: every repository in *TREE* -- the tree is the org's, exported --
+   less MODUS_SRC_EXCLUDE (default dist: the release binaries, modus.com among them)."
+  (let ((root (namestring (truename *tree*)))
+        (exclude (words (env "MODUS_SRC_EXCLUDE" "dist"))))
+    (sort (loop for d in (directory (concatenate 'string root "*/"))
+                for n = (let ((s (namestring d))) (subseq s (length root) (1- (length s))))
+                unless (member n exclude :test #'string=) collect n)
+          #'string<)))
+
+(let* ((repos (if (string-equal (env "MODUS_SRC_REPOS" "") "all") (all-repos) (closure-repos)))
        (names (sort (remove-if-not #'keep-p (loop for r in repos append (files-under r))) #'string<))
        (tar (write-tar names (env "MODUS_SRC_TAR"))))
   (format t "~&make-source-tar: ~D repositories (~{~A~^ ~}), ~D files, ~D bytes of tar~%"

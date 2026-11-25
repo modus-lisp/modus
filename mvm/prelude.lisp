@@ -1116,7 +1116,20 @@
 (defun %f32-bits-set-rt (a i bits) (%f32-bits-set a i bits))
 
 (defun %bits->single (b)
-  "IEEE32 bit pattern B (0..2^32-1) → a fresh boxed single-float."
+  "IEEE32 bit pattern B (0..2^32-1) → a fresh boxed single-float.  Through a one-lane packed
+   vector and the lane load the target compiles natively (FCVT on aarch64, CVTSS2SD on x64, the
+   soft-float routine elsewhere): the field-by-field Lisp conversion below -- a dozen shifts on
+   untyped integers, half of them overflow-checked calls -- was 60% of loading a Zipformer model,
+   one call per weight.  An infinity or NaN keeps the Lisp path, which preserves a signalling
+   NaN's payload where the hardware conversion would quiet it."
+  (if (= (logand b #x7F800000) #x7F800000)
+      (%bits->single-lisp b)
+      (let ((v (%make-f32-vector 1)))
+        (%f32-bits-set v 0 b)
+        (%f32-load v 0))))
+
+(defun %bits->single-lisp (b)
+  "IEEE32 bit pattern B (0..2^32-1) → a fresh boxed single-float, field by field (the reference)."
   (let* ((s (ash b -31))
          (e8 (logand (ash b -23) 255))
          (m23 (logand b 8388607))

@@ -236,6 +236,29 @@ and the jump from the loop body to the back-edge block (the front end emits `(:b
 L) (:safepoint) (:br top)` -- block layout / jump threading, an IR pass).  Then the instruction-
 count items (bounds check 8 -> 3 with an unsigned branch, index scaling, tag tests).
 
+## Step 3: model load (2026-11-25)
+
+stave on modus vs SBCL: passes now within 4% (1.27 vs 1.22 s), but loading the Zipformer model
+took 3.3 s against 0.4.  Profile: ~60% in %BITS->SINGLE (SB-KERNEL:MAKE-SINGLE-FLOAT, one call per
+weight: a field-by-field Lisp conversion with checked shifts and bignum ASH), ~25% in reading the
+262 MB weight file a byte at a time out of a 4 KB I/O page.
+
+- `%BITS->SINGLE` goes through a one-lane packed vector and the native lane load (infinities and
+  NaNs keep the Lisp path, which preserves a signalling NaN's payload).
+- `(setf (aref f32 i) (sb-kernel:make-single-float x))` as a statement compiles to
+  `%F32-BITS-SET` -- the bits into the lane, no float made, exact for every pattern.
+- `READ-SEQUENCE` of a regular file into a packed byte vector reads straight into the vector, a
+  megabyte a syscall (`%FS-READ-U8-BULK`): 262 MB 0.57 -> 0.032 s (SBCL 0.021).  Safe: no
+  allocation between taking the address and the read returning, and the plain syscall (not the
+  GC-safe-region one sockets use) holds collections off for the read.
+
+Model load 3.3 -> 0.6 s (SBCL 0.4).  test/model-load-paths.lisp.
+
+Found, not fixed: `(logand (+ 3 7) 255)` -- a LOGAND / LOGIOR of a literal-arithmetic argument --
+fails to compile at run time ("interp-closure compile failed"), on builds back to at least g17.
+`(mod (* 3 7) 256)` hits it through %MOD-POW2-REWRITE.  The inner error is swallowed by the
+mvm-eval compile wrapper.
+
 ## Front-end constraint log
 
 Each entry: what the front end does, what it costs, what a front end without the constraint

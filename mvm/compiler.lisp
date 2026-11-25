@@ -33735,6 +33735,18 @@
               (free-fp-reg))
             (free-temp-reg) (free-temp-reg)))
       (return-from compile-aset-1 nil))
+    ;; A FLOAT MADE FROM ITS BITS, stored: (setf (aref r i) (sb-kernel:make-single-float x)) -- how
+    ;; mill decodes every weight of a model -- is the 32-bit pattern written into the lane, no float
+    ;; made at all.  Exact for every pattern (NaN payloads too).  A discarded store only: the
+    ;; value of a used one is the float.
+    (when (and *mvm-eval-runtime-p* unused (consp val-form) (symbolp (car val-form)) (car val-form)
+               (string= (symbol-name (car val-form)) "MAKE-SINGLE-FLOAT")
+               (symbol-package (car val-form))
+               (string= (package-name (symbol-package (car val-form))) "SB-KERNEL")
+               (consp (cdr val-form)) (null (cddr val-form)))
+      (return-from compile-aset-1
+        (compile-form (list '%f32-bits-set arr-form idx-form (list 'logand (cadr val-form) 4294967295))
+                      env dest)))
     ;; A CHOICE OF TWO FLOAT VALUES -- (setf (aref r i) (if c (aref a j) (aref b k))), mill's Where --
     ;; is the store in each arm: the tree compiler has no IF, so the value was boxed and stored by a
     ;; %F32-ASET call per element.  Only with a variable array and index, which the arms then read

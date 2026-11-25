@@ -1286,6 +1286,23 @@
         (let ((j (funcall *net-fd-call* :read-bytes fd seq i end)))
           (%fs-set-pos stream (+ (%fs-pos stream) (- j i)))
           (setq i j)))
+      ;; A REGULAR FILE straight into SEQ's bytes, a megabyte a read.  Through the I/O page it was a
+      ;; 4 KB read and then a MEM-REF and a generic store per byte: 262 MB of model weights took
+      ;; 0.57 s (SBCL 0.02).  Safe because nothing here can move SEQ: no allocation between taking
+      ;; its address and the read returning, and the plain syscall -- not %SYS-READ-RAW, which on a
+      ;; threaded image parks in a GC safe region so a socket can block -- holds any collection
+      ;; off until the read is done.  A regular file's read does not block indefinitely, so
+      ;; holding it off is a few milliseconds.  Pipes, sockets and the like keep the page loop.
+      (when (and (< i end) (>= fd 0) (not (%cab-fd-p fd)) (not (%net-fd-p fd))
+                 (%prim-u8-vector-p seq) (> (%sys-fstat-size fd) 0))
+        (%fs-oflush stream)
+        (loop
+          (when (>= i end) (return nil))
+          (let ((n (syscall3 0 fd (+ (%val->word seq) 7 i) (min 1048576 (- end i)))))
+            (cond ((= n -4))                                   ; EINTR: again
+                  ((<= n 0) (return nil))
+                  (t (setq i (+ i n))
+                     (%fs-set-pos stream (+ (%fs-pos stream) n)))))))
       (when (and (< i end) (>= fd 0) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
         (loop
           (when (>= i end) (return nil))

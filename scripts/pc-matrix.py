@@ -294,8 +294,8 @@ def run_cell(cell, disk, idx, keep, forms=None):
                 except RuntimeError as e:
                     if 'bind()' not in str(e) or attempt == 3: raise
         while not m.at_prompt():
-            if time.time() - t0 > 180:
-                res['detail'] = 'no prompt in 180 s: ' + ' / '.join(m.text().strip().splitlines()[-3:])
+            if time.time() - t0 > PROMPT_S:
+                res['detail'] = 'no prompt in %d s: ' % PROMPT_S + ' / '.join(m.text().strip().splitlines()[-3:])
                 return res
             time.sleep(1)
         res['boot'] = time.time() - t0
@@ -342,6 +342,11 @@ def probe_text(p):
         return 'RAM %s, S %.1f MB, pool %.2f MB' % (('%.0f MB' % (ram / 1048576)), s / 1048576, pool / 1048576)
     except Exception:
         return p or ''
+
+# How long a cell may take to reach the prompt: 180 s, or PC_MATRIX_PROMPT_S on a busy machine
+# (QEMU's TCG and Bochs slow down with the load: measured, a load of 400 on 116 cores made the
+# control cell time out).
+PROMPT_S = int(os.environ.get('PC_MATRIX_PROMPT_S', '180'))
 
 def main():
     argv = sys.argv[1:]

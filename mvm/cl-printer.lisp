@@ -5720,6 +5720,19 @@
   (let ((len (- end start))
         (result (%make-string-array (- end start))))
     (let ((i 0))
+      ;; Codes copied directly into a word string (#x31) from a word or a
+      ;; narrow (#x13) source.  Through AREF / ASET a narrow source sent
+      ;; every character to %ASET-SLOW: a fifth of cl-bench COMPILER on the
+      ;; narrow-string web image.
+      (when (%prim-simple-string-p result)
+        (cond ((%prim-simple-string-p str)
+               (loop (when (= i len) (return-from %substring result))
+                 (%word-aset result i (%word-aref str (+ start i)))
+                 (setq i (+ i 1))))
+              ((%prim-base-string-p str)
+               (loop (when (= i len) (return-from %substring result))
+                 (%word-aset result i (%u8-ref str (+ start i)))
+                 (setq i (+ i 1))))))
       (loop
         (when (= i len) (return result))
         (aset result i (aref str (+ start i)))

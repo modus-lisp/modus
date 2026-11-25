@@ -7,7 +7,7 @@
 ;;;; release's source tarball unpacked): every file under it is a candidate, so it must be a
 ;;;; clean export, not a working checkout.  The output is a tar of DIR's repositories that
 ;;;;   - the systems in MODUS_SRC_SYSTEMS need (default: the window manager, cram and the disk
-;;;;     writers), by ASDF's dependency closure, plus modus and vessel themselves;
+;;;;     writers), by ASDF's dependency closure, plus modus, natrium and vessel themselves;
 ;;;;   - less what nothing loads: images, video and PDFs, inspect/ (screenshots and corpora)
 ;;;;     and modus's test/ladder/tars/;
 ;;;; with entries sorted by name, owner 0, mode 644 and mtime 0, so the bytes depend only on
@@ -31,7 +31,8 @@
             (if sp (setq start (1+ sp)) (return))))
     (nreverse acc)))
 
-(defparameter *always* '("modus" "vessel"))
+;; natrium too: building modus itself needs it (mvm/build-macos-cli.lisp's code signature)
+(defparameter *always* '("modus" "natrium" "vessel"))
 
 (defparameter *drop-types* '("pdf" "png" "jpg" "jpeg" "gif" "mp4" "webm" "mkv" "vob" "mov"))
 (defparameter *drop-dirs* '("inspect" ".git" ".github"))

@@ -1137,8 +1137,33 @@
 (defvar *win64-midpoint* nil "Semispace size (midpoint) to map, or NIL: +LINUX-X64-GC-MIDPOINT+.")
 (defvar *win64-jit-arena-size* nil "JIT arena bytes, or NIL: +LINUX-X64-JIT-ARENA-SIZE+.")
 (defun win64-midpoint () (or *win64-midpoint* +linux-x64-gc-midpoint+))
-(defun win64-heap-map-size ()
-  (if *win64-midpoint* (getf (x64-heap-layout *win64-midpoint*) :map) +linux-x64-heap-size+))
+(defun win64-choose-heap-bytes ()
+  "The heap chooser (X64-CHOOSE-HEAP-ITEMS) for the command line at RSI, GetCommandLineA's
+   one string: the first --dynamic-space-size in it, then blanks or `=', then the size.
+   With none, WIN64-MIDPOINT.  Position independent: rel jumps inside it only."
+  (let ((flag "--dynamic-space-size"))
+    (coerce
+     (x64-stub-assemble
+      (x64-choose-heap-items
+       `((#x31 #xD2)                                   ; xor edx,edx   (no size yet)
+         (:label :wscan)
+         (#x80 #x3E 0) (:jcc #x4 :done)                ; cmp byte [rsi],0 ; je
+         ,@(loop for c across flag for k from 0
+                 append `((#x80 #x7E ,k ,(char-code c)) (:jcc #x5 :wnext)))
+         (#x48 #x83 #xC6 ,(length flag))               ; add rsi,len
+         (:label :wsp)
+         (#x0F #xB6 #x06)                              ; movzx eax,byte [rsi]
+         (#x83 #xF8 #x20) (:jcc #x4 :wskip)            ; ' '
+         (#x83 #xF8 #x09) (:jcc #x4 :wskip)            ; tab
+         (#x83 #xF8 #x3D) (:jcc #x4 :wskip)            ; '='
+         (:jmp :wparse)
+         (:label :wskip)
+         (#x48 #xFF #xC6) (:jmp :wsp)                  ; inc rsi
+         (:label :wparse))
+       `((:label :wnext)
+         (#x48 #xFF #xC6) (:jmp :wscan))               ; inc rsi
+       (win64-midpoint)))
+     '(vector (unsigned-byte 8)))))
 (defun win64-jit-arena-size () (or *win64-jit-arena-size* +linux-x64-jit-arena-size+))
 
 (defun win64-heap-tail-bytes ()
@@ -1173,8 +1198,14 @@
     (:label :p-tls-ok)
     (:bytes #x48 #xB8 ,@(w64-le64 +win64-win32-stack-top+)) ; mov rax,Win32 stack top
     ,(w64-gs-store +win64-tls-stack+ 0)                  ; mov gs:[stack],rax
+    ;; --dynamic-space-size, from the command line (EMIT-LINUX-X64-CHOOSE-HEAP's parser
+    ;; and layout): the size to map in R12, and the three geometry words the heap tail
+    ;; reads stored
+    (:call-iat "GetCommandLineA")
+    (:bytes #x48 #x89 #xC6)                              ; mov rsi,rax
+    (:raw ,(win64-choose-heap-bytes))
     (:bytes #x48 #xB9 ,@(w64-le64 +linux-x64-fixed-heap-base+)) ; mov rcx,heap base
-    (:bytes #xBA ,@(w64-le32 (win64-heap-map-size)))     ; mov edx,heap size
+    (:bytes #x4C #x89 #xE2)                              ; mov rdx,r12  (heap size)
     (:bytes #x41 #xB8 #x00 #x30 #x00 #x00)               ; mov r8d,MEM_RESERVE|MEM_COMMIT
     (:bytes #x41 #xB9 #x04 #x00 #x00 #x00)               ; mov r9d,PAGE_READWRITE
     (:call-iat "VirtualAlloc")
@@ -1280,15 +1311,6 @@
     (:bytes #xC7 #x04 #x25 ,@(w64-le32 #x10000200) 1 0 0 0)
     (:bytes #x48 #xC7 #xC3 1 0 0 0)                      ; mov rbx,1   (argc, for the tail)
     (:bytes #x45 #x31 #xED #x45 #x31 #xF6 #x45 #x31 #xFF) ; r13, r14, r15 = 0
-    ;; The heap's geometry, which the Linux stub chooses at startup
-    ;; (EMIT-LINUX-X64-CHOOSE-HEAP) and the tail reads: here the default layout,
-    ;; the one +LINUX-X64-HEAP-SIZE+ committed above.
-    ,@(let ((l (x64-heap-layout (win64-midpoint))))
-        (loop for (slot v) in `((#x10000F88 ,(win64-midpoint))
-                                (#x10000F90 ,(getf l :data))
-                                (#x10000F98 ,(getf l :kind-delta)))
-              collect `(:bytes #x48 #xB9 ,@(w64-le64 v)             ; mov rcx, v
-                               #x48 #x89 #x0C #x25 ,@(w64-le32 slot)))) ; mov [slot], rcx
     (:raw ,(win64-heap-tail-bytes))))
 
 (defun win64-stub-items ()

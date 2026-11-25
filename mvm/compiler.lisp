@@ -3895,6 +3895,7 @@
   soft-float            ; 0 / 1, like +TARGET-SOFT-FLOAT+
   has-fpd               ; T / NIL, like *TARGET-HAS-FPD-P*
   w32-capable           ; T / NIL: the compiler may emit W32 opcodes (M2+)
+  tail-calls            ; T / NIL: the compiler may emit TAILCALL (+TARGET-TAIL-CALLS+)
   mv-count-addr mv-values-addr
   tag-cons tag-function tag-object tag-immediate tag-forward t-value nil-value)
 
@@ -3932,6 +3933,7 @@
 (defun %runtime-has-fpd-p () t)
 (defun %runtime-fpd-p () (and *mvm-eval-runtime-p* (%runtime-has-fpd-p)))
 (defun ct-w32-capable-p () (let ((c *compile-target*)) (if c (compile-target-w32-capable c) (eql +target-w32+ 1))))
+(defun ct-tail-calls-p () (let ((c *compile-target*)) (if c (compile-target-tail-calls c) (eql +target-tail-calls+ 1))))
 (defun ct-mv-count-addr () (let ((c *compile-target*)) (if c (compile-target-mv-count-addr c) +mv-count-addr+)))
 (defun ct-mv-values-addr () (let ((c *compile-target*)) (if c (compile-target-mv-values-addr c) +mv-values-addr+)))
 (defun ct-tag-cons () (let ((c *compile-target*)) (if c (compile-target-tag-cons c) +tag-cons+)))
@@ -4625,13 +4627,271 @@
   (let ((*compile-safety* level))
     (declare (special *compile-safety*))
     (%mvm-compile-function-internal-2 name params body parent-env rest-slot opt-start opt-count)))
+;;; ---- SELF TAIL CALLS AS LOOPS ----------------------------------------------
+;;; The compiler emits no TAILCALL, so a function calling itself in tail position
+;;; grew the stack per call: (defun f (n) (if (= n 0) :done (f (1- n)))) died at a
+;;; few hundred thousand calls on every target (x64 silently; the web with
+;;; STACK-EXHAUSTED), and so did a LABELS loop (cl-bench WALK-LIST/MESS's 2M-deep
+;;; MERGE-LOOP).  A DEFUN or LABELS function whose parameters are all required
+;;; and lexical, and which calls itself in tail position with exactly that many
+;;; arguments, is compiled as
+;;;
+;;;   (let ((#:a a) (#:b b))                      ; the loop's state
+;;;     (block #:self
+;;;       (tagbody #:top
+;;;         (return-from #:self
+;;;           (let ((a #:a) (b #:b)) DECLS BODY')))))
+;;;
+;;; with each such call in BODY' replaced by (progn (psetq #:a e1 #:b e2) (go #:top)).
+;;; The parameters are rebound per iteration, so a closure made in one
+;;; iteration keeps that iteration's bindings.  Pure IR -- a branch -- so every
+;;; target, the interpreter and the JIT get it alike.
+;;;
+;;; TAIL POSITION is followed only through PROGN, IF, LOCALLY, THE, %%FLET-SELF,
+;;; and LET / LET* that bind nothing special, and through macros that expand to
+;;; those (COND, WHEN, UNLESS, AND, OR, CASE ...).  Not through a dynamic binding,
+;;; HANDLER-CASE, UNWIND-PROTECT, CATCH, BLOCK, a lambda or a local function: a
+;;; call there is not a tail call.  A rewritten form keeps the expansion it was
+;;; found in; every other form is left as written.  CLHS 3.2.2.3 lets a function
+;;; assume its own name refers to itself, so a redefinition, like TRACE, does not
+;;; see the calls that became the loop.
+(defvar *self-tail-loops* t "NIL: compile self tail calls as calls (bisecting).")
+
+(defun %stl-op-p (op name) (and (symbolp op) (not (%shadows-cl-p op)) (name-eq op name)))
+
+(defun %stl-body-split (body)
+  "(DOCSTRING-AND-DECLS . FORMS) of BODY."
+  (let ((head nil) (rest body))
+    (loop
+      (cond ((and (consp rest) (consp (car rest)) (%stl-op-p (car (car rest)) "DECLARE"))
+             (push (car rest) head) (setq rest (cdr rest)))
+            ((and (consp rest) (stringp (car rest)) (consp (cdr rest)))
+             (push (car rest) head) (setq rest (cdr rest)))
+            (t (return))))
+    (cons (nreverse head) rest)))
+
+(defun %stl-walk-last (forms name gvars top)
+  "FORMS with its last form walked; the same list when nothing changed."
+  (if (atom forms)
+      forms
+      (let* ((lastf (car (last forms)))
+             (new (%stl-walk lastf name gvars top)))
+        (if (eq new lastf)
+            forms
+            (append (butlast forms) (list new))))))
+
+(defun %stl-walk (form name gvars top)
+  "FORM with NAME's self calls in tail position turned into jumps to TOP; FORM
+   itself (EQ) when it holds none."
+  (cond
+    ((atom form) form)
+    ((and name (eq (car form) name))
+     (if (and (listp (cdr form)) (null (cdr (last form)))
+              (eql (length (cdr form)) (length gvars)))
+         (let ((sets nil) (g gvars) (a (cdr form)))
+           (loop (when (null g) (return))
+                 (setq sets (append sets (list (car g) (car a))))
+                 (setq g (cdr g) a (cdr a)))
+           (setq *stl-self-count* (+ *stl-self-count* 1))
+           (list 'progn (cons 'psetq sets) (list 'go top)))
+         form))
+    ((not (symbolp (car form))) form)
+    (t
+     (let ((op (car form)))
+       (cond
+         ((or (%stl-op-p op "PROGN") (%stl-op-p op "%%FLET-SELF") (%stl-op-p op "LOCALLY"))
+          (let* ((pre (if (%stl-op-p op "%%FLET-SELF") 2 1))
+                 (head (subseq form 0 (min pre (length form))))
+                 (forms (nthcdr pre form))
+                 ;; a local function's block may be a cross-unit RETURN-FROM
+                 ;; target, which runs its body under a catch frame
+                 (new (let ((*tail-call-mark* (and *tail-call-mark* (= pre 1))))
+                        (%stl-walk-last forms name gvars top))))
+            (if (eq new forms) form (append head new))))
+         ((%stl-op-p op "IF")
+          (if (not (and (consp (cdr form)) (consp (cddr form)) (listp (cdddr form))))
+              form
+              (let* ((then (third form)) (else (fourth form))
+                     (nthen (%stl-walk then name gvars top))
+                     (nelse (if (cdddr form) (%stl-walk else name gvars top) else)))
+                (if (and (eq nthen then) (eq nelse else))
+                    form
+                    (list 'if (second form) nthen nelse)))))
+         ((%stl-op-p op "THE")
+          (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+              (let ((new (%stl-walk (third form) name gvars top)))
+                (if (eq new (third form)) form (list 'the (second form) new)))
+              form))
+         ((or (%stl-op-p op "LET") (%stl-op-p op "LET*"))
+          (if (not (and (consp (cdr form)) (listp (second form))))
+              form
+              (let* ((body (cddr form))
+                     (split (%stl-body-split body))
+                     (forms (cdr split)))
+                (if (or (null forms)
+                        (some (lambda (b)
+                                (let ((v (if (consp b) (car b) b)))
+                                  (or (not (symbolp v)) (%param-special-p v body))))
+                              (second form)))
+                    form
+                    (let ((new (%stl-walk-last forms name gvars top)))
+                      (if (eq new forms)
+                          form
+                          (append (list op (second form)) (car split) new)))))))
+         ;; any other operator: a macro is looked through -- and its expansion
+         ;; kept when a tail call was MARKED in it, so the form COMPILE-CALL
+         ;; sees is the one marked -- anything else stops, and a call to a
+         ;; global function is marked (*TAIL-CALL-FORMS*)
+         (t (let ((r (%quiet-macroexpand-1 form)))
+              (if (and r (cdr r) (not (equal (car r) form)))
+                  (let* ((m0 *tail-call-forms*)
+                         (new (%stl-walk (car r) name gvars top)))
+                    (if (and (eq new (car r)) (eq m0 *tail-call-forms*)) form new))
+                  (progn
+                    (when (and *tail-call-mark* (%tc-candidate-p form))
+                      (setq *tail-call-forms* (cons form *tail-call-forms*)))
+                    form)))))))))
+
+(defun %stl-calls-name-p (tree name)
+  "True when TREE holds a form (NAME ...) anywhere -- the cheap test that keeps
+   the rest of %SELF-TAIL-LOOP-BODY (macroexpansion) off every function that
+   never names itself: run on each runtime compile, it made a short benchmark
+   whose hot functions are built during its runs (DDERIV) 40% slower."
+  (let ((stack (list tree)) (budget 20000))
+    (loop
+      (when (or (null stack) (<= budget 0)) (return (<= budget 0)))
+      (let ((x (car stack)))
+        (setq stack (cdr stack) budget (- budget 1))
+        (when (consp x)
+          (when (eq (car x) name) (return t))
+          (setq stack (cons (car x) stack))
+          (when (consp (cdr x)) (setq stack (cons (cdr x) stack))))))))
+
+(defun %stl-real-call-p (name nparams)
+  "True when (NAME ARGS...) compiles as a CALL to the function NAME.  Not when
+   the compiler compiles that form itself (COMPILE-COMPOUND's dispatch: CAR, EQ,
+   CHAR-CODE ... -- whose image DEFUNs are wrappers round the primitive, so
+   CHAR-CODE's `(char-code c)' is the instruction, and looping on it hung boot),
+   when it is a macro to the compiler (LOGNOT), or when COMPILE-CALL rewrites it."
+  (and (not (%compound-dispatch-op-p (normalize-name name)))
+       (not (%vil-op-p name))
+       (not (member (symbol-name name) '("REPLACE" "FILL" "FBOUNDP" "NAME-EQ" "%SIGNAL-TYPE-ERROR")
+                    :test #'string=))
+       (let ((r (%quiet-macroexpand-1 (cons name (make-list nparams)))))
+         (not (and r (cdr r))))))
+
+;;; OTHER TAIL CALLS (mutual recursion).  The same walk MARKS each call to a
+;;; global function in tail position: *TAIL-CALL-FORMS* holds those forms
+;;; (EQ), and COMPILE-CALL, handed one of them, emits TAILCALL -- tear the
+;;; frame down, jump -- when the target has one (CT-TAIL-CALLS-P) and the
+;;; call is simple: a global function, at most +MAX-REG-ARGS+ arguments, no
+;;; temporaries saved around it, its value the function's.  Not in a
+;;; function whose name is a cross-unit RETURN-FROM target (its body runs
+;;; under a catch frame).  A form that occurs twice in the body (a macro that
+;;; duplicated it) is never marked: one copy might not be in tail position.
+(defvar *tail-calls* t "NIL: compile every call in tail position as a CALL (bisecting).")
+(defvar *tail-call-mark* nil "T while %STL-WALK marks tail calls.")
+(defvar *tail-call-forms* nil
+  "The call forms of the function being compiled that are in tail position (EQ).")
+(defvar *stl-self-count* 0 "Self tail calls %STL-WALK turned into jumps.")
+
+(defun %tc-candidate-p (form)
+  "FORM is (OP ARGS...) that compiles as a CALL of the global function OP."
+  (let ((op (car form)))
+    (and (symbolp op) op (not (eq op t))
+         (listp (cdr form)) (null (cdr (last form)))
+         (<= (length (cdr form)) +max-reg-args+)
+         (not (%compound-dispatch-op-p (normalize-name op)))
+         (not (%vil-op-p op))
+         (not (member (symbol-name op) '("REPLACE" "FILL" "FBOUNDP" "NAME-EQ" "%SIGNAL-TYPE-ERROR"
+                                         "FUNCALL" "APPLY" "VALUES" "ERROR")
+                      :test #'string=)))))
+
+(defun %tc-occurrences (tree x limit)
+  "How many times X (EQ) occurs in TREE, counting up to LIMIT."
+  (let ((stack (list tree)) (n 0) (budget 200000))
+    (loop
+      (when (or (null stack) (>= n limit) (<= budget 0)) (return (if (<= budget 0) limit n)))
+      (let ((y (car stack)))
+        (setq stack (cdr stack) budget (- budget 1))
+        (cond ((eq y x) (setq n (+ n 1)))
+              ((consp y)
+               (setq stack (cons (car y) stack))
+               (when (cdr y) (setq stack (cons (cdr y) stack)))))))))
+
+(defun %tail-call-mark-p ()
+  (and *tail-calls* (ct-tail-calls-p)))
+
+(defun %self-tail-loop-body (name params body)
+  "BODY of function NAME (PARAMS) with its self tail calls as a loop and its
+   other tail calls in *TAIL-CALL-FORMS*, or BODY."
+  (let* ((loop-ok (and *self-tail-loops* name (symbolp name) (consp body)
+                       (%stl-calls-name-p body name)
+                       (listp params) (consp params) (null (cdr (last params)))
+                       (every (lambda (p)
+                                (and p (symbolp p) (not (eq p t))
+                                     (let ((n (symbol-name p)))
+                                       (not (and (> (length n) 0) (char= (char n 0) #\&))))
+                                     (not (%param-special-p p body))))
+                              params)
+                       (%stl-real-call-p name (length params))))
+         (mark-ok (and (consp body) (%tail-call-mark-p))))
+    (if (not (or loop-ok mark-ok))
+        body
+        (let* ((split (%stl-body-split body))
+               (forms (cdr split))
+               (gvars (and loop-ok (mapcar (lambda (p) (%mvm-gensym (symbol-name p))) params)))
+               (top (%mvm-gensym "STL-TOP"))
+               (blk (%mvm-gensym "STL-SELF"))
+               (*stl-self-count* 0)
+               (*tail-call-mark* mark-ok)
+               (m0 *tail-call-forms*)
+               (new (handler-case (%stl-walk-last forms (and loop-ok name) gvars top)
+                      (t (c) (progn c (setq *tail-call-forms* m0) forms)))))
+          ;; a marked form that occurs twice is not marked
+          (when (not (eq m0 *tail-call-forms*))
+            (let ((keep m0) (l *tail-call-forms*))
+              (loop
+                (when (or (null l) (eq l m0)) (return))
+                (when (= 1 (%tc-occurrences new (car l) 2)) (setq keep (cons (car l) keep)))
+                (setq l (cdr l)))
+              (setq *tail-call-forms* keep)))
+          (cond
+            ((eq new forms) body)
+            ((eql *stl-self-count* 0) (append (car split) new))
+            (t (%stl-loop-wrap split params gvars top blk new)))))))
+
+(defun %stl-loop-wrap (split params gvars top blk new)
+  "The body of a function whose self tail calls became jumps to TOP (NEW)."
+  (let ((docs (remove-if-not #'stringp (car split)))
+        (decls (remove-if #'stringp (car split))))
+              (append docs
+                      ;; OPTIMIZE stays at the head too: %BODY-SAFETY reads it there
+                      (remove-if-not (lambda (d) (some (lambda (x) (and (consp x) (%stl-op-p (car x) "OPTIMIZE")))
+                                                       (cdr d)))
+                                     decls)
+                      (list (list 'let (mapcar #'list gvars params)
+                                  (list 'block blk
+                                        (list 'tagbody top
+                                              (list 'return-from blk
+                                                    (append (list 'let (mapcar #'list params gvars))
+                                                            decls new)))))))))
+
 (defun mvm-compile-function-internal-1 (name params body &optional parent-env rest-slot opt-start opt-count)
   "Compile a single function into IR (%MVM-COMPILE-FUNCTION-INTERNAL-2), at
    the SAFETY level its body declares, if any."
-  (let ((level (%body-safety body)))
-    (if level
-        (%mvm-compile-function-at-safety level name params body parent-env rest-slot opt-start opt-count)
-        (%mvm-compile-function-internal-2 name params body parent-env rest-slot opt-start opt-count))))
+  (let ((*tail-call-forms* nil))
+    (if (and (null rest-slot) (null opt-start))
+        (setq body (%self-tail-loop-body name params body))
+        (setq body (%tail-call-mark-body body)))
+    (let ((level (%body-safety body)))
+      (if level
+          (%mvm-compile-function-at-safety level name params body parent-env rest-slot opt-start opt-count)
+          (%mvm-compile-function-internal-2 name params body parent-env rest-slot opt-start opt-count)))))
+
+(defun %tail-call-mark-body (body)
+  "BODY with its tail calls marked, for a function whose self calls stay calls."
+  (%self-tail-loop-body nil nil body))
 
 ;;; ---- (declaim (inline f)) — honoured at runtime (mvm-eval) -----------------
 ;;;
@@ -10470,7 +10730,7 @@
       ;; silently running some special form's handler.  See
       ;; %OP-NAME-CONFIRMED-P.
       ((and op-name (symbolp op) (not (%op-name-confirmed-p op op-name)))
-       (compile-call op (cdr form) env dest))
+       (compile-call op (cdr form) env dest form))
       ;; SHADOWING GUARD -- the same reasoning, by package rather than by hash.
       ;; Every dispatch below matches the operator's NAME, so P::MAKE-ARRAY (P
       ;; shadowing CL's) compiled as CL's MAKE-ARRAY and P::AREF / P::CAR as CL's
@@ -10479,13 +10739,13 @@
       ;; macroexpanded above is a call to that package's function, as in SBCL.
       ;; FBOUNDP: the build host has no %SHADOWS-CL-NAME-P and no source shadows CL.
       ((and (symbolp op) (%shadows-cl-p op))
-       (compile-call op (cdr form) env dest))
+       (compile-call op (cdr form) env dest form))
       ;; AND BY KERNEL NAME: a user package's own function named like one of
       ;; this compiler's intrinsics (vessel's KILN-ZERO-BOOT::%KERNEL) is that
       ;; package's function, not the instruction.  Runtime compile only.
       ((and (symbolp op) *mvm-eval-runtime-p* (fboundp '%user-own-function-p)
             (funcall '%user-own-function-p op))
-       (compile-call op (cdr form) env dest))
+       (compile-call op (cdr form) env dest form))
       ;; Non-symbol operator (immediately-applied lambda, etc.).  Route
       ;; through compile-funcall, NOT compile-call: compile-call's
       ;; indirect path emits a bare :call-indirect with no closure
@@ -10504,7 +10764,7 @@
       ;; a 68000, paged, that was this whole 95 KB function read from disk for
       ;; one (FOO X).  %COMPOUND-DISPATCH-OP-P is one hash lookup.
       ((and (symbolp op) (not (%compound-dispatch-op-p op-name)) (not (%vil-op-p op)))
-       (compile-call op (cdr form) env dest))
+       (compile-call op (cdr form) env dest form))
       ;; --- Special Forms ---
       ((= op-name 338547669)    (compile-quote (cadr form) dest))  ; QUOTE
       ;; (%CONV-ADDR K): a runtime-data address used as a VALUE — rebased at
@@ -12436,7 +12696,7 @@
            (compile-call op (cdr form) env dest)
            (compile-nil dest)))
 
-      (t (compile-call op (cdr form) env dest)))))
+      (t (compile-call op (cdr form) env dest form)))))
 
 ;;; ============================================================
 ;;; Quote
@@ -18549,6 +18809,16 @@
   ;; vars) via the normal compile-lambda closure path; intra-FLET
   ;; mutual recursion still works because the cell pointer is constant
   ;; while its car is mutated.
+  ;; LABELS: a local function's self tail calls as a loop (%SELF-TAIL-LOOP-BODY),
+  ;; before the capture transform below rewrites its calls into FUNCALLs.  Not
+  ;; FLET: there the name in the body is the OUTER function.
+  (when (and labels-p (consp defs))
+    (setq defs (mapcar (lambda (d)
+                         (if (and (consp d) (symbolp (car d)) (consp (cdr d)) (listp (cadr d)))
+                             (let ((nb (let ((*tail-calls* nil)) (%self-tail-loop-body (car d) (cadr d) (cddr d)))))
+                               (if (eq nb (cddr d)) d (cons (car d) (cons (cadr d) nb))))
+                             d))
+                       defs)))
   (when (consp defs)
     (setq defs (mapcar #'%flet-def-mark-self defs)))
   (when (and (consp defs)
@@ -23024,7 +23294,12 @@
           ;; arms 0.06 us.
           ((or (= hash #.(compute-name-hash "QUOTE")) (= hash #.(compute-name-hash "FUNCTION"))
               (= hash #.(compute-name-hash "SETQ")) (= hash #.(compute-name-hash "PSETQ"))
-              (= hash #.(compute-name-hash "TAGBODY")) (= hash #.(compute-name-hash "LAMBDA")))
+              (= hash #.(compute-name-hash "TAGBODY")) (= hash #.(compute-name-hash "LAMBDA"))
+              ;; GO never returns, so it adds no values: a self tail call made a
+              ;; loop (%SELF-TAIL-LOOP-BODY) ends its branch in one, and read as
+              ;; "possibly multi-valued" it stopped the epilogue's clamp, so a
+              ;; :TEST's second value leaked out of TREE-EQUAL (TREE-EQUAL.6)
+              (= hash #.(compute-name-hash "GO")))
            nil)
           ;; RETURN-FROM / RETURN carry their VALUE form's values.  As a named
           ;; operator they read "possibly multi-valued", so a body like
@@ -32010,8 +32285,9 @@
    to right, and no call in it has more than two arguments."
   (if (null args) nil (list 'cons (car args) (%over-limit-args-form (cdr args)))))
 
-(defun compile-call (fn args env dest)
-  "Compile a function call (fn arg1 arg2 ...).
+(defun compile-call (fn args env dest &optional form)
+  "Compile a function call (fn arg1 arg2 ...).  FORM, when the caller has it,
+   is the call form itself: one in *TAIL-CALL-FORMS* may compile as TAILCALL.
    Register args are saved to the stack during evaluation to avoid
    exhausting temp registers when args contain nested function calls.
    Caller-saved temp registers (V5-V8) are saved/restored around the CALL
@@ -32546,7 +32822,19 @@
               ;; key when that package defines no such name, so a call that
               ;; crosses packages resolves exactly as it did before.
               (resolved-name (or unique-name (%fn-key-qualify fn fn-name))))
-         (emit-ir :call resolved-name nargs)))
+         (if (and form *tail-call-forms*
+                  (member form *tail-call-forms* :test #'eq)
+                  (null unique-name)
+                  (<= nargs +max-reg-args+)
+                  (<= save-count 1)
+                  (eql dest +vreg-vr+)
+                  (%tail-call-mark-p))
+             ;; a TAIL CALL: the callee's values are this function's, and its
+             ;; RET returns to our caller (*TAIL-CALL-FORMS*)
+             (progn
+               (emit-ir :frame-leave)
+               (emit-ir :tailcall resolved-name nargs))
+             (emit-ir :call resolved-name nargs))))
       ;; (setf name) function — emit as SETF-NAME call
       ((and (consp fn) (eq (car fn) 'setf) (symbolp (cadr fn)))
        (let* ((base-name (%setf-fn-name (cadr fn)))
@@ -33620,6 +33908,8 @@
                               (eq nil (handler-case
                                           (%block-runtime-catch-unsafe-p body)
                                         (t (c) :walker-signaled)))))
+         ;; the body runs under that catch frame: no call in it is a tail call
+         (*tail-call-forms* (if fn-blk-catch-p nil *tail-call-forms*))
          (*ir-buffer* nil)
          ;; same scope as *IR-BUFFER*: parked blocks belong to THIS function,
          ;; and a fragment that leaked into the next one would carry labels
@@ -33918,6 +34208,7 @@
       (:set-nargs 2)
       ;; Call: 1 opcode + 4 imm32 = 5 bytes
       (:call  5)
+      (:tailcall 5)
       (:stack-store 4)
       (:bne   5)
       (:cmp   3)
@@ -34249,7 +34540,7 @@
            (mvm-pop buf (second insn)))
           (:set-nargs
            (encode-instruction buf +op-set-nargs+ (second insn)))
-          (:call
+          ((:call :tailcall)
            (let* ((fn-name (second insn))
                   (fn-info (%fn-info-for-key fn-name))
                   (target (if fn-info
@@ -34276,7 +34567,9 @@
                (when (and *ddc-trace-nil-callee* (or (null fn-name) (equal fn-name "NIL")))
                  (format t "~&  NIL-CALLEE in ~A at ~A insn ~S~%"
                          *current-function-name* *current-source-location* insn)))
-             (mvm-call buf target)))
+             (if (eq (car insn) :tailcall)
+                 (mvm-tailcall buf target)
+                 (mvm-call buf target))))
           (:stack-store
            ;; store src to stack slot
            (let ((src-reg (second insn))

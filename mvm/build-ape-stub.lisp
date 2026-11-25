@@ -82,7 +82,7 @@
 (setf *win64-jit-arena-size* #x10000)
 ;; no collector: the allocation limit is the end of the small heap (a builder's own value
 ;; would be its midpoint)
-(setf *linux-x64-r14-offset* (win64-heap-map-size))
+(setf *linux-x64-r14-offset* (getf (x64-heap-layout (win64-midpoint)) :map))
 (setf modus.mvm.x64::*x64-native-code-offset* (win64-native-code-offset))
 (setf modus.mvm.x64::*x64-win-shim-va* (win64-shim-va))
 (let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))     ; function addresses, for a fault

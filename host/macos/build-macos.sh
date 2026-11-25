@@ -12,6 +12,10 @@
 #   MODUS_CLI_OUT=/tmp/modus-darwin.elf \
 #   sbcl --dynamic-space-size 16384 --script mvm/build-aarch64-cli.lisp
 # (MODUS_NO_JIT=1 also works; the JIT build is the default and is what the runner was tested with.)
+#
+# The cli executable can also be made on Linux with no Apple toolchain, by SBCL or a modus
+# builder: mvm/build-macos-cli.lisp (host/macos/shim.lisp is this directory's C and
+# assembly for the cli case, in Lisp).  docs/macos-hosting.md, "built without Apple's toolchain".
 set -eu
 IMAGE=$1
 OUT=$2

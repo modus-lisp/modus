@@ -296,6 +296,14 @@
 
 (defun emit-abs32 (buf addr) (emit-u32 buf addr))
 
+;;; BARE-METAL JIT region (#x0531's bare arm): code pages bump UP from LO, the JIT's
+;;; data pages (linkage cells) come DOWN from HI.  Above the bare heap (#x04000000..),
+;;; the collector's metadata (#x1E000000..) and the core-save area (#x20000000..);
+;;; inside 1 GB.  DEFUNS, as aarch64's %JIT-EXEC-*: this file is baked into the image
+;;; and a defvar's initform does not run there.
+(defun %x64-bare-jit-lo () #x30000000)
+(defun %x64-bare-jit-hi () #x38000000)
+
 (defun emit-cmp-abs64-zero (buf addr)
   "cmp qword [ADDR], 0   (absolute, no segment)"
   (emit-bytes buf #x48 #x83 #x3C #x25) (emit-abs32 buf addr) (emit-bytes buf #x00))
@@ -2380,6 +2388,35 @@
               ;; process puts its JIT pages at the same addresses and a snapshot
               ;; carries [arena, bump) verbatim -- the aarch64 arm's shape.  Bump
               ;; word 0 (no arena, or a bare image) is the mmap(NULL) path below.
+              (if (not *x64-linux-mode*)
+                ;; BARE METAL: no mmap.  Bump-allocate from the fixed RWX region
+                ;; [%X64-BARE-JIT-LO, %X64-BARE-JIT-HI) (the UEFI and multiboot stubs
+                ;; identity-map RAM with no NX), the bump word at 0x10000FB8 as on the
+                ;; hosted arena.  RAM is not zeroed, so a bump word outside the region
+                ;; restarts at its base -- aarch64's #x0531 shape.  A page that would
+                ;; pass the top returns 0: the JIT then interprets the form.  One CPU:
+                ;; a plain store.
+                (let ((have (make-label)) (reset (make-label)) (full (make-label)) (bdone (make-label)))
+                  (emit-mov-reg-imm buf 'rdi #x10000FB8)         ; rdi = &bump
+                  (emit-mov-reg-mem buf 'rax 'rdi 0)             ; rax = bump
+                  (emit-cmp-reg-imm buf 'rax (%x64-bare-jit-lo)) (emit-jcc buf :b reset)
+                  (emit-cmp-reg-imm buf 'rax (%x64-bare-jit-hi)) (emit-jcc buf :ae reset)
+                  (emit-jmp buf have)
+                  (emit-label buf reset)
+                  (emit-mov-reg-imm buf 'rax (%x64-bare-jit-lo))
+                  (emit-label buf have)
+                  (emit-mov-reg-reg buf 'rdx 'rsi)               ; rdx = tagged size
+                  (emit-bytes buf #x48 #xD1 #xFA)                ; sar rdx, 1
+                  (emit-bytes buf #x48 #x83 #xC2 #x0F)           ; add rdx, 15
+                  (emit-bytes buf #x48 #x83 #xE2 #xF0)           ; and rdx, -16
+                  (emit-add-reg-reg buf 'rdx 'rax)               ; rdx = new bump
+                  (emit-cmp-reg-imm buf 'rdx (%x64-bare-jit-hi)) (emit-jcc buf :a full)
+                  (emit-mov-mem-reg buf 'rdi 'rdx 0)             ; bump = new
+                  (emit-bytes buf #x48 #x8D #x34 #x00)           ; lea rsi, [rax+rax]  (tagged page)
+                  (emit-jmp buf bdone)
+                  (emit-label buf full)
+                  (emit-bytes buf #x31 #xF6)                     ; xor esi, esi: no page
+                  (emit-label buf bdone))
               (let ((fallback (make-label)) (done (make-label)))
                 (when (and *x64-linux-mode*
                            (not (equal (sb-ext:posix-getenv "MODUS_X64_ARENA_TRAP") "0")))  ; A/B knob
@@ -2408,7 +2445,7 @@
                 (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
                 (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag result)
                 (emit-bytes buf #x48 #x89 #xC6)    ; mov rsi, rax → V0
-                (emit-label buf done))
+                (emit-label buf done)))
               (emit-bytes buf #x41 #x5B)         ; pop r11
               (emit-bytes buf #x41 #x5A)         ; pop r10
               (emit-bytes buf #x41 #x59)         ; pop r9
@@ -5936,14 +5973,23 @@
          (let* ((target-offset (first operands))
                 (fn-table (translate-state-function-table state))
                 (label (when fn-table (gethash target-offset fn-table))))
-           ;; Restore RBX, tear down frame
+           ;; Restore RBX, tear down frame -- exactly +OP-RET+'s epilogue
            (emit-mov-reg-mem buf 'rbx 'rbp -8)
            (emit-mov-reg-reg buf 'rsp 'rbp)
            (emit-pop buf 'rbp)
-           ;; Jump instead of call
-           (if label
-               (emit-jmp buf label)
-               (emit-jmp buf (make-label)))))
+           ;; Jump instead of call: the callee returns to OUR caller.
+           (cond
+             (label (emit-jmp buf label))
+             ;; an out-of-module callee under the runtime JIT: +OP-CALL+'s
+             ;; patched absolute target, jumped to.  RAX is dead (RET's frame
+             ;; teardown above does not touch it) and is not an argument.
+             ((and *x64-jit-mode* target-offset (>= target-offset #x40000000))
+              (let ((imm-off (+ (code-buffer-position buf) 2)))
+                (push (cons imm-off target-offset) *x64-call-relocs*)
+                (push (cons imm-off *x64-last-set-nargs*) *x64-call-reloc-nargs*)
+                (emit-mov-reg-imm buf 'rax 0)
+                (emit-jmp-reg buf 'rax)))
+             (t (emit-jmp buf (make-label))))))
 
         ;; ============================================
         ;; GC and Allocation
@@ -7980,6 +8026,22 @@
     (emit-bytes buf #x58)                            ; pop rax
     (emit-bytes buf #xC3)))                          ; ret
 
+;;; THE BARE FRAME STACK'S SIZE.  64 frames in the low block (0x10000408..0x10000C08, against
+;;; the heap at 0x10001000) is less than an ordinary library install nests: compiling a
+;;; defmacro under INSTALL-TARBALL's per-file and per-form HANDLER-CASEs ran the UEFI image out
+;;; (measured: sb-gray's %GRAY-WRAP, then three of the T420 desk's DEFUNs, then the reader of the
+;;; next file -- HANDLER-STACK-EXHAUSTED, the loud overflow doing its job).  So a bare image that
+;;; is not an SEV-SNP guest keeps 1024 frames (32 KB) in RAM below the I/O pages instead, at
+;;; 0x0FD00000; an SNP guest keeps the old 64 (that RAM's state there is the SNP stub's
+;;; business).  Keyed off flags every bare x64 build already sets (the UEFI DDC replays them),
+;;; so no new build knob.  The push/pop helpers below and boot-x64's #PF rescue (which pops inline) ask these; they
+;;; live HERE because the bare JIT emits the helpers again at run time, in the image.
+(defun x64-bare-hstack-big-p ()
+  (and (not *x64-linux-mode*)
+       (not (and (boundp 'modus.mvm::*x64-snp-mode*) (symbol-value 'modus.mvm::*x64-snp-mode*)))))
+(defun x64-bare-hstack-base () (if (x64-bare-hstack-big-p) #x0FD00000 #x10000408))
+(defun x64-bare-hstack-frames () (if (x64-bare-hstack-big-p) 1024 64))
+
 (defun emit-handler-helpers-bare (buf push-label pop-label)
   "Bare-metal push/pop: 64 frames at 0x10000408, diagnostics at
    0x10000D00.., and a LOUD 65th push (EMIT-HSTACK-OVERFLOW).
@@ -7995,12 +8057,15 @@
     (emit-label buf push-label)
     (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
-    (emit-bytes buf #x49 #x83 #xFA #x40)             ; cmp r10, 64
+    (if (= (x64-bare-hstack-frames) 64)
+        (emit-bytes buf #x49 #x83 #xFA #x40)         ; cmp r10, 64
+        (progn (emit-bytes buf #x49 #x81 #xFA)       ; cmp r10, imm32
+               (emit-u32 buf (x64-bare-hstack-frames))))
     (emit-jcc buf :ge capped)
-    ;; r11 = depth*32 + 0x10000408
+    ;; r11 = depth*32 + the frame base
     (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
-    (emit-u32 buf #x10000408)
+    (emit-u32 buf (x64-bare-hstack-base))
     (emit-hstack-copy-armed-to-frame buf t)
     ;; depth++ ; [0x10000400] = r10
     (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
@@ -8056,10 +8121,10 @@
     (emit-bytes buf #x49 #xFF #xCA)                  ; dec r10
     (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000400)
-    ;; r11 = depth*32 + 0x10000408
+    ;; r11 = depth*32 + the frame base
     (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
-    (emit-u32 buf #x10000408)
+    (emit-u32 buf (x64-bare-hstack-base))
     (emit-hstack-copy-frame-to-armed buf t)
     (emit-jmp buf done)
     (emit-label buf empty)

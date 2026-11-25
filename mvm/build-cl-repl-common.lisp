@@ -395,13 +395,23 @@
 ;;; allocator's own range check re-initialises a garbage bump pointer to base —
 ;;; see the #x0531 arm.
 (defvar *cl-repl-jit-region-source*
-  (if *cl-repl-virt-p*
-      "
+  (cond (*cl-repl-virt-p*
+         "
 (defun %jit-exec-bump () 67108848)
 (defun %jit-exec-lo   () 67108864)
 (defun %jit-exec-hi   () 83886080)
-"
-      ""))
+")
+        ;; bare x64 with the JIT: translate-x64's #x0531 bare arm bumps the word at
+        ;; 0x10000FB8 through [#x30000000, #x38000000) (%X64-BARE-JIT-LO / -HI), and the
+        ;; arena bookkeeping (%CORE-JIT-ARENA-*, %JIT-DATA-PAGE, %JIT-ARENA-ROOM-P) must
+        ;; see the same region
+        ((and *cl-repl-x64-p* *jit-on*)
+         "
+(defun %jit-exec-bump () 268439480)
+(defun %jit-exec-lo   () 805306368)
+(defun %jit-exec-hi   () 939524096)
+")
+        (t "")))
 
 ;;; ------------------------------------------------------------
 ;;; BRING-UP CULLS (#209 rung 4).  Chain-loading a 20MB image over a 9600-baud
@@ -507,6 +517,33 @@
 ;; cell, and a desk makes framebuffers (two mutexes each) as windows open, so a fixed pool
 ;; would run out mid-session.  With one thread a mutex is a flag store and nothing waits, so
 ;; two objects sharing a cell cannot block each other.  A cell is zeroed on its first use only.
+(declaim (overridable %sync-cell))
+(defun %sync-cell ()
+  (let* ((n (mem-ref #x50000 :u32))
+         (a (+ #x50000 64 (* (mod n 511) 64))))
+    (when (< n 511) (dotimes (i 8) (%gc-write64 (+ a (* i 8)) 0)))
+    (setf (mem-ref #x50000 :u32) (+ n 1))
+    a))
+"
+        "")
+    ;; x64 (multiboot and UEFI): the same two, on the clock %PC-TSC-HZ calibrates (the x64 arm
+    ;; of *CLI-ARCH-OVERRIDE-SOURCE*), and the same arena, which boot-x64's entry zeroes on
+    ;; every boot -- low RAM below the stub's page tables' neighbours (0x10000..0x1BFFF) and
+    ;; clear of everything a bare x64 image places.  Without it %BARE-SYNC-ARENA is (0 0) and
+    ;; every mutex a glass desk makes is cell 0.
+    (if (and *cl-repl-x64-p*
+             (not (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)))
+        "
+(defun %sleep-ms (ms)
+  (let ((hz (%pc-tsc-hz)))
+    (if (> hz 0)
+        (let ((end (+ (rdtsc) (ceiling (* (max ms 0) hz) 1000))))
+          (loop (when (>= (rdtsc) end) (return nil))))
+        (let ((i 0) (n (* ms 20000)))
+          (loop (when (>= i n) (return nil)) (setq i (+ i 1))))))
+  nil)
+(declaim (overridable %bare-sync-arena))
+(defun %bare-sync-arena () (values #x50000 #x58000))
 (declaim (overridable %sync-cell))
 (defun %sync-cell ()
   (let* ((n (mem-ref #x50000 :u32))
@@ -986,7 +1023,88 @@
 ;; Back to lib/save-image.lisp's defaults.  Last definition wins.
 (defun %core-progress (k) k)
 (defun %core-pre-restore () t)
-")
+;; THE GEOMETRY, READ EXACTLY.  boot-x64's stub stores the GC control block and
+;; the MCGC config words RAW (as hosted x64's does), so lib/save-image.lisp's
+;; mem-ref :u64 defaults HALVE them: a core saved with them claimed its heap
+;; started at #x08000800 and saved 136 MB of RAM below the real heap
+;; (#x10001000), then refused to restore.  Hosted x64's overrides
+;; (build-generic-cli), with the bare kind bitmap: [bitmap base] + the delta
+;; word at #x10000F98, which the bare stub stores.
+(defun %core-from-start () (%gc-read64 #x10000040))
+(defun %core-to-start () (%gc-read64 #x10000048))
+(defun %core-space-size () (%gc-read64 #x10000050))
+(defun %core-page-base () (%gc-read64 #x10000E00))
+(defun %core-bitmap-base () (%gc-read64 #x10000E18))
+(defun %core-cons-bitmap-base () (+ (%core-bitmap-base) (%gc-read64 #x10000F98)))
+;; %RESTORE-IMAGE reads the header to (+ (%CORE-HEAP-BASE from) 256): from - 512
+;; there is the metadata page itself on this layout.  A free page under the
+;; io-buf page instead.
+(defun %core-heap-base (from) #x0FEFF000)
+;; The metadata window, with the JIT constant-vector root (0x10000F00) restored
+;; IN PLACE: JIT code in the arena reads its constants through it (hosted x64's).
+(defun %core-restore-window (fd stage)
+  (%core-slice fd stage #x60)
+  (%core-slice fd #x10000060 8)
+  (%core-slice fd stage #x18)
+  (%core-slice fd #x10000080 16)
+  (%core-slice fd stage #xB8)
+  (%core-slice fd #x10000148 8)
+  (%core-slice fd stage #x20)
+  (%core-slice fd #x10000170 8)
+  (%core-slice fd stage #xD88)
+  (%core-slice fd #x10000F00 8)
+  (%core-slice fd stage #x98)
+  (%core-slice fd #x10000FA0 16)
+  (%core-slice fd #x10000FB0 8)
+  (%core-slice fd stage #x18)
+  (%core-slice fd #x10000FD0 8)
+  (%core-slice fd stage #x28))
+"
+       (if (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)
+           ""
+           "
+;;; THE CLOCK ON A BARE PC.  Trap #x0311 (CNTFRQ) answers 0 on bare x64 -- no
+;;; OS clock to measure the TSC against -- and cl-fileio's defaults are a Linux
+;;; syscall, so GET-INTERNAL-REAL-TIME read 0 and the hot-function JIT's 10 ms
+;;; budget never fired: one expensive call never promoted its DEFUN.  The
+;;; reference is the 8254's channel 2, as in Linux's pit_calibrate_tsc: gate on
+;;; and speaker off (port #x61), mode 0 with a 10 ms count, and OUT2 (#x61 bit
+;;; 5) rises at zero.  Measured once, kept in a global SET at run time (a
+;;; DEFVAR initform does not run here).  No PIT answering within ~5 s of TSC
+;;; (a chipset that gates it off) leaves 0, \"no clock\", the old answer.  Not
+;;; under SEV-SNP: that guest must not touch legacy ports.
+(defun %pc-tsc-hz ()
+  (let ((hz (if (boundp '*pc-tsc-hz*) (symbol-value '*pc-tsc-hz*) nil)))
+    (if (integerp hz)
+        hz
+        (let ((latch 11932))
+          (io-out-byte #x61 (logior (logand (io-in-byte #x61) #xFC) 1))
+          (io-out-byte #x43 #xB0)
+          (io-out-byte #x42 (logand latch #xFF))
+          (io-out-byte #x42 (ash latch -8))
+          (let ((t0 (rdtsc)) (cap 17179869184))
+            (loop while (and (zerop (logand (io-in-byte #x61) #x20))
+                             (< (- (rdtsc) t0) cap)))
+            (let* ((dt (- (rdtsc) t0))
+                   (v (if (< dt cap) (floor (* dt 1193182) latch) 0)))
+              (setf (symbol-value '*pc-tsc-hz*) v)
+              v))))))
+(defun get-internal-real-time ()
+  (let ((hz (%pc-tsc-hz)))
+    (if (> hz 0)
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000)
+             (floor (* (mod ticks hz) 1000000) hz)))
+        0)))
+(defun %irt-ns ()
+  (let ((hz (%pc-tsc-hz)))
+    (if (> hz 0)
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000000)
+             (floor (* (mod ticks hz) 1000000000) hz)))
+        0)))
+(defun %irun-ns () (%irt-ns))
+"))
       (concatenate 'string
         (string #\Newline)
         (mvm-text "lib/fdt.lisp")
@@ -2034,7 +2152,19 @@
             ;; virtio-net AFTER e1000: its e1000-probe/send/receive/rx-buf
             ;; wrappers win (last-defun-wins) and pick virtio when the PCI scan
             ;; finds one, the E1000 otherwise.
-            (%rpi-net-text "virtio-net.lisp")      (string #\Newline))
+            (%rpi-net-text "virtio-net.lisp")      (string #\Newline)
+            ;; THE NIC/DHCP STATE BLOCK: arch-x86-cl.lisp does not place it (i386's
+            ;; adapter does), and only an SSH build's address map did, so every x64
+            ;; network image built WITHOUT SSH died in RUN-NET-PIPELINE's first step
+            ;; (an UNDEFINED-FUNCTION, surfacing as a TYPE-ERROR).  The SSH map's
+            ;; addresses; an SSH build has them from that map (a second DEFUN would
+            ;; be an undeclared redefinition).
+            (if *ssh-build-p*
+                ""
+                "
+(defun e1000-state-base ()   #x0C320000)
+(defun fe-scratch-base ()    #x0C320900)
+"))
       (if *cl-repl-virt-p*
           (concatenate 'string
             ;; QEMU virt: PCI ECAM + E1000.  arch-aarch64-cl.lisp also carries
@@ -4271,6 +4401,16 @@
   (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
   (setf modus.mvm.x64::*x64-linux-mode* nil)
   (setf modus.mvm.x64::*x64-gc-enabled* t)
+  ;; THE JIT CONSTANT VECTOR IS A ROOT OF THIS IMAGE'S COLLECTOR (build-generic-cli's
+  ;; rule).  The in-image co-init (%INIT-X64-TRANSLATOR) sets the flag, so JIT
+  ;; pages load their thunk constants through the vector at 0x10000F00 -- but
+  ;; without the host-side half the collector never forwarded it, the vector
+  ;; dangled at the first collection, and %JIT-CONSTVEC-COVERS-P's intactness
+  ;; check then refused every page: measured on the UEFI image, no hot DEFUN
+  ;; built after one collection.  The page at 0x10000000 is zeroed by the boot
+  ;; stub, so the root starts out "no vector".
+  (when cl-user::*jit-on*
+    (setf modus.mvm.x64::*x64-jit-constvec-p* t))
   ;; THE CONS-KIND scan_word REJECT IS ON, ON BARE x64 TOO (MODUS_X64_KINDCHECK=0
   ;; turns it off for an A/B).  It used to be forced OFF here on the argument
   ;; that the kind bitmap's address, [bitmap_base]+delta, is a Linux layout

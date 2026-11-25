@@ -25299,11 +25299,20 @@
 
 (defun apply-targets-safe-rest-fn-p (fn-form)
   "Return T iff FN-FORM is a literal `#'SYM` (i.e. (function SYM)) and
-   SYM names a registered &rest function with required-count = 0.
+   SYM names a registered &rest function with required-count = 0 and NO
+   &optional parameters.
    Used by the compile-form APPLY dispatch to decide whether the
    static-rest sentinel trick is safe (V0 = whole packed list).
    Anything else is conservative and the call falls back to the
-   cl-printer apply defun's runtime ladder."
+   cl-printer apply defun's runtime ladder.
+
+   &optional disqualifies it exactly as it does COMPILE-CALL's static
+   pre-pack: the sentinel makes EMIT-OPTIONAL-PROLOGUE NIL-init every
+   optional and EMIT-REST-PROLOGUE trust slot[req+optcount] -- not V0,
+   where the list is.  CL's own + and * are (&optional a b &rest more), so
+   every baked (apply #'+ list) ran + on NIL, NIL and a stale rest slot and
+   signalled a TYPE-ERROR: %CONST-INT-VALUE's fold of (+ 3 7), which made
+   the run-time compile of (logand (+ 3 7) 255) or (mod (* 3 7) 256) fail."
   (when (and (consp fn-form)
              (eq (car fn-form) 'function)
              (symbolp (cadr fn-form))
@@ -25315,7 +25324,9 @@
       (and info
            (function-info-rest-param-p info)
            (let ((req (function-info-required-count info)))
-             (or (null req) (zerop req)))))))
+             (or (null req) (zerop req)))
+           (let ((oc (function-info-optional-count info)))
+             (or (null oc) (zerop oc)))))))
 
 (defun compile-apply (args env dest)
   "Compile (APPLY fn arg1 … argN spread).

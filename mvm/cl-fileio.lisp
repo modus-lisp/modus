@@ -1113,10 +1113,55 @@
             (setq j (+ j 1)))))))
 
 ;;; --- File stream write-char ---
+;;; ASCII INTO THE WRITE BUFFER.  A character below #x80 is one byte in UTF-8 and
+;;; Latin-1 alike, so on a buffered output file (%FS-WBUF-P) whose buffer already
+;;; holds a byte (it is on *FS-BUFFERED-STREAMS* then) it is stored straight into
+;;; the buffer: no %FS-PUT-BYTE, no format test, no %UTF8-LEN-OF-CODE.  Every
+;;; byte used to take all three, ~50 ns a character (SBCL 6).  A string goes out
+;;; as a run (%FS-WRITE-STRING-RUN): the buffer's fill count, the position and
+;;; the line-start flag updated once for the run, not per byte.
+(defun %fs-write-string-run (stream str start end)
+  "Store the ASCII prefix of STR[START, END) in buffered output file STREAM's
+   buffer.  Returns the index of the first character not written: END when
+   all were, START when STREAM takes no run (not a buffered output file, or
+   STR[START] is not ASCII)."
+  (let ((fd (%fs-fd stream)))
+    (if (not (and (stringp str) (%fs-wbuf-p stream fd)))
+        start
+        (let ((buf (%fs-buf stream)) (n (%fs-blen stream)) (i start) (last -1))
+          ;; an empty buffer: on the exit flush list first, as %FS-PUT-BYTE does
+          (when (= n 0)
+            (unless (member stream *fs-buffered-streams* :test (function eq))
+              (setq *fs-buffered-streams* (cons stream *fs-buffered-streams*))))
+          (loop
+            (when (>= i end) (return nil))
+            (let ((c (char-code (char str i))))
+              (when (>= c 128) (return nil))
+              (when (>= n 4096)
+                ;; full: out it goes (the stream stays on *FS-BUFFERED-STREAMS*)
+                (%fs-set-blen stream n)
+                (%fs-flush stream)
+                (setq n 0))
+              (%prim-aset buf n c)
+              (setq n (+ n 1) last c i (+ i 1))))
+          (%fs-set-blen stream n)
+          (%fs-set-pos stream (+ (%fs-pos stream) (- i start)))
+          (when (>= last 0) (%fs-note-byte stream last))
+          i))))
+
 (defun %fs-write-char (code stream)
   "Write a char code to a file stream, UTF-8 encoded -- or as one byte on a
    :LATIN-1 stream, where a character past #xFF is written as ?."
   (let ((fd (%fs-fd stream)))
+    ;; ASCII into a buffer that holds a byte and has room (see above)
+    (when (and (< code 128) (%fs-wbuf-p stream fd))
+      (let ((n (%fs-blen stream)))
+        (when (and (> n 0) (< n 4096))
+          (%prim-aset (%fs-buf stream) n code)
+          (%fs-set-blen stream (+ n 1))
+          (%fs-set-pos stream (+ (%fs-pos stream) 1))
+          (%fs-note-byte stream code)
+          (return-from %fs-write-char nil))))
     (when (and (>= fd 0) (%fs-latin-1-p stream))
       (%fs-put-byte stream fd (if (< code 256) code 63))
       (%fs-set-pos stream (+ (%fs-pos stream) 1))

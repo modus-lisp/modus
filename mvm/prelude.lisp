@@ -1736,7 +1736,12 @@
       (let ((vec (car holder)))
         (when (null vec)
           ;; still small: build the index once the table crosses the threshold
-          (when (>= (car (cdr holder)) 32)
+          ;; -- 32 entries, or 8 for a STRING key: scanning compares each
+          ;; same-length name with STRING=, and a package's small symbol
+          ;; tables are these (a FIND-SYMBOL miss in CL-USER, for every symbol
+          ;; printed with a package prefix, was a third of cl-bench FPRINT)
+          (when (let ((n (car (cdr holder))))
+                  (or (>= n 32) (and (>= n 8) (stringp key))))
             (setq vec (%ht-read-build-index ht holder))))
         (when (consp vec)
           ;; COMPACT DICT (see %HTD-FIND)
@@ -1959,7 +1964,12 @@
       (let ((vec (car holder)))
         (when (null vec)
           ;; still small: build the index once the table crosses the threshold
-          (when (>= (car (cdr holder)) 32)
+          ;; -- 32 entries, or 8 for a STRING key: scanning compares each
+          ;; same-length name with STRING=, and a package's small symbol
+          ;; tables are these (a FIND-SYMBOL miss in CL-USER, for every symbol
+          ;; printed with a package prefix, was a third of cl-bench FPRINT)
+          (when (let ((n (car (cdr holder))))
+                  (or (>= n 32) (and (>= n 8) (stringp key))))
             (setq vec (%ht-read-build-index ht holder))))
         (when (consp vec)
           ;; A compact dict keeps its keys and values packed, with no conses:

@@ -35815,7 +35815,13 @@
          (let* ((rest-pos (position '&rest params))
                 (opt-pos  (position '&optional params))
                 (key-pos  (position '&key params))
-                (req-end  (or rest-pos opt-pos key-pos (length params)))
+                ;; the FIRST lambda-list keyword ends the required params: OR
+                ;; took &REST's position over an earlier &OPTIONAL's, so
+                ;; (a &optional b &rest c) recorded 3 required and every
+                ;; one-argument call compiled to a PROGRAM-ERROR
+                (req-end  (let ((ks (remove nil (list rest-pos opt-pos key-pos
+                                                      (position '&aux params)))))
+                            (if ks (reduce (function min) ks) (length params))))
                 (pp (preprocess-params params body t))  ; toplevel defun: allow &key transform
                 ;; 5th value: the POST-preprocess rest slot — either the
                 ;; synthesized &key-rest slot (real-&key transform) or the

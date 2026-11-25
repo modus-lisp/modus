@@ -20,9 +20,16 @@
     (%sos-push-codes (cdr (cdr stream)) str 0 (array-length str))
     (return-from %print-string-raw nil))
   ;; LENGTH (fp-aware) so fp-wrapped strings print only their active prefix.
-  (let ((len (length str)) (i 0))
+  (let ((len (length str)) (i 0)
+        (file (and (streamp stream) (= (%stream-type stream) 9))))
     (loop
       (when (= i len) (return nil))
+      ;; an ASCII run straight into a buffered file's buffer (cl-fileio);
+      ;; no progress at all means no buffer: stop asking
+      (when file
+        (let ((j (%fs-write-string-run stream str i len)))
+          (if (= j i) (setq file nil) (setq i j)))
+        (when (= i len) (return nil)))
       ;; %print-char wants a raw char-CODE.  Public AREF now lifts string
       ;; elements to characters (and peels fp/adj/displaced wrappers), so
       ;; char-code converts back.  %ensure-char-code tolerates either a
@@ -52,6 +59,7 @@
        (dolist (d digits) (%print-char d stream))))))
 
 ;;; Digit char for base N (0-9 A-Z)
+(declaim (inline %digit-char-upper))
 (defun %digit-char-upper (n)
   (if (< n 10) (+ 48 n) (+ 55 n)))   ; 55 = 65-10
 
@@ -164,8 +172,14 @@
     ((= n 0)
      (%print-char 48 stream))
     (t
-     ;; One TRUNCATE per digit, not a MOD and a TRUNCATE.
-     (dolist (d (%fmt-integer-digits n base)) (%print-char d stream)))))
+     ;; One TRUNCATE per digit, not a MOD and a TRUNCATE; the digits go out as
+     ;; one string (%PRINT-STRING-RAW: a run into a file's buffer, or onto a
+     ;; string-output stream), not a character at a time.
+     (let* ((ds (%fmt-integer-digits n base))
+            (s (make-string (length ds)))
+            (i 0))
+       (dolist (d ds) (aset s i (code-char d)) (setq i (+ i 1)))
+       (%print-string-raw s stream)))))
 
 ;;; Print radix prefix: #b, #o, #x, #Nr. Base 10 with *print-radix* is
 ;;; conventionally written with a TRAILING dot (not a leading prefix), so
@@ -182,7 +196,9 @@
        (%print-char 114 stream))))  ; #Nr
 
 ;;; Char-class predicates (use char codes; alpha test is ASCII-only,
-;;; which matches the rest of the printer/reader).
+;;; which matches the rest of the printer/reader).  Inline: the escape tests
+;;; ask them of every character of every symbol printed.
+(declaim (inline %ch-upperp %ch-lowerp %ch-alphap %ch-to-upper %ch-to-lower))
 (defun %ch-upperp (c) (and (>= c 65) (<= c 90)))
 (defun %ch-lowerp (c) (and (>= c 97) (<= c 122)))
 (defun %ch-alphap (c) (or (%ch-upperp c) (%ch-lowerp c)))
@@ -274,6 +290,15 @@
 ;;;
 ;;; Out-of-case chars pass through verbatim.
 (defun %print-name-with-rcase-and-pcase (name stream case rc)
+  ;; Every character verbatim -- the print case folds in-case letters to the
+  ;; case they already have, or (:PRESERVE) none is in case -- the default
+  ;; :UPCASE / :UPCASE above all: the whole name as one string, not a
+  ;; character at a time through WRITE-CHAR-TO-STREAM.
+  (when (or (eq rc :preserve)
+            (and (eq rc :upcase) (eq case :upcase))
+            (and (eq rc :downcase) (eq case :downcase)))
+    (%print-string-raw name stream)
+    (return-from %print-name-with-rcase-and-pcase nil))
   (let ((len (array-length name)) (i 0)
         (at-word-start t))
     (loop
@@ -5549,9 +5574,14 @@
                            (fixnump start) (fixnump eff-end) (<= 0 start) (<= start eff-end)
                            (<= eff-end len)
                            (%fs-write-string-cab s str start eff-end))
-                (let ((i start))
+                (let ((i start) (fs-run t))
                   (loop
                     (when (>= i eff-end) (return nil))
+                    ;; an ASCII run straight into a buffered file's buffer
+                    (when (and fs-run (= (%stream-type s) 9))
+                      (let ((j (%fs-write-string-run s str i eff-end)))
+                        (if (= j i) (setq fs-run nil) (setq i j)))
+                      (when (>= i eff-end) (return nil)))
                     (%write-char-to-stream (%ensure-char-code (aref str i)) s)
                     (setq i (+ i 1))))))
           ;; Serial fallback only handles whole-string writes; emulate.
@@ -5621,13 +5651,15 @@
    Avoids compiler bug with inline characterp + char-code."
   (if (fixnump x) x (char-code x)))
 
-(defun write-char (ch &rest stream-arg)
+(defun write-char (ch &optional sa (extra nil extra-p) &rest more)
   "Write character CH to stream. Stream designator: nil=*standard-output*, t=*terminal-io*."
   ;; CLHS: write-char takes char + optional stream — at most one trailing
-  ;; arg.  A 3rd positional arg signals program-error.  (write-char.error.2)
-  (when (cdr stream-arg) (%signal-program-error))
-  (let* ((code (if (characterp ch) (char-code ch) (%ensure-char-code ch)))
-         (sa (car stream-arg)))
+  ;; arg; a 3rd signals PROGRAM-ERROR (write-char.error.2).  The stream is an
+  ;; &OPTIONAL, not the head of a &REST list: that list was a cons per character
+  ;; (MORE is only ever consed for a call that is an error anyway).
+  (declare (ignore extra))
+  (when (or extra-p more) (modus.runtime::%signal-program-error))
+  (let* ((code (if (characterp ch) (char-code ch) (%ensure-char-code ch))))
     ;; A string-output stream takes the code inline (it went through
     ;; %RESOLVE-OUTPUT-STREAM and %WRITE-CHAR-TO-STREAM's dispatch).
     (if (and (consp sa) (eql (car sa) 7770001) (consp (cdr sa)) (eql (car (cdr sa)) 2))

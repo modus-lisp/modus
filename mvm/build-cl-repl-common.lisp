@@ -557,13 +557,27 @@
 ;; this is how a core that did not restore says why.  Multiboot images have no such stub.
 (defun %srepl-after-banner ()
   (let ((step (mem-ref #x1B0E0 :u32)))
-    (unless (or (= step 0) (> step 11))
+    (unless (> step 11)
       (write-string-serial \"UEFI CORE.BIN: step \") (print-dec step)
       (write-string-serial \" status \") (print-dec (mem-ref #x1B0E8 :u32))
       (write-string-serial \" size \") (print-dec (mem-ref #x1B0F0 :u32))
       (write-string-serial \" moved from \") (print-dec (mem-ref #x1B0F8 :u32))
       (write-string-serial (if (%core-requested-p) \" (a core is in RAM)\" \" (no core in RAM)\"))
-      (write-char-serial 10))))
+      (write-char-serial 10)
+      ;; ... and in blocks a webcam can read, on GOP's screen: a white square per step
+      ;; reached, the status's low byte as eight bits (red 1, grey 0, high bit first),
+      ;; then green when a core is in RAM, red when not.
+      (when (= (mem-ref #x1B020 :u32) 1)
+        (let ((base (mem-ref #x1B000 :u64)) (pitch (* 4 (mem-ref #x1B008 :u32))))
+          (flet ((sq (col row rgb)
+                   (let ((x0 (+ 40 (* col 50))) (y0 (+ 300 (* row 60))))
+                     (dotimes (y 40)
+                       (let ((a (+ base (* (+ y0 y) pitch) (* x0 4))))
+                         (dotimes (x 40) (setf (mem-ref (+ a (* x 4)) :u32) rgb)))))))
+            (dotimes (i (max step 1)) (sq i 0 (if (= step 0) #x404040 #xFFFFFF)))
+            (let ((st (logand (mem-ref #x1B0E8 :u32) 255)))
+              (dotimes (b 8) (sq b 1 (if (logbitp (- 7 b) st) #xFF0000 #x404040))))
+            (sq 0 2 (if (%core-requested-p) #x00FF00 #xFF0000))))))))
 "
         "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the

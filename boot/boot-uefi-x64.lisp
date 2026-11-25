@@ -485,6 +485,30 @@
 (defconstant +sfs-guid-qw0+ #x11D26459964E5B22)
 (defconstant +sfs-guid-qw1+ #x3B7269C9A000398E)
 
+;;; THE RECORD LIVES IN THE STUB UNTIL EXITBOOTSERVICES.  It used to be written straight to
+;;; #x1B0E0, low memory the firmware still owns until ExitBootServices -- and on the T420 the
+;;; image found it empty where OVMF's showed the steps (Lenovo's firmware reuses that page).  So
+;;; the loader writes it into 32 bytes of this stub's own section, RIP-relative, and
+;;; EMIT-UEFI-CORE-MOVE copies it to #x1B0E0..#x1B0FF once the machine is ours.  The fields keep
+;;; their #x1B0xx names; *UEFI-CORE-RECORD-AT* is the block's position in the stub buffer.
+(defvar *uefi-core-record-at* nil)
+(defun uefi-rec-disp (buf field insn-len)
+  (- (+ *uefi-core-record-at* (- field #x1B0E0)) (+ (mvm-buffer-position buf) insn-len)))
+(defun uefi-rec-imm32 (buf field imm)
+  "mov dword [record FIELD], IMM"
+  (let ((d (uefi-rec-disp buf field 10)))
+    (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x05)
+    (mvm-emit-u32 buf (ldb (byte 32 0) d)) (mvm-emit-u32 buf imm)))
+(defun uefi-rec-eax (buf field)
+  "mov [record FIELD], eax"
+  (let ((d (uefi-rec-disp buf field 6)))
+    (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x05) (mvm-emit-u32 buf (ldb (byte 32 0) d))))
+(defun uefi-rec-rax (buf field)
+  "mov [record FIELD], rax"
+  (let ((d (uefi-rec-disp buf field 7)))
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x05)
+    (mvm-emit-u32 buf (ldb (byte 32 0) d))))
+
 (defun emit-uefi-core-load (buf)
   (let ((fails nil)
         ;; 8 pushes leave RSP = 8 mod 16; 152 makes it 0 for every call below
@@ -502,6 +526,10 @@
              (dolist (p positions)
                (let ((rel (- target (+ p 4))) (bytes (mvm-buffer-bytes buf)))
                  (dotimes (k 4) (setf (aref bytes (+ p k)) (ldb (byte 8 (* 8 k)) rel)))))))
+      ;; the record's home: 32 bytes of this stub's own (writable) section, jumped over
+      (mvm-emit-byte buf #xE9) (mvm-emit-u32 buf 32)                ; jmp over the block
+      (setq *uefi-core-record-at* (mvm-buffer-position buf))
+      (dotimes (i 32) (mvm-emit-byte buf 0))
       (uefi-emit-sub-rsp buf frame)
       ;; THE RECORD, for a machine whose firmware says nothing we can see: the last step tried
       ;; (u32 at #x1B0E0: 1 LoadedImage, 2 SimpleFileSystem, 3 OpenVolume, 4 Open, 5-7 the size,
@@ -510,12 +538,12 @@
       ;; 32 bits at #x1B0E8: 0 success, 14 not found, 9 out of resources, ...), and the file's
       ;; size as the firmware reports it (u64 at #x1B0F0).  The image
       ;; prints them under its banner (%SREPL-AFTER-BANNER, build-cl-repl-common's x64 arm).
-      (uefi-emit-store-imm32-abs32 buf #x1B0E0 0)
-      (uefi-emit-store-imm32-abs32 buf #x1B0E8 0)
-      (uefi-emit-store-imm32-abs32 buf #x1B0F0 0)
-      (uefi-emit-store-imm32-abs32 buf #x1B0F4 0)
-      (uefi-emit-store-imm32-abs32 buf #x1B0F8 0)
-      (uefi-emit-store-imm32-abs32 buf #x1B0FC 0)
+      (uefi-rec-imm32 buf #x1B0E0 0)
+      (uefi-rec-imm32 buf #x1B0E8 0)
+      (uefi-rec-imm32 buf #x1B0F0 0)
+      (uefi-rec-imm32 buf #x1B0F4 0)
+      (uefi-rec-imm32 buf #x1B0F8 0)
+      (uefi-rec-imm32 buf #x1B0FC 0)
       ;; the name, UTF-16: \CORE.BIN and a NUL, padded to 3 qwords
       (let ((units (append (map 'list #'char-code "\\CORE.BIN") (list 0 0 0))))
         (dotimes (q 3)
@@ -528,9 +556,9 @@
       (uefi-emit-mov-reg-reg buf +rcx+ +r12+)
       (uefi-emit-lea-rsp buf +rdx+ guid)
       (uefi-emit-lea-rsp buf +r8+ li)
-      (uefi-emit-store-imm32-abs32 buf #x1B0E0 1)
+      (uefi-rec-imm32 buf #x1B0E0 1)
       (uefi-emit-call-mem buf +r14+ +efi-bs-handle-protocol+)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
       (test-fail)
       ;; HandleProtocol(li->DeviceHandle, &SimpleFileSystem, &sfs)
       (guid! +sfs-guid-qw0+ +sfs-guid-qw1+)
@@ -538,16 +566,16 @@
       (uefi-emit-mov-reg-mem buf +rcx+ +rax+ #x18)
       (uefi-emit-lea-rsp buf +rdx+ guid)
       (uefi-emit-lea-rsp buf +r8+ sfs)
-      (uefi-emit-store-imm32-abs32 buf #x1B0E0 2)
+      (uefi-rec-imm32 buf #x1B0E0 2)
       (uefi-emit-call-mem buf +r14+ +efi-bs-handle-protocol+)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
       (test-fail)
       ;; sfs->OpenVolume(sfs, &root)
       (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ sfs)
       (uefi-emit-lea-rsp buf +rdx+ root)
-      (uefi-emit-store-imm32-abs32 buf #x1B0E0 3)
+      (uefi-rec-imm32 buf #x1B0E0 3)
       (uefi-emit-call-mem buf +rcx+ #x08)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
       (test-fail)
       ;; root->Open(root, &file, name, EFI_FILE_MODE_READ, 0)
       (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)          ; xor eax, eax
@@ -556,16 +584,16 @@
       (uefi-emit-lea-rsp buf +rdx+ file)
       (uefi-emit-lea-rsp buf +r8+ name)
       (uefi-emit-mov-reg-imm64 buf +r9+ 1)
-      (uefi-emit-store-imm32-abs32 buf #x1B0E0 4)
+      (uefi-rec-imm32 buf #x1B0E0 4)
       (uefi-emit-call-mem buf +rcx+ #x08)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
       (test-fail)
       ;; the size: file->SetPosition(file, -1), GetPosition(file, &size), SetPosition(file, 0)
       (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
       (uefi-emit-mov-reg-imm64 buf +rdx+ #xFFFFFFFFFFFFFFFF)
-      (uefi-emit-store-imm32-abs32 buf #x1B0E0 5)
+      (uefi-rec-imm32 buf #x1B0E0 5)
       (uefi-emit-call-mem buf +rcx+ #x38)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
       (let ((close-fails nil))
         (flet ((test-close ()
                  (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x85) (mvm-emit-byte buf #xC0)
@@ -575,19 +603,18 @@
           (test-close)
           (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
           (uefi-emit-lea-rsp buf +rdx+ size)
-          (uefi-emit-store-imm32-abs32 buf #x1B0E0 6)
+          (uefi-rec-imm32 buf #x1B0E0 6)
       (uefi-emit-call-mem buf +rcx+ #x30)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
           (test-close)
           (uefi-emit-mov-reg-mem buf +rax+ +rsp+ size)                ; the size it reports:
-          (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x04)
-          (mvm-emit-byte buf #x25) (mvm-emit-u32 buf #x1B0F0)             ; mov [#x1B0F0], rax
+          (uefi-rec-rax buf #x1B0F0)                                 ; mov [record size], rax
           (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)          ; xor eax, eax (status 0 stays tested)
           (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
           (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xD2)       ; xor edx, edx
-          (uefi-emit-store-imm32-abs32 buf #x1B0E0 7)
+          (uefi-rec-imm32 buf #x1B0E0 7)
       (uefi-emit-call-mem buf +rcx+ #x38)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
           (test-close)
           ;; AllocatePages(AllocateAddress, EfiLoaderData, (size + 4095) >> 12, &mem = 0x20000000).
           ;; The page count is kept at [rsp+pages]: a call clobbers R8.
@@ -602,9 +629,9 @@
           (uefi-emit-mov-reg-imm64 buf +rcx+ 2)
           (uefi-emit-mov-reg-imm64 buf +rdx+ 2)
           (uefi-emit-lea-rsp buf +r9+ mem)
-          (uefi-emit-store-imm32-abs32 buf #x1B0E0 8)
+          (uefi-rec-imm32 buf #x1B0E0 8)
       (uefi-emit-call-mem buf +r14+ +efi-bs-allocate-pages+)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
           ;; THE FIXED ADDRESS MAY BE THE FIRMWARE'S: then any pages below 4 GB
           ;; (AllocateMaxAddress), the address kept at #x1B0F8, and the entry stub moves the core
           ;; to 0x20000000 once ExitBootServices has made that memory ours (EMIT-UEFI-CORE-MOVE).
@@ -618,21 +645,20 @@
             (uefi-emit-mov-reg-imm64 buf +rdx+ 2)
             (uefi-emit-mov-reg-mem buf +r8+ +rsp+ pages)
             (uefi-emit-lea-rsp buf +r9+ mem)
-            (uefi-emit-store-imm32-abs32 buf #x1B0E0 11)
+            (uefi-rec-imm32 buf #x1B0E0 11)
       (uefi-emit-call-mem buf +r14+ +efi-bs-allocate-pages+)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
             (test-close)
             (uefi-emit-mov-reg-mem buf +rax+ +rsp+ mem)
-            (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x04)
-            (mvm-emit-byte buf #x25) (mvm-emit-u32 buf #x1B0F8)    ; mov [#x1B0F8], rax: to move
+            (uefi-rec-rax buf #x1B0F8)                             ; the address to move from
             (patch (list at-fixed) (mvm-buffer-position buf)))
           ;; file->Read(file, &size, mem); a failure clears the magic and cancels the move
           (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
           (uefi-emit-lea-rsp buf +rdx+ size)
           (uefi-emit-mov-reg-mem buf +r8+ +rsp+ mem)
-          (uefi-emit-store-imm32-abs32 buf #x1B0E0 9)
+          (uefi-rec-imm32 buf #x1B0E0 9)
       (uefi-emit-call-mem buf +rcx+ #x20)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8)
+      (uefi-rec-eax buf #x1B0E8)
           (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x85) (mvm-emit-byte buf #xC0)
           (mvm-emit-byte buf #x74)                                 ; jz: read ok
           (let ((jz-at (mvm-buffer-position buf)))
@@ -640,15 +666,15 @@
             (uefi-emit-mov-reg-mem buf +rdi+ +rsp+ mem)
             (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x07)
             (mvm-emit-u32 buf 0)                                   ; mov qword [rdi], 0
-            (uefi-emit-store-imm32-abs32 buf #x1B0F8 0)
-            (uefi-emit-store-imm32-abs32 buf #x1B0FC 0)
+            (uefi-rec-imm32 buf #x1B0F8 0)
+            (uefi-rec-imm32 buf #x1B0FC 0)
             (setf (aref (mvm-buffer-bytes buf) jz-at) (- (mvm-buffer-position buf) (+ jz-at 1)))))
         ;; close: file->Close(file)
         (patch close-fails (mvm-buffer-position buf))
         (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ file)
-        (uefi-emit-store-imm32-abs32 buf #x1B0E0 10)
+        (uefi-rec-imm32 buf #x1B0E0 10)
       (uefi-emit-call-mem buf +rcx+ #x10)
-      (uefi-emit-store-eax-abs32 buf #x1B0E8))
+      (uefi-rec-eax buf #x1B0E8))
       (patch fails (mvm-buffer-position buf))
       (uefi-emit-add-rsp buf frame))))
 
@@ -663,6 +689,11 @@
            (let ((rel (- (mvm-buffer-position buf) (+ pos 4))) (bytes (mvm-buffer-bytes buf)))
              (dotimes (k 4) (setf (aref bytes (+ pos k)) (ldb (byte 8 (* 8 k)) rel))))))
     (b #x56 #x57 #x51 #x50)                                   ; push rsi, rdi, rcx, rax
+    ;; the loader's record, out of the stub to #x1B0E0..#x1B0FF (see *UEFI-CORE-RECORD-AT*)
+    (dotimes (q 4)
+      (let ((d (uefi-rec-disp buf (+ #x1B0E0 (* 8 q)) 7)))
+        (b #x48 #x8B #x05) (mvm-emit-u32 buf (ldb (byte 32 0) d)))  ; mov rax, [rip+record+8q]
+      (b #x48 #x89 #x04 #x25) (mvm-emit-u32 buf (+ #x1B0E0 (* 8 q)))) ; mov [#x1B0E0+8q], rax
     (b #x48 #x8B #x34 #x25) (mvm-emit-u32 buf #x1B0F8)        ; mov rsi, [#x1B0F8]
     (b #x48 #x85 #xF6)                                        ; test rsi, rsi
     (b #x0F #x84)                                             ; jz done

@@ -1386,6 +1386,15 @@
 (defun ppc-hdepth-addr ()     (+ (ppc-hbase) #x400))
 (defun ppc-hframes-addr ()    (+ (ppc-hbase) #x408))
 
+;; Cooperative threads (#x0560 / #x0561 above; net/ppcmac-threads.lisp): the
+;; handler state a switch carries, [base, base + 4 * words): jmpbuf #x10000180
+;; through the extension limit word #x100009D8.  A save area is 64 bytes of
+;; registers and then that copy.  The bare Mac's parked table (the collector's
+;; extra roots) is at +PPC-CO-TABLE+: a count, then (save area, stack top) pairs.
+(defconstant +ppc-co-handler-base+ #x10000180)
+(defun ppc-co-handler-words () (/ (- #x100009E0 #x10000180) 4))
+(defconstant +ppc-co-save-bytes+ (+ 64 (- #x100009E0 #x10000180)))
+(defconstant +ppc-co-table+ #x07240000)
 (defconstant +ppc-hstack-ext-addr+ #x100009D0
   "Hosted: ABSOLUTE address of the handler-frame extension, 0 until the first
    push past the in-memory frames reserves it.")
@@ -2013,6 +2022,73 @@
               (ppc-emit-cmpi-word buf +ppc-scratch1+ 0)
               (ppc-emit-bgt buf top)
               (ppc-emit-label buf done)))
+           ((and (member code '(#x0560 #x0561)) (not *ppc-64-bit*))
+            ;; COOPERATIVE THREADS (net/ppcmac-threads.lisp), ppc32.
+            ;; #x0560 %CO-SWITCH from to: save this computation in save area FROM,
+            ;;   resume the one in save area TO.  Result (when this one is resumed) 0.
+            ;; #x0561 %CO-FORK area top: save this computation in AREA (resumed: 1),
+            ;;   then go on in the CALLER'S code on a fresh stack below TOP with the
+            ;;   handler stack empty: result 0.  The caller must call (not tail-call)
+            ;;   into the new computation at once and never return: its frame
+            ;;   pointer is still the parent's.
+            ;; A SAVE AREA (+PPC-CO-SAVE-BYTES+): +0 the resume address, +4 r1, +8
+            ;; r31, +12 r14..r18, +32 r22..r28 -- every register translated code
+            ;; keeps across a call but the heap's r19/r20/r21 -- then at +64 the
+            ;; handler state [#x10000180, #x100009E0): jmpbuf, longjmp scratch,
+            ;; depth, the in-memory frames, the extension pointer and limit.  The
+            ;; collector roots a parked one's stack, area and extension frames
+            ;; (PPC-EMIT-GC-COLLECTOR, the parked table).  Operands TAGGED.
+            (let ((resume (mvm-make-label)) (save (mvm-make-label)) (done (mvm-make-label))
+                  (fork (= code #x0561)))
+              (labels ((copy (from to)
+                         ;; (ppc-co-handler-words) words from FROM to TO (registers)
+                         (let ((top (mvm-make-label)))
+                           (ppc-emit-li buf +ppc-r6+ (ppc-co-handler-words))
+                           (ppc-emit-mtctr buf +ppc-r6+)
+                           (ppc-emit-label buf top)
+                           (ppc-emit-lwz buf +ppc-r8+ from 0)
+                           (ppc-emit-stw buf +ppc-r8+ to 0)
+                           (ppc-emit-addi buf from from 4)
+                           (ppc-emit-addi buf to to 4)
+                           (ppc-emit-bc buf 16 0 top))))                  ; bdnz
+                (ppc-emit-srawi buf +ppc-r11+ +ppc-r3+ 1)
+                (ppc-emit-srawi buf +ppc-r12+ +ppc-r4+ 1)
+                (ppc-emit-bl buf save)                                    ; LR = the resume point
+                (ppc-emit-label buf resume)
+                (ppc-emit-li buf +ppc-r3+ (if fork 2 0))                  ; tagged 1 / 0
+                (ppc-emit-b buf done)
+                (ppc-emit-label buf save)
+                (ppc-emit-mflr buf +ppc-r0+)
+                (ppc-emit-stw buf +ppc-r0+ +ppc-r11+ 0)
+                (ppc-emit-stw buf +ppc-r1+ +ppc-r11+ 4)
+                (ppc-emit-stw buf +ppc-r31+ +ppc-r11+ 8)
+                (loop for r from 14 to 18 for o from 12 by 4 do (ppc-emit-stw buf r +ppc-r11+ o))
+                (loop for r from 22 to 28 for o from 32 by 4 do (ppc-emit-stw buf r +ppc-r11+ o))
+                (ppc-emit-li buf +ppc-r5+ +ppc-co-handler-base+)
+                (ppc-emit-addi buf +ppc-r7+ +ppc-r11+ 64)
+                (copy +ppc-r5+ +ppc-r7+)
+                (if fork
+                    (progn
+                      ;; the child: an empty handler stack, a fresh stack, result 0
+                      (ppc-emit-li buf +ppc-r5+ 0)
+                      (ppc-emit-li buf +ppc-r6+ (ppc-hdepth-addr))
+                      (ppc-emit-stw buf +ppc-r5+ +ppc-r6+ 0)
+                      (ppc-emit-addi buf +ppc-r1+ +ppc-r12+ -64)
+                      (ppc-emit-stw buf +ppc-r5+ +ppc-r1+ 0)                ; back chain 0
+                      (ppc-emit-li buf +ppc-r3+ 0))
+                    (progn
+                      ;; the target: its handler state, its registers, its resume point
+                      (ppc-emit-li buf +ppc-r5+ +ppc-co-handler-base+)
+                      (ppc-emit-addi buf +ppc-r7+ +ppc-r12+ 64)
+                      (copy +ppc-r7+ +ppc-r5+)
+                      (loop for r from 14 to 18 for o from 12 by 4 do (ppc-emit-lwz buf r +ppc-r12+ o))
+                      (loop for r from 22 to 28 for o from 32 by 4 do (ppc-emit-lwz buf r +ppc-r12+ o))
+                      (ppc-emit-lwz buf +ppc-r31+ +ppc-r12+ 8)
+                      (ppc-emit-lwz buf +ppc-r1+ +ppc-r12+ 4)
+                      (ppc-emit-lwz buf +ppc-r0+ +ppc-r12+ 0)
+                      (ppc-emit-mtctr buf +ppc-r0+)
+                      (ppc-emit-bctr buf)))
+                (ppc-emit-label buf done))))
            ((= code #x0533)
             ;; %JIT-ICACHE-FLUSH base len, both TAGGED: code was written as data.
             ;; Per 32-byte line: DCBST (data out to memory), then SYNC, ICBI
@@ -4036,6 +4112,44 @@
         (ppc-emit-add buf +ppc-r23+ +ppc-r22+ +ppc-r23+)
         (root-range)
         (here noext))
+      ;; ---- the PARKED THREADS (the bare Mac's cooperative threads, #x0560):
+      ;; +PPC-CO-TABLE+ holds a count, then (save area, stack top) per parked
+      ;; computation.  Each one's stack [saved r1, top), its save area (the
+      ;; registers it will resume with, and its copy of the handler state) and
+      ;; its live extension frames.  The running one is the stack above.
+      ;; r25..r27 survive SCAN (it uses r3..r11).  Mac mode only: the hosted
+      ;; ppc32 image has nothing mapped there.
+      (when *ppc-mac-mode*
+        (let ((top (lbl)) (out (lbl)) (noext (lbl))
+              (hb +ppc-co-handler-base+))
+          (ppc-emit-li buf +ppc-r25+ +ppc-co-table+)
+          (ppc-emit-lwz buf +ppc-r26+ +ppc-r25+ 0)
+          (ppc-emit-addi buf +ppc-r25+ +ppc-r25+ 4)
+          (here top)
+          (ppc-emit-cmpi-word buf +ppc-r26+ 0)
+          (ppc-emit-ble buf out)
+          (ppc-emit-lwz buf +ppc-r27+ +ppc-r25+ 0)                  ; the save area
+          (ppc-emit-lwz buf +ppc-r22+ +ppc-r27+ 4)                  ; its r1
+          (ppc-emit-lwz buf +ppc-r23+ +ppc-r25+ 4)                  ; its stack top
+          (root-range)
+          (ppc-emit-mr buf +ppc-r22+ +ppc-r27+)
+          (ppc-emit-addi buf +ppc-r23+ +ppc-r27+ +ppc-co-save-bytes+)
+          (root-range)
+          (ppc-emit-lwz buf +ppc-r22+ +ppc-r27+ (+ 64 (- +ppc-hstack-ext-addr+ hb)))
+          (ppc-emit-cmpi-word buf +ppc-r22+ 0)
+          (ppc-emit-beq buf noext)
+          (ppc-emit-lwz buf +ppc-r23+ +ppc-r27+ (+ 64 (- (ppc-hdepth-addr) hb)))
+          (ppc-emit-addi buf +ppc-r23+ +ppc-r23+ (- (ppc-hstack-max-depth)))
+          (ppc-emit-cmpi-word buf +ppc-r23+ 0)
+          (ppc-emit-ble buf noext)
+          (ppc-emit-slli buf +ppc-r23+ +ppc-r23+ (ppc-hframe-log2))
+          (ppc-emit-add buf +ppc-r23+ +ppc-r22+ +ppc-r23+)
+          (root-range)
+          (here noext)
+          (ppc-emit-addi buf +ppc-r25+ +ppc-r25+ 8)
+          (ppc-emit-addi buf +ppc-r26+ +ppc-r26+ -1)
+          (ppc-emit-b buf top)
+          (here out)))
       ;; ---- Cheney: r22 = object scan (up), r23 = cons scan (down) from to_end
       (meta +ppc-r24+)
       (ppc-emit-load-word buf +ppc-r22+ +ppc-r24+ #x08)

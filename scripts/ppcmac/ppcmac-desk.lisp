@@ -189,24 +189,30 @@
    console wants the REPL."
   (logtest (mem-ref #x08013020 :u8) 1))
 
-;;; SSH beside the desk.  An image built with MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1
-;;; (and MODUS_NET_NOAUTO=1: nothing networked before the desk) has the GMAC
-;;; driver, the IP stack and the synchronous SSH server.  The server's loop
-;;; (NET-ACTOR-MAIN) calls YIELD whenever no frame is waiting; YIELD becomes a
-;;; turn of the desk, and SSH-BOOT keeps the machine from then on.  Without a
-;;; network (no GMAC, no such image) DESK-NET-START returns and the desk runs alone.
-(defun %kernel-fn (name) (let ((s (find-symbol name "MODUS-INT"))) (and s (fboundp s) s)))
+;;; SSH beside the desk, on cooperative threads (net/ppcmac-threads.lisp).  An
+;;; image built with MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 (and MODUS_NET_NOAUTO=1:
+;;; nothing networked before the desk) has the GMAC driver, the IP stack, the
+;;; synchronous SSH server and the threads.  DESK-NET-START spawns one thread
+;;; that asks DHCP for an address and then serves SSH; every wait of the net
+;;; stack ends in IO-DELAY, which yields, and the desk (thread 0) yields once a
+;;; turn.  Without such an image DESK-NET-START does nothing.
+;; INTERN, not FIND-SYMBOL: a kernel function's symbol exists in MODUS-INT only
+;; once something has read or interned its name (the kernel finds its functions
+;; by name), so FIND-SYMBOL missed CO-SPAWN in a fresh image.
+(defun %kernel-fn (name) (let ((s (intern name "MODUS-INT"))) (and (fboundp s) s)))
 
-(defun desk-net-idle ()
-  (handler-case (when (desk-turn) (desk-idle-jit))
-    (error () nil)))
+(defvar *desk-co-yield* nil)
+
+(defun desk-co-yield ()
+  (when *desk-co-yield* (funcall *desk-co-yield*)))
 
 (defun desk-net-start ()
+  ;; (not a variable named YIELD: that name is the scheduler's, MODUS-INT's)
   (let ((pipeline (%kernel-fn "RUN-NET-PIPELINE")) (boot (%kernel-fn "SSH-BOOT"))
-        (yield (find-symbol "YIELD" "MODUS-INT")))
-    (when (and pipeline boot yield (ignore-errors (funcall pipeline)))
-      (setf (fdefinition yield) (lambda () (desk-net-idle)))
-      (funcall boot))))
+        (spawn (%kernel-fn "CO-SPAWN")) (co-yield-fn (%kernel-fn "CO-YIELD")))
+    (when (and pipeline boot spawn co-yield-fn)
+      (setq *desk-co-yield* co-yield-fn)
+      (funcall spawn (lambda () (when (funcall pipeline) (funcall boot)))))))
 
 (defun desk (&optional turns)
   "glass.wm on the screen: TURNS turns, or until a byte arrives on the serial
@@ -218,6 +224,7 @@
   (if turns
       (dotimes (i turns) (desk-turn))
       (loop (when (desk-turn) (desk-idle-jit))
+            (desk-co-yield)
             (when (serial-byte-waiting-p) (return)))))
 
 ;; At boot: the desk.  With a serial console (the firmware's was one: boot info

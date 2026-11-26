@@ -10337,7 +10337,7 @@
    ;; %PRIM-STRINGP %PRIM-U8-VECTOR-P %RAW-CONSP %SHARED-LITERAL %SLOT-REF %SPAWN-THREAD
    ;; %STRUCT-SLOT-REF %STRUCT-SLOT-SET %U8-REF %U8-REF-UNCHECKED %U8-SET
    ;; %U8-SET-UNCHECKED %UCAR %UCDR %VAL->WORD %WORD->VAL %WORD-AREF %WORD-ASET CHAR
-   ;; CNTFRQ SAFETY-CHECK SCHAR WITH-SIMPLE-RESTART %EXP-D
+   ;; CNTFRQ SAFETY-CHECK SCHAR WITH-SIMPLE-RESTART %EXP-D %CO-SWITCH %CO-FORK
     128401437 164901478 125009599 279156048 288867729 462383973 343008121 79476218
     103993613 58414919 121414968 156403790 108856844 9852007 388138896 75164491
     504669726 209633815 344711121 338108280 324903310 33180769 375151373 62768255
@@ -10348,7 +10348,7 @@
     367627940 469097205 84095010 323209429 14355506 434674778 231353088 17781339
     462768251 388046666 260184480 362441329 437115943 483756498 497160708 121290012
     292480825 189301986 429343799 367065803 155426392 228425908 483931868
-    314680310)
+    314680310 322861739 91908353)
   "The hashes of the names COMPILE-COMPOUND's dispatch tests for that
    *HASH-DISPATCH-NAMES* (made from its bare literals) does not have: the ones
    its clauses spell #.(COMPUTE-NAME-HASH \"NAME\").  The two together are
@@ -11751,6 +11751,14 @@
       ;; invalidate; x64 is a no-op.
       ((= op-name #.(compute-name-hash "%JIT-ICACHE-FLUSH"))
        (compile-jit-icache-flush (cdr form) env dest))
+      ;; (%co-switch from to) / (%co-fork area top) -- cooperative threads on
+      ;; the bare PowerPC Mac (net/ppcmac-threads.lisp; TRAPs #x0560 / #x0561 in
+      ;; translate-ppc).  Only in a function of their own: nothing may be live
+      ;; across them.
+      ((= op-name #.(compute-name-hash "%CO-SWITCH"))
+       (compile-co-trap (cdr form) env dest #x0560))
+      ((= op-name #.(compute-name-hash "%CO-FORK"))
+       (compile-co-trap (cdr form) env dest #x0561))
       ;; (%jit-free-page base len) — munmap a transient JIT exec page (WS4
       ;; #160 Piece 2 reclamation).  aarch64 munmap; x64 no-op.
       ((= op-name #.(compute-name-hash "%JIT-FREE-PAGE"))
@@ -29541,6 +29549,17 @@
   (emit-ir :mov +vreg-v1+ dest)
   (emit-ir :pop +vreg-v0+)
   (emit-ir :trap #x0533)
+  (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-co-trap (args env dest code)
+  "Compile a two-operand thread primitive: V0, V1 the (tagged) operands, TRAP
+   CODE, the result in V0 (translate-ppc #x0560 / #x0561)."
+  (compile-form (car args) env dest)
+  (emit-ir :push dest)
+  (compile-form (cadr args) env dest)
+  (emit-ir :mov +vreg-v1+ dest)
+  (emit-ir :pop +vreg-v0+)
+  (emit-ir :trap code)
   (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-jit-free-page (args env dest)

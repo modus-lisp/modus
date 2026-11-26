@@ -130,6 +130,9 @@
   (quote ("PCI-ASSIGN-BARS" "%PCI-BAR-BASE" "DWC2-BASE"
           ;; the actor scheduler's stubs, on boards that run no actors
           "YIELD" "SPIN-LOCK" "SPIN-UNLOCK"
+          ;; the bare Mac's cooperative threads (net/ppcmac-threads.lisp), which
+          ;; its adapter's IO-DELAY yields to
+          "CO-YIELD" "CO-YIELD-IF-DUE"
           "SNP-ACTIVE-P")))
 
 (defun %kernel-package-name-p (name)

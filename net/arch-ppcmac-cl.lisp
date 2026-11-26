@@ -22,9 +22,16 @@
 (defun pci-config-write (bus dev fn reg val) nil)
 (defun pci-assign-bars () nil)
 
-;; a RAM-read spin (no port I/O on a PowerPC)
+;; a RAM-read spin (no port I/O on a PowerPC) -- and, once cooperative threads
+;; are on (net/ppcmac-threads.lisp), the other threads' turn when this one has
+;; had the CPU for 2 ms: every wait of the net stack (DHCP, TCP, SSH) bottoms out
+;; here, so a thread waiting for the network lets the desk run.  A TIME SLICE,
+;; not a yield per call: many waits are counted in IO-DELAYs (an SSH teardown's
+;; tens of thousands), and a yield each made them last a desk turn apiece --
+;; the server sat for hours in the first session's close and refused the next.
 (defun io-delay ()
-  (dotimes (d 2000) (mem-ref #x07300000 :u8)))
+  (dotimes (d 2000) (mem-ref #x07300000 :u8))
+  (when (= (mem-ref #x07240FF0 :u32) 1) (co-yield-if-due)))
 
 (defun %serial-byte (b)
   (write-char-serial b))

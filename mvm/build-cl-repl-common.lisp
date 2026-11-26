@@ -2131,9 +2131,11 @@
             (%rpi-net-text "arch-i386-cl.lisp")    (string #\Newline))
       (if *cl-repl-ppcmac-p*
           (concatenate 'string
-            ;; the PowerPC Mac's GMAC (Sun GEM), and the board's adapter
+            ;; the PowerPC Mac's GMAC (Sun GEM), the board's adapter, and the
+            ;; cooperative threads the desk and the SSH server share the CPU by
             (%rpi-net-text "arch-ppcmac-cl.lisp")  (string #\Newline)
-            (%rpi-net-text "sungem.lisp")          (string #\Newline))
+            (%rpi-net-text "sungem.lisp")          (string #\Newline)
+            (%rpi-net-text "ppcmac-threads.lisp")  (string #\Newline))
       (if *cl-repl-x64-p*
           (concatenate 'string
             (%rpi-net-text "arch-x86-cl.lisp")     (string #\Newline)
@@ -2288,6 +2290,21 @@
                (bind "modus.net.cdc:cdcether-send" "modus.net.cdc:cdcether-receive"
                      "modus.net.cdc:cdcether-rx-buf" "modus.net.cdc:cdcether-probe"
                      "modus.net::no-read-reg"))))))
+
+;; The bare Mac's threads: the serial REPL's wait for a key lets the others run
+;; (the SSH server, while a REPL on the main thread waits).  Appended to the
+;; probe slot, AFTER lib/serial-repl.lisp's %CONSOLE-READ-CHAR, which it replaces;
+;; in the net source it came before and lost.  ESCC channel A, RR0 bit 0 (mac-io
+;; +#x13020), as the desk's SERIAL-BYTE-WAITING-P reads it.
+(when (and *net-build-p* *cl-repl-ppcmac-p*)
+  (setq *cli-arch-probe-source*
+        (concatenate 'string *cli-arch-probe-source* "
+(defun %console-read-char ()
+  (when (%co-active-p)
+    (loop (when (logtest (mem-ref #x08013020 :u8) 1) (return nil))
+          (co-yield)))
+  (read-char-serial))
+")))
 
 (when *net-build-p*
   (setq *net-nic-source*
@@ -5024,7 +5041,13 @@
          ;; with its BSS (1 MB), below the native tier's code area at #x02800000
          (when (> (+ image-end #x100000) #x02800000)
            (error "ppcmac layout: the image and its BSS end past #x~X, the native ~
-                   tier's code area at #x02800000." (+ image-end #x100000))))
+                   tier's code area at #x02800000." (+ image-end #x100000)))
+         ;; a net build carries the cooperative threads, whose stacks start at
+         ;; #x01A00000 (net/ppcmac-threads.lisp %CO-STACK-LOW): the image ends below
+         (when (and cl-user::*net-build-p* (> (+ image-end #x100000) #x01A00000))
+           (error "ppcmac layout: the image and its BSS end past #x~X, the first ~
+                   thread stack at #x01A00000 (net/ppcmac-threads.lisp)."
+                  (+ image-end #x100000))))
        ;; the first stage, beside the image: OUT.boot (boot-ppcmac.lisp)
        (let ((boot (concatenate 'string path ".boot"))
              (elf (funcall (intern "PPCMAC-LOADER-ELF" "MODUS.MVM"))))

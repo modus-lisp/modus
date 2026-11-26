@@ -1338,6 +1338,15 @@ blocks a webcam can read.  Three things this took, each a dead core first:
   at `0x111F1F20`, which on this layout is INSIDE THE HEAP: any core with more than ~18 MB of
   heap read its later slices from the wrong place and ran bytecode as code.  Found by a QEMU
   gdbstub watchpoint on the arena word (`gdb-multiarch`, no ptrace needed).
+- **The JIT arena's RAM is wherever the firmware has it** (`EMIT-UEFI-ARENA-ALLOC` /
+  `-REMAP`): before ExitBootServices the stub claims 2 MB pages one at a time
+  (AllocateAddress, from below 4 GB down to `0x20000000` + the core's size, never from physical
+  `[#x30000000, #x38000000)`), and once its identity map is built points the arena's 64 PDEs at
+  them, so every address a core or translator holds is unchanged.  One block would not do: at
+  768 MB OVMF's allocations and the 23 MB loaded image leave no 128 MB run above the core.
+  Pages it could not claim stay identity-mapped; no remap if the stub's code or stack is in the
+  arena's range.  The count is at `#x1B0D8` (`jit pages` under the banner), and
+  `%CORE-PRE-RESTORE` tests every arena page before restoring.
 - **1024 handler frames** at `0x0FD00000` (`X64-BARE-HSTACK-BASE`, translate-x64; SNP keeps 64
   at `0x10000408`): 64 could not hold a library install's nesting (peak measured: 91).
 

@@ -362,9 +362,10 @@
   ;; Pre-zero fb_valid so it stays 0 on failure
   (uefi-emit-store-imm32-abs32 buf +fb-valid-addr+ 0)
 
-  ;; Allocate sub-frame: 56 bytes (shadow=32 + GUID=16 + Interface=8)
-  ;; After 8 pushes RSP ≡ 8 mod 16; sub 56 → RSP ≡ 0 mod 16 → correct for CALL
-  (uefi-emit-sub-rsp buf 56)
+  ;; Allocate sub-frame: 104 bytes (shadow=32 + GUID=16 + Interface=8, then
+  ;; EMIT-UEFI-GOP-BEST-MODE's five slots at 56..95)
+  ;; After 8 pushes RSP ≡ 8 mod 16; sub 104 → RSP ≡ 0 mod 16 → correct for CALL
+  (uefi-emit-sub-rsp buf 104)
 
   ;; Zero Interface pointer at [RSP+48]
   (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)  ; xor eax, eax
@@ -391,7 +392,8 @@
   (let ((jnz-patch-pos (mvm-buffer-position buf)))
     (mvm-emit-u32 buf 0)  ; placeholder disp32
 
-    ;; ---- GOP found: extract framebuffer info ----
+    ;; ---- GOP found: a usable mode first, then extract framebuffer info ----
+    (emit-uefi-gop-best-mode buf)
     ;; RAX = GOP protocol pointer
     (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 48)
 
@@ -460,7 +462,74 @@
       (setf (aref bytes (+ jnz-patch-pos 3)) (ldb (byte 8 24) rel))))
 
   ;; Deallocate sub-frame
-  (uefi-emit-add-rsp buf 56))
+  (uefi-emit-add-rsp buf 104))
+
+;;; THE MODE THE FIRMWARE LEFT IS NOT ALWAYS THE PANEL'S.  The T420's Lenovo firmware hands an
+;;; EFI application GOP in 640x480 (measured on the machine: "x64: GOP 640x480"), while OVMF
+;;; sets its PcdVideo resolution (1280x800).  So when the current mode is narrower than 1024,
+;;; walk the modes with QueryMode and SetMode the one with the most pixels in a 32-bit format
+;;; (PixelRedGreenBlueReserved8BitPerColor 0 or PixelBlueGreenRedReserved8BitPerColor 1) --
+;;; on a laptop, the panel's native mode.  A failed SetMode leaves the current mode, which the
+;;; caller then reads as before.  Frame (EMIT-UEFI-GOP-QUERY's): [rsp+48] the protocol,
+;;; [rsp+56] SizeOfInfo out, [rsp+64] Info out, [rsp+72] the mode index, [rsp+80] the best
+;;; mode (-1: none), [rsp+88] its pixel count.
+(defun emit-uefi-gop-best-mode (buf)
+  (flet ((b (&rest bytes) (dolist (x bytes) (mvm-emit-byte buf x))))
+    (let ((to-skip nil) (to-done nil) (nexts nil) (to-skip2 nil) (to-skip3 nil))
+      ;; current width >= 1024: keep the firmware's mode
+      (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 48)
+      (b #x48 #x8B #x48 #x18)                       ; mov rcx, [rax+0x18]   Mode
+      (b #x48 #x8B #x49 #x08)                       ; mov rcx, [rcx+0x08]   Info
+      (b #x8B #x41 #x04)                            ; mov eax, [rcx+4]      width
+      (b #x3D) (mvm-emit-u32 buf 1024)              ; cmp eax, 1024
+      (b #x0F #x83) (setq to-skip (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)  ; jae skip
+      (b #x31 #xC0)                                 ; xor eax, eax
+      (uefi-emit-mov-mem-reg buf +rsp+ 72 +rax+)
+      (uefi-emit-mov-mem-reg buf +rsp+ 88 +rax+)
+      (b #x48 #xFF #xC8)                            ; dec rax: -1
+      (uefi-emit-mov-mem-reg buf +rsp+ 80 +rax+)
+      (let ((top (mvm-buffer-position buf)))
+        ;; i < MaxMode?
+        (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 48)
+        (b #x48 #x8B #x48 #x18)                     ; mov rcx, [rax+0x18]
+        (b #x8B #x09)                               ; mov ecx, [rcx]        MaxMode
+        (b #x8B #x54 #x24 #x48)                     ; mov edx, [rsp+72]
+        (b #x39 #xCA)                               ; cmp edx, ecx
+        (b #x0F #x83) (setq to-done (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)  ; jae done
+        ;; QueryMode(This, i, &SizeOfInfo, &Info)
+        (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ 48)
+        (uefi-emit-lea-rsp buf +r8+ 56)
+        (uefi-emit-lea-rsp buf +r9+ 64)
+        (uefi-emit-call-mem buf +rcx+ 0)
+        (b #x48 #x85 #xC0)                          ; test rax, rax
+        (b #x0F #x85) (push (mvm-buffer-position buf) nexts) (mvm-emit-u32 buf 0)    ; jnz next
+        (uefi-emit-mov-reg-mem buf +rdx+ +rsp+ 64)  ; Info
+        (b #x8B #x42 #x0C)                          ; mov eax, [rdx+12]     PixelFormat
+        (b #x83 #xF8 #x01)                          ; cmp eax, 1
+        (b #x0F #x87) (push (mvm-buffer-position buf) nexts) (mvm-emit-u32 buf 0)    ; ja next
+        (b #x8B #x42 #x04)                          ; mov eax, [rdx+4]      width
+        (b #x8B #x4A #x08)                          ; mov ecx, [rdx+8]      height
+        (b #x48 #x0F #xAF #xC1)                     ; imul rax, rcx
+        (b #x48 #x3B #x44 #x24 #x58)                ; cmp rax, [rsp+88]
+        (b #x0F #x86) (push (mvm-buffer-position buf) nexts) (mvm-emit-u32 buf 0)    ; jbe next
+        (uefi-emit-mov-mem-reg buf +rsp+ 88 +rax+)
+        (b #x8B #x4C #x24 #x48)                     ; mov ecx, [rsp+72]
+        (uefi-emit-mov-mem-reg buf +rsp+ 80 +rcx+)
+        (dolist (p nexts) (uefi-patch-rel32 buf p))
+        (b #xFF #x44 #x24 #x48)                     ; inc dword [rsp+72]
+        (b #xE9) (mvm-emit-u32 buf (ldb (byte 32 0) (- top (+ (mvm-buffer-position buf) 4)))))
+      (uefi-patch-rel32 buf to-done)
+      ;; a best mode, and not the current one: SetMode(This, best)
+      (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 80)
+      (b #x48 #x85 #xC0)                            ; test rax, rax
+      (b #x0F #x88) (setq to-skip2 (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)   ; js skip
+      (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ 48)
+      (b #x48 #x8B #x51 #x18)                       ; mov rdx, [rcx+0x18]   Mode
+      (b #x3B #x42 #x04)                            ; cmp eax, [rdx+4]      current mode
+      (b #x0F #x84) (setq to-skip3 (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)   ; je skip
+      (b #x89 #xC2)                                 ; mov edx, eax
+      (uefi-emit-call-mem buf +rcx+ 8)              ; SetMode
+      (dolist (p (list to-skip to-skip2 to-skip3)) (uefi-patch-rel32 buf p)))))
 
 ;;; ============================================================
 ;;; The saved core — \CORE.BIN on the boot volume, read to 0x20000000
@@ -713,6 +782,119 @@
       (b #xFC #xF3 #xA4)                                      ; forward: cld ; rep movsb
       (land to-done) (land to-done2))
     (b #x58 #x59 #x5F #x5E)))                                 ; pop rax, rcx, rdi, rsi
+
+;;; ============================================================
+;;; The JIT arena's RAM: wherever the firmware has it, 2 MB at a time
+;;; ============================================================
+;;; The runtime JIT's arena is the virtual range [#x30000000, #x38000000) (translate-x64
+;;; %X64-BARE-JIT-LO / -HI), and a saved core puts its code back there.  Identity-mapped, that
+;;; needed RAM up to 896 MB, so a smaller machine -- or firmware holding memory there -- could
+;;; not run a core.  Each of the arena's 64 page-directory entries maps 2 MB on its own, so the
+;;; RAM behind them need not be one block: before ExitBootServices the stub claims 2 MB pages
+;;; one at a time (AllocatePages, AllocateAddress), from just below 4 GB down to the end of the
+;;; core (0x20000000 + its size; the image, heap and stack are below that), and once the
+;;; identity map is built points the arena's entries at them in order.  Every address a
+;;; translator, core or table holds stays the same.  Two exclusions:
+;;; - no page from physical [#x30000000, #x38000000): an arena entry left identity-mapped (too
+;;;   few pages) would alias it;
+;;; - no remap at all when the stub's own code or stack is in that virtual range, since they
+;;;   are still in use after CR3 is loaded (measured under OVMF they are near the top of RAM).
+;;; Entries without a page stay identity-mapped, as before.  The pages are kept in 512 bytes of
+;;; this stub's own section until the machine is ours; the number mapped is published at
+;;; #x1B0D8.  %CORE-PRE-RESTORE tests that each arena page is RAM.
+
+(defconstant +uefi-arena-va+ #x30000000)
+(defconstant +uefi-arena-pdes+ 64)
+(defvar *uefi-arena-pa-at* nil "The stub buffer position of the arena's 64 page slots.")
+
+(defun uefi-arena-slot-disp (buf insn-len)
+  (ldb (byte 32 0) (- *uefi-arena-pa-at* (+ (mvm-buffer-position buf) insn-len))))
+
+(defun uefi-patch-rel32 (buf at &optional (to (mvm-buffer-position buf)))
+  (let ((rel (ldb (byte 32 0) (- to (+ at 4)))) (bytes (mvm-buffer-bytes buf)))
+    (dotimes (k 4) (setf (aref bytes (+ at k)) (ldb (byte 8 (* 8 k)) rel)))))
+
+(defun emit-uefi-arena-alloc (buf)
+  "Before ExitBootServices, after EMIT-UEFI-CORE-LOAD (whose record says the core's size)."
+  (flet ((b (&rest bytes) (dolist (x bytes) (mvm-emit-byte buf x))))
+    (b #xE9) (mvm-emit-u32 buf (* 8 +uefi-arena-pdes+))  ; jmp over the slots
+    (setq *uefi-arena-pa-at* (mvm-buffer-position buf))
+    (dotimes (i (* 8 +uefi-arena-pdes+)) (b 0))
+    ;; frame: [rsp+32] the page (in/out), [rsp+40] the candidate, [rsp+48] pages taken,
+    ;; [rsp+56] the floor.  8 pushes + 72 keeps RSP 16-aligned for the calls.
+    (uefi-emit-sub-rsp buf 72)
+    (uefi-emit-mov-reg-imm64 buf +rax+ #xFFE00000)
+    (uefi-emit-mov-mem-reg buf +rsp+ 40 +rax+)
+    (b #x31 #xC0) (uefi-emit-mov-mem-reg buf +rsp+ 48 +rax+)
+    ;; floor = 0x20000000 + the core's size (the record's), rounded up to 2 MB
+    (b #x48 #x8B #x05) (mvm-emit-u32 buf (ldb (byte 32 0) (uefi-rec-disp buf #x1B0F0 4)))
+    (b #x48 #x05) (mvm-emit-u32 buf (+ #x20000000 #x1FFFFF))   ; add rax, imm32
+    (b #x48 #x25) (mvm-emit-u32 buf #xFFE00000)                ; and rax, -2 MB
+    (uefi-emit-mov-mem-reg buf +rsp+ 56 +rax+)
+    (let ((top (mvm-buffer-position buf)) (to-done1 nil) (to-done2 nil) (to-next nil) (to-next2 nil))
+      ;; candidate below the floor: done
+      (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 40)
+      (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ 56)
+      (b #x48 #x39 #xC8)                                        ; cmp rax, rcx
+      (b #x0F #x82) (setq to-done1 (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)  ; jb done
+      ;; in [#x30000000, #x38000000): skip
+      (b #x48 #x8D #x88) (mvm-emit-u32 buf (ldb (byte 32 0) (- +uefi-arena-va+))) ; lea rcx,[rax-va]
+      (b #x48 #x81 #xF9) (mvm-emit-u32 buf (* #x200000 +uefi-arena-pdes+))       ; cmp rcx, 128 MB
+      (b #x0F #x82) (setq to-next (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)   ; jb next
+      (uefi-emit-mov-mem-reg buf +rsp+ 32 +rax+)
+      (uefi-emit-mov-reg-imm64 buf +rcx+ 2)               ; AllocateAddress
+      (uefi-emit-mov-reg-imm64 buf +rdx+ 2)               ; EfiLoaderData
+      (uefi-emit-mov-reg-imm64 buf +r8+ 512)              ; 2 MB
+      (uefi-emit-lea-rsp buf +r9+ 32)
+      (uefi-emit-call-mem buf +r14+ +efi-bs-allocate-pages+)
+      (b #x48 #x85 #xC0)                                  ; test rax, rax
+      (b #x0F #x85) (setq to-next2 (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)  ; jnz next
+      ;; slots[taken] = the page; taken++; 64 taken: done
+      (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ 48)
+      (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 40)
+      (b #x48 #x8D #x15) (mvm-emit-u32 buf (uefi-arena-slot-disp buf 4))  ; lea rdx, [slots]
+      (b #x48 #x89 #x04 #xCA)                             ; mov [rdx+rcx*8], rax
+      (b #x48 #xFF #xC1)                                  ; inc rcx
+      (uefi-emit-mov-mem-reg buf +rsp+ 48 +rcx+)
+      (b #x48 #x83 #xF9 +uefi-arena-pdes+)                ; cmp rcx, 64
+      (b #x0F #x83) (setq to-done2 (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)  ; jae done
+      ;; next: candidate -= 2 MB
+      (uefi-patch-rel32 buf to-next) (uefi-patch-rel32 buf to-next2)
+      (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 40)
+      (b #x48 #x2D) (mvm-emit-u32 buf #x200000)           ; sub rax, 2 MB
+      (uefi-emit-mov-mem-reg buf +rsp+ 40 +rax+)
+      (b #xE9) (mvm-emit-u32 buf (ldb (byte 32 0) (- top (+ (mvm-buffer-position buf) 4))))
+      (uefi-patch-rel32 buf to-done1) (uefi-patch-rel32 buf to-done2))
+    (uefi-emit-add-rsp buf 72)))
+
+(defun emit-uefi-arena-remap (buf)
+  "After the identity map is filled, before CR3 is loaded: the arena's PDEs onto its pages."
+  (flet ((b (&rest bytes) (dolist (x bytes) (mvm-emit-byte buf x))))
+    (b #x31 #xC9)                                       ; ecx = 0: pages mapped
+    ;; the stub's code and stack must not be in the arena's virtual range
+    (let ((skips nil))
+      (b #x48 #x8D #x05) (mvm-emit-u32 buf 0)           ; lea rax, [rip]
+      (dolist (reg '(:rip :rsp))
+        (when (eq reg :rsp) (b #x48 #x89 #xE0))         ; mov rax, rsp
+        (b #x48 #x2D) (mvm-emit-u32 buf +uefi-arena-va+) ; sub rax, va
+        (b #x48 #x3D) (mvm-emit-u32 buf (* #x200000 +uefi-arena-pdes+)) ; cmp rax, 128 MB
+        (b #x0F #x82) (push (mvm-buffer-position buf) skips) (mvm-emit-u32 buf 0)) ; jb skip
+      (b #x48 #x8D #x35) (mvm-emit-u32 buf (uefi-arena-slot-disp buf 4))  ; lea rsi, [slots]
+      (uefi-emit-mov-reg-imm64 buf +rdi+ (+ +x64-page-tables-addr+ #x2000
+                                            (* 8 (ash +uefi-arena-va+ -21))))
+      (let ((top (mvm-buffer-position buf)) (to-skip nil))
+        (b #x48 #x8B #x04 #xCE)                         ; mov rax, [rsi+rcx*8]
+        (b #x48 #x85 #xC0)                              ; test rax, rax
+        (b #x0F #x84) (setq to-skip (mvm-buffer-position buf)) (mvm-emit-u32 buf 0) ; jz: no more
+        (b #x48 #x0D) (mvm-emit-u32 buf #x83)           ; or rax, 0x83
+        (b #x48 #x89 #x04 #xCF)                         ; mov [rdi+rcx*8], rax
+        (b #xFF #xC1)                                   ; inc ecx
+        (b #x83 #xF9 +uefi-arena-pdes+)                 ; cmp ecx, 64
+        (b #x0F #x82) (mvm-emit-u32 buf (ldb (byte 32 0) (- top (+ (mvm-buffer-position buf) 4))))
+        (push to-skip skips))
+      (dolist (p skips) (uefi-patch-rel32 buf p)))
+    (b #x89 #x0C #x25) (mvm-emit-u32 buf #x1B0D8)       ; mov [#x1B0D8], ecx: pages mapped
+    (b #xC7 #x04 #x25) (mvm-emit-u32 buf #x1B0DC) (mvm-emit-u32 buf 0)))
 
 ;;; ============================================================
 ;;; Font Data — 8×8 bitmap font, ASCII 32–126 (95 glyphs)
@@ -1180,6 +1362,8 @@
 
   ;; ---- \CORE.BIN, if the boot volume has one, to 0x20000000 ----
   (unless *x64-snp-mode* (emit-uefi-core-load buf))
+  ;; ---- the JIT arena's RAM, wherever the firmware has it ----
+  (unless *x64-snp-mode* (emit-uefi-arena-alloc buf))
 
   ;; ---- SEV-SNP: locate the secrets page while the system table is live ----
   (when *x64-snp-mode* (emit-snp-find-secrets buf))
@@ -1344,6 +1528,8 @@
       (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x85)  ; JNZ rel32
       (mvm-emit-u32 buf (logand rel #xFFFFFFFF))))
 
+  ;; the JIT arena's page-directory entries onto the RAM the firmware gave it
+  (unless *x64-snp-mode* (emit-uefi-arena-remap buf))
   (emit-uefi-spin-point buf "pre-cr3")
   ;; Load CR3 (SNP: the PML4 page is encrypted, so CR3 carries the C-bit too)
   (uefi-emit-mov-reg-imm64 buf +rax+ +x64-page-tables-addr+)

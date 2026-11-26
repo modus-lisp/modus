@@ -913,6 +913,34 @@
        (%call-interp-closure closure (cdr form)))
       (t (%signal-program-error)))))
 
+(defun %interp-cm-shim (form &rest extra)
+  "%INTERP-MACRO-SHIM for a COMPILER macro (COMPILER-MACRO-FUNCTION): the same
+   (form env) protocol, and a leading &WHOLE bound to the WHOLE form, operator
+   included (CLHS 3.4.4, 3.2.2.1).  The expander is an %INTERP-CLOSURE over the
+   raw lambda list, called with (CDR FORM), so &WHOLE took the argument list:
+   (funcall (compiler-macro-function 'f) '(f 1 2) nil) gave &WHOLE (1 2).  A
+   compiler macro that declines returns its &WHOLE form, so that answer was a
+   call to 1.  &WHOLE is taken off the lambda list and bound around the body --
+   or destructured, when it is a pattern -- and the rest is called as before."
+  (declare (ignore extra))
+  (let* ((nargs (%get-nargs))
+         (closure (car (%get-cenv)))
+         (params (cadr closure)))
+    (cond
+      ((/= nargs 2) (%signal-program-error))
+      ((and (consp params) (symbolp (car params)) (car params)
+            (string= (symbol-name (car params)) "&WHOLE") (consp (cdr params)))
+       (let* ((whole (cadr params))
+              (body (caddr closure))
+              (inner (if (consp whole)
+                         (list (list 'destructuring-bind whole (list 'quote form)
+                                     (cons 'locally body)))
+                         (list (list* 'let (list (list whole (list 'quote form)))
+                                      body)))))
+         (%call-interp-closure (list '%interp-closure (cddr params) inner (cadddr closure))
+                               (cdr form))))
+      (t (%call-interp-closure closure (cdr form))))))
+
 (defun %argfn-macro-shim (form &rest extra)
   "A DEFMACRO's expander when its lambda list is an ordinary one (the
    compiler's DEFMACRO, %MAKE-ARGFN-EXPANDER): the macro's own function,
@@ -6416,7 +6444,7 @@
       (cond
         ((null raw) nil)
         ((%interp-closure-p raw)
-         (%make-closure #'%interp-macro-shim (cons raw nil)))
+         (%make-closure #'%interp-cm-shim (cons raw nil)))
         (t raw)))))
 
 ;;; ============================================================

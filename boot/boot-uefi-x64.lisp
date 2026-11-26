@@ -362,9 +362,10 @@
   ;; Pre-zero fb_valid so it stays 0 on failure
   (uefi-emit-store-imm32-abs32 buf +fb-valid-addr+ 0)
 
-  ;; Allocate sub-frame: 56 bytes (shadow=32 + GUID=16 + Interface=8)
-  ;; After 8 pushes RSP ≡ 8 mod 16; sub 56 → RSP ≡ 0 mod 16 → correct for CALL
-  (uefi-emit-sub-rsp buf 56)
+  ;; Allocate sub-frame: 104 bytes (shadow=32 + GUID=16 + Interface=8, then
+  ;; EMIT-UEFI-GOP-BEST-MODE's five slots at 56..95)
+  ;; After 8 pushes RSP ≡ 8 mod 16; sub 104 → RSP ≡ 0 mod 16 → correct for CALL
+  (uefi-emit-sub-rsp buf 104)
 
   ;; Zero Interface pointer at [RSP+48]
   (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)  ; xor eax, eax
@@ -391,7 +392,8 @@
   (let ((jnz-patch-pos (mvm-buffer-position buf)))
     (mvm-emit-u32 buf 0)  ; placeholder disp32
 
-    ;; ---- GOP found: extract framebuffer info ----
+    ;; ---- GOP found: a usable mode first, then extract framebuffer info ----
+    (emit-uefi-gop-best-mode buf)
     ;; RAX = GOP protocol pointer
     (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 48)
 
@@ -460,7 +462,74 @@
       (setf (aref bytes (+ jnz-patch-pos 3)) (ldb (byte 8 24) rel))))
 
   ;; Deallocate sub-frame
-  (uefi-emit-add-rsp buf 56))
+  (uefi-emit-add-rsp buf 104))
+
+;;; THE MODE THE FIRMWARE LEFT IS NOT ALWAYS THE PANEL'S.  The T420's Lenovo firmware hands an
+;;; EFI application GOP in 640x480 (measured on the machine: "x64: GOP 640x480"), while OVMF
+;;; sets its PcdVideo resolution (1280x800).  So when the current mode is narrower than 1024,
+;;; walk the modes with QueryMode and SetMode the one with the most pixels in a 32-bit format
+;;; (PixelRedGreenBlueReserved8BitPerColor 0 or PixelBlueGreenRedReserved8BitPerColor 1) --
+;;; on a laptop, the panel's native mode.  A failed SetMode leaves the current mode, which the
+;;; caller then reads as before.  Frame (EMIT-UEFI-GOP-QUERY's): [rsp+48] the protocol,
+;;; [rsp+56] SizeOfInfo out, [rsp+64] Info out, [rsp+72] the mode index, [rsp+80] the best
+;;; mode (-1: none), [rsp+88] its pixel count.
+(defun emit-uefi-gop-best-mode (buf)
+  (flet ((b (&rest bytes) (dolist (x bytes) (mvm-emit-byte buf x))))
+    (let ((to-skip nil) (to-done nil) (nexts nil) (to-skip2 nil) (to-skip3 nil))
+      ;; current width >= 1024: keep the firmware's mode
+      (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 48)
+      (b #x48 #x8B #x48 #x18)                       ; mov rcx, [rax+0x18]   Mode
+      (b #x48 #x8B #x49 #x08)                       ; mov rcx, [rcx+0x08]   Info
+      (b #x8B #x41 #x04)                            ; mov eax, [rcx+4]      width
+      (b #x3D) (mvm-emit-u32 buf 1024)              ; cmp eax, 1024
+      (b #x0F #x83) (setq to-skip (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)  ; jae skip
+      (b #x31 #xC0)                                 ; xor eax, eax
+      (uefi-emit-mov-mem-reg buf +rsp+ 72 +rax+)
+      (uefi-emit-mov-mem-reg buf +rsp+ 88 +rax+)
+      (b #x48 #xFF #xC8)                            ; dec rax: -1
+      (uefi-emit-mov-mem-reg buf +rsp+ 80 +rax+)
+      (let ((top (mvm-buffer-position buf)))
+        ;; i < MaxMode?
+        (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 48)
+        (b #x48 #x8B #x48 #x18)                     ; mov rcx, [rax+0x18]
+        (b #x8B #x09)                               ; mov ecx, [rcx]        MaxMode
+        (b #x8B #x54 #x24 #x48)                     ; mov edx, [rsp+72]
+        (b #x39 #xCA)                               ; cmp edx, ecx
+        (b #x0F #x83) (setq to-done (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)  ; jae done
+        ;; QueryMode(This, i, &SizeOfInfo, &Info)
+        (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ 48)
+        (uefi-emit-lea-rsp buf +r8+ 56)
+        (uefi-emit-lea-rsp buf +r9+ 64)
+        (uefi-emit-call-mem buf +rcx+ 0)
+        (b #x48 #x85 #xC0)                          ; test rax, rax
+        (b #x0F #x85) (push (mvm-buffer-position buf) nexts) (mvm-emit-u32 buf 0)    ; jnz next
+        (uefi-emit-mov-reg-mem buf +rdx+ +rsp+ 64)  ; Info
+        (b #x8B #x42 #x0C)                          ; mov eax, [rdx+12]     PixelFormat
+        (b #x83 #xF8 #x01)                          ; cmp eax, 1
+        (b #x0F #x87) (push (mvm-buffer-position buf) nexts) (mvm-emit-u32 buf 0)    ; ja next
+        (b #x8B #x42 #x04)                          ; mov eax, [rdx+4]      width
+        (b #x8B #x4A #x08)                          ; mov ecx, [rdx+8]      height
+        (b #x48 #x0F #xAF #xC1)                     ; imul rax, rcx
+        (b #x48 #x3B #x44 #x24 #x58)                ; cmp rax, [rsp+88]
+        (b #x0F #x86) (push (mvm-buffer-position buf) nexts) (mvm-emit-u32 buf 0)    ; jbe next
+        (uefi-emit-mov-mem-reg buf +rsp+ 88 +rax+)
+        (b #x8B #x4C #x24 #x48)                     ; mov ecx, [rsp+72]
+        (uefi-emit-mov-mem-reg buf +rsp+ 80 +rcx+)
+        (dolist (p nexts) (uefi-patch-rel32 buf p))
+        (b #xFF #x44 #x24 #x48)                     ; inc dword [rsp+72]
+        (b #xE9) (mvm-emit-u32 buf (ldb (byte 32 0) (- top (+ (mvm-buffer-position buf) 4)))))
+      (uefi-patch-rel32 buf to-done)
+      ;; a best mode, and not the current one: SetMode(This, best)
+      (uefi-emit-mov-reg-mem buf +rax+ +rsp+ 80)
+      (b #x48 #x85 #xC0)                            ; test rax, rax
+      (b #x0F #x88) (setq to-skip2 (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)   ; js skip
+      (uefi-emit-mov-reg-mem buf +rcx+ +rsp+ 48)
+      (b #x48 #x8B #x51 #x18)                       ; mov rdx, [rcx+0x18]   Mode
+      (b #x3B #x42 #x04)                            ; cmp eax, [rdx+4]      current mode
+      (b #x0F #x84) (setq to-skip3 (mvm-buffer-position buf)) (mvm-emit-u32 buf 0)   ; je skip
+      (b #x89 #xC2)                                 ; mov edx, eax
+      (uefi-emit-call-mem buf +rcx+ 8)              ; SetMode
+      (dolist (p (list to-skip to-skip2 to-skip3)) (uefi-patch-rel32 buf p)))))
 
 ;;; ============================================================
 ;;; The saved core — \CORE.BIN on the boot volume, read to 0x20000000

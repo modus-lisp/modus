@@ -571,6 +571,20 @@
           (write-string-serial \"FASL-END\") (write-char-serial 10)))
       ;; sent: out of the heap (a whole payload's fasls would fill it)
       (setq *fasl-mem* (remove k *fasl-mem* :key (function car) :test (function string=))))))
+;; THE BOOT'S PROGRESS BAR (boot-ppcmac.lisp: the first stage draws 0..30%, the
+;; stub 30..35%): FROM% .. TO% of the screen's width, 8 rows ending 16 above its
+;; bottom, from the boot info (+4 the framebuffer's VA, +8 width, +12 height,
+;; +16 linebytes, +20 depth).  Ink #xFF on 8 bits, 0 deeper.
+(defun %ppcmac-bar (from to)
+  (let ((fb (%ppcmac-u32 #x07F80004)))
+    (when (> fb 0)
+      (let* ((w (%ppcmac-u32 #x07F80008)) (h (%ppcmac-u32 #x07F8000C))
+             (lb (%ppcmac-u32 #x07F80010)) (bpp (floor (%ppcmac-u32 #x07F80014) 8))
+             (ink (if (= bpp 1) 255 0))
+             (x0 (* bpp (floor (* w from) 100))) (x1 (* bpp (floor (* w to) 100))))
+        (dotimes (r 8)
+          (let ((a (+ fb (* (+ (- h 24) r) lb))))
+            (do ((x x0 (+ x 1))) ((>= x x1)) (setf (mem-ref (+ a x) :u8) ink))))))))
 (defun %ppcmac-boot-payload ()
   (let ((a #x04800000))
     (unless (boundp (quote *fasl-mem*)) (setq *fasl-mem* nil))
@@ -587,6 +601,7 @@
                  ;; a fasl stays where the firmware put it: (address . length)
                  (data (if fasl (cons (+ q 4) dl) (%ppcmac-octets (+ q 4) dl))))
             (setq p (+ q 4 (* 4 (ceiling dl 4))))
+            (%ppcmac-bar 35 (+ 35 (floor (* 60 (+ i 1)) n)))
             (cond
               (fasl
                (fasl-mem-put (subseq name 5) data)

@@ -790,6 +790,41 @@
       (let ((*ppc-mac-mode* t))
         (dolist (r (list +ppc-r16+ +ppc-r20+ +ppc-r18+ +ppc-r24+ +ppc-r25+ +ppc-r26+ +ppc-r27+ +ppc-r19+ +ppc-r28+))
           (ppcmac-emit-put-hex buf r)))
+      ;; the progress bar the first stage began (30% .. 35%: the stub is in
+      ;; charge), in the framebuffer it found: r18 its VA (0: none), r21
+      ;; width, r22 height, r23 linebytes, r24 depth.  Ink #xFF on 8 bits, 0
+      ;; deeper; the band's 8 rows end 16 above the bottom.  r3..r12, r0, CTR.
+      (let ((skip (mvm-make-label)) (row (mvm-make-label)) (px (mvm-make-label)) (deep (mvm-make-label)))
+        (ppc-emit-cmpwi buf +ppc-r18+ 0) (ppc-emit-beq buf skip)
+        (li +ppc-r9+ 100)
+        (li +ppc-r6+ 30) (ppc-emit-mullw buf +ppc-r6+ +ppc-r6+ +ppc-r21+) (ppc-emit-divw buf +ppc-r6+ +ppc-r6+ +ppc-r9+)
+        (li +ppc-r7+ 35) (ppc-emit-mullw buf +ppc-r7+ +ppc-r7+ +ppc-r21+) (ppc-emit-divw buf +ppc-r7+ +ppc-r7+ +ppc-r9+)
+        (ppc-emit-rlwinm buf +ppc-r11+ +ppc-r24+ 29 3 31)            ; bytes a pixel
+        (ppc-emit-mullw buf +ppc-r6+ +ppc-r6+ +ppc-r11+)
+        (ppc-emit-mullw buf +ppc-r7+ +ppc-r7+ +ppc-r11+)
+        (ppc-emit-subf buf +ppc-r7+ +ppc-r6+ +ppc-r7+)
+        (ppc-emit-cmpwi buf +ppc-r7+ 0) (ppc-emit-ble buf skip)
+        (li +ppc-r0+ 0)
+        (ppc-emit-cmpwi buf +ppc-r11+ 1) (ppc-emit-bne buf deep)
+        (li +ppc-r0+ #xFF)
+        (ppc-emit-label buf deep)
+        (ppc-emit-addi buf +ppc-r8+ +ppc-r22+ -24)
+        (ppc-emit-mullw buf +ppc-r9+ +ppc-r8+ +ppc-r23+)
+        (ppc-emit-add buf +ppc-r9+ +ppc-r9+ +ppc-r18+)
+        (ppc-emit-add buf +ppc-r9+ +ppc-r9+ +ppc-r6+)
+        (li +ppc-r8+ 8)
+        (ppc-emit-label buf row)
+        (ppc-emit-mr buf +ppc-r10+ +ppc-r9+)
+        (ppc-emit-mtctr buf +ppc-r7+)
+        (ppc-emit-label buf px)
+        (ppc-emit-stb buf +ppc-r0+ +ppc-r10+ 0)
+        (ppc-emit-addi buf +ppc-r10+ +ppc-r10+ 1)
+        (ppc-emit-bc buf 16 0 px)
+        (ppc-emit-add buf +ppc-r9+ +ppc-r9+ +ppc-r23+)
+        (ppc-emit-addi buf +ppc-r8+ +ppc-r8+ -1)
+        (ppc-emit-cmpwi buf +ppc-r8+ 0)
+        (ppc-emit-bgt buf row)
+        (ppc-emit-label buf skip))
       ;; ---- 4. what the hosted stub does after its mmaps ----------------------
       (li +ppc-r1+ (- +ppcmac-stack-top+ 64))
       (li +ppc-r0+ 0)
@@ -877,7 +912,7 @@
                  "/chosen" "bootargs" "stdout" "." "hd:,\\modus.elf"
                  "instance-to-package" "device_type" "call-method" "load" " tftp "
                  "interpret" "/options" "bootpath" "boot-device" "boot-file" "auto-boot?" "true"
-                 "setenv " " "))
+                 "setenv " " " "screen" "address" "width" "height" "linebytes" "depth"))
          (msgs `(("boot" . ,(format nil "~C~Cmodus: loading " #\Return #\Newline))
                  ("fail" . ,(format nil "~C~Cmodus: cannot read the image~C~C" #\Return #\Newline #\Return #\Newline))
                  ("go" . ,(format nil " ok~C~C" #\Return #\Newline))))
@@ -889,6 +924,7 @@
          (hdr (+ +ppcmac-loader-base+ #x8000))
          (path (+ +ppcmac-loader-base+ #x9000))
          (netf (+ path #x200))            ; 1: the image came whole, over the network, to NETBUF
+         (fbi (+ path #x300))             ; the screen: address, width, height, linebytes, bytes a pixel, ink
          (netbuf +ppcmac-netboot-buf+)
          (past (mvm-make-label)) (fail (mvm-make-label)))
     (labels ((off (s) (cdr (assoc s offs :test #'string=)))
@@ -909,6 +945,48 @@
                (ppc-emit-mtctr buf +ppc-r30+)
                (ppc-emit-bctrl buf)
                (when into (ppc-emit-lwz buf into +ppc-r1+ (+ 76 (* 4 (length args))))))
+             (bar (from to)
+               ;; THE BOOT'S PROGRESS BAR, a band across the bottom of the screen from
+               ;; FROM% to TO% of its width (numbers, or (:reg R)), drawn into the
+               ;; framebuffer the firmware named (FBI; 0: none, nothing drawn).  On
+               ;; a Mac booting itself there is no other sign of life: the firmware
+               ;; shows its grey until something draws.  r5..r12, r0, CTR.
+               (let ((skip (mvm-make-label)) (row (mvm-make-label)) (px (mvm-make-label)))
+                 ;; a number, or (:reg R)
+                 (if (consp from) (ppc-emit-mr buf +ppc-r6+ (second from)) (li +ppc-r6+ from))
+                 (if (consp to) (ppc-emit-mr buf +ppc-r7+ (second to)) (li +ppc-r7+ to))
+                 (li +ppc-r10+ fbi)
+                 (ppc-emit-lwz buf +ppc-r5+ +ppc-r10+ 0)
+                 (ppc-emit-cmpwi buf +ppc-r5+ 0) (ppc-emit-beq buf skip)
+                 (ppc-emit-lwz buf +ppc-r8+ +ppc-r10+ 4)                   ; width
+                 (li +ppc-r9+ 100)
+                 (ppc-emit-mullw buf +ppc-r6+ +ppc-r6+ +ppc-r8+) (ppc-emit-divw buf +ppc-r6+ +ppc-r6+ +ppc-r9+)
+                 (ppc-emit-mullw buf +ppc-r7+ +ppc-r7+ +ppc-r8+) (ppc-emit-divw buf +ppc-r7+ +ppc-r7+ +ppc-r9+)
+                 (ppc-emit-cmpw buf +ppc-r7+ +ppc-r6+) (ppc-emit-ble buf skip)
+                 (ppc-emit-lwz buf +ppc-r11+ +ppc-r10+ 16)                 ; bytes a pixel
+                 (ppc-emit-mullw buf +ppc-r6+ +ppc-r6+ +ppc-r11+)
+                 (ppc-emit-mullw buf +ppc-r7+ +ppc-r7+ +ppc-r11+)
+                 (ppc-emit-subf buf +ppc-r7+ +ppc-r6+ +ppc-r7+)            ; bytes a row
+                 (ppc-emit-lwz buf +ppc-r8+ +ppc-r10+ 8)
+                 (ppc-emit-addi buf +ppc-r8+ +ppc-r8+ -24)                 ; y0: height - 24
+                 (ppc-emit-lwz buf +ppc-r12+ +ppc-r10+ 12)                 ; linebytes
+                 (ppc-emit-mullw buf +ppc-r9+ +ppc-r8+ +ppc-r12+)
+                 (ppc-emit-add buf +ppc-r9+ +ppc-r9+ +ppc-r5+)
+                 (ppc-emit-add buf +ppc-r9+ +ppc-r9+ +ppc-r6+)
+                 (ppc-emit-lwz buf +ppc-r0+ +ppc-r10+ 20)                  ; ink
+                 (li +ppc-r8+ 8)                                            ; 8 rows
+                 (ppc-emit-label buf row)
+                 (ppc-emit-mr buf +ppc-r11+ +ppc-r9+)
+                 (ppc-emit-mtctr buf +ppc-r7+)
+                 (ppc-emit-label buf px)
+                 (ppc-emit-stb buf +ppc-r0+ +ppc-r11+ 0)
+                 (ppc-emit-addi buf +ppc-r11+ +ppc-r11+ 1)
+                 (ppc-emit-bc buf 16 0 px)                                  ; bdnz
+                 (ppc-emit-add buf +ppc-r9+ +ppc-r9+ +ppc-r12+)
+                 (ppc-emit-addi buf +ppc-r8+ +ppc-r8+ -1)
+                 (ppc-emit-cmpwi buf +ppc-r8+ 0)
+                 (ppc-emit-bgt buf row)
+                 (ppc-emit-label buf skip)))
              (say (s)
                ;; write(stdout, s, len) when there is a stdout
                (let ((skip (mvm-make-label)))
@@ -960,6 +1038,29 @@
         (li +ppc-r4+ bp) (ppc-emit-add buf +ppc-r4+ +ppc-r4+ +ppc-r15+)
         (li +ppc-r3+ 0) (ppc-emit-stb buf +ppc-r3+ +ppc-r4+ 0)
         (ppc-emit-label buf none))
+      ;; the screen, for the progress bar: the "screen" alias's address (its
+      ;; virtual address under the firmware's map), width, height, linebytes,
+      ;; depth -> bytes a pixel; ink #xFF on 8 bits (black in the Mac palette
+      ;; the firmware leaves), 0 (black) deeper
+      (let ((none (mvm-make-label)) (deep (mvm-make-label)) (ink (mvm-make-label)))
+        (li +ppc-r3+ 0) (li +ppc-r4+ fbi) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 0)
+        (cif "finddevice" (list (list :str "screen")) 1 +ppc-r15+)
+        (ppc-emit-cmpwi buf +ppc-r15+ -1) (ppc-emit-beq buf none)
+        (ppc-emit-cmpwi buf +ppc-r15+ 0) (ppc-emit-beq buf none)
+        (loop for (prop off) in '(("width" 4) ("height" 8) ("linebytes" 12) ("depth" 16) ("address" 0))
+              do (cif "getprop" (list +ppc-r15+ (list :str prop) (list :imm (+ fbi off)) (list :imm 4)) 1))
+        (li +ppc-r4+ fbi)
+        (ppc-emit-lwz buf +ppc-r3+ +ppc-r4+ 16)
+        (ppc-emit-rlwinm buf +ppc-r3+ +ppc-r3+ 29 3 31)                   ; depth / 8
+        (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 16)
+        (ppc-emit-cmpwi buf +ppc-r3+ 1) (ppc-emit-bne buf deep)
+        (li +ppc-r3+ #xFF) (ppc-emit-b buf ink)
+        (ppc-emit-label buf deep)
+        (li +ppc-r3+ 0)
+        (ppc-emit-label buf ink)
+        (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 20)
+        (ppc-emit-label buf none))
+      (bar 0 5)
       (say (msg "boot"))
       ;; open the image; read its ELF header and program headers
       (cif "open" (list (list :imm path)) 1 +ppc-r28+)
@@ -985,6 +1086,7 @@
         (ppc-emit-cmpwi buf +ppc-r3+ 0) (ppc-emit-bne buf fail)
         (ppc-emit-lwz buf +ppc-r15+ +ppc-r1+ 92)
         (ppc-emit-cmpwi buf +ppc-r15+ 52) (ppc-emit-blt buf fail)
+        (bar 5 30)
         (li +ppc-r3+ 1) (li +ppc-r4+ netf) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 0)
         (li +ppc-r26+ netbuf)
         (ppc-emit-b buf have-hdr)
@@ -1037,6 +1139,12 @@
           (ppc-emit-add buf +ppc-r14+ +ppc-r14+ +ppc-r25+)
           (ppc-emit-subf buf +ppc-r15+ +ppc-r25+ +ppc-r15+)
           (say ".")
+          ;; the bar: 5% + 25% of this segment read (r14 - r17 of r18)
+          (ppc-emit-subf buf +ppc-r3+ +ppc-r17+ +ppc-r14+)
+          (li +ppc-r4+ 25) (ppc-emit-mullw buf +ppc-r3+ +ppc-r3+ +ppc-r4+)
+          (ppc-emit-divw buf +ppc-r3+ +ppc-r3+ +ppc-r18+)
+          (ppc-emit-addi buf +ppc-r3+ +ppc-r3+ 5)
+          (bar 5 (list :reg +ppc-r3+))
           (ppc-emit-b buf chunk)
           (ppc-emit-label buf rdone))
         ;; the BSS: [vaddr+filesz, vaddr+memsz) zeroed

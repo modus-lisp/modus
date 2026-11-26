@@ -24,8 +24,8 @@
 ;;;;
 ;;;; GEM-RECEIVE returns a frame IN PLACE: GEM-RX-BUF is its DMA buffer, valid
 ;;;; until the next GEM-RECEIVE, which gives that descriptor back to the chip.
-;;;; The link is taken as Open Firmware left it (a network boot has just used
-;;;; it): full duplex, no PHY programming.
+;;;; The PHY is brought up as Linux does on a Mac (GEM-PHY-UP): Open Firmware's
+;;;; QUIESCE leaves it silent on the MII bus.
 
 (in-package :modus.net.sungem)
 
@@ -121,6 +121,60 @@
     (when (zerop any)
       (dotimes (i 6) (setf (mem-ref (+ st 8 i) :u8) (if (= i 0) 2 (if (= i 5) 9 0)))))))
 
+(defun gem-ms (n)
+  "Wait N milliseconds (the timebase, through GET-INTERNAL-REAL-TIME)."
+  (let ((end (+ (get-internal-real-time) (* n (floor internal-time-units-per-second 1000)) 1)))
+    (loop while (< (get-internal-real-time) end))))
+
+;;; ---- the PHY, through the MIF in frame mode (Linux's __sungem_phy_read/write) ----
+(defun gem-phy-rd (a g)
+  (gem-wr #x620C (logior #x60020000 (ash a 23) (ash g 18)))       ; ST, read, TA MSB
+  (dotimes (i 1000) (when (logtest (gem-rd #x620C) #x10000) (return nil)))
+  (logand (gem-rd #x620C) #xFFFF))
+
+(defun gem-phy-wr (a g v)
+  (gem-wr #x620C (logior #x50020000 (ash a 23) (ash g 18) (logand v #xFFFF)))
+  (dotimes (i 1000) (when (logtest (gem-rd #x620C) #x10000) (return nil))))
+
+(defun gem-phy-up ()
+  "The PHY, as Linux brings it up on a Mac: reset by KeyLargo's GPIO
+   (core99_gmac_phy_reset: KL_GPIO_ETH_PHY_RESET, mac-io +#x7A -- the
+   firmware's QUIESCE leaves it silent), the MII bus MDIO1 when present
+   (gem_check_invariants), the first address that answers, a BMCR reset,
+   autonegotiation, and up to 5 s for the link.  T for full duplex.  Kept at
+   (GEM-STATE) +20: the address (#xFF none), +24 BMSR, +28 the partner's
+   abilities, +32 MIF_CFG."
+  (let ((io (mem-ref #x07F80018 :u32)) (st (gem-state)) (addr #xFF))
+    (when (> io 0)
+      (setf (mem-ref (+ io #x7A) :u8) 4)                          ; output, low: reset
+      (gem-ms 10)
+      (setf (mem-ref (+ io #x7A) :u8) 1)                          ; released
+      (gem-ms 20))
+    (let ((cfg (logand (gem-rd #x6210) (lognot 7))))              ; frame mode, no poll
+      (gem-wr #x6210 (if (logtest cfg #x200) (logior cfg 1) cfg))
+      (setf (mem-ref (+ st 32) :u32) (gem-rd #x6210)))
+    (dotimes (a 32)
+      (let ((b (gem-phy-rd a 1)))
+        (when (and (/= b #xFFFF) (/= b 0)) (setq addr a) (return nil))))
+    (setf (mem-ref (+ st 20) :u32) addr)
+    (if (= addr #xFF)
+        t
+        (progn
+          (gem-phy-wr addr 0 #x8000)                                ; BMCR reset
+          (dotimes (i 50) (gem-ms 10) (unless (logtest (gem-phy-rd addr 0) #x8000) (return nil)))
+          (gem-phy-wr addr 4 #x01E1)                                ; advertise 10/100, half/full
+          (gem-phy-wr addr 0 #x1200)                                ; autonegotiate, restart
+          (dotimes (i 50)
+            (gem-ms 100)
+            (gem-phy-rd addr 1)                                     ; BMSR's link bit latches low
+            (when (logtest (gem-phy-rd addr 1) #x24) (when (logtest (gem-phy-rd addr 1) 4) (return nil))))
+          (let ((bmsr (gem-phy-rd addr 1)) (lpa (gem-phy-rd addr 5)))
+            (setf (mem-ref (+ st 24) :u32) bmsr)
+            (setf (mem-ref (+ st 28) :u32) lpa)
+            ;; full duplex when both ends offer it at the speed they share
+            (or (logtest lpa #x0100) (and (not (logtest lpa #x0080)) (logtest lpa #x0040))
+                (zerop lpa)))))))
+
 (defun gem-rx-fresh (i)
   "Give RX descriptor I to the chip: its 2 KB buffer, OWN."
   (let ((d (+ (gem-rx-ring) (* i 16))))
@@ -174,10 +228,15 @@
           (dotimes (i 5) (gem-wr (+ #x60A4 (* i 4)) 0))
           (dotimes (i 16) (gem-wr (+ #x60C0 (* i 4)) #xFFFF))
           (gem-wr #x6020 #xFFFF) (gem-wr #x6024 #xFFFF) (gem-wr #x6028 #xFFFFFFFF)
-          ;; the link as the firmware left it: full duplex (GEM-SET-LINK-MODES)
+          ;; the link: the PHY up, and the MAC told its duplex (GEM-SET-LINK-MODES)
           (gem-wr #x6038 0)
-          (gem-wr #x6030 (logior #x08 #x10 #x02 #x04))       ; EIPG0 NGU ICS ICOLL
-          (gem-wr #x603C (logior #x01 #x20 #x40))             ; OE LLED FLED
+          (if (gem-phy-up)
+              (progn (gem-wr #x6030 (logior #x08 #x10 #x02 #x04))   ; EIPG0 NGU ICS ICOLL
+                     (gem-wr #x603C (logior #x01 #x20 #x40))         ; OE LLED FLED
+                     (gem-wr #x604C 64))
+              (progn (gem-wr #x6030 (logior #x08 #x10))             ; half: EIPG0 NGU
+                     (gem-wr #x603C (logior #x01 #x20 #x04))         ; OE LLED DISE
+                     (gem-wr #x604C 512)))
           ;; go: DMA, then the MACs (RX: strip FCS, promiscuous -- a point-to-point
           ;; link, and broadcast for ARP and DHCP without the hash filter)
           (gem-wr #x2004 (logior (gem-rd #x2004) 1))

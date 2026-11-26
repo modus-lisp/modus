@@ -187,6 +187,24 @@
       (error (c) (ignore-errors (modus-int::write-string-serial "usb: ") (princ c)))))
   *mac-via-kind*)
 
+;;; ---- restart ---------------------------------------------------------------
+;;; (REBOOT): the machine restarts as from its power key, into Open Firmware's
+;;; auto-boot.  To come back into Modus over the network every time, set once at
+;;; the ok prompt (Cmd-Opt-P-R at the chime undoes it):
+;;;   setenv boot-device enet:10.0.0.1,modus-boot.elf,10.0.0.9
+;;;   setenv boot-file enet:10.0.0.1,modus.elf,10.0.0.9
+;;;   setenv auto-boot? true
+;;; (BOOT with no arguments loads boot-device and hands boot-file over as the
+;;; bootargs, which modus-boot.elf reads as the image's path.)  The PMU's
+;;; PMU_RESET (#xD0, no data) or CUDA's pseudo command RESET_SYSTEM (#x11), as
+;;; Linux's pmu_restart / cuda_restart.
+
+(defun reboot ()
+  (if (= (if (and (= (mem-ref #x07F80000 :u16) #x5050) (= (mac-boot-info 28) 2)) 2 1) 2)
+      (pmu-command #xD0 nil)
+      (cuda-send (list 1 #x11)))
+  (loop))                                       ; until the machine goes
+
 ;;; ---- the clock -------------------------------------------------------------
 ;;;
 ;;; Both microcontrollers keep the real-time clock: seconds since 1904-01-01

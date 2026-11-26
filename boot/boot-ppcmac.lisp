@@ -875,7 +875,9 @@
          (buf (make-ppc-buffer))
          (strs '("finddevice" "getprop" "open" "read" "seek" "close" "claim" "write" "exit"
                  "/chosen" "bootargs" "stdout" "." "hd:,\\modus.elf"
-                 "instance-to-package" "device_type" "call-method" "load" " tftp "))
+                 "instance-to-package" "device_type" "call-method" "load" " tftp "
+                 "interpret" "/options" "bootpath" "boot-device" "boot-file" "auto-boot?" "true"
+                 "setenv " " "))
          (msgs `(("boot" . ,(format nil "~C~Cmodus: loading " #\Return #\Newline))
                  ("fail" . ,(format nil "~C~Cmodus: cannot read the image~C~C" #\Return #\Newline #\Return #\Newline))
                  ("go" . ,(format nil " ok~C~C" #\Return #\Newline))))
@@ -1060,6 +1062,67 @@
         (ppc-emit-b buf ph)
         (ppc-emit-label buf done))
       (cif "close" (list +ppc-r28+) 0)
+      ;; Booted from the network: make it the firmware's default, so a restart
+      ;; (Lisp's REBOOT, the power key) comes straight back here -- boot-device
+      ;; what the firmware just booted (/chosen's bootpath), boot-file the image's
+      ;; path (BOOT with no arguments hands it over as the bootargs), auto-boot?
+      ;; true.  Each by SETENV through the client interface's INTERPRET, and only
+      ;; when /options holds something else (the NVRAM is flash).  Option at the
+      ;; chime still picks another disk; Cmd-Opt-P-R forgets all of it.
+      (let ((skip-all (mvm-make-label)) (bp (+ hdr #x2000)) (cur (+ hdr #x2200)) (cmd (+ hdr #x2400)))
+        (labels ((copy-from-r6 ()
+                   ;; the NUL-terminated string at r6 to r5 (no NUL), r5 past it
+                   (let ((top (mvm-make-label)) (end (mvm-make-label)))
+                     (ppc-emit-label buf top)
+                     (ppc-emit-lbz buf +ppc-r7+ +ppc-r6+ 0)
+                     (ppc-emit-cmpwi buf +ppc-r7+ 0) (ppc-emit-beq buf end)
+                     (ppc-emit-stb buf +ppc-r7+ +ppc-r5+ 0)
+                     (ppc-emit-addi buf +ppc-r5+ +ppc-r5+ 1) (ppc-emit-addi buf +ppc-r6+ +ppc-r6+ 1)
+                     (ppc-emit-b buf top)
+                     (ppc-emit-label buf end)))
+                 (val-to-r6 (val)
+                   (if (integerp val) (li +ppc-r6+ val) (ppc-emit-addi buf +ppc-r6+ +ppc-r29+ (off val))))
+                 (setvar (name val)
+                   ;; VAL: an address, or a string of the loader's
+                   (let ((skip (mvm-make-label)) (cmp (mvm-make-label)) (differ (mvm-make-label)) (noterm (mvm-make-label)))
+                     (cif "finddevice" (list (list :str "/options")) 1 +ppc-r22+)
+                     (li +ppc-r3+ 0) (li +ppc-r4+ cur) (ppc-emit-stw buf +ppc-r3+ +ppc-r4+ 0)
+                     (ppc-emit-cmpwi buf +ppc-r22+ -1) (ppc-emit-beq buf noterm)
+                     (cif "getprop" (list +ppc-r22+ (list :str name) (list :imm cur) (list :imm 255)) 1 +ppc-r15+)
+                     (ppc-emit-cmpwi buf +ppc-r15+ 0) (ppc-emit-ble buf noterm)
+                     (li +ppc-r4+ cur) (ppc-emit-add buf +ppc-r4+ +ppc-r4+ +ppc-r15+)
+                     (li +ppc-r3+ 0) (ppc-emit-stb buf +ppc-r3+ +ppc-r4+ 0)
+                     (ppc-emit-label buf noterm)
+                     ;; the same string already?
+                     (li +ppc-r5+ cur) (val-to-r6 val)
+                     (ppc-emit-label buf cmp)
+                     (ppc-emit-lbz buf +ppc-r7+ +ppc-r5+ 0) (ppc-emit-lbz buf +ppc-r8+ +ppc-r6+ 0)
+                     (ppc-emit-cmpw buf +ppc-r7+ +ppc-r8+) (ppc-emit-bne buf differ)
+                     (ppc-emit-cmpwi buf +ppc-r7+ 0) (ppc-emit-beq buf skip)
+                     (ppc-emit-addi buf +ppc-r5+ +ppc-r5+ 1) (ppc-emit-addi buf +ppc-r6+ +ppc-r6+ 1)
+                     (ppc-emit-b buf cmp)
+                     ;; no: "setenv NAME VAL", interpreted
+                     (ppc-emit-label buf differ)
+                     (li +ppc-r5+ cmd)
+                     (ppc-emit-addi buf +ppc-r6+ +ppc-r29+ (off "setenv ")) (copy-from-r6)
+                     (ppc-emit-addi buf +ppc-r6+ +ppc-r29+ (off name)) (copy-from-r6)
+                     (ppc-emit-addi buf +ppc-r6+ +ppc-r29+ (off " ")) (copy-from-r6)
+                     (val-to-r6 val) (copy-from-r6)
+                     (li +ppc-r3+ 0) (ppc-emit-stb buf +ppc-r3+ +ppc-r5+ 0)
+                     (cif "interpret" (list (list :imm cmd)) 1)
+                     (ppc-emit-label buf skip))))
+          (li +ppc-r4+ netf) (ppc-emit-lwz buf +ppc-r3+ +ppc-r4+ 0)
+          (ppc-emit-cmpwi buf +ppc-r3+ 0) (ppc-emit-beq buf skip-all)
+          (cif "finddevice" (list (list :str "/chosen")) 1 +ppc-r24+)
+          (ppc-emit-cmpwi buf +ppc-r24+ -1) (ppc-emit-beq buf skip-all)
+          (cif "getprop" (list +ppc-r24+ (list :str "bootpath") (list :imm bp) (list :imm 255)) 1 +ppc-r15+)
+          (ppc-emit-cmpwi buf +ppc-r15+ 1) (ppc-emit-blt buf skip-all)
+          (li +ppc-r4+ bp) (ppc-emit-add buf +ppc-r4+ +ppc-r4+ +ppc-r15+)
+          (li +ppc-r3+ 0) (ppc-emit-stb buf +ppc-r3+ +ppc-r4+ 0)
+          (setvar "boot-device" bp)
+          (setvar "boot-file" path)
+          (setvar "auto-boot?" "true")
+          (ppc-emit-label buf skip-all)))
       (say (msg "go"))
       ;; into the image: r5 = the client interface, OF's stack, r3 = r4 = 0
       (ppc-emit-mr buf +ppc-r5+ +ppc-r30+)

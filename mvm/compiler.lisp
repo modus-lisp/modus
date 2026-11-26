@@ -5797,8 +5797,11 @@
         ;; one-argument expander's body is the expansion's own error, and retrying
         ;; it as (form env) replaced that error with "invalid number of arguments:
         ;; 2" to the expander -- which named neither the macro nor what went wrong.
-        ((%expander-arity-takes-p mf 1) (funcall mf form))
+        ;; (form env) first, as CLHS and SBCL call a macro function: an expander
+        ;; taking &REST may be a forwarder (cortez's, for a cell holding a symbol)
+        ;; to one that requires both, and (form) alone reached it short.
         ((%expander-arity-takes-p mf 2) (funcall mf form nil))
+        ((%expander-arity-takes-p mf 1) (funcall mf form))
         (t (block expand
              (handler-bind
                  ((program-error

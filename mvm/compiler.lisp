@@ -5798,8 +5798,24 @@
                  ((program-error
                     (lambda (c)
                       (declare (ignore c))
-                      (return-from expand (funcall mf form nil)))))
+                      ;; Declined when MF cannot take two: then the PROGRAM-ERROR
+                      ;; came from inside its body, and retrying replaced it with
+                      ;; "invalid number of arguments: 2" to the expander, which
+                      ;; named neither the macro nor what went wrong.
+                      (unless (%expander-refuses-two-p mf)
+                        (return-from expand (funcall mf form nil))))))
                (funcall mf form))))))
+
+(defun %expander-refuses-two-p (mf)
+  "MF's arity is known, fixed, and excludes two arguments.  Asked only once a
+   one-argument call has signalled a PROGRAM-ERROR, and any failure to answer
+   is NIL (unknown): some function objects in TI's world under cortez make
+   %FUNCTION-ARITY itself signal, and asking on every expansion stopped its
+   boot.  An expander taking &REST may forward to one requiring (form env), so
+   only a fixed maximum says the retry cannot help."
+  (let ((a (and *mvm-eval-runtime-p* (functionp mf)
+                (handler-case (%function-arity mf) (error () nil)))))
+    (and (consp a) (cdr a) (< (cdr a) 2))))
 
 (defun %hook-expander (form env)
   "The expander a user's *MACROEXPAND-HOOK* is handed: the one

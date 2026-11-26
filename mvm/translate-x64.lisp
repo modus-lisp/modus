@@ -5149,6 +5149,26 @@
              (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
              (maybe-store-scratch buf vd))))
 
+        ;; ---- packed double-float vector lanes (#x18): MOVSD xmm <-> [arr + 8*idx + 7].
+        ;; The tagged index is 2*idx, so the offset is 4*tagged: SHL 2, no untag.  Only
+        ;; RAX and R13 (saved) are touched, as EMIT-F32-LANE-ADDR.
+        ((or (op= +op-fpd-lane-load+) (op= +op-fpd-lane-store+))
+         (let* ((ld (op= +op-fpd-lane-load+))
+                (fr (x64-fpp (if ld (first operands) (third operands))))
+                (varr (if ld (second operands) (first operands)))
+                (vidx (if ld (third operands) (second operands))))
+           (emit-load-vreg buf vidx +scratch-reg+)
+           (emit-shl-reg-imm buf +scratch-reg+ 2)
+           (let ((pobj (vreg-phys varr)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf varr 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           (x64-sse-rax7 buf #xF2 (if ld #x10 #x11) fr)))           ; movsd xmmR, [rax+7] / [rax+7], xmmR
+
         ((or (op= +op-fpd-add+) (op= +op-fpd-sub+) (op= +op-fpd-mul+) (op= +op-fpd-div+))
          (let* ((fd (x64-fpp (first operands)))
                 (fa (x64-fpp (second operands)))
@@ -9622,7 +9642,7 @@
         ;; carried with the string forever -- measured on a cortez corpus read,
         ;; symbol NAMES ("TYPE-LIST" +8) held old READ-CHAR &rest lists, their
         ;; string streams and whole file texts.
-        (dolist (st '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x31 #x60 #x64 #x65 #x66))
+        (dolist (st '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x18 #x31 #x60 #x64 #x65 #x66))
           (emit-cmp-reg-imm buf 'r8 st)
           (emit-jcc buf :e leaf))
         (emit-jmp buf scan-it)
@@ -10218,7 +10238,7 @@
       (%gen-header-size buf)
       (emit-add-reg-reg buf 'rax 'rdi)
       (st 56 'rax)                                    ; next object
-      (dolist (s '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x31 #x60 #x64 #x65 #x66))
+      (dolist (s '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x18 #x31 #x60 #x64 #x65 #x66))
         (emit-cmp-reg-imm buf 'rsi s)
         (emit-jcc buf :e leaf))
       ;; slots [max(obj+16, card start), min(obj+16+count*8, card end))

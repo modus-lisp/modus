@@ -484,6 +484,9 @@
        ;; packed (unsigned-byte 32) vectors (#x17): 4-byte lanes, not words
        (not (eq (obj-subtag dst) #x17))
        (not (eq (obj-subtag src) #x17))
+       ;; packed double vectors (#x18): raw IEEE bits, not Lisp words
+       (not (eq (obj-subtag dst) #x18))
+       (not (eq (obj-subtag src) #x18))
        ;; narrow strings (#x13) are byte-packed too
        (not (eq (obj-subtag dst) #x13))
        (not (eq (obj-subtag src) #x13))
@@ -499,6 +502,14 @@
 ;;; -- and the builds that do override it to T (build-generic-cli, the Pi board).
 (declaim (overridable %u32-vectors-p))
 (defun %u32-vectors-p () nil)
+
+;;; PACKED DOUBLE-FLOAT VECTORS (compiler.lisp +SUBTAG-F64-VECTOR+, #x18): one raw IEEE754
+;;; binary64 per element at 16 + 8I, no pointers -- sized as a word vector, a LEAF to every
+;;; collector.  %F64-VECTORS-P says whether this build makes them: its collectors know #x18
+;;; and its translators have :FPD-LANE-LOAD / -STORE (x64, aarch64).  Those builds override
+;;; it to T (build-generic-cli, build-aarch64-cli).
+(declaim (overridable %f64-vectors-p))
+(defun %f64-vectors-p () nil)
 
 ;;; NARROW STRINGS (compiler.lisp +SUBTAG-BASE-STRING+, #x13): a byte per
 ;;; character.  %NARROW-STRINGS-P says whether this build makes them; the
@@ -573,6 +584,111 @@
     (setf (mem-ref raw :u32) (logand (logior (ash n 8) #x17) #xFFFFFFFF))
     (setf (mem-ref (+ raw 4) :u32) (ash n -24))
     s))
+
+;;; ---- Packed double-float vectors (#x18) ----
+;;; The compiled accessors are %F64-LOAD / %F64-STORE (compiler.lisp COMPILE-F64-LOAD):
+;;; one lane load or store and a box or unbox, no Lisp call.  The -RT pair below is the
+;;; same lane through :U32 halves -- the interpreter's reference arm for the lane opcodes,
+;;; and what a build without them compiles %F64-LOAD to.  Little-endian lanes: only the
+;;; 64-bit little-endian targets (x64, aarch64) turn packing on.
+
+(defun %make-f64-vector (n)
+  "A fresh packed double-float vector (#x18) of N elements, all +0.0d0: a byte vector of
+   8N (zero-filled) whose header is rewritten to (N << 8) | #x18, as %MAKE-U32-VECTOR does
+   for #x17.  Same size either way (16 + 8N), and nothing allocates in between."
+  (let* ((s (%alloc-u8 (* 8 n)))
+         (raw (- (%val->word s) +tag-object+)))
+    (setf (mem-ref raw :u32) (logand (logior (ash n 8) #x18) #xFFFFFFFF))
+    (setf (mem-ref (+ raw 4) :u32) (ash n -24))
+    s))
+
+(defun %f64-boxed-double-p (x)
+  "X is a boxed DOUBLE-FLOAT (#x60; LONG-FLOAT #x66 is the same IEEE double): what a
+   packed double vector may hold.  Checked without CL-TYPES (prelude is first)."
+  (and (eql (%lowtag x) +tag-object+) (not (eq x t))
+       (let ((st (obj-subtag x))) (or (eq st #x60) (eq st #x66)))))
+
+(defun %f64-lane-check (a i)
+  (unless (and (fixnump i) (>= i 0) (< i (%prim-array-length a)))
+    (%aref-index-error a i)))
+
+(defun %f64-aref-rt (a i)
+  "Lane I of packed double vector A as a fresh double, through :U32 halves.  Nothing
+   allocates between the address and the two loads."
+  (%f64-lane-check a i)
+  (let* ((raw (+ (- (%val->word a) +tag-object+) 16 (* 8 i)))
+         (lo (mem-ref raw :u32))
+         (hi (mem-ref (+ raw 4) :u32)))
+    (%float-set-bits (%make-float2) hi lo)))
+
+(defun %f64-aset-rt (a i x)
+  "Store the boxed float X's IEEE double bits into lane I of A (no type check: the
+   callers' job).  The halves are read before the address is computed."
+  (%f64-lane-check a i)
+  (let ((hi (%float-hi32 x)) (lo (%float-lo32 x)))
+    (let ((raw (+ (- (%val->word a) +tag-object+) 16 (* 8 i))))
+      (setf (mem-ref raw :u32) lo)
+      (setf (mem-ref (+ raw 4) :u32) hi)))
+  x)
+
+(defun %f64-aref (a i)
+  "%PRIM-AREF's / AREF's packed double arm, out of line: the lane, boxed."
+  (%f64-load a i))
+
+(defun %f64-aset (a i x)
+  "%PRIM-ASET's / ASET's packed double arm: store X, which must be a DOUBLE-FLOAT (as
+   SBCL: a single-float or an integer is a TYPE-ERROR, not converted).  Returns X."
+  (if (%f64-boxed-double-p x)
+      (progn (%f64-store a i x) x)
+      (error 'type-error :datum x :expected-type 'double-float)))
+
+(defun %f64-bare-p (x)
+  "True for a plain packed double-float vector (subtag #x18): no header, no wrapper."
+  (and x (not (consp x)) (not (%mda-p x)) (eq (obj-subtag x) #x18)))
+
+(defun %bulk-copy-f64-ok-p (dst src)
+  "Both plain packed double vectors: copy 8-byte lanes as raw bits (%BULK-COPY-OK-P
+   excludes #x18 -- its slots are not Lisp words, and a word move's per-element
+   shared-store guard would read IEEE bits as pointers)."
+  (and (%f64-bare-p dst) (%f64-bare-p src)))
+
+(defun %f64-copy-lane (dst di src si)
+  (let* ((s (+ (- (%val->word src) +tag-object+) 16 (* 8 si)))
+         (lo (mem-ref s :u32)) (hi (mem-ref (+ s 4) :u32))
+         (d (+ (- (%val->word dst) +tag-object+) 16 (* 8 di))))
+    (setf (mem-ref d :u32) lo)
+    (setf (mem-ref (+ d 4) :u32) hi)))
+
+(declaim (overridable %bulk-copy-f64))
+(defun %bulk-copy-f64 (dst dstart src sstart n)
+  "Lane copy SRC[sstart...] -> DST[dstart...], memmove semantics like %BULK-COPY-U32.  A
+   lane at a time (as two :U32 halves, never a raw word in a Lisp register); the aarch64
+   and x64 images replace this with one BULK-MOVE of 8N bytes."
+  (declare (type fixnum dstart sstart n))
+  (if (and (eq dst src) (> dstart sstart))
+      (let ((i (- n 1)))
+        (declare (type fixnum i))
+        (loop (when (< i 0) (return dst))
+          (%f64-copy-lane dst (+ dstart i) src (+ sstart i))
+          (setq i (- i 1))))
+      (let ((i 0))
+        (declare (type fixnum i))
+        (loop (when (>= i n) (return dst))
+          (%f64-copy-lane dst (+ dstart i) src (+ sstart i))
+          (setq i (+ i 1))))))
+
+(declaim (overridable %fill-f64))
+(defun %fill-f64 (seq start end item)
+  "SEQ[START..END) := ITEM, a boxed double, SEQ a plain packed double vector, END within
+   it.  The first lane, then copies of it; the aarch64 and x64 images replace the copies
+   with doubling BULK-MOVEs (native-bulk-u32.lisp)."
+  (when (< start end)
+    (%f64-aset-rt seq start item)
+    (let ((i (+ start 1)))
+      (loop (when (>= i end) (return nil))
+        (%f64-copy-lane seq i seq start)
+        (setq i (+ i 1)))))
+  seq)
 
 (defun %u32-aset (v i x)
   "%PRIM-ASET's packed (unsigned-byte 32) arm: store X, which must be such an integer."
@@ -794,8 +910,11 @@
           nil))))
 
 (defun %svref-slow (a i)
-  "SVREF of anything but a plain simple vector: the generic AREF."
-  (aref a i))
+  "SVREF of anything but a plain simple vector: the generic AREF -- except a packed
+   double-float vector, which is not a SIMPLE-VECTOR and is refused, as SBCL does."
+  (if (%f64-bare-p a)
+      (error 'type-error :datum a :expected-type 'simple-vector)
+      (aref a i)))
 
 (defun %simple-string= (a b)
   "Two plain #x31 strings with the same characters: lengths, then the code
@@ -4514,6 +4633,7 @@
                              (eq (obj-subtag seq) #x12)) (%make-f32-vector len))
                        ((and (not (consp seq)) (not (%mda-p seq))
                              (eq (obj-subtag seq) #x17)) (%make-u32-vector len))
+                       ((%f64-bare-p seq) (%make-f64-vector len))
                        (t (make-array len)))))
         (let ((i 0))
           (cond
@@ -4526,6 +4646,8 @@
              (%bulk-copy-u8 result 0 seq start len) result)
             ((%bulk-copy-u32-ok-p result seq)
              (%bulk-copy-u32 result 0 seq start len) result)
+            ((%bulk-copy-f64-ok-p result seq)
+             (%bulk-copy-f64 result 0 seq start len) result)
             ((%bulk-copy-ok-p result seq)
              (%bulk-copy result 0 seq start len) result)
             (t

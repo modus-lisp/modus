@@ -3424,6 +3424,21 @@
              (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
                (setf (svref regs vd) (coerce (svref fregs fs) 'double-float))
                (setf pc npc2))))
+          ;; packed double-float vector lanes (#x18): the prelude's :U32-half
+          ;; reference (NOT %F64-AREF, which is the compiled lane op itself)
+          (#.+op-fpd-lane-load+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (varr npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (vidx npc3) (%ifetch-reg bc npc2)
+                 (setf (svref fregs fd)
+                       (%f64-aref-rt (svref regs varr) (svref regs vidx)))
+                 (setf pc npc3)))))
+          (#.+op-fpd-lane-store+
+           (multiple-value-bind (varr npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vidx npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (fs npc3) (%ifetch-reg bc npc2)
+                 (%f64-aset-rt (svref regs varr) (svref regs vidx) (svref fregs fs))
+                 (setf pc npc3)))))
           ((#.+op-fpd-add+ #.+op-fpd-sub+ #.+op-fpd-mul+ #.+op-fpd-div+)
            (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (fa npc2) (%ifetch-reg bc npc)

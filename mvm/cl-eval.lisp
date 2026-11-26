@@ -5220,6 +5220,8 @@
    signals program-error."
   (when (%seq-type-u8-p result-type)
     (return-from map (%seq-u8-copy (apply (function map) 'vector fn seqs))))
+  (when (and seqs (%seq-type-f64-p result-type))
+    (return-from map (%f64-result result-type (apply (function map) 'vector fn seqs))))
   ;; a bit-vector result: map into a general vector, then the packed array
   (when (and seqs (%bit-seq-type-p result-type))
     (return-from map
@@ -5476,6 +5478,10 @@
         (when (%bulk-copy-u32-ok-p seq1 seq2)
           (%bulk-copy-u32 seq1 start1 seq2 start2 count)
           (return-from %replace-pos seq1))
+        ;; packed double vectors: the lanes as raw bits
+        (when (%bulk-copy-f64-ok-p seq1 seq2)
+          (%bulk-copy-f64 seq1 start1 seq2 start2 count)
+          (return-from %replace-pos seq1))
         (when (%bulk-copy-ok-p seq1 seq2)
           (%bulk-copy seq1 start1 seq2 start2 count)
           (return-from %replace-pos seq1))
@@ -5490,6 +5496,9 @@
               (return-from %replace-pos seq1))
             (when (%bulk-copy-u32-ok-p d1 d2)
               (%bulk-copy-u32 d1 start1 d2 start2 count)
+              (return-from %replace-pos seq1))
+            (when (%bulk-copy-f64-ok-p d1 d2)
+              (%bulk-copy-f64 d1 start1 d2 start2 count)
               (return-from %replace-pos seq1))
             (when (%bulk-copy-ok-p d1 d2)
               (%bulk-copy d1 start1 d2 start2 count)

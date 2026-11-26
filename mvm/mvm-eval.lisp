@@ -3040,6 +3040,7 @@
 (defun %static-vector-subtag (element-type)
   (cond ((equal element-type '(unsigned-byte 8)) (values #x11 1))
         ((member element-type '(single-float short-float)) (values #x12 4))
+        ((and (member element-type '(double-float long-float)) (%f64-vectors-p)) (values #x18 8))
         (t (error "MAKE-STATIC-VECTOR: element type ~S is not (UNSIGNED-BYTE 8) or SINGLE-FLOAT"
                   element-type))))
 
@@ -3132,7 +3133,9 @@
             (when (zerop s) (push (cons (+ a 9) bytes) *static-vector-maps*))
             (%word->val (+ a 9)))
           (make-array n :element-type element-type
-                        :initial-element (if (= subtag #x12) 0.0 0))))))
+                        :initial-element (cond ((= subtag #x12) 0.0)
+                                               ((= subtag #x18) 0.0d0)
+                                               (t 0)))))))
 
 (defun free-static-vector (v)
   "Unmap V, a vector MAKE-STATIC-VECTOR returned; T if it did.  A vector it

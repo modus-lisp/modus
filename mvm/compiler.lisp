@@ -77,6 +77,13 @@
 ;; characters.  4 bytes an element where the word form spends 8, and the 32-bit lanes
 ;; XRGB8888 pixels are, so a framebuffer is the bytes a display controller reads.
 (defconstant +subtag-u32-vector+ #x17)
+;; PACKED DOUBLE-FLOAT VECTOR: (simple-array double-float (*)) in a build that makes them
+;; (%F64-ON-P) -- one raw IEEE754 binary64 per element at 16 + 8I, no pointers, so the
+;; object is sized as a word vector (16 + 8N) and is a LEAF to every collector.  A
+;; worker's store into a main-made vector is then a store of bits, not of a pointer to
+;; the worker's own box (which the shared-store guard rightly refuses).  #x18 was free in
+;; every translator, gc.lisp, save-image and web/mvm.js; #x14 stays u64-vector's.
+(defconstant +subtag-f64-vector+ #x18)
 (defconstant +subtag-f32-vector+ #x12)  ; packed single-float vector (4-byte IEEE32 lanes)
 (defconstant +subtag-ratio+  #x33)   ; 2-slot: numerator, denominator
 (defconstant +subtag-mda+    #x34)   ; 7-slot multi-dim array header:
@@ -1335,6 +1342,17 @@
 (defun %u32-on-p ()
   "Does this build make packed u32 vectors (#x17), and so emit their arms?"
   (if *mvm-eval-runtime-p* (%u32-vectors-p) *u32-vectors-p*))
+
+(defvar *f64-vectors-p* nil
+  "Host flag: this build packs (simple-array double-float (*)) as #x18 (its collectors
+   treat the subtag as a leaf and its translators have the :FPD-LANE-LOAD / -STORE arms).
+   The image's own compiler asks %F64-VECTORS-P instead.  Set by build-generic-cli and
+   build-aarch64-cli; NOT by the UEFI or aarch64-Linux DDC images, so the DDC's two
+   compilers agree without a self-host setting.")
+
+(defun %f64-on-p ()
+  "Does this build make packed double-float vectors (#x18), and so emit their arms?"
+  (if *mvm-eval-runtime-p* (%f64-vectors-p) *f64-vectors-p*))
 
 (defvar *string32-p* t
   "With *NARROW-LITERALS-P*: does the AOT build make 32-bit (#x15) strings?
@@ -5323,6 +5341,7 @@
         (let ((ty (list 'simple-array et (list '*))))
           (cond ((%u8-simple-array-decl-p ty) ty)
                 ((%u32-simple-array-decl-p ty) ty)
+                ((%f64-packed-decl-p ty) ty)
                 ((%generic-element-type-p et) ty)
                 ;; the packed single-float vector a declared f32 array is
                 ;; (illatio's f32-dot16 accumulator: every AREF was generic)
@@ -10602,7 +10621,7 @@
    ;; %PRIM-STRINGP %PRIM-U8-VECTOR-P %RAW-CONSP %SHARED-LITERAL %SLOT-REF %SPAWN-THREAD
    ;; %STRUCT-SLOT-REF %STRUCT-SLOT-SET %U8-REF %U8-REF-UNCHECKED %U8-SET
    ;; %U8-SET-UNCHECKED %UCAR %UCDR %VAL->WORD %WORD->VAL %WORD-AREF %WORD-ASET CHAR
-   ;; CNTFRQ SAFETY-CHECK SCHAR WITH-SIMPLE-RESTART %EXP-D
+   ;; CNTFRQ SAFETY-CHECK SCHAR WITH-SIMPLE-RESTART %EXP-D %F64-LOAD %F64-STORE
     128401437 164901478 125009599 279156048 288867729 462383973 343008121 79476218
     103993613 58414919 121414968 156403790 108856844 9852007 388138896 75164491
     504669726 209633815 344711121 338108280 324903310 33180769 375151373 62768255
@@ -10613,7 +10632,7 @@
     367627940 469097205 84095010 323209429 14355506 434674778 231353088 17781339
     462768251 388046666 260184480 362441329 437115943 483756498 497160708 121290012
     292480825 189301986 429343799 367065803 155426392 228425908 483931868
-    314680310)
+    314680310 25021701 141437028)
   "The hashes of the names COMPILE-COMPOUND's dispatch tests for that
    *HASH-DISPATCH-NAMES* (made from its bare literals) does not have: the ones
    its clauses spell #.(COMPUTE-NAME-HASH \"NAME\").  The two together are
@@ -12285,6 +12304,10 @@
        (compile-f32-load (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%F32-STORE"))
        (compile-f32-store (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name #.(compute-name-hash "%F64-LOAD"))
+       (compile-f64-load (cadr form) (caddr form) env dest))
+      ((= op-name #.(compute-name-hash "%F64-STORE"))
+       (compile-f64-store (cadr form) (caddr form) (cadddr form) env dest))
       ((= op-name #.(compute-name-hash "%FROUND32"))
        (compile-fround32 (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%FSQRT"))
@@ -16175,6 +16198,7 @@
               ((string= n "LENGTH")
                (and (consp (cdr form)) (null (cddr form)) (symbolp (cadr form))
                     (or (%declared-f32-array-var-p (cadr form) env)
+                        (%declared-f64-array-var-p (cadr form) env)
                         (%declared-u8-array-var-p (cadr form) env)
                         (%declared-generic-array-var-p (cadr form) env))
                     t))
@@ -16231,6 +16255,8 @@
                     (symbolp (cadr form))
                     (or (%declared-f32-array-var-p (cadr form) env)
                         (%declared-generic-array-var-p (cadr form) env)
+                        ;; a packed double's AREF is one lane load and a box
+                        (and (%f64-lanes-native-p) (%declared-f64-array-var-p (cadr form) env))
                         ;; a declared byte vector's AREF is one u8 load too (a
                         ;; K-quant kernel reads its scales beside its lanes)
                         (%declared-u8-array-var-p (cadr form) env))
@@ -16262,6 +16288,10 @@
                            (symbolp (cadr place)) (%simple-index-form-p (caddr place))
                            (cond ((%declared-f32-array-var-p (cadr place) env)
                                   (and (%fp-tree-need val env) t))
+                                 ;; a double tree goes straight into the lane (else
+                                 ;; a checked store, whose slow arm is a call)
+                                 ((%declared-f64-array-var-p (cadr place) env)
+                                  (and (%f64-lanes-native-p) (%fpd-pure-need val env) t))
                                  ((%declared-generic-array-var-p (cadr place) env)
                                   (%fp-scope-call-free-p val env (1+ depth)))
                                  (t nil))))))
@@ -24805,6 +24835,8 @@
            ((and form (not (env-lookup env form)) (%double-constant-p form)) 1)
            (t nil)))
     ((assoc form *fpd-hoisted* :test #'eq) 1)
+    ;; (AREF A i) of a declared packed double vector, simple index: one lane load
+    ((%fpd-lane-aref-p form env) 1)
     ((%fpd-unary-minus-p form) (%fpd-tree-need (list '* -1.0d0 (cadr form)) env))
     ((and (consp form) (symbolp (car form))
           (member (symbol-name (car form)) '("+" "-" "*" "/") :test #'string=)
@@ -24836,6 +24868,15 @@
     ((%tree-inline form env)
      (%with-tree-inline form (function %fpd-tree-need) env))
     (t nil)))
+
+(defun %fpd-lane-aref-p (form env)
+  "True for (AREF A i), A a declared (simple-array double-float (*)) in a packing build and
+   I a call-free index: a leaf of a double tree, read straight into an FP register."
+  (and (consp form) (symbolp (car form)) (name-eq (car form) "AREF")
+       (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+       (%f64-lanes-native-p)
+       (%declared-f64-array-var-p (cadr form) env)
+       (%simple-index-form-p (caddr form))))
 
 (defun %fpd-arith-op (name)
   (cond ((string= name "+") :fpd-add)
@@ -24878,6 +24919,15 @@
   (when (%fpd-unary-minus-p form)
     (return-from compile-double-unboxed
       (compile-double-unboxed (list '* -1.0d0 (cadr form)) env fd)))
+  (when (%fpd-lane-aref-p form env)
+    (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
+      (compile-form (cadr form) env ta)
+      (compile-form (caddr form) env ti)
+      (let ((lk (%lane-index-check-begin ta ti)))
+        (emit-ir :fpd-lane-load fd ta ti)
+        (%lane-index-check-end lk))
+      (free-temp-reg) (free-temp-reg))
+    (return-from compile-double-unboxed nil))
   (cond ((%fp-abs-p form)
          (compile-double-unboxed (cadr form) env fd)
          (emit-ir :fp-op1 fd fd 1)                               ; fabs.d
@@ -29060,6 +29110,11 @@
       (emit-ir :li temp2 (ash +subtag-u32-vector+ +fixnum-shift+))
       (emit-ir :cmp temp temp2)
       (emit-ir :beq true-label))
+    ;; packed double-float vector (subtag #x18), in a build that makes them
+    (when (%f64-on-p)
+      (emit-ir :li temp2 (ash +subtag-f64-vector+ +fixnum-shift+))
+      (emit-ir :cmp temp temp2)
+      (emit-ir :beq true-label))
     (emit-ir-label false-label)
     (compile-nil dest)
     (emit-ir :br end-label)
@@ -30716,6 +30771,14 @@
 (defun %declared-f32-array-var-p (form env)
   (and form (symbolp form) (%f32-simple-array-decl-p (%expr-dtype form env))))
 
+(defun %f64-packed-decl-p (ty)
+  "True for a declared (simple-array double-float ...) in a build that packs it (#x18):
+   element access is an 8-byte IEEE lane (:FPD-LANE-LOAD / :FPD-LANE-STORE), not a word."
+  (and (%f64-on-p) (%f64-simple-array-decl-p ty)))
+
+(defun %declared-f64-array-var-p (form env)
+  (and form (symbolp form) (%f64-packed-decl-p (%expr-dtype form env))))
+
 (defun %u8-simple-array-decl-p (ty)
   "True for a declared (simple-array (unsigned-byte 8) …) — the byte-packed
    #x11 vector, whose element access is %u8-ref / %u8-set."
@@ -31442,14 +31505,16 @@
       (compile-form nil env dest))))
 
 ;;; %PRIM-AREF / %PRIM-ASET — subtag-dispatching primitive element access.
-(defun %prim-dispatch-form (g-arr u8-form s32-form u32-form word-form)
+(defun %prim-dispatch-form (g-arr u8-form s32-form u32-form word-form &optional f64-form)
   "The subtag dispatch both expand to: byte-packed (#x11 u8 vector, #x13 narrow string),
-   then the 32-bit-lane kinds the build makes (#x15 strings: %STRING32-ON-P; #x17 u32
-   vectors: %U32-ON-P), then the tagged word."
-  (if (not (or (%u32-on-p) (%string32-on-p)))
+   then the lane kinds the build makes (#x15 strings: %STRING32-ON-P; #x17 u32
+   vectors: %U32-ON-P; #x18 double-float vectors: %F64-ON-P), then the tagged word."
+  (if (not (or (%u32-on-p) (%string32-on-p) (and f64-form (%f64-on-p))))
       ;; neither: the historic shape, so such an image compiles exactly as before
       `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13)) ,u8-form ,word-form)
       (let ((tail word-form))
+        ;; a packed double's lane is raw IEEE bits: read as a word it is not a Lisp value
+        (when (and f64-form (%f64-on-p)) (setq tail `(if (eq st #x18) ,f64-form ,tail)))
         (when (%u32-on-p) (setq tail `(if (eq st #x17) ,u32-form ,tail)))
         (when (%string32-on-p) (setq tail `(if (eq st #x15) ,s32-form ,tail)))
         `(let ((st (obj-subtag ,g-arr)))
@@ -31480,7 +31545,8 @@
                               `(%u8-ref ,g-arr ,g-idx)
                               `(%c32-aref ,g-arr ,g-idx)
                               `(%c32-aref ,g-arr ,g-idx)
-                              `(%word-aref ,g-arr ,g-idx)))
+                              `(%word-aref ,g-arr ,g-idx)
+                              `(%f64-aref ,g-arr ,g-idx)))
      env dest)))
 
 (defun compile-struct-slot (args setp env dest)
@@ -31539,7 +31605,8 @@
                               `(%u8-set ,g-arr ,g-idx ,g-val)
                               `(%c32-aset ,g-arr ,g-idx ,g-val)
                               `(%u32-aset ,g-arr ,g-idx ,g-val)
-                              `(%word-aset ,g-arr ,g-idx ,g-val)))
+                              `(%word-aset ,g-arr ,g-idx ,g-val)
+                              `(%f64-aset ,g-arr ,g-idx ,g-val)))
      env dest)))
 
 (defun compile-prim-array-length (arr-form env dest)
@@ -31676,6 +31743,99 @@
       (free-temp-reg)
       (free-temp-reg))
     (free-temp-reg)))
+
+;;; Packed double-float vector (subtag #x18) primitives.  A lane is the IEEE bits at byte
+;;; 16 + 8I; :FPD-LANE-LOAD / :FPD-LANE-STORE move it between the vector and an FP vreg, so
+;;; a read is one load and a box, a store one unbox and one store, with the ordinary bounds
+;;; check around the access unless (SAFETY 0).  Where the FPD ops do not exist the
+;;; prelude's :U32-half reference functions stand in.
+(defun %f64-lanes-native-p ()
+  "The lane opcodes may be emitted: a packing build (only x64 and aarch64, whose
+   translators have them, turn it on) with the FPD ops."
+  (and (%f64-on-p) (or (%runtime-fpd-p) (ct-has-fpd-p))))
+
+(defun %emit-f64-chunk-address (arr-reg idx-reg addr k)
+  "ADDR := the raw address of 16-bit chunk K (0 = the high bits, a boxed double's slot 0)
+   of lane IDX-REG (tagged) of packed double vector ARR-REG: the tagged pointer + 4*idx
+   + 7 + 2*(3-K), little-endian lanes."
+  (let ((c (alloc-temp-reg)))
+    (emit-ir :shl addr idx-reg 2)
+    (emit-ir :add addr addr arr-reg)
+    (emit-ir :li c (+ 7 (* 2 (- 3 k))))
+    (emit-ir :add addr addr c)
+    (free-temp-reg)))
+
+(defun %compile-f64-load-gp (arr-reg idx-reg dest)
+  "The lane boxed with general registers only, a 16-bit chunk at a time into a fresh
+   double's four slots: for a scope whose FP registers are all held by FP-resident locals
+   (which a call would clobber, so this must not be one).  Box first: the collection its
+   allocation may run updates ARR-REG before the addresses are made from it."
+  (let ((addr (alloc-temp-reg)) (v (alloc-temp-reg)))
+    (emit-ir :gc-check)
+    (emit-ir :alloc-obj dest +float-slots+ +subtag-float+)
+    (dotimes (k 4)
+      (%emit-f64-chunk-address arr-reg idx-reg addr k)
+      (emit-ir :load v addr (car (memory-width-code :u16)))
+      (emit-ir :shl v v +fixnum-shift+)
+      (emit-ir :obj-set dest k v))
+    (free-temp-reg) (free-temp-reg)))
+
+(defun %compile-f64-store-gp (arr-reg idx-reg val-reg)
+  "The boxed double VAL-REG's four 16-bit chunks into lane IDX-REG, general registers
+   only (see %COMPILE-F64-LOAD-GP).  Nothing allocates."
+  (let ((addr (alloc-temp-reg)) (v (alloc-temp-reg)))
+    (dotimes (k 4)
+      (emit-ir :obj-ref v val-reg k)
+      (emit-ir :sar v v +fixnum-shift+)
+      (%emit-f64-chunk-address arr-reg idx-reg addr k)
+      (emit-ir :store addr v (car (memory-width-code :u16))))
+    (free-temp-reg) (free-temp-reg)))
+
+(defun compile-f64-load (arr-form idx-form env dest)
+  "Compile (%f64-load arr idx): lane IDX of packed double vector ARR as a fresh double."
+  (if (not (%f64-lanes-native-p))
+      (compile-form (list '%f64-aref-rt arr-form idx-form) env dest)
+      (let ((arr-reg (alloc-temp-reg))
+            (idx-reg (alloc-temp-reg)))
+        (compile-form arr-form env arr-reg)
+        (compile-form idx-form env idx-reg)
+        (let ((skip (make-compiler-label)))
+          (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+          (if (>= *fp-reg-counter* +fp-reg-max+)
+              (%compile-f64-load-gp arr-reg idx-reg dest)
+              (let ((fd (alloc-fp-reg)))
+                (emit-ir :fpd-lane-load fd arr-reg idx-reg)
+                (emit-ir :gc-check)
+                (emit-ir :fpd-box dest fd)
+                (free-fp-reg)))
+          (emit-ir-label skip))
+        (free-temp-reg)
+        (free-temp-reg))))
+
+(defun compile-f64-store (arr-form idx-form val-form env dest)
+  "Compile (%f64-store arr idx double): the boxed double's bits into lane IDX.  No type
+   check (%F64-ASET's job).  Returns DOUBLE."
+  (if (not (%f64-lanes-native-p))
+      (compile-form (list '%f64-aset-rt arr-form idx-form val-form) env dest)
+      (let ((val-reg (alloc-temp-reg)))
+        (compile-form val-form env val-reg)
+        (let ((arr-reg (alloc-temp-reg))
+              (idx-reg (alloc-temp-reg)))
+          (compile-form arr-form env arr-reg)
+          (compile-form idx-form env idx-reg)
+          (let ((skip (make-compiler-label)))
+            (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+            (if (>= *fp-reg-counter* +fp-reg-max+)
+                (%compile-f64-store-gp arr-reg idx-reg val-reg)
+                (let ((fd (alloc-fp-reg)))
+                  (emit-ir :fpd-unbox fd val-reg)
+                  (emit-ir :fpd-lane-store arr-reg idx-reg fd)
+                  (free-fp-reg)))
+            (emit-ir :mov dest val-reg)
+            (emit-ir-label skip))
+          (free-temp-reg)
+          (free-temp-reg))
+        (free-temp-reg))))
 
 (defun compile-fsqrt (val-form env dest)
   "Compile (%fsqrt float) -- a fresh DOUBLE-float box holding the correctly
@@ -31882,7 +32042,8 @@
     (let ((ty (%expr-dtype arr-form env)))
       (and ty
            (or (%u8-simple-array-decl-p ty) (%f32-simple-array-decl-p ty)
-               (%u32-simple-array-decl-p ty) (%generic-simple-array-decl-p ty))
+               (%u32-simple-array-decl-p ty) (%f64-packed-decl-p ty)
+               (%generic-simple-array-decl-p ty))
            ty))))
 
 (defun compile-aref-1 (arr-form idx-form env dest)
@@ -31919,6 +32080,9 @@
   ;; DECLARED (simple-array (unsigned-byte 32) …) in a packing build: the raw lane.
   (when (%declared-u32-array-var-p arr-form env)
     (return-from compile-aref-1 (compile-c32-ref arr-form idx-form env dest)))
+  ;; DECLARED (simple-array double-float …) in a packing build: the 8-byte lane, boxed.
+  (when (%declared-f64-array-var-p arr-form env)
+    (return-from compile-aref-1 (compile-f64-load arr-form idx-form env dest)))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot access, no
   ;; wrapper/string/mda dispatch.  See %declared-generic-array-var-p.
   (when (%declared-generic-array-var-p arr-form env)
@@ -32045,9 +32209,12 @@
               (d2 (cadr (caddr ty)))
               (idx (list '+ (list '* (car subs) d2) (cadr subs)))
               (data (list '%prim-aref arr 6)))         ; %mda-data
-         (compile-form (if (%u8-simple-array-decl-p (list 'simple-array et (list '*)))
-                           (list '%u8-ref data idx)
-                           (list '%word-aref data idx))
+         (compile-form (cond ((%u8-simple-array-decl-p (list 'simple-array et (list '*)))
+                              (list '%u8-ref data idx))
+                             ;; a packed double store (#x18): the lane, boxed
+                             ((%f64-packed-decl-p (list 'simple-array et (list '*)))
+                              (list '%f64-load data idx))
+                             (t (list '%word-aref data idx)))
                        env dest)))
       ((null subs)
        ;; 0-sub aref on a 0-dim MDA → slot 0 of data.  %aref-multi-public
@@ -32142,6 +32309,39 @@
       (return-from compile-aset-1 nil))
     (return-from compile-aset-1
       (compile-form (list '%f32-aset arr-form idx-form val-form) env dest)))
+  ;; DECLARED (simple-array double-float …) in a packing build: an unboxed double tree goes
+  ;; straight into the lane (no box at all unless the value is used); any other value is
+  ;; checked to be a double unless (SAFETY 0) and its bits stored.
+  (when (%declared-f64-array-var-p arr-form env)
+    (let ((need (and (%f64-lanes-native-p) (%fpd-pure-need val-form env))))
+      (when (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))
+        (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
+          (compile-form arr-form env ta)
+          (compile-form idx-form env ti)
+          (let ((fd (alloc-fp-reg)))
+            (compile-double-unboxed val-form env fd)
+            (let ((lk (%lane-index-check-begin ta ti)))
+              (emit-ir :fpd-lane-store ta ti fd)
+              (%lane-index-check-end lk))
+            (when (and dest (not unused))
+              (emit-ir :gc-check)
+              (emit-ir :fpd-box dest fd))
+            (free-fp-reg))
+          (free-temp-reg) (free-temp-reg))
+        (return-from compile-aset-1 nil)))
+    (return-from compile-aset-1
+      (let ((ga (%mvm-gensym "F64A")) (gi (%mvm-gensym "F64I")) (gv (%mvm-gensym "F64V")))
+        ;; bound in CL's order -- array, index, value -- as every ASET is
+        (compile-form (if (%bounds-check-p)
+                          `(let ((,ga ,arr-form) (,gi ,idx-form) (,gv ,val-form))
+                             ;; a #x60 box inline; anything else (a long-float, or the
+                             ;; TYPE-ERROR) through %F64-ASET
+                             (if (and (eql (%lowtag ,gv) ,(ct-tag-object)) (eq (obj-subtag ,gv) #x60))
+                                 (%f64-store ,ga ,gi ,gv)
+                                 (%f64-aset ,ga ,gi ,gv)))
+                          `(let ((,ga ,arr-form) (,gi ,idx-form) (,gv ,val-form))
+                             (%f64-store ,ga ,gi ,gv)))
+                      env dest))))
   ;; DECLARED (simple-array (unsigned-byte 32) …) in a packing build: the raw lane -- the
   ;; value checked to be such an integer unless (safety 0), as every checked path is.
   (when (%declared-u32-array-var-p arr-form env)
@@ -32508,7 +32708,8 @@
              (consp args) (null (cdr args)) (symbolp (car args))
              (or (%declared-generic-array-var-p (car args) env)
                  (%declared-u8-array-var-p (car args) env)
-                 (%declared-f32-array-var-p (car args) env)))
+                 (%declared-f32-array-var-p (car args) env)
+                 (%declared-f64-array-var-p (car args) env)))
     (return-from compile-call
       (compile-form (list '%prim-array-length (car args)) env dest)))
   (when (and *mvm-eval-runtime-p* (symbolp fn) (name-eq fn "FILL")
@@ -34343,6 +34544,8 @@
       (:fp-div 4)
       (:fpd-unbox 3)
       (:fpd-box 3)
+      (:fpd-lane-load 4)
+      (:fpd-lane-store 4)
       (:fpd-itof 3)
       (:fpd-lt 4)
       (:fpd-le 4)
@@ -34832,6 +35035,8 @@
           (:fp-div (mvm-fp-div buf (second insn) (third insn) (fourth insn)))
           (:fpd-unbox (mvm-fpd-unbox buf (second insn) (third insn)))
           (:fpd-box (mvm-fpd-box buf (second insn) (third insn)))
+          (:fpd-lane-load (mvm-fpd-lane-load buf (second insn) (third insn) (fourth insn)))
+          (:fpd-lane-store (mvm-fpd-lane-store buf (second insn) (third insn) (fourth insn)))
           (:fpd-itof (mvm-fpd-itof buf (second insn) (third insn)))
           (:fpd-lt (mvm-fpd-lt buf (second insn) (third insn) (fourth insn)))
           (:fpd-le (mvm-fpd-le buf (second insn) (third insn) (fourth insn)))

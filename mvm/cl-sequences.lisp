@@ -562,7 +562,7 @@
       ;; Build a new vector skipping to-drop indices.
       (let* ((drop-count (length to-drop))
              (out-len (- len drop-count))
-             (out (if string-p (%make-string-array out-len) (make-array out-len)))
+             (out (if string-p (%make-string-array out-len) (%vector-like vec out-len)))
              (i 0) (j 0))
         (setq to-drop (%ascending-indices to-drop))
         (loop
@@ -625,7 +625,7 @@
               (setq to-drop (subseq rev 0 (min count (length rev)))))))
       (let* ((drop-count (length to-drop))
              (out-len (- len drop-count))
-             (out (if string-p (%make-string-array out-len) (make-array out-len)))
+             (out (if string-p (%make-string-array out-len) (%vector-like vec out-len)))
              (i 0) (j 0))
         (setq to-drop (%ascending-indices to-drop))
         (loop
@@ -2025,6 +2025,8 @@
     ((eql (obj-subtag a) #x12) 'single-float)
     ;; Packed (unsigned-byte 32) vector (subtag #x17).
     ((eql (obj-subtag a) #x17) '(unsigned-byte 32))
+    ;; Packed double-float vector (subtag #x18).
+    ((eql (obj-subtag a) #x18) 'double-float)
     (t t)))
 (defun check-type-error (fn args) nil)
 (defun make-array-with-checks (dims &rest args) (if (consp dims) (make-array (car dims)) (make-array dims)))
@@ -2068,6 +2070,47 @@
        (member (symbol-name (car type)) '("SIMPLE-ARRAY" "ARRAY" "VECTOR") :test #'string=)
        (consp (cdr type))
        (%f32-element-type-p (cadr type))))
+
+(defun %seq-type-f64-p (type)
+  "True when TYPE is an array/vector type specifier whose element type upgrades to
+   DOUBLE-FLOAT (the packed #x18 vector), in a build that has them."
+  (and (consp type) (symbolp (car type))
+       (member (symbol-name (car type)) '("SIMPLE-ARRAY" "ARRAY" "VECTOR") :test #'string=)
+       (consp (cdr type))
+       (%f64-element-type-p (cadr type))))
+
+(defun %f64-type-length (type)
+  "The length a (VECTOR DOUBLE-FLOAT n) / (SIMPLE-ARRAY DOUBLE-FLOAT (n)) pins, or NIL."
+  (let ((d (and (consp (cddr type)) (caddr type))))
+    (cond ((integerp d) d)
+          ((and (consp d) (null (cdr d)) (integerp (car d))) (car d))
+          (t nil))))
+
+(defun %seq-f64-copy (seq)
+  "A fresh packed double-float vector holding SEQ's elements, each of which must be a
+   DOUBLE-FLOAT (no conversion: CL's COERCE / MAP / CONCATENATE signal otherwise)."
+  (let* ((n (length seq))
+         (v (%make-f64-vector n)))
+    (if (listp seq)
+        (let ((i 0)) (dolist (e seq) (setf (aref v i) e) (setq i (+ i 1))))
+        (dotimes (i n) (setf (aref v i) (aref seq i))))
+    v))
+
+(defun %f64-result (type v)
+  "V (a general vector the caller built) as the packed vector TYPE names, its pinned length
+   checked."
+  (let ((n (%f64-type-length type)))
+    (when (and n (/= n (length v)))
+      (error 'type-error :datum v :expected-type type)))
+  (%seq-f64-copy v))
+
+(defun %vector-like (seq len)
+  "A fresh simple vector of LEN for REVERSE / REMOVE of the non-string vector SEQ: a packed
+   double vector when SEQ's element type is DOUBLE-FLOAT (as SBCL's result is), else a
+   general one."
+  (if (and (%f64-vectors-p) (eq (array-element-type seq) 'double-float))
+      (%make-f64-vector len)
+      (make-array len)))
 
 (defun %seq-u8-copy (seq)
   "A fresh packed (unsigned-byte 8) vector holding SEQ's elements."
@@ -2142,6 +2185,24 @@
         (if p
             (make-array size :element-type (cadr type) :initial-element (cadr p))
             (make-array size :element-type (cadr type))))))
+  ;; (VECTOR / SIMPLE-ARRAY / ARRAY <an element type that upgrades to DOUBLE-FLOAT>): the
+  ;; packed #x18 vector, as MAKE-ARRAY makes it
+  (when (and (consp type) (member (car type) '(vector simple-array array)) (consp (cdr type))
+             (%f64-element-type-p (cadr type))
+             (or (not (eq (car type) 'vector)) (null (cddr type)) (null (cdddr type))))
+    (let ((n (and (consp (cddr type))
+                  (let ((d (caddr type)))
+                    (cond ((eq (car type) 'vector) d)
+                          ((and (consp d) (null (cdr d))) (car d))
+                          (t d))))))
+      (when (and (integerp n) (not (= n size)))
+        (%signal-type-error)
+        (return-from make-sequence nil)))
+    (return-from make-sequence
+      (let ((p (member :initial-element args)))
+        (if p
+            (make-array size :element-type 'double-float :initial-element (cadr p))
+            (make-array size :element-type 'double-float)))))
   ;; Resolve a class designator (class object or class-proxy) to its name
   ;; so the dispatch below can match symbols uniformly.  Keeps callers
   ;; using `(find-class 'list)' / `(class-of '(a b c))' working.
@@ -2540,6 +2601,8 @@
         (make-array (length v) :element-type 'bit :initial-contents v))))
   (when (%seq-type-u8-p result-type)
     (return-from concatenate (%seq-u8-copy (apply (function concatenate) 'vector seqs))))
+  (when (%seq-type-f64-p result-type)
+    (return-from concatenate (%f64-result result-type (apply (function concatenate) 'vector seqs))))
   (%concat-check-seqs seqs)
   ;; Reject known non-sequence head types + check pinned-length match.
   (let* ((head (if (consp result-type) (car result-type) result-type)))
@@ -2889,6 +2952,11 @@
            ;; packed u32 (glass's framebuffer clear and every FB-RECT row)
            ((and (fixnump store-item) (<= 0 store-item 4294967295) (%u32-bare-p seq))
             (%fill-u32 seq i eff-end store-item)
+            seq)
+           ;; packed double vector: one lane stored, then copied (a non-double
+           ;; item takes the element loop, whose ASET signals the TYPE-ERROR)
+           ((and (%f64-boxed-double-p store-item) (%f64-bare-p seq))
+            (%fill-f64 seq i eff-end store-item)
             seq)
            ((and (not (stringp seq)) (%bulk-copy-ok-p seq seq))
             ;; plain word-slot array (general or typed-generic, not a
@@ -4175,7 +4243,7 @@
      (let* ((len (length seq))
             (out (cond ((stringp seq) (make-string len))
                        ((bit-vector-p seq) (make-array len :element-type 'bit))
-                       (t (make-array len))))
+                       (t (%vector-like seq len))))
             (i 0))
        (loop
          (when (= i len) (return out))
@@ -4191,7 +4259,7 @@
          (setq i (+ i 1)))))
     ((arrayp seq)
      (let* ((len (array-length seq))
-            (out (make-array len))
+            (out (%vector-like seq len))
             (i 0))
        (loop
          (when (= i len) (return out))
@@ -4895,6 +4963,9 @@
                        (new-arr (cond (str-p (%make-string-array new-cap))
                                       ((%prim-u8-vector-p arr)
                                        (make-array new-cap :element-type '(unsigned-byte 8)))
+                                      ;; a packed double store grows into one (its ASETs
+                                      ;; box and unbox, so the copy below is right)
+                                      ((%f64-bare-p arr) (%make-f64-vector new-cap))
                                       (t (make-array new-cap)))))
                   ;; Copy old visible contents (0..cap from old aref-routing)
                   ;; through the MDA's current view so displacement is honored.
@@ -5342,6 +5413,9 @@
     ;; build that has it.  ALL of them, not just (UNSIGNED-BYTE 32): upgrading must be
     ;; monotonic (CLHS 15.1.2.1), and (UNSIGNED-BYTE 16) is a subtype of it.
     ((%u32-element-type-p type) '(unsigned-byte 32))
+    ;; DOUBLE-FLOAT (and LONG-FLOAT, the same format) -- the packed #x18 vector, in a
+    ;; build that has it.
+    ((%f64-element-type-p type) 'double-float)
     ;; Everything else is stored as a general (T) element.
     (t t)))
 
@@ -5373,6 +5447,8 @@
     ((eql (obj-subtag x) #x12) nil)
     ;; Packed (unsigned-byte 32) vector (subtag #x17).
     ((eql (obj-subtag x) #x17) nil)
+    ;; Packed double-float vector (subtag #x18).
+    ((eql (obj-subtag x) #x18) nil)
     ;; Native multi-dim header: only rank-1, T-element, plain vectors qualify.
     ((%mda-p x)
      (and (eql (%mda-rank x) 1)
@@ -5717,6 +5793,22 @@
          ;; a DEFTYPE: ask
          (t (ignore-errors (values (subtypep etype '(unsigned-byte 32))))))))
 
+(defun %f64-element-type-p (etype)
+  "True if ETYPE upgrades to DOUBLE-FLOAT, the packed #x18 vector, in a build that makes
+   them (%F64-VECTORS-P): DOUBLE-FLOAT and LONG-FLOAT (the same format here), a range of
+   either, and an EQL / MEMBER of doubles -- every subtype SBCL upgrades so."
+  (and (%f64-vectors-p)
+       (cond ((or (eq etype 'double-float) (eq etype 'long-float)) t)
+             ((and (consp etype) (symbolp (car etype)))
+              (let ((h (car etype)))
+                (cond ((or (eq h 'double-float) (eq h 'long-float)) t)
+                      ((eq h 'eql) (and (consp (cdr etype)) (double-float-p (cadr etype))))
+                      ((eq h 'member)
+                       (and (consp (cdr etype))
+                            (dolist (x (cdr etype) t) (unless (double-float-p x) (return nil)))))
+                      (t nil))))
+             (t nil))))
+
 (defun %f32-element-type-p (etype)
   "True if ETYPE upgrades to SINGLE-FLOAT (the packed #x12 vector):
    single-float and short-float (which upgrades to single)."
@@ -5852,6 +5944,12 @@
                            (= rank 1) (not (consp dim))
                            (not fp) (not adj) (not disp)
                            (equal (upgraded-array-element-type etype) '(unsigned-byte 32))))
+             ;; Packed double-float storage (subtag #x18), 8 bytes of IEEE bits an element
+             ;; and no pointer -- for EVERY rank and shape, as a byte vector is: the MDA
+             ;; header's accessors reach their data through %PRIM-AREF / %PRIM-ASET, which
+             ;; dispatch #x18 (a worker's store into a main-made matrix is then raw bits
+             ;; too).  Not under a displacement: that shares its target's store.
+             (f64-elt (and etype-set (not disp) (%f64-element-type-p etype)))
              ;; BIT: built as the 0/1 words below like any general array,
              ;; then packed eight to a byte under an MDA header (cl-clos.lisp,
              ;; PACKED BIT ARRAYS) -- every rank and shape, so the header's
@@ -5879,6 +5977,7 @@
                                       (u8-elt (%make-u8-vector total))
                                       (f32-elt (%make-f32-vector total))
                                       (u32-elt (%make-u32-vector total))
+                                      (f64-elt (%make-f64-vector total))
                                       (t (make-array total))))
                              (store (if (and char-elt (characterp ie))
                                         (char-code ie) ie))
@@ -5898,6 +5997,9 @@
                           ;; tensor (make-tensor zeroes its data this way).
                           ((and f32-elt (eql store 0.0)) a)
                           ((and f32-elt (typep store 'single-float)) (%f32-fill a store total))
+                          ;; a double vector is zero-filled too: +0.0d0 is nothing to do
+                          ((and f64-elt (eql store 0.0d0)) a)
+                          ((and f64-elt (%f64-boxed-double-p store)) (%fill-f64 a 0 total store))
                           (t
                            (loop (when (>= i total) (return a))
                              (aset a i store)
@@ -5909,12 +6011,14 @@
                                      (u8-elt (%make-u8-vector total))
                                      (f32-elt (%make-f32-vector total))
                                      (u32-elt (%make-u32-vector total))
+                                     (f64-elt (%make-f64-vector total))
                                      (t (make-array total)))))
                         (%mda-fill-contents-flat a ic dim-list)))
                      (char-elt (%make-string-array total))
                      (u8-elt (%make-u8-vector total))
                      (f32-elt (%make-f32-vector total))
                      (u32-elt (%make-u32-vector total))
+                     (f64-elt (%make-f64-vector total))
                      (t (make-array total)))))
         ;; Decide return shape.  Phase 2a: wrap in MDA whenever rank ≠ 1,
         ;; or any non-trivial kwarg appeared, or the dim was passed as
@@ -5944,7 +6048,8 @@
                            (if ic-p (%pack-bits data total) data))))
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp)
-                (or (eq etype t) (and (not char-elt) (not u8-elt) (not f32-elt) (not u32-elt))))
+                (or (eq etype t) (and (not char-elt) (not u8-elt) (not f32-elt) (not u32-elt)
+                                      (not f64-elt))))
            data)
           ;; Plain 1-D single-float vector: the packed #x12 object itself.
           ((and (= rank 1) (not (consp dim))
@@ -5953,6 +6058,10 @@
           ;; ... and the packed (unsigned-byte 32) one.
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp) u32-elt)
+           data)
+          ;; ... and the packed double-float one.  (Under a header it is the data below.)
+          ((and (= rank 1) (not (consp dim))
+                (not fp) (not adj) (not disp) f64-elt)
            data)
           ;; (VECTOR NIL): see NIL-ELT above.  Only the simple one; a fill
           ;; pointer / adjustable / displaced one takes the general MDA arm

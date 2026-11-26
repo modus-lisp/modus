@@ -4366,15 +4366,37 @@
            ;; place first, which runs ITS expander on the probe's X -- a
            ;; DEFFLAVOR asked this way defined a flavor.  For any other name
            ;; SETF's cases are tests of the name alone.
+           ;;
+           ;; THE FALLBACK IS LOOKED FOR ANYWHERE IN THE EXPANSION, not only as
+           ;; its head.  Since b65808af it is (LET* (... the site's late (SETF
+           ;; NAME) lookup ...) (IF setter (FUNCALL setter ...) (SET-NAME ...))),
+           ;; and a test of the head alone answered T for every name there is:
+           ;; cortez then took each corpus accessor for one with an expander,
+           ;; never fetched TI's DEFSETF for it, and compiled (SETF (AR-1-FORCE
+           ;; A I) V) through the subst's body to an undefined
+           ;; SET-COMMON-LISP-AR-1-FORCE.
            (let* ((exp (and (not (macro-function name))
                             (not (special-operator-p name))
                             (car (%macroexpand-1-mvm-raw (list 'setf (list name 'x) 'v)))))
-                  (fallback (and (consp exp) (symbolp (car exp)) (car exp)
-                                 (string= (symbol-name (car exp))
-                                          (concatenate 'string "SET-" (symbol-name name))))))
+                  (fallback (and (consp exp)
+                                 (%form-calls-named exp (concatenate 'string "SET-"
+                                                                     (symbol-name name))))))
              (and (consp exp)
-                  (or (not fallback) (fboundp (car exp))))))
+                  (or (not fallback) (fboundp fallback)))))
        t))
+
+(defun %form-calls-named (form fname)
+  "The symbol named FNAME that FORM calls somewhere -- an operator position
+   anywhere in it, QUOTE's datum aside -- or NIL.  For %SETF-PLACE-KNOWN-P."
+  (cond ((atom form) nil)
+        ((and (symbolp (car form)) (car form) (string= (symbol-name (car form)) fname))
+         (car form))
+        ((eq (car form) 'quote) nil)
+        (t (let ((cur form) (hit nil))
+             (loop
+               (when (or hit (atom cur)) (return hit))
+               (setq hit (%form-calls-named (car cur) fname))
+               (setq cur (cdr cur)))))))
 
 (defun %setf-site-setter (site name)
   "Refill a SETF site's cache cons SITE (REGISTRY . SETTER) for accessor NAME, and

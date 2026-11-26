@@ -23179,6 +23179,15 @@
   (let ((form (if (consp body) (car (last body)) body)))
     (when (atom form) (return-from tail-form-is-values-p nil))
     (let ((op (car form)))
+      ;; A LAMBDA FORM is a FUNCALL of its function (CLHS 3.1.2.1.2.4), and
+      ;; FUNCALL's arm below answers T: the callee owns the values.  Answered
+      ;; NIL with the rest of the non-symbol heads, the enclosing epilogue set
+      ;; the count to 1, so ((lambda (x) (values 1 x)) 7) returned 1 alone --
+      ;; and TI's LOOP expands to exactly that shape, so every (RETURN (VALUES
+      ;; ...)) out of one of their LOOPs lost all but its first value (their
+      ;; MAP-NAMESPACE-OPERATION's namespace, and with it every host lookup).
+      (when (and (consp op) (symbolp (car op)) (car op) (name-eq (car op) "LAMBDA"))
+        (return-from tail-form-is-values-p t))
       (when (not (symbolp op)) (return-from tail-form-is-values-p nil))
       (let ((hash (normalize-name op)))
         (cond

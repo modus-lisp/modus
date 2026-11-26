@@ -5793,15 +5793,6 @@
    -- only a PROGRAM-ERROR means the one-argument call was the wrong shape."
   (cond ((eq kind :interp) (%call-interp-closure mf (cdr form)))
         ((eq kind :one) (funcall mf form))
-        ;; Asked first, when the expander can say: a PROGRAM-ERROR from INSIDE a
-        ;; one-argument expander's body is the expansion's own error, and retrying
-        ;; it as (form env) replaced that error with "invalid number of arguments:
-        ;; 2" to the expander -- which named neither the macro nor what went wrong.
-        ;; (form env) first, as CLHS and SBCL call a macro function: an expander
-        ;; taking &REST may be a forwarder (cortez's, for a cell holding a symbol)
-        ;; to one that requires both, and (form) alone reached it short.
-        ((%expander-arity-takes-p mf 2) (funcall mf form nil))
-        ((%expander-arity-takes-p mf 1) (funcall mf form))
         (t (block expand
              (handler-bind
                  ((program-error
@@ -5809,15 +5800,6 @@
                       (declare (ignore c))
                       (return-from expand (funcall mf form nil)))))
                (funcall mf form))))))
-
-(defun %expander-arity-takes-p (mf n)
-  "MF is known to accept N arguments: its arity is recorded and admits N.  NIL
-   when the arity is not known (image code), so the caller falls back to trying
-   the shapes."
-  (let ((a (and *mvm-eval-runtime-p* (functionp mf) (%function-arity mf))))
-    (and (consp a)
-         (<= (car a) n)
-         (or (null (cdr a)) (<= n (cdr a))))))
 
 (defun %hook-expander (form env)
   "The expander a user's *MACROEXPAND-HOOK* is handed: the one

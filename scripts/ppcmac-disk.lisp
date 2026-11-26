@@ -25,6 +25,8 @@
 ;;;; a .lisp entry is evaluated at boot, any other kept as bytes by NAME.
 ;;;;
 ;;;; --elf-out FILE also writes that ELF alone, for a network boot (TFTP).
+;;;; --compress makes it (on the disk and in --elf-out) an MDZ1 container of
+;;;; LZMA streams, which the first stage decodes (MDZ-CONTAINER).
 ;;;;
 ;;;; --fasl-record makes a disk whose boot records the payload's fasls and sends
 ;;;; them on the serial port; --fasls DIR puts DIR's KEY.mfasl files in the
@@ -111,13 +113,48 @@
       (replace out payload :start1 off2)
       out)))
 
+;;; --compress: the image as an MDZ1 container of LZMA streams, which the first
+;;; stage decodes (boot/boot-ppcmac.lisp, PPCMAC-EMIT-LZMA): "MDZ1", the entry,
+;;; the segment count, per segment (address, compressed size, size, memory
+;;; size), then the streams -- cram's LZMA-COMPRESS (lc 3 lp 0 pb 2, no end
+;;; marker), each checked by cram's LZMA-DECOMPRESS before it is written.  A
+;;; network boot's TFTP stops at 32 MB (Apple's client does not roll the block
+;;; number over); the whole image is ~4x smaller, and so ~4x quicker to load.
+(defun mdz-container (elf)
+  (load-cram)
+  (flet ((u32 (o) (logior (ash (aref elf o) 24) (ash (aref elf (+ o 1)) 16) (ash (aref elf (+ o 2)) 8) (aref elf (+ o 3))))
+         (u16 (o) (logior (ash (aref elf o) 8) (aref elf (+ o 1)))))
+    (let* ((entry (u32 24)) (phoff (u32 28)) (phnum (u16 44))
+           (segs (loop for i below phnum
+                       for at = (+ phoff (* 32 i))
+                       when (= (u32 at) 1)
+                         collect (let* ((off (u32 (+ at 4))) (va (u32 (+ at 8)))
+                                        (fsz (u32 (+ at 16))) (msz (u32 (+ at 20)))
+                                        (data (subseq elf off (+ off fsz)))
+                                        (z (funcall (find-symbol "LZMA-COMPRESS" "CRAM") data
+                                                    :lc 3 :lp 0 :pb 2 :end-marker nil)))
+                                   (assert (equalp (funcall (find-symbol "LZMA-DECOMPRESS" "CRAM") z
+                                                            :lc 3 :lp 0 :pb 2 :size fsz)
+                                                   data)
+                                           () "mdz: segment at #x~X does not round-trip" va)
+                                   (format t "ppcmac-disk: mdz: #x~X: ~D -> ~D bytes~%" va fsz (length z))
+                                   (list va z fsz msz))))
+           (out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+      (loop for c across "MDZ1" do (vector-push-extend (char-code c) out))
+      (be32 out entry) (be32 out (length segs))
+      (dolist (sg segs)
+        (be32 out (first sg)) (be32 out (length (second sg))) (be32 out (third sg)) (be32 out (fourth sg)))
+      (dolist (sg segs) (loop for b across (second sg) do (vector-push-extend b out)))
+      (coerce out '(simple-array (unsigned-byte 8) (*))))))
+
 (defun ascii-bytes (s)
   (map '(vector (unsigned-byte 8)) #'char-code s))
 
-(defun main (image out &key (size-mb nil) payload loader fasl-record fasls elf-out)
+(defun main (image out &key (size-mb nil) payload loader fasl-record fasls elf-out compress)
   (let* ((loader (or loader (let ((b (concatenate 'string image ".boot"))) (and (probe-file b) b))))
          (boot (and loader (read-bytes loader)))
          (elf (if payload (elf-with-payload (read-bytes image) (payload-bytes payload :fasl-record fasl-record :fasls fasls)) (read-bytes image)))
+         (elf (if compress (mdz-container elf) elf))
          (vol-bytes (* 512 (ceiling (max (* 4 1024 1024)
                                          (+ (* 2 (length elf)) (* 1024 1024)))
                                     512)))
@@ -188,4 +225,5 @@
                    (and p (nth (1+ p) args)))))
     (main (first args) (second args) :size-mb size :payload payload :loader loader
           :fasl-record (and (member "--fasl-record" args :test #'string=) t) :fasls fasls
-          :elf-out elf-out)))
+          :elf-out elf-out
+          :compress (and (member "--compress" args :test #'string=) t))))

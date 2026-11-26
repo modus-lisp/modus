@@ -50,6 +50,7 @@ def main():
         n += 1
     print(f'fasl-record: {n} fasls in {fdir}')
     extra = ['--elf-out', sys.argv[sys.argv.index('--elf-out') + 1]] if '--elf-out' in sys.argv else []
+    if '--compress' in sys.argv: extra.append('--compress')
     subprocess.run(['sbcl', '--script', disk_lisp, image, out, '--payload', payload, '--fasls', fdir] + extra, check=True)
 
 if __name__ == '__main__':

@@ -61,11 +61,13 @@
   (let ((r (%payload-file "LiberationSans-Regular.ttf"))
         (b (%payload-file "LiberationSans-Bold.ttf")))
     (when r (setf glass::*font-regular* (scribe:open-font r)))
-    (when b (setf glass::*font-bold* (scribe:open-font b)))
+    ;; bold: its own face when the payload has one, else the regular face (the
+    ;; network image leaves the 400 KB bold out: TFTP's 32 MB)
+    (when (or b r) (setf glass::*font-bold* (if b (scribe:open-font b) glass::*font-regular*)))
     ;; the listener's monospace face (glass/term reads it from glass's fonts/)
     (let ((m (%payload-file "IosevkaTerm-Regular.ttf")))
       (when m (setf glass-term::*term-fonts* (list (scribe:open-font m)))))
-    (and r b t)))
+    (and r t)))
 
 (defun desk-blit (fb x0 y0 x1 y1)
   (let ((px (glass::fb-pixels fb)) (w (glass::fb-width fb)) (bpp (floor *screen-depth* 8)))

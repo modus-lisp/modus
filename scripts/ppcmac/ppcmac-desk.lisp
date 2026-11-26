@@ -133,12 +133,20 @@
   *wm*)
 
 (defun desk-present ()
+  "Copy what the window manager painted to the screen.  The pointer comes down
+   first only when the painted rectangle reaches it: taking it down for every
+   paint made it blink at each key and at each tick of the clock."
   (let ((d (nth-value 1 (glass:fb-take-frame *fb*))))
     (when d
-      (pointer-hide)
-      (if (eq d :full)
-          (desk-blit *fb* 0 0 *screen-w* *screen-h*)
-          (desk-blit *fb* (first d) (second d) (third d) (fourth d)))
+      (multiple-value-bind (x0 y0 x1 y1)
+          (if (eq d :full)
+              (values 0 0 *screen-w* *screen-h*)
+              (values (first d) (second d) (third d) (fourth d)))
+        (when (and *under-at*
+                   (destructuring-bind (px . py) *under-at*
+                     (and (< x0 (+ px 11)) (< px x1) (< y0 (+ py 16)) (< py y1))))
+          (pointer-hide))
+        (desk-blit *fb* x0 y0 x1 y1))
       t)))
 
 (defun desk-turn ()
@@ -154,7 +162,8 @@
                (:key (glass.wm:wm-key *wm* (second e) (third e)))))
     (glass.wm:wm-tick *wm*)
     (let ((painted (desk-present)))
-      (when (or painted moved (null *under-at*))
+      ;; drawn again when it moved or a paint took it down (PAINTED alone: no)
+      (when (or moved (null *under-at*))
         (pointer-hide)
         (pointer-show *mac-mouse-x* *mac-mouse-y*))
       (not (or events painted)))))

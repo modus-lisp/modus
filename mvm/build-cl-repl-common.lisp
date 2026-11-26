@@ -2384,7 +2384,7 @@
         ;; ~27 s with it and ~35 ms is the Pi's without; the PC images' ~50-60 s
         ;; SSH connections were the same cost.
         (if *ssh-build-p*
-            (format nil "~%(defun usb-keepalive () 0)~%")
+            (format nil "~%(declaim (overridable usb-keepalive))~%(defun usb-keepalive () 0)~%")
             "")
         ;; Threaded :VIRT maps VA 0x10200000-0x1FFFFFFF to DRAM, so the E1000's
         ;; BARs go where the fixpoint map still has PCI identity space.
@@ -2864,6 +2864,11 @@
 ;; used: 10.0.0.9, gateway 10.0.0.1.  No library fetch: the image is a desk.
 (defvar *net-ppcmac-pipeline-source*
   (%pc32-zero-loops "(defun dhcp-wait-tries () 250000)
+;; The crypto's keep-alive (called every 16 squarings of a field inversion, every
+;; 32 ladder steps of X25519, ...): the other threads' turn on the time slice, so
+;; an SSH key exchange (~10 s on a 1.33 GHz G4) no longer freezes the desk.
+;; Spliced after *NET-SOURCE*'s stub (USB-KEEPALIVE = 0), so it wins.
+(defun usb-keepalive () (co-yield-if-due) 0)
 ;; NET-ACTOR-MAIN's idle step, a SEAM (net/nic.lisp's mechanism): it calls through
 ;; *YIELD-FN*, so a (setf fdefinition) at run time rebinds the compiled callers too.
 ;; A wait by default; the desk (scripts/ppcmac/ppcmac-desk.lisp) makes it a turn of

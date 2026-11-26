@@ -96,9 +96,8 @@
   (with-open-file (o out :direction :output :if-exists :supersede)
     (dolist (f *files*)
       (format o "~A~C~A~%" f #\Tab (repo-path f)))
-    ;; regular only: the desk uses it for bold too (ppcmac-desk.lisp DESK-FONTS),
-    ;; and the bold face's 400 KB put a network image past TFTP's 32 MB
-    (dolist (font '("LiberationSans-Regular.ttf"))
+    ;; (DESK-FONTS falls back to the regular face for bold when this has none)
+    (dolist (font '("LiberationSans-Regular.ttf" "LiberationSans-Bold.ttf"))
       (format o "~A~C~A~%" font #\Tab (repo-path (concatenate 'string "scribe/fonts/" font))))
     (format o "~A~C~A~%" "IosevkaTerm-Regular.ttf" #\Tab (repo-path "glass/fonts/IosevkaTerm-Regular.ttf"))
     (dolist (f '("ppcmac-input.lisp" "ppcmac-usb.lisp" "ppcmac-desk.lisp"))

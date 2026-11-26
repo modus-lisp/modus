@@ -55,6 +55,16 @@
        (equal (eval '(two-arg-ok a b)) '(a b)))
 (check "and so does one taking &REST"
        (integerp (eval '(rest-ok a b))))
+;; cortez's forwarder: a cell holding a symbol becomes (lambda (&rest args) (apply
+;; definition args)), and the definition takes (form env) -- as SBCL calls it.
+(defun fwd-target (form env) (declare (ignore env)) (list 'quote (cdr form)))
+(setf (macro-function 'fwd-ok)
+      (eval '(lambda (&rest args) (apply 'fwd-target args))))
+(check "a &REST forwarder to a (form env) expander is called with both"
+       (equal (eval '(fwd-ok a b)) '(a b)))
+(check "and so inside a DEFUN"
+       (progn (eval '(defun use-fwd () (fwd-ok 3)))
+              (equal (funcall 'use-fwd) '(3))))
 (check "inside a DEFUN too"
        (progn (eval '(defun use-ok () (list (one-arg-ok 1) (two-arg-ok 2))))
               (equal (funcall 'use-ok) '((1) (2)))))

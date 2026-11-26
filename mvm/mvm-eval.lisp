@@ -5249,8 +5249,100 @@
             (values-list (cons %prim (cdr %mv))))
         %prim)))
 
+(defvar *%unit-defined* nil
+  "Inside a compilation unit, the function-name strings its compiles DEFINED
+   (each module's FT-LIST names): COMPILE-FILE compiles a DEFUN without running
+   it, so at the unit's end its name is not FBOUNDP yet, and is still not
+   undefined.")
+
+(defvar *%deferred-undefined* :off
+  "Inside WITH-COMPILATION-UNIT (and COMPILE-FILE, which is one), the names the
+   unit's compiles called while they were undefined, (SYMBOL . KEY) most recent
+   first; :OFF outside.  As SBCL: a forward reference to a function a later form of the
+   unit defines is not worth a warning, so the unit says at its END which of
+   them are still undefined.  Main thread only, as *%CALL-NAMES*.")
+
+(defun %warn-undefined-function (sym)
+  "SBCL's warning for SYM, or for (SETF NAME) when SYM is the SET-NAME a SETF
+   fallback calls (%SETF-FALLBACK-PLACE): what the source wrote."
+  (let ((place (%setf-fallback-place sym)))
+    (warn (make-condition 'modus.runtime::simple-style-warning
+                          :format-control "undefined ~(~A~): ~S"
+                          :format-arguments (list :function (if place (list 'setf place) sym))))))
+
+(defun %call-defined-p (sym)
+  "SYM can be called: FBOUNDP, or a SETF fallback's SET-NAME whose (SETF NAME)
+   stands -- the one the fallback calls instead."
+  (or (fboundp sym)
+      (let ((place (%setf-fallback-place sym)))
+        (and place (%find-setf-function place) t))))
+
+(defun %name-key-in-p (key names)
+  "KEY (a call key, maybe package-qualified) or its bare name among NAMES, the
+   name strings of compiled functions."
+  (let ((bare (%fn-key-unqualify key)))
+    (dolist (f names nil)
+      (when (or (equal f key) (and bare (equal f bare)))
+        (return t)))))
+
+(defun %warn-undefined-calls (outer ft-list)
+  "Before an EVAL'd form runs: a STYLE-WARNING for each global function it calls
+   that is neither defined nor defined by the form itself, shaped as SBCL's --
+   format arguments (:FUNCTION name) -- since that is what a caller listening
+   for it reads.  Inside a compilation unit the names are kept for its end
+   instead (*%DEFERRED-UNDEFINED*).  OUTER is the enclosing compile's list, put
+   back first: a handler may EVAL, and a nested compile starts its own.
+   FT-LIST is the module's compiled functions, (NAME-STRING ...) each: the
+   form's own DEFUNs, which are not FBOUNDP until it runs.  Not *FUNCTIONS*,
+   which also holds an entry for every name the form merely CALLS.
+
+   Why it exists: a compiled call to a name that is not yet a MACRO stays a
+   call when the macro arrives, so (ONCE-ONLY (X) ...) in a macro defined before
+   ONCE-ONLY evaluated (X) at every expansion.  SBCL says so as it compiles, and
+   a loader that fetches definitions on demand (cortez) fetches the macro and
+   compiles again; this image said nothing, and the call failed at run time on
+   the macro's first argument instead (\"The function COND-FORM is undefined\")."
+  (let ((names *%call-names*) (seen nil) (defined (mapcar #'car ft-list)))
+    (setq *%call-names* outer)
+    (when (listp *%deferred-undefined*)
+      (setq *%unit-defined* (append defined *%unit-defined*)))
+    (when (consp names)
+      (dolist (e (reverse names))
+        (let ((sym (car e)))
+          (unless (or (member sym seen :test #'eq)
+                      (%call-defined-p sym)
+                      (%name-key-in-p (cdr e) defined))
+            (setq seen (cons sym seen))
+            (if (listp *%deferred-undefined*)
+                (setq *%deferred-undefined* (cons e *%deferred-undefined*))
+                (%warn-undefined-function sym))))))))
+
+(defun %call-with-compilation-unit (thunk override)
+  "WITH-COMPILATION-UNIT: THUNK's values, and at the end of the OUTERMOST unit
+   (or of one asked to OVERRIDE) a warning for each name its compiles called
+   that is still undefined then.  Only on a normal exit: an unwound unit's
+   forward references were never given their chance to be defined."
+  (if (or (not (%mvm-on-main-thread-p))
+          (and (listp *%deferred-undefined*) (not override)))
+      (funcall thunk)
+      (let ((outer *%deferred-undefined*) (outer-defined *%unit-defined*) (done nil))
+        (setq *%deferred-undefined* nil)
+        (setq *%unit-defined* nil)
+        (unwind-protect
+             (multiple-value-prog1 (funcall thunk) (setq done t))
+          (let ((names (reverse *%deferred-undefined*)) (defined *%unit-defined*) (seen nil))
+            (setq *%deferred-undefined* outer)
+            (setq *%unit-defined* outer-defined)
+            (when done
+              (dolist (e names)
+                (let ((sym (car e)))
+                  (unless (or (member sym seen :test #'eq) (%call-defined-p sym)
+                              (%name-key-in-p (cdr e) defined))
+                    (setq seen (cons sym seen))
+                    (%warn-undefined-function sym))))))))))
+
 (defun %mvm-eval-forms-2 (forms)
-  (let ((%fslot nil) (%ftaint0 nil))
+  (let ((%fslot nil) (%ftaint0 nil) (%calls-outer :off))
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic
   ;; binding the compiler's compile-integer reads).  Native builds never call
@@ -5322,6 +5414,9 @@
           (%eval-lock-drop-for-run)
           (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
   (setq *%mexp-impure* nil)
+  (when (%mvm-on-main-thread-p)
+    (setq %calls-outer *%call-names*)
+    (setq *%call-names* nil))
   (let ((*functions* (make-hash-table :test (quote equal)))
         (*function-table* nil)
         (*constant-table* nil)
@@ -5589,6 +5684,7 @@
             ;; 40 KB) it is room the form itself needs.
             (setq all-ir nil)
             (%mexp-memo-release)
+            (when (%mvm-on-main-thread-p) (%warn-undefined-calls %calls-outer ft-list))
             ;; COMPILE-FILE (mvm/fasl.lisp): built, recorded, and not run.
             (if (and *fasl-compile-only* (%fasl-compile-only-skip-p %fslot forms %ftaint0))
                 nil

@@ -5846,7 +5846,10 @@
       (handler-bind ((warning (lambda (c)
                                 (setq warnings-p t)
                                 (unless (typep c 'style-warning) (setq failure-p t)))))
-        (%compile-file-1 in-true out-path))
+        ;; A file is a compilation unit: a function a later form defines is
+        ;; not warned of, as SBCL (%CALL-WITH-COMPILATION-UNIT).
+        (modus-int::%call-with-compilation-unit
+         (lambda () (%compile-file-1 in-true out-path)) nil))
       (when verbose
         (format t "~&; wrote ~A~%" (namestring out-path)))
       (values (truename out-path) warnings-p failure-p))))
@@ -6671,12 +6674,29 @@
           (setq result val))))
     result))
 
+(defvar *%load-warning-resignal* nil
+  "The warning %LOAD-REPORT-WARNING is re-signalling, so that a re-entry of the
+   same handler declines it rather than recursing.")
+
 (defun %load-report-warning (c)
   "An unhandled WARNING during LOAD: report it and let the form CONTINUE
    (CLHS 9.2 WARN).  The per-form HANDLER-CASE below has a T clause, which
    also caught warnings -- aborting the rest of the form and reporting the
    warning as an UNHANDLED-ESCAPE (the real ansi-test's 'Redefining test'
-   warning did exactly that)."
+   warning did exactly that).
+
+   UNHANDLED is the word: the handlers of LOAD's CALLER come first, as they
+   would with this one not here.  Being innermost, it used to muffle every
+   warning a loaded file raised before any of them saw it -- a HANDLER-BIND
+   around (LOAD ...) caught nothing.  So the warning is signalled again from
+   here, which offers it to the outer handlers (and their MUFFLE-WARNING still
+   reaches WARN's restart); only if that returns is it reported."
+  (when (eq *%load-warning-resignal* c)
+    (return-from %load-report-warning nil))
+  (let ((saved *%load-warning-resignal*))
+    (setq *%load-warning-resignal* c)
+    (unwind-protect (signal c)
+      (setq *%load-warning-resignal* saved)))
   (handler-case
       (let ((out (symbol-value '*error-output*)))
         (write-string "WARNING: " out)

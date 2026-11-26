@@ -1400,6 +1400,11 @@
        (error "ASDF:LOAD-SYSTEM: circular dependency on system ~A." n))
       (t
        (setq asdf::*systems-loading* (cons n asdf::*systems-loading*))
+       ;; One compilation unit for the system and its dependencies, as ASDF's
+       ;; PERFORM-PLAN: a function a later file defines is not warned of, and
+       ;; the unit says at its end which names are still undefined.  Nested
+       ;; LOAD-SYSTEMs join the outer unit.
+       (with-compilation-unit ()
        (unwind-protect
             (progn
               (dolist (d (asdf::%dep-names sys)) (asdf::load-system d))
@@ -1413,7 +1418,7 @@
               (asdf::%apply-system-quirks n)
               (asdf::%jit-loaded-system))
          (setq asdf::*systems-loading*
-               (asdf::%remove-name n asdf::*systems-loading*)))
+               (asdf::%remove-name n asdf::*systems-loading*))))
        t))))
 
 (defun asdf::require-system (name &rest keys)

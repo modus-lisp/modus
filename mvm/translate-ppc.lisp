@@ -4122,7 +4122,12 @@
       (when *ppc-mac-mode*
         (let ((top (lbl)) (out (lbl)) (noext (lbl))
               (hb +ppc-co-handler-base+))
+          ;; only once the threads are on (their flag, +#xFF0): before CO-INIT the
+          ;; table is whatever the page held (on real hardware, not zeros)
           (ppc-emit-li buf +ppc-r25+ +ppc-co-table+)
+          (ppc-emit-lwz buf +ppc-r26+ +ppc-r25+ #xFF0)
+          (ppc-emit-cmpi-word buf +ppc-r26+ 1)
+          (ppc-emit-bne buf out)
           (ppc-emit-lwz buf +ppc-r26+ +ppc-r25+ 0)
           (ppc-emit-addi buf +ppc-r25+ +ppc-r25+ 4)
           (here top)

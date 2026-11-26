@@ -832,6 +832,11 @@
       (fill-range base #x28000 0)                                ; the fixed block, argv
       (fill-range #xDEAC0000 #x20000 +nil-value+)                ; NIL's page (and block)
       (fill-range #x07D00000 #x10000 0)                          ; the mutex arena
+      ;; the cooperative threads' page (net/ppcmac-threads.lisp): the parked
+      ;; table the collector reads, the "on" flag at +#xFF0.  A real Mac's RAM
+      ;; is not zeroed: a PowerBook6,4's collector walked a garbage table there
+      ;; at its first collection, before any thread existed, and died
+      (fill-range #x07240000 #x1000 0)
       ;; the handler-frame extension: fixed (translate-ppc's Mac arm), capped
       (li +ppc-r3+ +ppc-hstack-ext-limit-addr+)
       (li +ppc-r4+ +ppcmac-hstack-ext-frames+)

@@ -46,7 +46,7 @@
   (:use)
   (:export "STAT" "STAT-MODE" "STAT-UID" "STAT-GID" "STAT-INO" "STAT-SIZE"
            "S-ISDIR" "S-ISSOCK" "S-ISREG" "CHMOD" "UNLINK" "GETUID" "GETPID"
-           "RENAME" "FTRUNCATE" "SYSCALL-ERROR" "ENOENT" "SETENV" "UNSETENV"
+           "RENAME" "FTRUNCATE" "SYSCALL-ERROR" "ENOENT" "GETENV" "SETENV" "UNSETENV"
            "TERMIOS" "TCGETATTR" "TCSETATTR" "TERMIOS-IFLAG" "TERMIOS-OFLAG"
            "TERMIOS-CFLAG" "TERMIOS-LFLAG" "TERMIOS-CC"
            "TCSANOW" "TCSADRAIN" "TCSAFLUSH" "ECHO" "ICANON" "ISIG" "IEXTEN" "ECHOE"
@@ -585,6 +585,12 @@
    by SB-POSIX:SETENV or UNSETENV is answered first."
   (let ((c (assoc name sb-posix::*environment-changes* :test #'string=)))
     (if c (cdr c) (%cli-getenv name))))
+
+(defun sb-posix:getenv (name)
+  "getenv(3): NAME's value as a string, or NIL -- what SB-EXT:POSIX-GETENV answers, so a change
+   made by SB-POSIX:SETENV / UNSETENV is seen.  It was missing: (sb-posix:getenv \"HOME\") was an
+   UNDEFINED-FUNCTION while SETENV worked."
+  (sb-ext:posix-getenv name))
 
 (defun sb-posix:setenv (name value overwrite)
   "setenv(3): NAME is VALUE from now on, unless NAME is set and OVERWRITE is 0.

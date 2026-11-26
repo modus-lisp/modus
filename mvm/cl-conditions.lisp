@@ -2946,6 +2946,10 @@
         (if (and (/= self 0) (= (%gc-read64 m) 1))
             (progn
               (%gc-write64 m 0)
+              ;; A refused store inside a locked section (SET-SYMBOL-VALUE's PUTHASH of a worker's
+              ;; value) is about to unwind past that section's %RT-LEAVE: let the lock go first,
+              ;; or the next thread to need it waits and stops the process.
+              (%rt-abandon)
               ;; This condition says more than the signal would: claim it.
               (%clear-pending-fault)
               (setq *current-condition*

@@ -3311,6 +3311,11 @@
 (defun %rt-enter-locked () 0)
 (declaim (overridable %rt-leave-locked))
 (defun %rt-leave-locked () 0)
+(declaim (overridable %rt-abandon))
+(defun %rt-abandon ()
+  "Release the runtime lock entirely if this thread holds it (net/hosted-sync.lisp); a no-op
+   where nothing takes it."
+  0)
 
 (defun %rt-enter ()
   (if (= (mem-ref #x10000DB8 :u32) 0) 0 (%rt-enter-locked)))

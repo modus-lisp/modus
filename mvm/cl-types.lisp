@@ -1112,6 +1112,7 @@
     ((eq n 'simple-error) '(simple-condition error))
     ((eq n 'simple-type-error) '(simple-condition type-error))
     ((eq n 'simple-warning) '(simple-condition warning))
+    ((eq n 'simple-style-warning) '(simple-condition style-warning))
     ((eq n 'type-error) '(error))
     ((eq n 'storage-condition) '(serious-condition))
     ((eq n 'warning) '(condition))

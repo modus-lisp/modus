@@ -913,6 +913,34 @@
        (%call-interp-closure closure (cdr form)))
       (t (%signal-program-error)))))
 
+(defun %interp-cm-shim (form &rest extra)
+  "%INTERP-MACRO-SHIM for a COMPILER macro (COMPILER-MACRO-FUNCTION): the same
+   (form env) protocol, and a leading &WHOLE bound to the WHOLE form, operator
+   included (CLHS 3.4.4, 3.2.2.1).  The expander is an %INTERP-CLOSURE over the
+   raw lambda list, called with (CDR FORM), so &WHOLE took the argument list:
+   (funcall (compiler-macro-function 'f) '(f 1 2) nil) gave &WHOLE (1 2).  A
+   compiler macro that declines returns its &WHOLE form, so that answer was a
+   call to 1.  &WHOLE is taken off the lambda list and bound around the body --
+   or destructured, when it is a pattern -- and the rest is called as before."
+  (declare (ignore extra))
+  (let* ((nargs (%get-nargs))
+         (closure (car (%get-cenv)))
+         (params (cadr closure)))
+    (cond
+      ((/= nargs 2) (%signal-program-error))
+      ((and (consp params) (symbolp (car params)) (car params)
+            (string= (symbol-name (car params)) "&WHOLE") (consp (cdr params)))
+       (let* ((whole (cadr params))
+              (body (caddr closure))
+              (inner (if (consp whole)
+                         (list (list 'destructuring-bind whole (list 'quote form)
+                                     (cons 'locally body)))
+                         (list (list* 'let (list (list whole (list 'quote form)))
+                                      body)))))
+         (%call-interp-closure (list '%interp-closure (cddr params) inner (cadddr closure))
+                               (cdr form))))
+      (t (%call-interp-closure closure (cdr form))))))
+
 (defun %argfn-macro-shim (form &rest extra)
   "A DEFMACRO's expander when its lambda list is an ordinary one (the
    compiler's DEFMACRO, %MAKE-ARGFN-EXPANDER): the macro's own function,
@@ -5861,7 +5889,10 @@
       (handler-bind ((warning (lambda (c)
                                 (setq warnings-p t)
                                 (unless (typep c 'style-warning) (setq failure-p t)))))
-        (%compile-file-1 in-true out-path))
+        ;; A file is a compilation unit: a function a later form defines is
+        ;; not warned of, as SBCL (%CALL-WITH-COMPILATION-UNIT).
+        (modus-int::%call-with-compilation-unit
+         (lambda () (%compile-file-1 in-true out-path)) nil))
       (when verbose
         (format t "~&; wrote ~A~%" (namestring out-path)))
       (values (truename out-path) warnings-p failure-p))))
@@ -6428,7 +6459,7 @@
       (cond
         ((null raw) nil)
         ((%interp-closure-p raw)
-         (%make-closure #'%interp-macro-shim (cons raw nil)))
+         (%make-closure #'%interp-cm-shim (cons raw nil)))
         (t raw)))))
 
 ;;; ============================================================
@@ -6686,12 +6717,29 @@
           (setq result val))))
     result))
 
+(defvar *%load-warning-resignal* nil
+  "The warning %LOAD-REPORT-WARNING is re-signalling, so that a re-entry of the
+   same handler declines it rather than recursing.")
+
 (defun %load-report-warning (c)
   "An unhandled WARNING during LOAD: report it and let the form CONTINUE
    (CLHS 9.2 WARN).  The per-form HANDLER-CASE below has a T clause, which
    also caught warnings -- aborting the rest of the form and reporting the
    warning as an UNHANDLED-ESCAPE (the real ansi-test's 'Redefining test'
-   warning did exactly that)."
+   warning did exactly that).
+
+   UNHANDLED is the word: the handlers of LOAD's CALLER come first, as they
+   would with this one not here.  Being innermost, it used to muffle every
+   warning a loaded file raised before any of them saw it -- a HANDLER-BIND
+   around (LOAD ...) caught nothing.  So the warning is signalled again from
+   here, which offers it to the outer handlers (and their MUFFLE-WARNING still
+   reaches WARN's restart); only if that returns is it reported."
+  (when (eq *%load-warning-resignal* c)
+    (return-from %load-report-warning nil))
+  (let ((saved *%load-warning-resignal*))
+    (setq *%load-warning-resignal* c)
+    (unwind-protect (signal c)
+      (setq *%load-warning-resignal* saved)))
   (handler-case
       (let ((out (symbol-value '*error-output*)))
         (write-string "WARNING: " out)

@@ -566,6 +566,9 @@
   (%define-condition 'simple-error '(simple-condition error) nil nil nil)
   ;; simple-warning
   (%define-condition 'simple-warning '(simple-condition warning) nil nil nil)
+  ;; simple-style-warning: SBCL's SB-INT:SIMPLE-STYLE-WARNING, which a caller
+  ;; reads as a SIMPLE-CONDITION (the undefined-function warning, mvm-eval.lisp)
+  (%define-condition 'simple-style-warning '(simple-condition style-warning) nil nil nil)
   ;; type-error
   (%define-condition 'type-error '(error)
     (list (list 'datum '(:datum) :no-initform)

@@ -1643,6 +1643,30 @@
 (defvar *unresolved-calls* (make-hash-table :test 'equal)
   "Tracks unresolved function calls: name-string -> count")
 
+(defvar *%setf-fallback-places* nil
+  "SET-NAME symbol -> NAME, for each SETTER the runtime SETF fallback has
+   emitted: that call is reached only when no (SETF NAME) function stands when
+   the form runs, so an undefined SET-NAME is undefined only if (SETF NAME) is
+   too, and is (SETF NAME) to the warning.  Main thread only.")
+
+(defun %note-setf-fallback (setter name)
+  (when (%mvm-on-main-thread-p)
+    (unless *%setf-fallback-places*
+      (setq *%setf-fallback-places* (make-hash-table :test 'eq)))
+    (setf (gethash setter *%setf-fallback-places*) name))
+  nil)
+
+(defun %setf-fallback-place (sym)
+  "NAME when SYM is a SETF fallback's SET-NAME, else NIL."
+  (and *%setf-fallback-places* (gethash sym *%setf-fallback-places*)))
+
+(defvar *%call-names* :off
+  "While an in-image EVAL compiles a form on main, the global function calls it
+   emits, as (SYMBOL . KEY), most recent first; :OFF otherwise.  Read by
+   %WARN-UNDEFINED-CALLS (mvm-eval.lisp) before the form runs, which is the
+   one moment a caller can still learn that a name it calls is undefined --
+   SBCL's \"undefined function: X\" STYLE-WARNING.")
+
 (defvar *global-uses* nil
   "Host-side census, NIL unless mvm/build-checks.lisp installs a hash: for each
    global or constant the build compiles, (PACKAGE-NAME . SYMBOL-NAME) -> the
@@ -6588,9 +6612,15 @@
   ;; the body to evaluate normally and return its values.  Drop the
   ;; options list (whatever it says, default-policy is identical) and
   ;; emit `(progn body...)`.  Unblocks with-compilation-unit.{1..7} tests.
+  ;; The body as a thunk to %CALL-WITH-COMPILATION-UNIT (mvm-eval.lisp), which
+  ;; keeps the unit's undefined-function warnings for its end, as SBCL does.
+  ;; :OVERRIDE is the one option it reads; the rest change nothing here.
   (mvm-define-macro "WITH-COMPILATION-UNIT"
     (lambda (form)
-      `(progn ,@(cddr form))))  ;; WITH-STANDARD-IO-SYNTAX — (with-standard-io-syntax body*)
+      (let ((opts (cadr form)))
+        `(%call-with-compilation-unit
+          (lambda () ,@(cddr form))
+          ,(and (consp opts) (getf opts :override))))))  ;; WITH-STANDARD-IO-SYNTAX — (with-standard-io-syntax body*)
   ;; The runtime worker %WITH-STANDARD-IO-SYNTAX (mvm/cl-reader.lisp) has
   ;; existed for years, but nothing bound the CL macro NAME to it outside the
   ;; ANSI-gate builds' source rewriter.  In a clean image the form compiled to
@@ -8012,8 +8042,14 @@
                    ;; the cons as a fresh copy, whose car no live registry is EQ to
                    ;; either, so it refills on first use (%SETF-SITE-SETTER).
                    (if *mvm-eval-runtime-p*
-                       (let ((gargs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "SFA"))
-                                            (cdr place)))
+                       (let ((gargs (progn
+                                      ;; SETTER is called only when no (SETF
+                                      ;; NAME) stands at run time: the undefined-
+                                      ;; function warning asks after both
+                                      ;; (%SETF-FALLBACK-PLACE).
+                                      (%note-setf-fallback setter (car place))
+                                      (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "SFA"))
+                                              (cdr place))))
                              (gval (%mvm-gensym "SFV"))
                              (gfn (%mvm-gensym "SFF"))
                              (gsite (%mvm-gensym "SFS")))
@@ -33079,6 +33115,9 @@
               ;; key when that package defines no such name, so a call that
               ;; crosses packages resolves exactly as it did before.
               (resolved-name (or unique-name (%fn-key-qualify fn fn-name))))
+         (when (and *mvm-eval-runtime-p* (null unique-name) (listp *%call-names*)
+                    (%mvm-on-main-thread-p))
+           (setq *%call-names* (cons (cons fn resolved-name) *%call-names*)))
          (if (and form *tail-call-forms*
                   (member form *tail-call-forms* :test #'eq)
                   (null unique-name)

@@ -52,6 +52,9 @@
 (defconstant +i386-cl-stack-size+ #x100000)
 (defconstant +i386-cl-low-va+     #x10000000)
 (defconstant +i386-cl-low-size+   #x20000 "+linux-i386-bss-end+ - #x10000000.")
+(defconstant +i386-cl-hext-va+ #x10020000 "The handler-frame extension, past the fixed block.")
+(defconstant +i386-cl-hext-size+ #x10000 "64 KB: 2730 frames of 24 bytes.")
+(defconstant +i386-cl-hext-frames+ 2048 "The extension's frames the push helper may use.")
 (defconstant +i386-cl-pt-reserve+ #x40000 "RAM kept back for the heap's page tables.")
 (defconstant +i386-cl-fb-window+ #x0E000000
   "VA of the 16 MB framebuffer window: four page tables at +I386-CL-FB-PTS+,
@@ -309,8 +312,26 @@
        (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 alloc)
        '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 zero)
        '(#x5E)                                                ; pop esi
+       ;; the handler-frame extension's two words (below), through the block's PHYSICAL
+       ;; address: paging is not on yet, so a store to its VA would land elsewhere
+       ;; (measured: both read 0 at the REPL).  Literal offsets: this file is read before
+       ;; translate-i386's package exists (+I386-HSTACK-EXT-ADDR+ #x1001FF00, its limit +4).
+       (append '(#xC7 #x86) (i386l-le32-list #x1FF00) (i386l-le32-list +i386-cl-hext-va+))
+       (append '(#xC7 #x86) (i386l-le32-list #x1FF04) (i386l-le32-list +i386-cl-hext-frames+))
        (cons #xBF (i386l-le32-list +i386-cl-low-va+))
        (cons #xB9 (i386l-le32-list (floor +i386-cl-low-size+ 4096))) '(:call 0 map)
+       ;; THE HANDLER-FRAME EXTENSION (translate-i386, THE HANDLER-FRAME STACK HAS NO SILENT
+       ;; CEILING): hosted mmaps it at the first push past the fixed block's 127 frames; bare has
+       ;; no mmap, so it is mapped here, just above the fixed block, and named in the two words
+       ;; the push helper reads (+I386-HSTACK-EXT-ADDR+ and its limit).  127 frames were too few
+       ;; for an install: compiling weft's FILL-POLY under the installer's handlers ran out.  The
+       ;; words (set above, with the fixed block) are in that block, so a core restore puts back
+       ;; the same values.
+       (cons #xB9 (i386l-le32-list +i386-cl-hext-size+)) '(:call 0 alloc)
+       '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-hext-size+)) '(:call 0 zero)
+       '(#x5E)                                                ; pop esi
+       (cons #xBF (i386l-le32-list +i386-cl-hext-va+))
+       (cons #xB9 (i386l-le32-list (floor +i386-cl-hext-size+ 4096))) '(:call 0 map)
        ;; the stack: 1 MB of extended memory, or on a machine under 16 MB
        ;; 256 KB of CONVENTIONAL memory, [4F000h, 8F000h), which nothing uses
        ;; once the image runs (the boot stack's top is in it, and done with

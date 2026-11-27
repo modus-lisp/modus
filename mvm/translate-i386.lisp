@@ -452,6 +452,12 @@
    reach Linux is the bare one (COM1 port I/O, RDTSC).  Set by
    I386-SET-CL-BARE-MODE; *I386-LINUX-MODE* stays NIL.")
 
+(defun i386-hstack-ext-p ()
+  "Does the handler-frame stack have an EXTENSION past its in-memory frames?  Hosted Linux
+   mmaps it at the first push past them; the bare CL image's boot maps it at #x10020000
+   (boot-i386-cl.lisp +I386-CL-HEXT-VA+) and names it in +I386-HSTACK-EXT-ADDR+."
+  (or *i386-linux-mode* *i386-cl-bare*))
+
 (defun i386-hosted-layout-p ()
   "Is the memory picture the hosted one (Linux, or bare over it)?"
   (or *i386-linux-mode* *i386-cl-bare*))
@@ -2715,7 +2721,7 @@
          (hd *i386-hstack-depth-addr*)
          (hs *i386-hstack-base-addr*)
          (cap *i386-hstack-max-depth*)
-         (hosted *i386-linux-mode*)
+         (hosted (i386-hstack-ext-p))
          (ext (i386-make-label))
          (have-ext (i386-make-label))
          (reserve (i386-make-label))
@@ -2744,7 +2750,7 @@
         (i386-emit-label buf ext)
         (i386-emit-mov-reg-abs buf +scratch1+ +i386-hstack-ext-addr+)
         (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
-        (i386-emit-jcc buf :e reserve)
+        (i386-emit-jcc buf :e (if *i386-linux-mode* reserve overflow))   ; bare: the boot maps it
         (i386-emit-label buf have-ext)
         ;; EAX (saved above) = extension index
         (i386-emit-mov-reg-reg buf +i386-eax+ +scratch0+)
@@ -2760,8 +2766,9 @@
         (i386-emit-label buf no-limit)
         (i386-emit-hstack-ext-frame-addr buf +scratch1+ +i386-eax+)
         (i386-emit-jmp-rel32 buf store))
-      (i386-emit-label buf reserve)
-      (i386-emit-hstack-reserve buf have-ext overflow))
+      (when *i386-linux-mode*
+        (i386-emit-label buf reserve)
+        (i386-emit-hstack-reserve buf have-ext overflow)))
     (i386-emit-label buf overflow)
     (i386-emit-hstack-overflow buf pop-label))
   ;; ---------------- __handler_pop ----------------
@@ -2780,7 +2787,7 @@
     (i386-emit-jcc buf :e empty)
     (i386-emit-add-reg-imm buf +scratch0+ -1)
     (i386-emit-mov-abs-reg buf hd +scratch0+)
-    (when *i386-linux-mode*
+    (when (i386-hstack-ext-p)
       (i386-emit-cmp-reg-imm buf +scratch0+ cap)
       (i386-emit-jcc buf :ge ext))                         ; signed, as the push's
     (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
@@ -2790,8 +2797,8 @@
       (i386-emit-mov-reg-mem buf +i386-eax+ +scratch1+ (* 4 i))
       (i386-emit-mov-abs-reg buf (+ jb (* 4 i)) +i386-eax+))
     (i386-emit-jmp-rel32 buf done)
-    (when *i386-linux-mode*
-      ;; extension frame (the push that stored it reserved the extension)
+    (when (i386-hstack-ext-p)
+      ;; extension frame (the push that stored it reserved the extension, or the boot mapped it)
       (i386-emit-label buf ext)
       (i386-emit-sub-reg-imm buf +scratch0+ cap)
       (i386-emit-hstack-ext-frame-addr buf +scratch1+ +scratch0+)
@@ -3070,7 +3077,7 @@
       (i386-emit-add-reg-imm buf +i386-ebp+ 4)
       (i386-emit-jmp-rel32 buf hl)
       (i386-emit-label buf hd))
-    (when *i386-linux-mode*
+    (when (i386-hstack-ext-p)
       (let ((xl (i386-make-label)) (xd (i386-make-label)))
         (i386-emit-mov-reg-abs buf +scratch0+ *i386-hstack-depth-addr*)
         (i386-emit-sub-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
@@ -3699,6 +3706,17 @@ modus: heap exhausted -- this machine needs more RAM
                 (i386-emit-byte buf #x5A)                              ; pop edx
                 (i386-emit-byte buf #x59)                              ; pop ecx
                 (i386-emit-byte buf #x5B)))                            ; pop ebx
+
+             ((and (member code '(#x0502 #x0503)) *i386-cl-bare* (not *i386-linux-mode*))
+              ;; BARE METAL HAS NO KERNEL: a Linux syscall answers -ENOSYS (-38),
+              ;; tagged for #x0502 and raw for #x0503, as the call returns.  Every
+              ;; caller already reads a negative result as failure, so PROBE-FILE is
+              ;; NIL and OPEN :IF-DOES-NOT-EXIST NIL is NIL.  This was the
+              ;; unimplemented trap's INT3, which stopped the machine: weft/render
+              ;; counts CPUs from /proc/cpuinfo at load time (inside IGNORE-ERRORS),
+              ;; and bare i386 died loading it.  Bare x64 executes a real SYSCALL,
+              ;; which faults into a catchable error.
+              (i386-emit-mov-reg-imm buf +i386-esi+ (if (= code #x0502) -76 -38)))
 
              ((and (= code #x0503) *i386-linux-mode*)
               ;; Raw 3-arg syscall: number is TAGGED, args 1-3 are RAW, and the

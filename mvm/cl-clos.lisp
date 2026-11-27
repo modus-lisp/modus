@@ -2977,7 +2977,11 @@
   (let ((name (cond ((%clos-class-p cls) (aref cls 1))
                     ((symbolp cls) cls)
                     (t nil))))
-    (if name (%direct-slots-for name) nil)))
+    (cond ((null name)
+           (if (%class-proxy-p cls) (%struct-class-slot-names (%class-proxy-name cls) t) nil))
+          ((and (symbolp cls) (null (%find-clos-class cls)) (%find-struct-type cls))
+           (%struct-class-slot-names cls t))
+          (t (%direct-slots-for name)))))
 
 (defun class-slots (cls)
   "Return the EFFECTIVE slots of CLS: its own plus every inherited one.
@@ -2990,8 +2994,21 @@
     ((%clos-class-p cls) (aref cls 2))
     ((symbolp cls)
      (let ((c (%find-clos-class cls)))
-       (if c (aref c 2) nil)))
+       (if c (aref c 2) (%struct-class-slot-names cls nil))))
+    ((%class-proxy-p cls) (%struct-class-slot-names (%class-proxy-name cls) nil))
     (t nil)))
+
+(defun %struct-class-slot-names (name direct)
+  "The slots of DEFSTRUCT type NAME (a fresh list): every effective slot, or with DIRECT
+   only those NAME declares itself, i.e. less its :INCLUDE parent's.  CLASS-OF a structure
+   is a class proxy, and CLASS-SLOTS of one answered NIL, so a portable deep copy
+   (copy-structure, then each SB-MOP:CLASS-SLOTS slot) shared every slot's contents."
+  (let ((desc (and name (%find-struct-type name))))
+    (if (null desc) nil
+        (let ((all (copy-list (%struct-type-desc-slots desc)))
+              (parent (and direct (%struct-type-desc-parent desc)
+                           (%find-struct-type (%struct-type-desc-parent desc)))))
+          (if parent (nthcdr (length (%struct-type-desc-slots parent)) all) all)))))
 
 (defun compute-class-precedence-list (cls)
   "MOP function: recompute the CPL.  We just return the stored CPL."

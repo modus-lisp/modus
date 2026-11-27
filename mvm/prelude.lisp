@@ -2157,25 +2157,41 @@
       (when vec (%ht-addr-stale ht)))
     removed))
 
+(defun %ht-alist-oldest-first (alist)
+  "A fresh copy of ALIST's spine (a table's alist is newest first) in insertion
+   order; the (KEY . VALUE) conses are the table's own."
+  (let ((acc nil) (cur alist))
+    (loop
+      (when (null cur) (return acc))
+      (setq acc (cons (car cur) acc))
+      (setq cur (cdr cur)))))
+
+;;; ITERATION ORDER IS INSERTION ORDER, as on SBCL.  CLHS leaves it unspecified,
+;;; but portable code relies on SBCL's: a JSON object built in a hash table
+;;; serialises its keys in the order they were stored (cl-deposits' proofs, whose
+;;; byte-exact JSON is a shared test vector, came out with their keys reversed).
+;;; MAPHASH, %MAPHASH-IMPL, %HT-PAIRS (LOOP's HASH-KEYS / HASH-VALUES and the
+;;; inline MAPHASH) and WITH-HASH-TABLE-ITERATOR all walk oldest first: a compact
+;;; dict's packed entries in order, then the keys it keeps on its alist.
+
 (defun maphash (fn ht)
-  "Call FN with each key-value pair in HT, newest first."
+  "Call FN with each key-value pair in HT, oldest first (insertion order)."
   (let* ((holder (%ht-bucket-holder ht))
          (d (and holder (%ht-h-vec holder))))
     (if (consp d)
-        ;; compact dict: the alist's keys (see above), then its entries newest
-        ;; first, as the alist ran
-        (let* ((idx (car d)) (e (cdr d)) (j (- (%word-aref e 0) 1)) (cur (car ht)))
+        (let* ((e (cdr d)) (used (%word-aref e 0)) (j 0)
+               (rest (%ht-alist-oldest-first (car ht))))
           (loop
-            (when (null cur) (return nil))
-            (let ((pair (car cur))) (funcall fn (car pair) (cdr pair)))
-            (setq cur (cdr cur)))
-          (loop
-            (when (< j 0) (return nil))
+            (when (>= j used) (return nil))
             (let ((k (%word-aref e (+ 2 (+ j j)))))
               (unless (eq k e)
                 (funcall fn k (%word-aref e (+ 3 (+ j j))))))
-            (setq j (- j 1))))
-        (let ((cur (car ht)))
+            (setq j (+ j 1)))
+          (loop
+            (when (null rest) (return nil))
+            (let ((pair (car rest))) (funcall fn (car pair) (cdr pair)))
+            (setq rest (cdr rest))))
+        (let ((cur (%ht-alist-oldest-first (car ht))))
           (loop
             (when (null cur) (return nil))
             (let ((pair (car cur)))
@@ -3183,19 +3199,30 @@
     alist))
 
 (defun %ht-pairs (ht)
-  "HT's entries as an alist of (K . V), newest first: the table's own alist,
-   or a fresh one for a dict.  For walkers; PUTHASH does not reach a fresh one."
+  "HT's entries as a fresh alist of (K . V), oldest first (insertion order, see
+   MAPHASH): a dict's packed entries, then the keys on the table's alist.  For
+   walkers; PUTHASH does not reach a dict's fresh pairs."
   (let ((holder (%ht-bucket-holder ht)))
     (if (and holder (consp (%ht-h-vec holder)))
-        (let* ((d (%ht-h-vec holder)) (idx (car d)) (e (cdr d))
-               (used (%word-aref e 0)) (j 0) (alist nil))
+        (let* ((d (%ht-h-vec holder)) (e (cdr d))
+               (used (%word-aref e 0)) (j 0) (acc nil))
+          ;; ACC is built newest first: the dict's entries, then the alist's
+          ;; (already newest first) in front of them; one NREVERSE at the end
           (loop
-            (when (>= j used) (return (if (car ht) (append (car ht) alist) alist)))
+            (when (>= j used) (return nil))
             (let ((k (%word-aref e (+ 2 (+ j j)))))
               (unless (eq k e)
-                (setq alist (cons (cons k (%word-aref e (+ 3 (+ j j)))) alist))))
-            (setq j (+ j 1))))
-        (car ht))))
+                (setq acc (cons (cons k (%word-aref e (+ 3 (+ j j)))) acc))))
+            (setq j (+ j 1)))
+          (let ((cur (car ht)) (front nil))
+            (loop
+              (when (null cur) (return nil))
+              (setq front (cons (car cur) front))
+              (setq cur (cdr cur)))
+            ;; FRONT is the alist oldest first; ACC the dict newest first
+            (let ((out (%ht-alist-oldest-first acc)))
+              (if front (nconc out front) out))))
+        (%ht-alist-oldest-first (car ht)))))
 
 (defun hash-table-count (ht)
   "Return the number of entries in HT."
@@ -3292,7 +3319,7 @@
   "Internal worker: parse OPTIONS plist (`(:test eq :size 100 ...)`) and
    build a metadata-bearing hash-table.  Defaults: test=eql, rsize=2,
    rthresh=1, size=16."
-  (let ((test 'eql) (rsize 2) (rthresh 1) (size 16) (cur options))
+  (let ((test 'eql) (rsize 2) (rthresh 1) (size 16) (sync nil) (cur options))
     (loop
       (when (null cur) (return nil))
       (when (null (cdr cur)) (return nil))
@@ -3301,7 +3328,8 @@
           ((eq k :test)             (setq test (%ht-canonicalize-test v)))
           ((eq k :size)             (setq size v))
           ((eq k :rehash-size)      (setq rsize v))
-          ((eq k :rehash-threshold) (setq rthresh v))))
+          ((eq k :rehash-threshold) (setq rthresh v))
+          ((eq k :synchronized)     (setq sync (if v t nil)))))
       (setq cur (cddr cur)))
     ;; Metadata is a PROPER 5-list: (test rsize rthresh size bucket-holder).
     ;; bucket-holder = (vec-or-flag count . strcmp?) — a mutable cell that
@@ -3328,7 +3356,19 @@
       ;; a core made before it existed) never index object keys by address.
       (cons nil
             (cons (%ht-tag)
-                  (list test rsize rthresh size holder (cons nil nil)))))))
+                  (list test rsize rthresh size holder (cons nil nil)
+                        ;; the 8th, (SYNCHRONIZED-P . LOCK-CELL): SB-EXT's
+                        ;; HASH-TABLE-SYNCHRONIZED-P and WITH-LOCKED-HASH-TABLE
+                        ;; (net/sb-sys-shim.lisp); the cell is made on first lock
+                        (cons sync 0)))))))
+
+(defun %ht-sync-slot (ht)
+  "The (SYNCHRONIZED-P . LOCK-CELL) cons of a MAKE-HASH-TABLE-ARGS table, or NIL."
+  (let ((c (cdr ht)))
+    (if (and (consp c) (eq (car c) (%ht-tag)))
+        (let ((r (cdr (cdr (cdr (cdr (cdr (cdr (cdr (cdr ht))))))))))
+          (if (consp r) (car r) nil))
+        nil)))
 
 ;;; ============================================================
 ;;; Gensym (for macro expansion)

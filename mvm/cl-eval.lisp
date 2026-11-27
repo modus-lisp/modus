@@ -44,7 +44,9 @@
   "Walk SRC hash-table internal alist and mirror each (name-string → fn)
    entry as (name-hash → fn) into *native-sym-function-table*.
    Written without maphash to avoid closure-capture issues."
-  (let ((cur (%ht-pairs src)))
+  ;; newest first, as this walked before %HT-PAIRS became insertion order: on a
+  ;; name-hash collision the OLDEST name's function is the one left mirrored
+  (let ((cur (%ht-alist-oldest-first (%ht-pairs src))))
     (loop
       (when (null cur) (return nil))
       (let ((pair (car cur)))

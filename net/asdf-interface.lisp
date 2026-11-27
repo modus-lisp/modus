@@ -86,7 +86,19 @@
            "SUBPROCESS-ERROR" "SUBPROCESS-ERROR-CODE" "SUBPROCESS-ERROR-COMMAND"
            "SUBPROCESS-ERROR-PROCESS" "PROCESS-INFO" "PROCESS-INFO-PID"
            "FILE-EXISTS-P" "DIRECTORY-EXISTS-P" "TRUENAMIZE" "ENSURE-PATHNAME"
-           "DELETE-FILE-IF-EXISTS"))
+           "DELETE-FILE-IF-EXISTS"
+           ;; section 2c: the rest of what org code calls (census 2026-11-27)
+           "PROCESS-INFO-INPUT" "PROCESS-INFO-OUTPUT" "PROCESS-INFO-ERROR-OUTPUT"
+           "CLOSE-STREAMS" "COPY-FILE" "RENAME-FILE-OVERWRITING-TARGET"
+           "SLURP-STREAM-STRING" "WITH-OUTPUT-FILE" "CALL-WITH-OUTPUT-FILE"
+           "WITH-TEMPORARY-FILE" "CALL-WITH-TEMPORARY-FILE"
+           "WITH-CURRENT-DIRECTORY" "CALL-WITH-CURRENT-DIRECTORY"
+           "DIRECTORY-PATHNAME-P" "SUBPATHP" "PARSE-UNIX-NAMESTRING"
+           "DEFAULT-TEMPORARY-DIRECTORY" "OS-MACOSX-P" "OS-UNIX-P" "OS-WINDOWS-P"
+           "XDG-CACHE-HOME" "XDG-CONFIG-HOME" "XDG-CONFIG-DIRS" "XDG-CONFIG-PATHNAMES"
+           "*COMPILE-FILE-WARNINGS-BEHAVIOUR*" "*COMPILE-FILE-FAILURE-BEHAVIOUR*"
+           "*IMAGE-RESTORE-HOOK*" "CALL-IMAGE-RESTORE-HOOK" "COMMAND-LINE-ARGUMENTS"
+           "DEFINE-PACKAGE"))
 
 (defpackage "ASDF"
   (:use "COMMON-LISP" "UIOP")
@@ -347,6 +359,9 @@
 
 (defclass uiop::process-info ()
   ((pid :initarg :pid :reader uiop::process-info-pid)
+   (input :initarg :input :initform nil :reader uiop::process-info-input)
+   (output :initarg :output :initform nil :reader uiop::process-info-output)
+   (error-output :initarg :error-output :initform nil :reader uiop::process-info-error-output)
    (code :initform nil :accessor %pinfo-code)
    (closes :initarg :closes :initform nil :accessor %pinfo-closes)))
 
@@ -365,8 +380,15 @@
     fd))
 
 (defun %uiop-in-fd (input closes)
-  "stdin for the child: (values fd closes temp-file)."
+  "stdin for the child: (values fd closes temp-file our-write-fd)."
   (cond
+    ((eq input :stream)
+     ;; LAUNCH-PROGRAM's :STREAM: the child reads a pipe whose write end we keep.
+     ;; Both ends are O_CLOEXEC, so the child does not inherit our end and sees
+     ;; EOF when we close it.
+     (let ((p (%proc-pipe)))
+       (unless p (error "UIOP:LAUNCH-PROGRAM: pipe failed"))
+       (values (car p) (cons (car p) closes) nil (cdr p))))
     ((null input) (let ((fd (%uiop-open-or-error "/dev/null" :input))) (values fd (cons fd closes) nil)))
     ((or (eq input t) (eq input :interactive)) (values -1 closes nil))
     ((%uiop-file-designator-p input)
@@ -392,7 +414,7 @@
        (error "UIOP:RUN-PROGRAM: output file ~A exists" spec))
      (let ((fd (%uiop-open-or-error spec (if (eq if-exists :append) :append :supersede))))
        (values fd (cons fd closes) -1)))
-    ((or (eq spec :string) (eq spec :lines) (streamp spec))
+    ((or (eq spec :string) (eq spec :lines) (eq spec :stream) (streamp spec))
      (let ((p (%proc-pipe)))
        (unless p (error "UIOP:RUN-PROGRAM: pipe failed"))
        (values (cdr p) (cons (cdr p) closes) (car p))))
@@ -413,13 +435,13 @@
 
 (defun %uiop-start (who command input output error-output if-output-exists
                     if-error-output-exists directory)
-  "Spawn COMMAND.  (values pid out-read-fd err-read-fd temp-input)."
+  "Spawn COMMAND.  (values pid out-read-fd err-read-fd temp-input in-write-fd)."
   (unless (%uiop-can-spawn-p) (%uiop-no-processes who))
   (let* ((argv (%uiop-argv command))
          (prog (%proc-find-program (car argv)))
          (closes nil))
     (unless prog (error "UIOP:~A: program ~S not found on PATH" who (car argv)))
-    (multiple-value-bind (in c1 tmp) (%uiop-in-fd input closes)
+    (multiple-value-bind (in c1 tmp in-w) (%uiop-in-fd input closes)
       (setq closes c1)
       (multiple-value-bind (out c2 out-r) (%uiop-out-fd output if-output-exists closes)
         (setq closes c2)
@@ -435,9 +457,9 @@
             ;; The child holds its own copies now; ours would keep pipes open.
             (dolist (fd closes) (%proc-close fd))
             (when (< pid 0)
-              (%proc-close out-r) (%proc-close err-r)
+              (%proc-close out-r) (%proc-close err-r) (when in-w (%proc-close in-w))
               (error "UIOP:~A: fork failed (errno ~D)" who (- pid)))
-            (values pid out-r err-r tmp)))))))
+            (values pid out-r err-r tmp in-w)))))))
 
 (defun uiop::run-program (command &key input output error-output
                                     (if-output-exists :supersede)
@@ -462,16 +484,29 @@
                                        (if-error-output-exists :supersede)
                                        directory
                              &allow-other-keys)
-  "Start COMMAND without waiting.  Outputs may be files, NIL or inherited
-   (:STREAM is not supported yet).  WAIT-PROCESS collects the exit code."
-  (when (or (member output '(:stream :string :lines)) (member error-output '(:stream :string :lines))
-            (streamp output) (streamp error-output) (eq input :stream))
-    (error "UIOP:LAUNCH-PROGRAM: stream / string outputs are not supported on Modus yet"))
-  (multiple-value-bind (pid out-r err-r tmp)
+  "Start COMMAND without waiting.  INPUT, OUTPUT and ERROR-OUTPUT may be files,
+   NIL, T (inherited) or :STREAM, which makes a pipe whose other end is
+   PROCESS-INFO-INPUT / -OUTPUT / -ERROR-OUTPUT.  WAIT-PROCESS collects the exit
+   code.  :STRING, :LINES and stream objects are RUN-PROGRAM's, not this one's."
+  (when (or (member output '(:string :lines)) (member error-output '(:string :lines))
+            (streamp output) (streamp error-output) (streamp input))
+    (error "UIOP:LAUNCH-PROGRAM: :STRING, :LINES and stream objects are RUN-PROGRAM's; use :STREAM"))
+  (multiple-value-bind (pid out-r err-r tmp in-w)
       (%uiop-start "LAUNCH-PROGRAM" command input output error-output
                    if-output-exists if-error-output-exists directory)
-    (declare (ignore out-r err-r))
-    (make-instance 'uiop::process-info :pid pid :closes (and tmp (list tmp)))))
+    (flet ((in-stream (fd keep) (if (and keep (>= fd 0)) (%make-file-stream-full fd 0)
+                                    (progn (%proc-close fd) nil))))
+      (make-instance 'uiop::process-info
+                     :pid pid :closes (and tmp (list tmp))
+                     :input (and in-w (%make-file-stream-full in-w 1))
+                     :output (in-stream out-r (eq output :stream))
+                     :error-output (in-stream err-r (eq error-output :stream))))))
+
+(defun uiop::close-streams (p)
+  "Close whichever of P's three streams LAUNCH-PROGRAM made."
+  (dolist (s (list (uiop::process-info-input p) (uiop::process-info-output p)
+                   (uiop::process-info-error-output p)))
+    (when s (ignore-errors (close s)))))
 
 (defun uiop::wait-process (p)
   (or (%pinfo-code p)
@@ -515,6 +550,211 @@
                               (namestring d) (- r))))))
           (walk d)
           d))))                           ; UIOP returns the directory
+
+;;; =====================================================================
+;;; 2c.  The rest of the UIOP the org's code calls
+;;;
+;;; A census (2026-11-27) of every uiop: name in the org's repos found 21 this
+;;; image lacked; cl-deposits' restart suite stopped on the first,
+;;; RENAME-FILE-OVERWRITING-TARGET.  test/run-uiop-gaps.sh checks each against
+;;; SBCL's real UIOP, line for line.
+;;; =====================================================================
+
+(defvar uiop::*compile-file-warnings-behaviour* :warn)
+(defvar uiop::*compile-file-failure-behaviour* :error) ; UIOP's value on SBCL
+(defvar uiop::*image-restore-hook* nil)
+
+(defun uiop::call-image-restore-hook ()
+  "Run *IMAGE-RESTORE-HOOK*'s functions in order.  A modus image restored from
+   a core does not call it by itself."
+  (dolist (f uiop::*image-restore-hook*) (funcall f))
+  nil)
+
+(defun uiop::command-line-arguments (&optional (arguments nil argp))
+  "The arguments after the program's own: SB-EXT:*POSIX-ARGV* without argv[0],
+   which is what UIOP answers on SBCL (`sbcl --script f a b' => (\"a\" \"b\"))."
+  (if argp
+      arguments
+      (cdr (symbol-value (find-symbol "*POSIX-ARGV*" "SB-EXT")))))
+
+(defun uiop::os-macosx-p () (and (member :darwin *features*) t))
+(defun uiop::os-unix-p () (and (or (member :unix *features*) (member :linux *features*)
+                                   (member :darwin *features*)) t))
+(defun uiop::os-windows-p () (and (or (member :win32 *features*) (member :windows *features*)) t))
+
+(defun %uiop-empty-component-p (x)
+  (or (null x) (eq x :unspecific) (and (stringp x) (zerop (length x)))))
+
+(defun uiop::directory-pathname-p (p)
+  "P (as a pathname) when it names a directory -- no name and no type -- else NIL."
+  (let ((pn (pathname p)))
+    (and (%uiop-empty-component-p (pathname-name pn))
+         (%uiop-empty-component-p (pathname-type pn))
+         pn)))
+
+(defun uiop::subpathp (maybe-subpath base)
+  "MAYBE-SUBPATH relative to directory BASE, when it is under BASE; else NIL."
+  (let ((s (namestring maybe-subpath))
+        (b (namestring (uiop::ensure-directory-pathname base))))
+    (and (uiop::string-prefix-p b s)
+         (pathname (subseq s (length b))))))
+
+(defun uiop::parse-unix-namestring (name &key ensure-directory type &allow-other-keys)
+  "NAME, a Unix namestring, as a pathname; a directory one when ENSURE-DIRECTORY,
+   with TYPE as its type when TYPE is given and NAME has none."
+  (cond ((null name) nil)
+        ((pathnamep name) name)
+        (ensure-directory (uiop::ensure-directory-pathname name))
+        (t (let ((p (pathname name)))
+             (if (and type (%uiop-empty-component-p (pathname-type p)))
+                 (make-pathname :type type :defaults p)
+                 p)))))
+
+(defun uiop::default-temporary-directory () (uiop::temporary-directory))
+
+(defun %uiop-join (dir more)
+  "DIR followed by the components MORE: every one but the last is a directory,
+   the last a file unless it ends in /, as UIOP's resolve-location reads them."
+  (let ((s (namestring (uiop::ensure-directory-pathname dir))))
+    (loop for (m . rest) on more
+          for ms = (if (pathnamep m) (namestring m) (asdf::%string-of m))
+          do (setq s (concatenate 'string s
+                                  (if rest (string-right-trim "/" ms) ms)
+                                  (if rest "/" ""))))
+    (pathname s)))
+
+(defun %uiop-env-dir (var fallback)
+  (let ((v (uiop::getenv var)))
+    (if (and v (plusp (length v)))
+        (uiop::ensure-directory-pathname v)
+        (merge-pathnames fallback (user-homedir-pathname)))))
+
+(defun uiop::xdg-cache-home (&rest more) (%uiop-join (%uiop-env-dir "XDG_CACHE_HOME" ".cache/") more))
+(defun uiop::xdg-config-home (&rest more) (%uiop-join (%uiop-env-dir "XDG_CONFIG_HOME" ".config/") more))
+
+(defun uiop::xdg-config-dirs (&rest more)
+  (let ((v (uiop::getenv "XDG_CONFIG_DIRS")))
+    (mapcar (lambda (d) (%uiop-join d more))
+            (if (and v (plusp (length v)))
+                (remove "" (uiop::split-string v :separator '(#\:)) :test #'equal)
+                (list "/etc/xdg/")))))
+
+(defun uiop::xdg-config-pathnames (&rest more)
+  "XDG-CONFIG-HOME then each of XDG-CONFIG-DIRS, each followed by MORE."
+  (cons (apply #'uiop::xdg-config-home more) (apply #'uiop::xdg-config-dirs more)))
+
+(defun uiop::slurp-stream-string (input &key stripped &allow-other-keys)
+  "Every remaining character of INPUT, as a string (whitespace-trimmed if STRIPPED)."
+  (let ((out (make-string-output-stream)))
+    (loop (let ((c (read-char input nil nil)))
+            (if c (write-char c out) (return nil))))
+    (let ((s (get-output-stream-string out)))
+      (if stripped (string-trim '(#\Space #\Tab #\Newline #\Return) s) s))))
+
+(defun uiop::copy-file (input output &key &allow-other-keys)
+  "Copy the bytes of file INPUT to file OUTPUT, replacing OUTPUT."
+  (with-open-file (in input :element-type '(unsigned-byte 8))
+    (with-open-file (out output :direction :output :element-type '(unsigned-byte 8)
+                                :if-exists :supersede :if-does-not-exist :create)
+      (let ((buf (make-array 65536 :element-type '(unsigned-byte 8))))
+        (loop (let ((n (read-sequence buf in)))
+                (when (zerop n) (return nil))
+                (write-sequence buf out :end n))))))
+  t)
+
+(defun uiop::rename-file-overwriting-target (source target)
+  "Rename SOURCE to TARGET, replacing TARGET if it exists (rename(2) does)."
+  (rename-file source target))
+
+(defun %uiop-strip-keys (keys drop)
+  (loop for (k v) on keys by #'cddr unless (member k drop) append (list k v)))
+
+(defun uiop::call-with-output-file (pathname thunk &rest keys
+                                    &key (if-exists :error) (if-does-not-exist :create)
+                                    &allow-other-keys)
+  (with-open-stream (s (apply #'open pathname :direction :output
+                              :if-exists if-exists :if-does-not-exist if-does-not-exist
+                              (%uiop-strip-keys keys '(:if-exists :if-does-not-exist :direction))))
+    (funcall thunk s)))
+
+(defmacro uiop::with-output-file ((var pathname &rest keys) &body body)
+  "Open PATHNAME for output (by default :IF-EXISTS :ERROR, as UIOP's) as VAR."
+  `(uiop::call-with-output-file ,pathname (lambda (,var) ,@body) ,@keys))
+
+(defun uiop::call-with-temporary-file (thunk &key want-stream-p directory prefix suffix
+                                                 (type "tmp") keep (element-type 'character)
+                                       &allow-other-keys)
+  "Make a fresh file in DIRECTORY (default the temporary directory) and call THUNK
+   with (STREAM PATHNAME) -- STREAM open for output when WANT-STREAM-P, else NIL.
+   The file is deleted afterwards, even on a non-local exit, unless KEEP."
+  (let* ((dir (uiop::ensure-directory-pathname (or directory (uiop::temporary-directory))))
+         (path (loop for p = (merge-pathnames
+                              (make-pathname :name (format nil "~A~36R~36R~@[~A~]"
+                                                           (or prefix "tmp") (random 1000000000)
+                                                           (get-universal-time) suffix)
+                                             :type type)
+                              dir)
+                     unless (probe-file p) return p)))
+    (unwind-protect
+         (let ((stream (open path :direction :output :if-exists :supersede
+                                  :if-does-not-exist :create :element-type element-type)))
+           (if want-stream-p
+               (unwind-protect (funcall thunk stream path) (close stream))
+               (progn (close stream) (funcall thunk nil path))))
+      (unless keep (when (probe-file path) (delete-file path))))))
+
+(defmacro uiop::with-temporary-file ((&key (stream nil streamp) (pathname nil)
+                                           directory prefix suffix (type "tmp") keep
+                                           (element-type ''character) &allow-other-keys)
+                                     &body body)
+  (let ((s (or stream (gensym "STREAM"))) (p (or pathname (gensym "PATHNAME"))))
+    `(uiop::call-with-temporary-file
+      (lambda (,s ,p) (declare (ignorable ,s ,p)) ,@body)
+      :want-stream-p ,streamp :directory ,directory :prefix ,prefix :suffix ,suffix
+      :type ,type :keep ,keep :element-type ,element-type)))
+
+(defun uiop::call-with-current-directory (dir thunk)
+  "Call THUNK with the process in directory DIR (and *DEFAULT-PATHNAME-DEFAULTS*
+   bound to it), then go back."
+  (if (null dir)
+      (funcall thunk)
+      (let ((here (uiop::getcwd))
+            (d (uiop::ensure-directory-pathname dir)))
+        (uiop::chdir d)
+        (unwind-protect
+             (let ((*default-pathname-defaults* d)) (funcall thunk))
+          (uiop::chdir here)))))
+
+(defmacro uiop::with-current-directory ((&optional dir) &body body)
+  `(uiop::call-with-current-directory ,dir (lambda () ,@body)))
+
+(defun %uiop-reexport (name from)
+  "Export from package NAME every external symbol of the packages FROM."
+  (let ((to (find-package name)))
+    (dolist (f from)
+      (do-external-symbols (sym (find-package f))
+        (let ((here (find-symbol (symbol-name sym) to)))
+          (unless (eq here sym) (shadowing-import sym to))
+          (export sym to))))))
+
+(defmacro uiop::define-package (name &rest options)
+  "UIOP's DEFINE-PACKAGE as DEFPACKAGE: :MIX is :USE (without UIOP's conflict
+   resolution), :REEXPORT / :USE-REEXPORT / :MIX-REEXPORT also export the named
+   packages' external symbols, :RECYCLE and :UNINTERN are ignored."
+  (let ((use nil) (reexport nil) (std nil) (saw-use nil))
+    (dolist (o options)
+      (case (car o)
+        ((:use) (setq saw-use t use (append use (cdr o))))
+        ((:mix) (setq saw-use t use (append use (cdr o))))
+        ((:reexport) (setq reexport (append reexport (cdr o))))
+        ((:use-reexport :mix-reexport)
+         (setq saw-use t use (append use (cdr o)) reexport (append reexport (cdr o))))
+        ((:recycle :unintern) nil)
+        (t (push o std))))
+    `(eval-when (:compile-toplevel :load-toplevel :execute)
+       (defpackage ,name ,@(when saw-use `((:use ,@use))) ,@(reverse std))
+       ,@(when reexport `((%uiop-reexport ',name ',reexport)))
+       (find-package ',name))))
 
 (defun asdf::%string-of (x)
   "A string designator (string / symbol / character) as a STRING.  Written

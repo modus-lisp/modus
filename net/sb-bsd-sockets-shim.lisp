@@ -46,12 +46,15 @@
 
 (defun %sock-signal (r)
   "Turn a negative -errno into the condition SBCL would signal.  ECONNREFUSED
-   is 111, EADDRINUSE 98, EINTR 4; everything else is the base SOCKET-ERROR
+   is 111, EADDRINUSE 98, EINTR 4, EINPROGRESS 115; everything else is the base SOCKET-ERROR
    carrying its number, which is better than inventing a class for it."
   (let ((e (- 0 r)))
     (cond ((= e 111) (error 'sb-bsd-sockets:connection-refused-error :errno e))
           ((= e 98)  (error 'sb-bsd-sockets:address-in-use-error :errno e))
           ((= e 4)   (error 'sb-bsd-sockets:interrupted-error :errno e))
+          ;; a non-blocking connect still under way: SBCL's OPERATION-IN-PROGRESS,
+          ;; which a timed connect waits out with WAIT-UNTIL-FD-USABLE :OUTPUT
+          ((= e 115) (error 'sb-bsd-sockets:operation-in-progress :errno e))
           (t (error 'sb-bsd-sockets:socket-error :errno e)))))
 
 (defclass sb-bsd-sockets:socket ()

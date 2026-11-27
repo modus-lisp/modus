@@ -8,6 +8,8 @@
 ;;;;   5 a non-blocking SOCKET-SEND on a full socket: NIL (modus: SOCKET-ERROR)
 ;;;;   6 CL_SOURCE_REGISTRY read on first use (modus: only after INITIALIZE-SOURCE-REGISTRY);
 ;;;;     SYSTEM-SOURCE-DIRECTORY a pathname (modus: a string)
+;;;;   7 a non-blocking SOCKET-CONNECT under way is OPERATION-IN-PROGRESS (modus: SOCKET-ERROR
+;;;;     errno 115), so a connect bounded by WAIT-UNTIL-FD-USABLE :OUTPUT works
 (require :asdf) (require :sb-bsd-sockets)
 (defvar *m* (sb-thread:make-mutex :name "held"))
 (defvar *r* :unset)
@@ -50,3 +52,23 @@
           (and dir (equal (namestring (asdf:system-source-directory "sr-probe"))
                           (concatenate 'string dir "sr-probe/"))))
   (format t "6 system-source-directory is a pathname: ~s~%" (pathnamep (asdf:system-source-directory "sr-probe"))))
+(defun timed-connect (address port timeout)
+  "cl-transport's timed connect: non-blocking connect, wait for writable, peername."
+  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (setf (sb-bsd-sockets:non-blocking-mode s) t)
+    (let ((started (handler-case (progn (sb-bsd-sockets:socket-connect s address port) :at-once)
+                     (sb-bsd-sockets:operation-in-progress () :in-progress)
+                     (error (e) (list :signalled (type-of e))))))
+      (prog1 (list started
+                   (and (sb-sys:wait-until-fd-usable (sb-bsd-sockets:socket-file-descriptor s)
+                                                     :output timeout)
+                        (handler-case (progn (sb-bsd-sockets:socket-peername s) :connected)
+                          (error () :failed))))
+        (sb-bsd-sockets:socket-close s)))))
+;; 10.255.255.1 is unroutable: the SYN goes unanswered (cl-transport's own test target)
+(format t "7 timed connect to an unroutable host: ~s~%" (timed-connect #(10 255 255 1) 9 1))
+(let ((l (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+  (sb-bsd-sockets:socket-bind l #(127 0 0 1) 0) (sb-bsd-sockets:socket-listen l 4)
+  (format t "7 timed connect to a listener: ~s~%"
+          (second (timed-connect #(127 0 0 1) (nth-value 1 (sb-bsd-sockets:socket-name l)) 5)))
+  (sb-bsd-sockets:socket-close l))

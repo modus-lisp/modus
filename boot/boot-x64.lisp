@@ -651,6 +651,52 @@
   (mvm-emit-u16 buf port)
   (mvm-emit-byte buf #xEE))                                 ; out dx, al
 
+;;; THE STACK GUARD (*X64-STACK-GUARD*: the UEFI big-heap layout).  The stack grows down from its
+;;; top toward the collector's metadata with nothing between: a runaway recursion (measured: an
+;;; error whose signalling read a special whose lookup signalled again, 650,000 frames) wrote 129 MB
+;;; down through the kind bitmap and into the heap, and what failed next was anywhere.  So the
+;;; 2 MB page below the stack's last 32 MB is unmapped, and the faults that can hit it -- #PF, and
+;;; #GP / #DF behind it -- run on IST1, a stack of their own below the guard; the recovery
+;;; handler then longjmps to the innermost handler-case as for any fault.  The UEFI stub's page
+;;; tables (2 MB pages, PD0 at +x64-page-tables-addr+ + 0x2000) and GDT (0x600) are the ones live
+;;; here; the TSS goes at 0x700 and a new GDT with its descriptor at 0x640.
+(defvar *x64-stack-guard* nil)
+(defun x64-stack-guard-base () (- (x64-effective-stack-top) #x2200000))   ; 2 MB under the last 32 MB
+
+(defun emit-x64-stack-guard (buf)
+  (let* ((guard (x64-stack-guard-base))
+         (ist-top guard)                                       ; IST1 grows down from the guard
+         (bm-end (+ (x64-mcgc-bitmap-base)
+                    (let ((sym (find-symbol "*MCGC-KINDBITMAP-DELTA*" "MODUS.MVM.X64")))
+                      (if (and sym (boundp sym)) (symbol-value sym) #xFE4000))
+                    (ash (- (x64-mcgc-data-end) +x64-mcgc-data-base+) -7)))
+         (pde (+ +x64-page-tables-addr+ #x2000 (* 8 (ash guard -21)))))
+    (unless (< (+ bm-end #x200000) ist-top)
+      (error "x64 stack guard: the IST stack below ~X would run into the GC metadata ending ~X" ist-top bm-end))
+    (flet ((b (&rest xs) (dolist (x xs) (mvm-emit-byte buf x)))
+           (abs32 (a) (mvm-emit-u32 buf a))
+           (q (addr val)                                       ; mov rax, val ; mov [addr], rax
+             (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
+             (mvm-emit-u32 buf (logand val #xFFFFFFFF)) (mvm-emit-u32 buf (ash val -32))
+             (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x04) (mvm-emit-byte buf #x25)
+             (mvm-emit-u32 buf addr)))
+      ;; the TSS: 104 bytes at 0x700, IST1 at +0x24, no I/O bitmap
+      (b #x48 #xBF) (abs32 #x700) (abs32 0)                   ; mov rdi, 0x700
+      (b #xB9) (abs32 13) (b #x31 #xC0) (b #xF3 #x48 #xAB)    ; 13 qwords of zero
+      (q #x724 ist-top)
+      (b #x66 #xC7 #x04 #x25) (abs32 #x766) (mvm-emit-u16 buf 104)
+      ;; the GDT at 0x640: null, the stub's 32- and 64-bit code (0x08, 0x10), the TSS (0x18)
+      (q #x640 0) (q #x648 #x00CF9A000000FFFF) (q #x650 #x00AF9A000000FFFF)
+      (q #x658 (logior 103 (ash #x700 16) (ash #x89 40)))     ; base 0x700, limit 103, 64-bit TSS
+      (q #x660 0)
+      (b #x66 #xC7 #x04 #x25) (abs32 #x670) (mvm-emit-u16 buf 39)
+      (q #x672 #x640)
+      (b #x0F #x01 #x14 #x25) (abs32 #x670)                   ; lgdt [0x670]
+      (b #x66 #xB8) (mvm-emit-u16 buf #x18) (b #x0F #x00 #xD8) ; ltr 0x18
+      ;; the guard: its page-directory entry not present, the TLB flushed
+      (b #x48 #xC7 #x04 #x25) (abs32 pde) (abs32 0)           ; mov qword [pde], 0
+      (b #x0F #x20 #xD8 #x0F #x22 #xD8))))                    ; mov rax, cr3 ; mov cr3, rax
+
 (defun emit-x64-interrupt-setup (buf)
   "Set up PIC remap, PIT timer (~100Hz), and minimal IDT for HLT-based io-delay.
    After this, STI + HLT will sleep until the next PIT timer tick (~10ms)."
@@ -1148,10 +1194,13 @@
       ;; SSE-before-OSFXSR historically, or garbage-byte execution) took a
       ;; #UD -> #GP(IDT-miss) double-hop through the recovery path.
       ;; Same encoding pattern as vector 0x20 above.
-      (dolist (vec '(6 13 14))
+      (dolist (vec (if *x64-stack-guard* '(6 8 13 14) '(6 13 14)))
         (let* ((eoff (* vec 16))
                (eaddr (+ idt-base eoff))
                (target (if (= vec 6) (+ sigsegv-isr-addr 4) sigsegv-isr-addr))
+               ;; THE STACK GUARD: #DF, #GP and #PF run on IST1 (the TSS below), so a fault AT
+               ;; the guard -- a stack overflow -- has a stack to be handled on
+               (ist (if (and *x64-stack-guard* (member vec '(8 13 14))) 1 0))
                (off-lo (logand target #xFFFF))
                (off-mid (logand (ash target -16) #xFFFF))
                (off-hi (logand (ash target -32) #xFFFFFFFF)))
@@ -1164,7 +1213,7 @@
           (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
           ;; Word 1: type_attr + offset_mid
           (mvm-emit-byte buf #xB8)
-          (mvm-emit-u32 buf (logior (ash type-attr 8) (ash off-mid 16)))
+          (mvm-emit-u32 buf (logior ist (ash type-attr 8) (ash off-mid 16)))
           (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x04)
           ;; Word 2: offset_hi
           (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x08)
@@ -1172,6 +1221,8 @@
           ;; Word 3: reserved = 0
           (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x0C)
           (mvm-emit-u32 buf 0))))
+
+    (when *x64-stack-guard* (emit-x64-stack-guard buf))
 
     ;; === Load IDTR ===
     ;; IDTR format: [limit:16 | base:64] at a scratch location

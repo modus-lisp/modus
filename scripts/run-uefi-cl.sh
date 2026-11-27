@@ -20,9 +20,11 @@
 set -u
 EFI=${1:?usage: run-uefi-cl.sh IMAGE.efi [form ...]}; shift
 OVMF=${OVMF:-/usr/share/OVMF/OVMF_CODE_4M.fd}
-W=$(mktemp -d /tmp/modus-uefi-cl.XXXXXX)
+W=$(mktemp -d "${TMPDIR:-/tmp}/modus-uefi-cl.XXXXXX")
 IMG=$W/boot.img; VARS=$W/vars.fd; OUT=${OUT:-$W/serial.txt}
 SZ=$(( ( $(stat -c %s "$EFI") / 1048576 ) + 8 ))
+# FAT32 needs 65525 clusters or more (mformat -F: "Too few clusters"): at least ~33 MB of disk
+(( SZ < 40 )) && SZ=40
 dd if=/dev/zero of=$IMG bs=1M count=$SZ status=none
 mformat -i $IMG -F :: && mmd -i $IMG ::/EFI && mmd -i $IMG ::/EFI/BOOT && mcopy -i $IMG "$EFI" ::/EFI/BOOT/BOOTX64.EFI || exit 1
 cp /usr/share/OVMF/OVMF_VARS_4M.fd $VARS

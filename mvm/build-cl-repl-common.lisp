@@ -120,6 +120,18 @@
 ;; PE32+ wrapper, boot-uefi-x64's entry stub in front of boot-x64's kernel64
 ;; entry, optional SEV-SNP hooks (boot/boot-uefi-snp.lisp).  Set by the head.
 (defvar *cl-repl-uefi-p* nil)
+;; MODUS_X64_BIG_HEAP=1 (UEFI x64 only): a heap for big workloads -- a web browser's libraries
+;; and pages did not fit the standard layout (two 104 MB semispaces between 0x10000000 and
+;; 0x1E000000, the stack and the saved core at 0x20000000; loom's closure thrashed it, 321
+;; collections extracting one 13 MB tarball, and came back corrupt).  The heap runs to
+;; 0x2C000000 (two ~216 MB semispaces; its metadata above), the stack's top is 0x30000000 (just
+;; below the JIT arena), and \CORE.BIN loads at 0x38000000 (just above it).  The machine needs
+;; RAM to 0x38000000 + the core: ~1.1 GB.  The stack gets 32 MB and an unmapped guard page below
+;; it (boot-x64 EMIT-X64-STACK-GUARD).  Off, every image is byte-identical to before.
+(defvar *x64-big-heap-p*
+  (and *cl-repl-x64-p* *cl-repl-uefi-p*
+       (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_X64_BIG_HEAP"))) (and v (string= v "1")))))
+(defun %x64-core-addr () (if *x64-big-heap-p* #x38000000 #x20000000))
 ;; :I386 — the bare-metal 32-bit x86 QEMU-pc image (mvm/build-i386-cl-repl.lisp).
 ;; Same thin-head contract as :X64, and the same console: translate-i386's bare
 ;; path already emits COM1 port I/O for the serial traps (#x0300 write, #x0301
@@ -1168,7 +1180,7 @@
       (concatenate 'string "
 (defun %cli-getenv (name) nil)
 " *cl-repl-rpi-core-source* "
-(defun %core-addr () #x20000000)
+" (format nil "(defun %core-addr () #x~X)" (%x64-core-addr)) "
 ;; The Pi's restore diagnostics do not apply here: its skip window is timed by
 ;; the BCM2835 system timer at #x3F003004, which on x86 never advances (the
 ;; wait never ends, and only a byte on serial -- which SKIPS the restore --
@@ -1199,6 +1211,13 @@
           (write-string-serial \" of 64 pages above the core)\")
           (write-char-serial 10)
           nil))))
+;; AN ALLOCATION THAT DOES NOT FIT AFTER A FULL COLLECTION.  The sized checks call this
+;; (translate-x64, %X64-BARE-EXHAUSTED-TARGET); before it they went ahead and ran past the limit
+;; into memory the next collection copies over -- measured: extracting a 13 MB tarball on the 104
+;; MB-semispace desk came back as a truncated, corrupt list.  An ERROR, not a STORAGE-CONDITION:
+;; a desk window's or a command's (error (e) ...) handler takes it, which is the point.
+(defun %heap-exhausted ()
+  (error \"heap exhausted: an allocation does not fit after a full collection\"))
 ;; THE GEOMETRY, READ EXACTLY.  boot-x64's stub stores the GC control block and
 ;; the MCGC config words RAW (as hosted x64's does), so lib/save-image.lisp's
 ;; mem-ref :u64 defaults HALVE them: a core saved with them claimed its heap
@@ -4684,7 +4703,18 @@
 ;;; on, and the native-code offset is measured from the boot preamble the
 ;;; descriptor emits (multiboot header + 32-bit boot + 64-bit entry).
 (when cl-user::*cl-repl-x64-p*
-  (setf modus.mvm::*x64-stack-top-override* #x20000000)
+  (setf modus.mvm::*x64-stack-top-override* (if cl-user::*x64-big-heap-p* #x30000000 #x20000000))
+  ;; MODUS_X64_GC_POISON=1: a debugging build whose collector poisons each evacuated semispace
+  (when (equal (sb-ext:posix-getenv "MODUS_X64_GC_POISON") "1")
+    (setf modus.mvm.x64::*x64-gc-poison* t)
+    (format t "~&;; GC POISON: evacuated semispaces are filled with #xDEADDEADDEADDE01~%"))
+  (when cl-user::*x64-big-heap-p*
+    (setf modus.mvm::*x64-heap-end-override* #x2C000000
+          modus.mvm::*uefi-core-addr* (cl-user::%x64-core-addr)
+          ;; and a guard under the stack's last 32 MB, its faults on a stack of their own
+          ;; (boot-x64 EMIT-X64-STACK-GUARD)
+          modus.mvm::*x64-stack-guard* t)
+    (format t "~&;; BIG HEAP: heap to 2C000000, stack top 30000000, core at ~X~%" (cl-user::%x64-core-addr)))
   (setf modus.mvm::*x64-nx-data-enable* t)
   (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
   (setf modus.mvm.x64::*x64-linux-mode* nil)

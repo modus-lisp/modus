@@ -547,7 +547,10 @@
 
 (defconstant +efi-bs-allocate-pages+   #x28)
 (defconstant +efi-bs-handle-protocol+  #x98)
-(defconstant +uefi-core-addr+ #x20000000)
+;; Where \CORE.BIN goes: 0x20000000 above the standard heap (0x10000000..0x1E000000).  A build
+;; with a larger heap (*X64-HEAP-END-OVERRIDE*, MODUS_X64_BIG_HEAP) moves it above the JIT
+;; arena; %CORE-ADDR in the image says the same address (build-cl-repl-common).
+(defvar *uefi-core-addr* #x20000000)
 ;; {5B1B31A1-9562-11D2-8E3F-00A0C969723B}, {964E5B22-6459-11D2-8E39-00A0C969723B}
 (defconstant +loaded-image-guid-qw0+ #x11D295625B1B31A1)
 (defconstant +loaded-image-guid-qw1+ #x3B7269C9A0003F8E)
@@ -693,7 +696,7 @@
           (mvm-emit-byte buf #x49) (mvm-emit-byte buf #xC1) (mvm-emit-byte buf #xE8)
           (mvm-emit-byte buf 12)                                   ; shr r8, 12
           (uefi-emit-mov-mem-reg buf +rsp+ pages +r8+)
-          (uefi-emit-mov-reg-imm64 buf +rax+ +uefi-core-addr+)
+          (uefi-emit-mov-reg-imm64 buf +rax+ *uefi-core-addr*)
           (uefi-emit-mov-mem-reg buf +rsp+ mem +rax+)
           (uefi-emit-mov-reg-imm64 buf +rcx+ 2)
           (uefi-emit-mov-reg-imm64 buf +rdx+ 2)
@@ -767,7 +770,7 @@
     (b #x48 #x85 #xF6)                                        ; test rsi, rsi
     (b #x0F #x84)                                             ; jz done
     (let ((to-done (rel32-here)) (to-fwd1 nil) (to-fwd2 nil) (to-done2 nil))
-      (uefi-emit-mov-reg-imm64 buf +rdi+ +uefi-core-addr+)    ; rdi = 0x20000000
+      (uefi-emit-mov-reg-imm64 buf +rdi+ *uefi-core-addr*)    ; rdi = where the core goes
       (b #x48 #x8B #x0C #x25) (mvm-emit-u32 buf #x1B0F0)      ; mov rcx, [#x1B0F0]
       (b #x48 #x39 #xFE)                                      ; cmp rsi, rdi
       (b #x0F #x83) (setq to-fwd1 (rel32-here))               ; jae forward
@@ -792,7 +795,7 @@
 ;;; not run a core.  Each of the arena's 64 page-directory entries maps 2 MB on its own, so the
 ;;; RAM behind them need not be one block: before ExitBootServices the stub claims 2 MB pages
 ;;; one at a time (AllocatePages, AllocateAddress), from just below 4 GB down to the end of the
-;;; core (0x20000000 + its size; the image, heap and stack are below that), and once the
+;;; core (*UEFI-CORE-ADDR* + its size; the image, heap and stack are below that), and once the
 ;;; identity map is built points the arena's entries at them in order.  Every address a
 ;;; translator, core or table holds stays the same.  Two exclusions:
 ;;; - no page from physical [#x30000000, #x38000000): an arena entry left identity-mapped (too
@@ -826,9 +829,9 @@
     (uefi-emit-mov-reg-imm64 buf +rax+ #xFFE00000)
     (uefi-emit-mov-mem-reg buf +rsp+ 40 +rax+)
     (b #x31 #xC0) (uefi-emit-mov-mem-reg buf +rsp+ 48 +rax+)
-    ;; floor = 0x20000000 + the core's size (the record's), rounded up to 2 MB
+    ;; floor = the core's address + its size (the record's), rounded up to 2 MB
     (b #x48 #x8B #x05) (mvm-emit-u32 buf (ldb (byte 32 0) (uefi-rec-disp buf #x1B0F0 4)))
-    (b #x48 #x05) (mvm-emit-u32 buf (+ #x20000000 #x1FFFFF))   ; add rax, imm32
+    (b #x48 #x05) (mvm-emit-u32 buf (+ *uefi-core-addr* #x1FFFFF))   ; add rax, imm32
     (b #x48 #x25) (mvm-emit-u32 buf #xFFE00000)                ; and rax, -2 MB
     (uefi-emit-mov-mem-reg buf +rsp+ 56 +rax+)
     (let ((top (mvm-buffer-position buf)) (to-done1 nil) (to-done2 nil) (to-next nil) (to-next2 nil))
@@ -1621,7 +1624,7 @@
   ;; R12 = alloc pointer
   (uefi-emit-mov-reg-imm64 buf +r12+ #x10000000)
   ;; R14 = alloc limit
-  (uefi-emit-mov-reg-imm64 buf +r14+ #x1E000000)
+  (uefi-emit-mov-reg-imm64 buf +r14+ (x64-heap-end))
   ;; RBP = RSP
   (uefi-emit-mov-reg-reg buf +rbp+ +rsp+)
 

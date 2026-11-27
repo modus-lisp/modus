@@ -18,7 +18,7 @@ core boots from the ESP as \\CORE.BIN: boot/boot-uefi-x64.lisp's stub reads it b
 """
 import json, os, re, select, shutil, socket, subprocess, sys, tempfile, time
 
-BASE = 0x20000000
+BASE = int(os.environ.get("CORE_BASE", "0x20000000"), 0)   # %CORE-ADDR: 0x38000000 with MODUS_X64_BIG_HEAP=1
 
 
 def main():

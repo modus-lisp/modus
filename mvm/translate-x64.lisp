@@ -29,6 +29,20 @@
 ;;; earlier.  Declare them special up front to avoid forward-reference warnings.
 (declaim (special *x64-genadd-label* *x64-genmul-label* *x64-gensub-label*))
 
+(defvar *x64-gc-poison* nil
+  "Debugging builds (MODUS_X64_GC_POISON=1): the collector fills each semispace it has just
+   evacuated with a faulting pattern (EMIT-GC-TRAMPOLINE).")
+
+(defun %x64-bare-exhausted-target (function-table)
+  "Bare metal: where the sized allocation checks' exhausted routine calls -- (:OFFSET . bytecode
+   offset) of %HEAP-EXHAUSTED in this unit's FUNCTION-TABLE (the image), (:ENTRY . address) of the
+   image's for a runtime-JIT page, or NIL when there is none (the image does not define it)."
+  (let ((e (find "%HEAP-EXHAUSTED" function-table :key #'first :test #'string-equal)))
+    (cond (e (cons :offset (second e)))
+          (*x64-jit-mode*
+           (let ((a (%x64-jit-genarith-entry "%HEAP-EXHAUSTED"))) (and a (cons :entry a))))
+          (t nil))))
+
 (defun %x64-jit-genarith-entry (name)
   "JIT-mode fallback target for a checked-arith overflow slow path.  Resolve a
    main-image runtime helper (GENERIC-ADD / GENERIC-SUBTRACT / GENERIC-MULTIPLY)
@@ -10913,6 +10927,18 @@
         (emit-label buf capped)
         (emit-sub-reg-reg buf 'rax 'r11)))
     (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
+    ;; POISON THE EVACUATED SEMISPACE (MODUS_X64_GC_POISON=1, a debugging build): everything
+    ;; live was copied out, so nothing may point into [old from_start, +space_size) now.  Fill
+    ;; it with a non-canonical address carrying a cons tag, and a stale pointer faults where
+    ;; it is first followed instead of reading what the next allocations put there -- how the
+    ;; arm32, 68k and PowerPC collector defects were found.  RAX/RCX/RDI were pushed at entry.
+    (when *x64-gc-poison*
+      (emit-bytes buf #xFC)                      ; cld
+      (emit-mov-reg-reg buf 'rdi 'rbx)           ; rdi = old from_start
+      (emit-mov-reg-mem buf 'rcx 'rsi modus.mvm::+gc-off-space-size+)
+      (emit-shr-reg-imm buf 'rcx 3)              ; qwords
+      (emit-mov-reg-imm buf 'rax #xDEADDEADDEADDE01)
+      (emit-bytes buf #xF3 #x48 #xAB))           ; rep stosq
     ;; HEAP EXHAUSTED.  When the survivors alone reach the new limit, the next
     ;; :gc-check collects again, copies the same live set back, and so on
     ;; forever: one core at 100%, memory flat, no output -- what a cl-bench
@@ -12508,8 +12534,13 @@
          (fn-entry-labels (when call-pad (make-array n-functions)))
          ;; GC trampoline label (pre-allocated so all translate-states can use it)
          (gc-trampoline-label (when *x64-gc-enabled* (make-label)))
-         ;; the sized checks' heap-exhausted routine (hosted only: it writes to stderr)
-         (exhausted-label (when (and *x64-gc-enabled* *x64-linux-mode*) (make-label)))
+         ;; the sized checks' heap-exhausted routine: hosted, a message on stderr and exit; bare
+         ;; metal, a call to the image's %HEAP-EXHAUSTED (an ERROR the caller can handle), when
+         ;; the image has one -- without it, as before, no routine and no re-test
+         (bare-exhausted (and *x64-gc-enabled* (not *x64-linux-mode*)
+                              (%x64-bare-exhausted-target function-table)))
+         (exhausted-label (when (and *x64-gc-enabled* (or *x64-linux-mode* bare-exhausted))
+                            (make-label)))
          ;; MCGC stage-4 page-collector trampoline label (only when pinning on).
          ;; Stashed in *mcgc-page-gc-label* so gc-check / ensure-room sites can
          ;; reach it during instruction translation below.
@@ -12726,8 +12757,22 @@
       ;; HEAP EXHAUSTED: the sized checks' routine (translate-state-exhausted-label).
       (when exhausted-label
         (emit-label buf exhausted-label)
-        (emit-fatal-message buf (format nil "~%Modus: heap exhausted -- an allocation does not fit after a full collection (raise --dynamic-space-size)~%")
-                            137))
+        (if *x64-linux-mode*
+            (emit-fatal-message buf (format nil "~%Modus: heap exhausted -- an allocation does not fit after a full collection (raise --dynamic-space-size)~%")
+                                137)
+            ;; BARE METAL: signal it.  The routine never returns (the handler that takes the
+            ;; error unwinds by longjmp), so the stack is only aligned, not kept.
+            (let ((target (if (eq (car bare-exhausted) :offset)
+                              (gethash (cdr bare-exhausted) fn-offset-to-label)
+                              nil)))
+              (emit-bytes buf #x48 #x83 #xE4 #xF0)              ; and rsp, -16
+              (emit-tls-prefix buf)                              ; nargs is per-thread
+              (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x00 #x00 #x00 #x00) ; [nargs]=0
+              (if target
+                  (emit-call buf target)
+                  (progn (emit-mov-reg-imm buf 'rax (cdr bare-exhausted))
+                         (emit-call-reg buf 'rax)))
+              (emit-bytes buf #x0F #x0B))))                      ; ud2: it did return
       ;; Emit the shared cons-kind-bit setter (CALLed from cons alloc sites).
       (when cons-bit-label
         (emit-mcgc-cons-bit-subroutine buf cons-bit-label))

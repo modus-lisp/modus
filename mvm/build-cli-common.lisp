@@ -736,16 +736,35 @@
 ")
    ;; Bare-metal x64: the runtime JIT must mirror the BARE baked code, not the
    ;; hosted-Linux defaults set above.  linux-mode is nil (R14 holds the absolute
-   ;; bare alloc limit, not an mmap-relative offset), and the cons-kind scan_word
-   ;; reject stays OFF -- +mcgc-kindbitmap-delta+ is a Linux layout constant that
-   ;; addresses a wrong, uninitialised region on bare, so a JIT'd reject would
-   ;; drop live objects across a collection (see build-cl-repl-common's build-time
-   ;; *ws5-force-no-kindcheck*; without this the JIT re-enabled it at runtime and
-   ;; the alexandria install corrupted).
+   ;; bare alloc limit, not an mmap-relative offset).
+   ;;
+   ;; THE CONS-KIND REJECT FOLLOWS THE IMAGE'S (build-cl-repl-common, MODUS_X64_KINDCHECK):
+   ;; ON.  It used to be forced OFF here, because the kind bitmap's offset was then a
+   ;; Linux layout constant that addressed the wrong region on bare.  The check now
+   ;; reads the offset at run time from the word bare x64 stores
+   ;; (EMIT-X64-ADD-KIND-DELTA, #x10000F98), so the reason is gone -- and the JIT
+   ;; page's collector (the copy every collection a JIT page's gc-check starts runs)
+   ;; went without the guard the image's has: a stack word holding an object's base
+   ;; with a cons tag was copied AS A CONS, 16 bytes and a forwarding word over the
+   ;; object's header.  Measured on the T420 desk installing loom's libraries: the
+   ;; globals table wrecked mid-load, every run, always by a collection started from
+   ;; a JIT page (a QEMU watchpoint on the table caught the JIT arena's copy writing
+   ;; the forwarding word).
    (if *cli-bare-metal*
        "  (setq *x64-linux-mode* nil)
-  (setq *ws5-force-no-kindcheck* t)
-  (setq *x64-gc-region-percpu* nil)
+"
+       "")
+   (if *cli-bare-metal*
+       (format nil "  (setq *ws5-force-no-kindcheck* ~a)~%~a"
+               (if (equal (sb-ext:posix-getenv "MODUS_X64_KINDCHECK") "0") "t" "nil")
+               ;; and a poisoning build's JIT collector poisons too (translate-x64 *X64-GC-POISON*)
+               (if (equal (sb-ext:posix-getenv "MODUS_X64_GC_POISON") "1")
+                   "  (setq modus.mvm.x64::*x64-gc-poison* t)
+"
+                   ""))
+       "")
+   (if *cli-bare-metal*
+       "  (setq *x64-gc-region-percpu* nil)
   (setq *x64-sched-lock-addr* nil)
   (setq *x64-stw* nil)
   (setq *park-safepoints* nil)

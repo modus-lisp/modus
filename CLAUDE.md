@@ -3387,8 +3387,26 @@ THREAD'S BINDING STACK has the design; the shape:
 `test/run-thread-bindings.sh` holds it against SBCL line for line.  Cost on
 the x64 CLI: a single-threaded LET of 3 specials +30% (the log), reads
 unchanged; after a thread has run main's LET is ~2x what it was (a worker's is
-~7x); image +0.8 MB.  **Not ported to aarch64** (its window block covers
-`#x10010000`; it needs its own fixed block, root scans and init).
+~7x); image +0.8 MB.
+
+**Hosted AArch64 too (2026-11-27)**, with its own block at `#x10020000`
+(`#x10010000` is AArch64 main's handler-frame stack).  The block is a LAYOUT
+key, `:MAIN-DYNB` (hosted-layout-env.lisp `ENABLE-LAYOUT-THREADS`, only where
+the region is not moved: no conv delta, not PC-relative, not Darwin -- those
+keep main's shallow binding), so every literal of it is
+`(%LAYOUT :MAIN-DYNB #x10010000 OFF)` in runtime source (`%LAYOUT` takes a
+literal offset now) and `%MAIN-DYNB-BASE` in the compiler; x86-64 compiles the
+same addresses.  The image's compiler learns the key right after
+init-all-globals (`*CLI-EARLY-LAYOUT-SOURCE*`), BEFORE the JIT co-init sets the
+whole layout: a LET compiled at runtime inlines the log push at that address.
+Roots: `EMIT-AARCH64-DYNBIND-ROOT-SCAN` (delta 0 = main: the block #x10000D60
+names) and `EMIT-AARCH64-WINDOW-ROOT-SCAN` (another thread's window that is
+the low block).  `test/main-dynb-gc.lisp` churns region 0 under main's
+bindings in both modes: with the AArch64 scan left out its deep section dies
+4 of 4.  `run-thread-bindings.sh WRAPPER` passes on the aarch64 CLI (it drops
+that CLI's pre-existing `WARNING: undefined function: %...` stderr lines).
+Cost under qemu-aarch64 (TCG; relative only): single-threaded 3-special LET
++10%, after a thread +25%, reads unchanged, a worker's LET unchanged.
 
 ### MODUS:MAKE-CHANNEL — messages between threads that cost the shared heap nothing (2026-10-14)
 

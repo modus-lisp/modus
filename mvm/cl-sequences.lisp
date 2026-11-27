@@ -2482,7 +2482,29 @@
            (%float-mul n (%float-div (%float-from-int next) 1073741824d0)))
           ((floatp-impl n)
            (* n (/ (float next) 1073741824.0)))
-          (t (- next (* (truncate next n) n)))))))
+          ((<= n #x40000000) (- next (* (truncate next n) n)))
+          ;; A LIMIT wider than the generator's 30 bits: one draw reduced
+          ;; modulo N never exceeded 2^30, so (random (expt 2 64)) had 30
+          ;; bits.  Chain draws until there are 30 bits more than N has, then
+          ;; reduce: every value below N is reachable and the modulo bias is
+          ;; below 2^-30.
+          (t (%random-wide n next cell))))))
+
+(defun %random-wide (n first cell)
+  "RANDOM's integer path for N above 2^30: draws continuing from FIRST (the draw
+   RANDOM already made, and the generator's state), concatenated until they cover
+   N's bits and 30 more, modulo N.  The state left behind is the last draw's, in
+   CELL (a RANDOM-STATE's) or the BSS seed word."
+  (let ((acc first) (seed first) (bits 30) (need (+ (integer-length n) 30)))
+    (loop
+      (when (>= bits need) (return nil))
+      (setq seed (logand (+ (* seed 1664525) 1013904223) #x3FFFFFFF))
+      (setq acc (+ (* acc #x40000000) seed))
+      (setq bits (+ bits 30)))
+    (if cell
+        (rplaca cell seed)
+        (setf (mem-ref #x10000FD8 :u32) seed))
+    (mod acc n)))
 (defun do-special-strings (fn) (funcall fn ""))
 
 ;;; String functions

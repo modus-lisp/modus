@@ -246,11 +246,21 @@
 (defun sb-bsd-sockets:socket-name (socket) (%sock-getname socket 51))
 (defun sb-bsd-sockets:socket-peername (socket) (%sock-getname socket 52))
 
-(defun sb-bsd-sockets:socket-send (socket buffer length &key address external-format)
+(defun sb-bsd-sockets:socket-send (socket buffer length &key address external-format dontwait)
   "Write LENGTH bytes (all of BUFFER when NIL) of the (unsigned-byte 8) vector
-   BUFFER; returns the count written.  ADDRESS, (host port), sends one datagram
-   there (sendto).  PARTIAL: EXTERNAL-FORMAT is not supported and must be NIL."
+   BUFFER; returns the count written -- or NIL, as SBCL, when the socket is non-blocking (or
+   DONTWAIT is true) and the send would block: nothing went out and nothing is wrong.  It used
+   to signal SOCKET-ERROR there, which a caller cannot tell from a broken connection.
+   DONTWAIT makes this one call non-blocking (O_NONBLOCK around it; SBCL passes MSG_DONTWAIT).
+   ADDRESS, (host port), sends one datagram there (sendto).  PARTIAL: EXTERNAL-FORMAT is not
+   supported and must be NIL."
   external-format
+  (when (and dontwait (not (%sbs-nonblocking-of socket)))
+    (%sbs-set-nonblocking t socket)
+    (return-from sb-bsd-sockets:socket-send
+      (unwind-protect
+           (sb-bsd-sockets:socket-send socket buffer length :address address)
+        (%sbs-set-nonblocking nil socket))))
   (when address
     ;; a datagram to (host port): sendto(2), one datagram or none
     (let ((n (%sbs-sendto (%socket-fd socket) buffer (or length (length buffer))
@@ -258,9 +268,9 @@
       (when (< n 0) (error 'sb-bsd-sockets:socket-error :errno (- n)))
       (return-from sb-bsd-sockets:socket-send n)))
   (let ((n (socket-send (%socket-fd socket) buffer (or length (length buffer)))))
-    (if (< n 0)
-        (error 'sb-bsd-sockets:socket-error :errno (- n))
-        n)))
+    (cond ((= n -11) nil)                     ; EAGAIN: would block, nothing sent (SBCL: NIL)
+          ((< n 0) (error 'sb-bsd-sockets:socket-error :errno (- n)))
+          (t n))))
 
 ;;; NON-BLOCKING-MODE and its SETF, for a HOSTED image: O_NONBLOCK on the descriptor
 ;;; (net/hosted-sockets-post.lisp's fcntl helpers).  The gateway sets it on its glass

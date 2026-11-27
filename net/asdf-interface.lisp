@@ -766,10 +766,30 @@
           ((char= (char s (- (length s) 1)) #\/) s)
           (t (concatenate 'string s "/")))))
 
+(defvar asdf::*%source-registry-initialized* nil
+  "True once the source registry has been read -- by INITIALIZE-SOURCE-REGISTRY, or by the
+   first lookup, which reads it itself as SBCL's ASDF does.")
+
+(defun asdf::%ensure-source-registry ()
+  "Read the source registry (CL_SOURCE_REGISTRY) once, on first use.  SBCL's ASDF does this
+   lazily the first time it looks a system up; modus read it only when
+   INITIALIZE-SOURCE-REGISTRY was called, so CL_SOURCE_REGISTRY was silently ignored by any
+   script that did not call it."
+  ;; APPENDED, not pushed in front: in SBCL's ASDF *CENTRAL-REGISTRY* is searched before the
+  ;; source registry, so a script that sets it keeps its precedence over the environment.
+  ;; (An explicit INITIALIZE-SOURCE-REGISTRY still puts its directories first, as before.)
+  (unless asdf::*%source-registry-initialized*
+    (setq asdf::*%source-registry-initialized* t)
+    (let ((dirs (ignore-errors (asdf::%source-registry-dirs '(:source-registry :inherit-configuration)))))
+      (dolist (d dirs)
+        (unless (member d asdf::*central-registry* :test #'equal)
+          (setq asdf::*central-registry* (append asdf::*central-registry* (list d))))))))
+
 (defun asdf::%locate-asd (name)
   "Path of the .asd defining NAME, searching *CENTRAL-REGISTRY* in order,
    or NIL.  A secondary system \"foo/test\" lives in foo.asd, so the
    PRIMARY name is what is looked for."
+  (asdf::%ensure-source-registry)
   (let ((base (asdf::primary-system-name name)) (found nil))
     (dolist (d asdf::*central-registry*)
       (when (null found)
@@ -888,6 +908,7 @@
    directory SPEC names (see %SOURCE-REGISTRY-DIRS) goes to the FRONT of the
    registry, in order, so it wins over earlier entries.  With no SPEC, the
    CL_SOURCE_REGISTRY environment variable is read."
+  (setq asdf::*%source-registry-initialized* t)
   (let ((dirs (asdf::%source-registry-dirs (or spec '(:source-registry :inherit-configuration)))))
     (setq asdf::*central-registry*
           (append dirs (remove-if (lambda (x) (member x dirs :test #'equal))
@@ -966,16 +987,22 @@
    discarded the rest of the file."
   (asdf::%system-source-file (asdf::%as-system sys)))
 
-(defun asdf::system-source-directory (sys)
-  "ASDF:SYSTEM-SOURCE-DIRECTORY — the directory of SYS's .asd, with a
-   trailing \"/\".  NIL for an archive install, which has no on-disk .asd."
+(defun asdf::%system-source-dirstring (sys)
+  "The directory of SYS's .asd as a STRING with a trailing \"/\", or NIL for an archive
+   install -- what this file's own path arithmetic concatenates."
   (let ((f (asdf::system-source-file sys)))
     (and f (%it-dirname f))))
+
+(defun asdf::system-source-directory (sys)
+  "ASDF:SYSTEM-SOURCE-DIRECTORY — the directory of SYS's .asd, as a PATHNAME (ASDF's
+   contract; it was a string).  NIL for an archive install, which has no on-disk .asd."
+  (let ((d (asdf::%system-source-dirstring sys)))
+    (and d (pathname d))))
 
 (defun asdf::system-relative-pathname (sys name)
   "ASDF:SYSTEM-RELATIVE-PATHNAME — NAME resolved against SYS's source
    directory."
-  (let ((d (asdf::system-source-directory sys)))
+  (let ((d (asdf::%system-source-dirstring sys)))
     (when (null d)
       (error "ASDF:SYSTEM-RELATIVE-PATHNAME: system ~A has no source directory (it was installed from an archive)."
              (asdf::component-name sys)))
@@ -987,7 +1014,7 @@
 (defun asdf::%load-system-files (sys)
   "Load SYS's components, in dependency order, from its source directory."
   (let* ((form (asdf::%system-form sys))
-         (dir (asdf::system-source-directory sys)))
+         (dir (asdf::%system-source-dirstring sys)))
     (when (null dir)
       (error "ASDF:LOAD-SYSTEM: system ~A was installed from an archive and has no source directory to reload from."
              (asdf::component-name sys)))

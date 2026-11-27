@@ -365,13 +365,17 @@
 
 (defun sb-sys:wait-until-fd-usable (fd direction &optional timeout serve-events)
   "Wait until FD is ready for DIRECTION (:input or :output), at most TIMEOUT
-   seconds (NIL: no limit).  T when ready, NIL on timeout.  Input is poll(2);
-   output is reported ready at once (sockets here block on write instead).
+   seconds (NIL: no limit).  T when ready, NIL on timeout.  Both are poll(2): POLLIN, or
+   POLLOUT for :output.  (Output used to be answered T at once, so a caller asking whether a
+   full socket would take more, as non-blocking writers do, was told yes and then blocked.)
    SERVE-EVENTS is accepted and ignored -- there is no serve-event loop."
   serve-events
-  (if (eq direction :output)
-      t
-      (> (%sbs-poll-in fd (if timeout (max 0 (round (* timeout 1000))) -1)) 0)))
+  (let ((ms (if timeout (max 0 (round (* timeout 1000))) -1)))
+    (if (eq direction :output)
+        (if (fboundp '%sbs-wait-writable)
+            (> (funcall '%sbs-wait-writable fd ms) 0)
+            t)
+        (> (%sbs-poll-in fd ms) 0))))
 
 (defun sb-sys:make-fd-stream (fd &key input output (element-type 'character)
                                       buffering external-format timeout name)

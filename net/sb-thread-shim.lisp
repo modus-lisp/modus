@@ -61,7 +61,8 @@
            "CONDITION-WAIT" "CONDITION-NOTIFY" "CONDITION-BROADCAST"
            "SEMAPHORE" "MAKE-SEMAPHORE" "SEMAPHORE-NAME" "SEMAPHORE-COUNT"
            "SIGNAL-SEMAPHORE" "WAIT-ON-SEMAPHORE" "TRY-SEMAPHORE"
-           "THREAD-ERROR" "JOIN-THREAD-ERROR" "INTERRUPT-THREAD-ERROR"))
+           "THREAD-ERROR" "JOIN-THREAD-ERROR" "INTERRUPT-THREAD-ERROR"
+           "LIST-ALL-THREADS" "MAIN-THREAD" "ABORT-THREAD"))
 
 ;;; ============================================================
 ;;; BRINGING THE PROCESS UP TO MULTITHREADED, ONCE
@@ -186,6 +187,23 @@
 
 (defun sb-thread::main-thread-p (&optional (thread sb-thread:*current-thread*))
   (eq thread *sb-main-thread*))
+
+(defun sb-thread::main-thread () *sb-main-thread*)
+
+(defun sb-thread::list-all-threads ()
+  "The live threads: the main thread and every thread MAKE-THREAD started that
+   has not ended."
+  (cons *sb-main-thread* (remove-if-not #'sb-thread:thread-alive-p *sb-all-threads*)))
+
+(defun sb-thread::abort-thread (&key allow-exit)
+  "End the calling thread now, unwinding it; JOIN-THREAD on it then signals
+   JOIN-THREAD-ERROR (or returns its DEFAULT), as for a thread that failed.  On
+   the main thread this is an error unless ALLOW-EXIT, which exits the process."
+  (if (sb-thread:main-thread-p)
+      (if allow-exit
+          (%cli-exit 1)                 ; SB-EXT does not exist yet when this file is read
+          (error "sb-thread:abort-thread: the main thread may not abort (pass :ALLOW-EXIT T)."))
+      (throw '%sb-abort-thread :%sb-aborted)))
 
 (defun sb-thread::thread-yield ()
   "sched_yield(2) -- syscall 24 on x86-64.  On bare metal there is no OS behind the
@@ -483,10 +501,14 @@ modus: unhandled error in a thread: "))
   (let ((sb-thread:*current-thread* thread))
     (setf (car box)
           (handler-case
-              (%sb-publish-value
-               (if arguments
-                   (apply function arguments)
-                   (funcall function)))
+              (let ((v (catch '%sb-abort-thread
+                         (%sb-publish-value
+                          (if arguments
+                              (apply function arguments)
+                              (funcall function))))))
+                (if (eq v :%sb-aborted)
+                    (%sb-locked (256) (list :%sb-thread-error (copy-seq "the thread aborted")))
+                    v))
             (serious-condition (e)
               (let ((m (%sb-condition-text e)))
                 (%sb-raw-report m)
@@ -522,10 +544,16 @@ modus: unhandled error in a thread: "))
     (%mutex-unlock (%sb-registry-lock))
     n))
 
-(defun %sb-check-passable (value)
+(defun %sb-check-passable (value &optional (default :%sb-no-default))
+  "VALUE, a joined thread's box, as JOIN-THREAD's answer.  A thread that did not
+   finish normally (an unhandled error, ABORT-THREAD) answers DEFAULT when one was
+   supplied, and otherwise signals JOIN-THREAD-ERROR -- SBCL's contract."
   (when (and (consp value) (eq (car value) :%sb-thread-error))
-    (error "sb-thread:join-thread: the thread ended with an unhandled error: ~A"
-           (cadr value)))
+    (if (eq default :%sb-no-default)
+        (error 'sb-thread::join-thread-error
+               :format-control "sb-thread:join-thread: the thread did not finish normally: ~A"
+               :format-arguments (list (cadr value)))
+        (return-from %sb-check-passable default)))
   (if (and (consp value) (eq (car value) :%sb-unpassable))
       (error "sb-thread:join-thread: the thread returned ~A, which cannot be passed ~
               between threads -- modus threads share no state; return data ~
@@ -560,7 +588,7 @@ modus: unhandled error in a thread: "))
                "sb-thread:join-thread: cannot join the main thread."))
       ;; Joined before, or reaped: the slot may belong to a newer thread now,
       ;; so the answer is the box's and never the slot's.
-      ((%thread-joined thread) (%sb-check-passable (car (%thread-box thread))))
+      ((%thread-joined thread) (%sb-check-passable (car (%thread-box thread)) default))
       (t
         (let* ((deadline (if timeout
                              (+ (%monotonic-ns)
@@ -592,10 +620,10 @@ modus: unhandled error in a thread: "))
                     (%join-native-thread slot 1000)
                     (setq *sb-all-threads* (%sb-registry-without thread)))
                   (%mutex-unlock (%sb-registry-lock))
-                  (%sb-check-passable value)))
+                  (%sb-check-passable value default)))
               (if (eq default :%sb-no-default)
-                  (error 'simple-error :format-control
-                         "sb-thread:join-thread: timed out.")
+                  (error 'sb-thread::join-thread-error :format-control
+                         "sb-thread:join-thread: timed out." :format-arguments nil)
                   default
 )))))))
 
@@ -885,7 +913,7 @@ modus: unhandled error in a thread: "))
 ;;; ============================================================
 
 (define-condition sb-thread::thread-error (error) ())
-(define-condition sb-thread::join-thread-error (sb-thread::thread-error) ())
+(define-condition sb-thread::join-thread-error (sb-thread::thread-error simple-condition) ())
 (define-condition sb-thread::interrupt-thread-error (sb-thread::thread-error) ())
 
 ;;; ============================================================

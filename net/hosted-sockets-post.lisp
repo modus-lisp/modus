@@ -1150,21 +1150,37 @@
    long — refused rather than truncated into a different filename."
   (%cstr-percpu path))
 
-(defun %sbs-stat-field (path which)
-  "stat(2) — syscall 4 — returning ONE field: WHICH 0 = mode, 1 = uid, 2 = gid,
-   3 = inode, 4 = size.  A negative return is -errno."
+(defun %sbs-stat-word (buf which)
+  "One field of the struct stat at BUF: WHICH 0 mode, 1 uid, 2 gid, 3 inode,
+   4 size, 5 mtime, 6 ctime, 7 atime (seconds), 8 dev, 9 nlink."
+  (cond ((= which 0) (mem-ref (+ buf #x18) :u32))
+        ((= which 1) (mem-ref (+ buf #x1C) :u32))
+        ((= which 2) (mem-ref (+ buf #x20) :u32))
+        ((= which 3) (%gc-read64 (+ buf #x08)))
+        ((= which 4) (%gc-read64 (+ buf #x30)))
+        ((= which 5) (%gc-read64 (+ buf #x58)))
+        ((= which 6) (%gc-read64 (+ buf #x68)))
+        ((= which 7) (%gc-read64 (+ buf #x48)))
+        ((= which 8) (%gc-read64 buf))
+        (t (%gc-read64 (+ buf #x10)))))
+
+(defun %sbs-stat-field (path which &optional (nr 4))
+  "stat(2) -- syscall 4 -- or, NR 6, lstat(2), returning ONE field (see
+   %SBS-STAT-WORD).  A negative return is -errno."
   (let ((buf (%struct-scratch))
         (p (%sbs-path-cstr path)))
     (if (or (zerop buf) (zerop p))
         -36
-        (let ((r (syscall3 4 p buf 0)))
-          (if (< r 0)
-              r
-              (if (= which 0) (mem-ref (+ buf #x18) :u32)
-                  (if (= which 1) (mem-ref (+ buf #x1C) :u32)
-                      (if (= which 2) (mem-ref (+ buf #x20) :u32)
-                          (if (= which 3) (%gc-read64 (+ buf #x08))
-                              (%gc-read64 (+ buf #x30)))))))))))
+        (let ((r (syscall3 nr p buf 0)))
+          (if (< r 0) r (%sbs-stat-word buf which))))))
+
+(defun %sbs-fstat-field (fd which)
+  "fstat(2) -- syscall 5 -- on descriptor FD, returning ONE field, or -errno."
+  (let ((buf (%struct-scratch)))
+    (if (zerop buf)
+        -12
+        (let ((r (syscall3 5 fd buf 0)))
+          (if (< r 0) r (%sbs-stat-word buf which))))))
 
 (defun %sbs-chmod (path mode)
   (let ((p (%sbs-path-cstr path)))
@@ -1200,6 +1216,41 @@
 
 (defun %sbs-getuid () (syscall3 102 0 0 0))
 (defun %sbs-getpid () (syscall3 39 0 0 0))
+
+;;; More of SB-POSIX (the 2026-11-27 census of what org code calls): raw-descriptor
+;;; open/fsync, symlinks, kill, getgid.  open(2) and fsync(2) can block (a FIFO, a
+;;; slow disk), so they are stop-the-world safe regions.
+(defun %sbs-open-path (path flags mode)
+  (let ((p (%sbs-path-cstr path)))
+    (if (zerop p) -36 (%gc-safe-block-3 2 p flags mode))))
+(defun %sbs-fsync (fd) (%gc-safe-block-3 74 fd 0 0))
+(defun %sbs-kill (pid sig) (syscall3 62 pid sig 0))
+(defun %sbs-getgid () (syscall3 104 0 0 0))
+
+(defun %sbs-symlink (target link)
+  "symlink(2) -- syscall 88: LINK becomes a symbolic link to TARGET."
+  (let ((b (%struct-scratch)))
+    (if (or (zerop b) (> (length target) 500))
+        -36
+        (progn
+          (%string-to-cstr target b)
+          (let ((p (%sbs-path-cstr link)))
+            (if (zerop p) -36 (syscall3 88 b p 0)))))))
+
+(defun %sbs-readlink (path)
+  "readlink(2) -- syscall 89: the link's target as a string, or -errno."
+  (let ((b (%struct-scratch))
+        (p (%sbs-path-cstr path)))
+    (if (or (zerop b) (zerop p))
+        -36
+        (let ((n (syscall3 89 p b 512)))
+          (if (< n 0)
+              n
+              (let ((v (make-array n :element-type '(unsigned-byte 8))) (i 0))
+                (loop (when (>= i n) (return nil))
+                      (setf (aref v i) (mem-ref (+ b i) :u8))
+                      (setq i (+ i 1)))
+                (%it-utf8-bytes-to-string v)))))))
 
 ;;; ============================================================
 ;;; BLOCKING CALLS ARE STOP-THE-WORLD SAFE REGIONS

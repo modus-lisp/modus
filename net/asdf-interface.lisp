@@ -171,8 +171,12 @@
 ;;; =====================================================================
 
 (defun uiop::getenv (name)
-  "The value of environment variable NAME, or NIL."
-  (%cli-getenv (asdf::%string-of name)))
+  "The value of environment variable NAME, or NIL -- SB-EXT:POSIX-GETENV's answer
+   where the SB surface is installed, so a change made by SB-POSIX:SETENV / PUTENV
+   is seen, as on SBCL."
+  (let ((n (asdf::%string-of name))
+        (pg (and (find-package "SB-EXT") (find-symbol "POSIX-GETENV" "SB-EXT"))))
+    (if (and pg (fboundp pg)) (funcall pg n) (%cli-getenv n))))
 
 (defun uiop::quit (&optional (code 0) (finish-output t))
   "Exit with CODE, flushing the standard streams first unless FINISH-OUTPUT

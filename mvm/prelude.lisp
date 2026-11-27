@@ -2630,6 +2630,12 @@
   (let ((r (cdr (cdr (cdr (cdr (cdr (cdr (cdr ht)))))))))
     (if (consp r) (car r) nil)))
 
+(defun %ht-synchronized-p (ht)
+  "True when HT was made with :SYNCHRONIZED true (MAKE-HASH-TABLE-ARGS's 8th
+   metadata element); NIL for every other table."
+  (let ((r (cdr (cdr (cdr (cdr (cdr (cdr (cdr (cdr ht))))))))))
+    (if (consp r) (car r) nil)))
+
 (defun %ht-addr-ok-p ()
   "True on the thread whose active region is region 0 (see ADDRESS INDEX)."
   (eql (%gc-region) (%conv-addr #x10000040)))
@@ -3292,7 +3298,7 @@
   "Internal worker: parse OPTIONS plist (`(:test eq :size 100 ...)`) and
    build a metadata-bearing hash-table.  Defaults: test=eql, rsize=2,
    rthresh=1, size=16."
-  (let ((test 'eql) (rsize 2) (rthresh 1) (size 16) (cur options))
+  (let ((test 'eql) (rsize 2) (rthresh 1) (size 16) (sync nil) (cur options))
     (loop
       (when (null cur) (return nil))
       (when (null (cdr cur)) (return nil))
@@ -3301,7 +3307,8 @@
           ((eq k :test)             (setq test (%ht-canonicalize-test v)))
           ((eq k :size)             (setq size v))
           ((eq k :rehash-size)      (setq rsize v))
-          ((eq k :rehash-threshold) (setq rthresh v))))
+          ((eq k :rehash-threshold) (setq rthresh v))
+          ((eq k :synchronized)     (setq sync (if v t nil)))))
       (setq cur (cddr cur)))
     ;; Metadata is a PROPER 5-list: (test rsize rthresh size bucket-holder).
     ;; bucket-holder = (vec-or-flag count . strcmp?) — a mutable cell that
@@ -3326,9 +3333,12 @@
       ;; The 7th element, (EPOCH), is the ADDRESS INDEX's cell for EQ/EQL
       ;; tables -- see %HT-ADDR-CELL.  Tables built without it (the 0-arg path,
       ;; a core made before it existed) never index object keys by address.
+      ;; The 8th, SYNC, is SBCL's :SYNCHRONIZED as given (SB-EXT:HASH-TABLE-
+      ;; SYNCHRONIZED-P reports it; %HT-SYNCHRONIZED-P).  It changes nothing else:
+      ;; a table is only ever mutated by the thread that made it here.
       (cons nil
             (cons (%ht-tag)
-                  (list test rsize rthresh size holder (cons nil nil)))))))
+                  (list test rsize rthresh size holder (cons nil nil) sync))))))
 
 ;;; ============================================================
 ;;; Gensym (for macro expansion)

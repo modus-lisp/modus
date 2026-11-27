@@ -50,12 +50,19 @@
            "TERMIOS" "TCGETATTR" "TCSETATTR" "TERMIOS-IFLAG" "TERMIOS-OFLAG"
            "TERMIOS-CFLAG" "TERMIOS-LFLAG" "TERMIOS-CC"
            "TCSANOW" "TCSADRAIN" "TCSAFLUSH" "ECHO" "ICANON" "ISIG" "IEXTEN" "ECHOE"
-           "ICRNL" "OPOST" "ONLCR" "VMIN" "VTIME" "VINTR" "VEOF"))
+           "ICRNL" "OPOST" "ONLCR" "VMIN" "VTIME" "VINTR" "VEOF"
+           ;; the 2026-11-27 census of what org code calls
+           "OPEN" "CLOSE" "FSYNC" "FSTAT" "LSTAT" "SYMLINK" "READLINK" "RMDIR" "CHDIR"
+           "KILL" "GETGID" "PUTENV" "S-ISLNK"
+           "STAT-MTIME" "STAT-CTIME" "STAT-ATIME" "STAT-DEV" "STAT-NLINK"
+           "O-RDONLY" "O-WRONLY" "O-RDWR" "O-CREAT" "O-EXCL" "O-TRUNC" "O-APPEND"
+           "O-NONBLOCK" "EACCES" "EAGAIN" "EEXIST" "EINTR" "ECONNREFUSED"))
 
 (defpackage "SB-SYS"
   (:use)
   (:export "FD-STREAM" "FD-STREAM-P" "FD-STREAM-FD" "MAKE-FD-STREAM"
-           "WITH-PINNED-OBJECTS" "ENABLE-INTERRUPT"))
+           "WITH-PINNED-OBJECTS" "ENABLE-INTERRUPT"
+           "INTERACTIVE-INTERRUPT" "IO-TIMEOUT" "DEADLINE-TIMEOUT" "WITHOUT-INTERRUPTS"))
 
 ;;; SB-UNIX: the signal numbers SB-SYS:ENABLE-INTERRUPT takes (beacon ignores SIGPIPE with
 ;;; them).  Only the ones Linux and Darwin number alike.
@@ -90,7 +97,9 @@
            "FLOAT-NAN-P" "FLOAT-INFINITY-P" "GET-TIME-OF-DAY"
            "MAKE-WEAK-POINTER" "WEAK-POINTER-VALUE" "PARSE-NATIVE-NAMESTRING" "NATIVE-NAMESTRING"
            "WITH-TIMEOUT" "TIMEOUT" "GET-BYTES-CONSED"
-           "WORD" "ATOMIC-INCF" "ATOMIC-DECF"))
+           "WORD" "ATOMIC-INCF" "ATOMIC-DECF"
+           "WITH-LOCKED-HASH-TABLE" "HASH-TABLE-SYNCHRONIZED-P" "POSIX-ENVIRON"
+           "*GC-RUN-TIME*" "BYTES-CONSED-BETWEEN-GCS" "*AFTER-GC-HOOKS*"))
 
 ;;; SB-UNICODE: the one name shuttle's regular expressions use (\p{...}).
 (defpackage "SB-UNICODE"
@@ -102,11 +111,12 @@
 (defpackage "SB-KERNEL"
   (:use)
   (:export "MAKE-SINGLE-FLOAT" "MAKE-DOUBLE-FLOAT" "SINGLE-FLOAT-BITS"
-           "DOUBLE-FLOAT-HIGH-BITS" "DOUBLE-FLOAT-LOW-BITS" "%FUN-NAME"))
+           "DOUBLE-FLOAT-HIGH-BITS" "DOUBLE-FLOAT-LOW-BITS" "%FUN-NAME" "DYNAMIC-USAGE"))
 
 (defpackage "SB-INT"
   (:use)
-  (:export "WITH-FLOAT-TRAPS-MASKED"))
+  (:export "WITH-FLOAT-TRAPS-MASKED" "ENCAPSULATE" "UNENCAPSULATE" "ENCAPSULATED-P"
+           "STRERROR"))
 
 ;;; OCTETS-TO-STRING / STRING-TO-OCTETS — SBCL's byte<->text conversions, for
 ;;; UTF-8 (the default) and Latin-1.  cassette reads WebM tag strings with the
@@ -414,34 +424,55 @@
    (uid  :initarg :uid  :accessor sb-posix:stat-uid)
    (gid  :initarg :gid  :accessor sb-posix:stat-gid)
    (ino  :initarg :ino  :accessor sb-posix:stat-ino)
-   (size :initarg :size :accessor sb-posix:stat-size)))
+   (size :initarg :size :accessor sb-posix:stat-size)
+   (mtime :initarg :mtime :accessor sb-posix:stat-mtime)
+   (ctime :initarg :ctime :accessor sb-posix:stat-ctime)
+   (atime :initarg :atime :accessor sb-posix:stat-atime)
+   (dev :initarg :dev :accessor sb-posix:stat-dev)
+   (nlink :initarg :nlink :accessor sb-posix:stat-nlink)))
 
 (define-condition sb-posix:syscall-error (error)
   ((errno :initarg :errno :initform 0 :reader sb-posix::syscall-errno)))
+
+(defun %sb-stat-result (field)
+  "A STAT-RESULT from FIELD, a function of a field number (%SBS-STAT-WORD's) that
+   answers that field or -errno; SYSCALL-ERROR if the first read fails."
+  (let ((mode (funcall field 0)))
+    (if (< mode 0)
+        (error 'sb-posix:syscall-error :errno (- 0 mode))
+        (make-instance 'sb-posix::stat-result
+                       :mode mode :uid (funcall field 1) :gid (funcall field 2)
+                       :ino (funcall field 3) :size (funcall field 4)
+                       :mtime (funcall field 5) :ctime (funcall field 6)
+                       :atime (funcall field 7) :dev (funcall field 8)
+                       :nlink (funcall field 9)))))
+
+(defun %sb-path-string (pathname) (if (stringp pathname) pathname (namestring pathname)))
 
 (defun sb-posix:stat (pathname)
   "stat(2).  Signals SB-POSIX:SYSCALL-ERROR on failure, as SBCL\'s does; a
    caller distinguishes `no such file\' from `a file with mode 0\' by catching,
    not by comparing to NIL.  The syscall is issued from AOT code — see THE
-   SYSCALL FLOOR in net/hosted-sockets-post.lisp.
+   SYSCALL FLOOR in net/hosted-sockets-post.lisp.  PARTIAL: mode, uid, gid,
+   ino, size, the three times (seconds), dev and nlink are read out of the
+   buffer; the rest are there and not exposed."
+  (let ((path (%sb-path-string pathname)))
+    (%sb-stat-result (lambda (which) (%sbs-stat-field path which)))))
 
-   PARTIAL: five fields are read out of the buffer (mode, uid, gid, ino, size).
-   The other twenty are in the buffer and are not exposed; adding one is two
-   lines, and guessing one is not done."
-  (let* ((path (if (stringp pathname) pathname (namestring pathname)))
-         (mode (%sbs-stat-field path 0)))
-    (if (< mode 0)
-        (error 'sb-posix:syscall-error :errno (- 0 mode))
-        (make-instance 'sb-posix::stat-result
-                       :mode mode
-                       :uid  (%sbs-stat-field path 1)
-                       :gid  (%sbs-stat-field path 2)
-                       :ino  (%sbs-stat-field path 3)
-                       :size (%sbs-stat-field path 4)))))
+(defun sb-posix:lstat (pathname)
+  "lstat(2): STAT of the link itself, not what it points to."
+  (let ((path (%sb-path-string pathname)))
+    (%sb-stat-result (lambda (which) (%sbs-stat-field path which 6)))))
+
+(defun sb-posix:fstat (fd)
+  "fstat(2) on a raw descriptor (or a stream with one)."
+  (let ((fd (if (integerp fd) fd (sb-sys:fd-stream-fd fd))))
+    (%sb-stat-result (lambda (which) (%sbs-fstat-field fd which)))))
 
 (defun sb-posix:s-isdir  (mode) (= (logand mode #xF000) #x4000))
 (defun sb-posix:s-issock (mode) (= (logand mode #xF000) #xC000))
 (defun sb-posix:s-isreg  (mode) (= (logand mode #xF000) #x8000))
+(defun sb-posix:s-islnk  (mode) (= (logand mode #xF000) #xA000))
 
 (defun sb-posix:chmod (pathname mode)
   "chmod(2)."
@@ -1078,3 +1109,216 @@
       (when (< r 0)
         (error "SB-SYS:ENABLE-INTERRUPT: rt_sigaction(~D, ~S) failed, errno ~D" signal handler (- r)))
       nil)))
+
+;;; ============================================================
+;;; THE 2026-11-27 CENSUS: what the org's code calls and modus lacked
+;;; ============================================================
+;;;
+;;; Every sb-*: name in the org's repos was asked of SBCL and of modus.  These are
+;;; the ones used outside #+sbcl and with an honest meaning here.  Not provided, by
+;;; design: SAPs and SB-ALIEN beyond the subset above (modus hands out no
+;;; addresses of Lisp objects), and SB-UNIX's raw-descriptor calls, which org code
+;;; only ever calls with a SAP.  test/run-sb-census.sh checks them against SBCL.
+
+;;; ---- SB-POSIX: raw descriptors, links, processes ----------------------------------
+
+(defconstant sb-posix:o-rdonly 0)
+(defconstant sb-posix:o-wronly 1)
+(defconstant sb-posix:o-rdwr 2)
+(defconstant sb-posix:o-creat #o100)
+(defconstant sb-posix:o-excl #o200)
+(defconstant sb-posix:o-trunc #o1000)
+(defconstant sb-posix:o-append #o2000)
+(defconstant sb-posix:o-nonblock #o4000)
+(defconstant sb-posix:eintr 4)
+(defconstant sb-posix:eagain 11)
+(defconstant sb-posix:eacces 13)
+(defconstant sb-posix:eexist 17)
+(defconstant sb-posix:econnrefused 111)
+
+(defun %sb-posix-result (r)
+  (if (and (integerp r) (< r 0)) (error 'sb-posix:syscall-error :errno (- 0 r)) r))
+
+(defun sb-posix:open (pathname flags &optional (mode #o666))
+  "open(2): a raw descriptor, or SYSCALL-ERROR."
+  (%sb-posix-result (%sbs-open-path (%sb-path-string pathname) flags mode)))
+
+(defun sb-posix:close (fd)
+  "close(2) on a raw descriptor."
+  (%sb-posix-result (%sbs-close fd))
+  0)
+
+(defun sb-posix:fsync (fd)
+  "fsync(2): FD (a descriptor, or a stream with one)'s data is on the disk."
+  (%sb-posix-result (%sbs-fsync (if (integerp fd) fd (sb-sys:fd-stream-fd fd))))
+  0)
+
+(defun sb-posix:symlink (oldpath newpath)
+  "symlink(2): NEWPATH becomes a symbolic link to OLDPATH."
+  (%sb-posix-result (%sbs-symlink (%sb-path-string oldpath) (%sb-path-string newpath)))
+  0)
+
+(defun sb-posix:readlink (pathname)
+  "readlink(2): the link's target, a string."
+  (%sb-posix-result (%sbs-readlink (%sb-path-string pathname))))
+
+(defun sb-posix:rmdir (pathname)
+  (%sb-posix-result (%sys-rmdir (string-right-trim "/" (%sb-path-string pathname))))
+  0)
+
+(defun sb-posix:chdir (pathname)
+  (%sb-posix-result (%sbs-chdir (%sb-path-string pathname)))
+  0)
+
+(defun sb-posix:kill (pid signal) (%sb-posix-result (%sbs-kill pid signal)) 0)
+(defun sb-posix:getgid () (%sbs-getgid))
+
+(defun sb-posix:putenv (string)
+  "putenv(3) of a NAME=VALUE string: SETENV, with SETENV's PARTIAL (POSIX-GETENV
+   and UIOP:GETENV see it, a child process does not)."
+  (let ((i (position #\= string)))
+    (unless (and i (plusp i)) (error 'sb-posix:syscall-error :errno 22))
+    (sb-posix:setenv (subseq string 0 i) (subseq string (+ i 1)) 1)))
+
+;;; ---- SB-EXT -----------------------------------------------------------------------
+
+(defvar %sb-locked-ht-mutex nil
+  "The one recursive lock WITH-LOCKED-HASH-TABLE takes, for every table: made on
+   first use, in shared memory so a worker may be the one to make it.")
+
+(defun %sb-locked-ht-mutex ()
+  (or %sb-locked-ht-mutex
+      (progn
+        (%mutex-lock (%sb-registry-lock))
+        (unwind-protect
+             (or %sb-locked-ht-mutex
+                 (setq %sb-locked-ht-mutex
+                       (%sb-locked (256) (sb-thread:make-mutex :name "with-locked-hash-table"))))
+          (%mutex-unlock (%sb-registry-lock))))))
+
+(defun %sb-call-with-locked-hash-table (table thunk)
+  (declare (ignore table))
+  (sb-thread:with-recursive-lock ((%sb-locked-ht-mutex)) (funcall thunk)))
+
+(defmacro sb-ext:with-locked-hash-table ((hash-table) &body body)
+  "BODY with HASH-TABLE locked against other threads.  One recursive lock serves
+   every table (SBCL has one per table): correct, and coarser."
+  `(%sb-call-with-locked-hash-table ,hash-table (lambda () ,@body)))
+
+(defun sb-ext:hash-table-synchronized-p (hash-table)
+  "True when HASH-TABLE was made with :SYNCHRONIZED true.  modus records it and
+   otherwise treats every table alike: a table is mutated only by the thread that
+   made it, so there is nothing for it to synchronise."
+  (unless (hash-table-p hash-table) (error 'type-error :datum hash-table :expected-type 'hash-table))
+  (and (%ht-synchronized-p hash-table) t))
+
+(defun sb-ext:posix-environ ()
+  "The environment as a list of NAME=VALUE strings: the process's own, with
+   SETENV / PUTENV / UNSETENV's changes applied."
+  (let* ((argc (%cli-argc))
+         (envp (+ (%cli-argv-base) (* 8 (+ argc 1))))
+         (out nil) (i 0))
+    (loop
+      (let ((ptr (%cli-read-ptr (+ envp (* 8 i)))))
+        (when (eql ptr 0) (return nil))
+        (let ((e (%cli-cstr-at ptr))) (when e (push e out))))
+      (setq i (+ i 1)))
+    (setq out (nreverse out))
+    (dolist (c (reverse sb-posix::*environment-changes*))
+      (let ((prefix (concatenate 'string (car c) "=")))
+        (setq out (remove-if (lambda (e) (and (>= (length e) (length prefix))
+                                              (string= prefix e :end2 (length prefix))))
+                             out))
+        (when (cdr c) (setq out (append out (list (concatenate 'string prefix (cdr c))))))))
+    out))
+
+(defvar sb-ext:*gc-run-time* 0
+  "SBCL's run time spent collecting.  modus does not count it: always 0.")
+
+(defvar sb-ext:*after-gc-hooks* nil
+  "SBCL runs these after each collection.  modus's collector calls no Lisp, so
+   they are never run here.")
+
+(defun %sb-hosted-x64-p () (and (member :x86-64 *features*) (member :linux *features*) t))
+
+(defun sb-ext:bytes-consed-between-gcs ()
+  "The allocation that fills this thread's heap from empty: its semispace's size.
+   (SBCL's is the nursery's; modus's collector runs when a semispace fills.)"
+  (unless (%sb-hosted-x64-p)
+    (error "sb-ext:bytes-consed-between-gcs: hosted x86-64 Linux only."))
+  (* 2 (mem-ref (+ (%gc-region) #x10) :u64)))
+
+(defun sb-kernel:dynamic-usage ()
+  "Bytes in use in this thread's heap: what has been allocated since its last
+   collection, survivors included."
+  (unless (%sb-hosted-x64-p)
+    (error "sb-kernel:dynamic-usage: hosted x86-64 Linux only."))
+  (- (get-alloc-ptr) (* 2 (mem-ref (%gc-region) :u64))))
+
+;;; ---- SB-INT: ENCAPSULATE, as TRACE and test stubs use it --------------------------
+
+(defvar %sb-encapsulations nil
+  "((NAME BASE (TYPE . FUNCTION) ...) ...): each encapsulated name, its own
+   definition, and its layers, newest first.")
+
+(defun %sb-encapsulation-entry (name) (assoc name %sb-encapsulations :test #'equal))
+
+(defun %sb-install-encapsulations (name)
+  (let* ((e (%sb-encapsulation-entry name))
+         (f (second e)))
+    (dolist (layer (reverse (cddr e)))
+      (let ((inner f) (fn (cdr layer)))
+        (setq f (lambda (&rest args) (apply fn inner args)))))
+    (setf (fdefinition name) f)))
+
+(defun sb-int:encapsulate (name type function)
+  "Wrap NAME's definition: calls to NAME become (FUNCTION original-function . args).
+   TYPE names the layer, for UNENCAPSULATE; encapsulating again with the same TYPE
+   replaces that layer."
+  (let ((e (%sb-encapsulation-entry name)))
+    (unless e
+      (setq e (list name (fdefinition name)))
+      (push e %sb-encapsulations))
+    (setf (cddr e) (cons (cons type function) (remove type (cddr e) :key #'car :test #'eq)))
+    (%sb-install-encapsulations name)
+    name))
+
+(defun sb-int:unencapsulate (name type)
+  "Remove NAME's TYPE layer; with none left, NAME is its own definition again."
+  (let ((e (%sb-encapsulation-entry name)))
+    (when e
+      (setf (cddr e) (remove type (cddr e) :key #'car :test #'eq))
+      (%sb-install-encapsulations name)
+      (unless (cddr e)
+        (setq %sb-encapsulations (remove e %sb-encapsulations)))))
+  name)
+
+(defun sb-int:encapsulated-p (name type)
+  (and (assoc type (cddr (%sb-encapsulation-entry name)) :test #'eq) t))
+
+(defun sb-int:strerror (&optional (errno 0))
+  "The text for ERRNO, for the numbers modus's own errors carry."
+  (case errno
+    (1 "Operation not permitted") (2 "No such file or directory") (4 "Interrupted system call")
+    (5 "Input/output error") (9 "Bad file descriptor") (11 "Resource temporarily unavailable")
+    (12 "Cannot allocate memory") (13 "Permission denied") (17 "File exists")
+    (20 "Not a directory") (21 "Is a directory") (22 "Invalid argument")
+    (28 "No space left on device") (32 "Broken pipe") (36 "File name too long")
+    (98 "Address already in use") (104 "Connection reset by peer")
+    (110 "Connection timed out") (111 "Connection refused") (115 "Operation now in progress")
+    (t (format nil "Unknown error ~D" errno))))
+
+;;; ---- SB-SYS -----------------------------------------------------------------------
+
+(define-condition sb-sys:interactive-interrupt (serious-condition) ()
+  (:documentation "SBCL's condition for a Ctrl-C.  modus never signals it (it runs no
+   Lisp from a signal); defined so handlers for it compile."))
+
+(define-condition sb-sys:deadline-timeout (sb-ext:timeout) ())
+
+(define-condition sb-sys:io-timeout (stream-error sb-ext:timeout)
+  ((direction :initarg :direction :initform nil :reader sb-sys::io-timeout-direction)))
+
+(defmacro sb-sys:without-interrupts (&body body)
+  "BODY.  modus delivers no asynchronous interrupts to Lisp, so there is nothing to defer."
+  `(progn ,@body))

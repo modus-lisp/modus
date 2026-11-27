@@ -22075,7 +22075,7 @@
   "Return T if establishing a runtime CATCH frame around BODY (the wrap
    compile-block uses for a cross-unit RETURN-FROM) would conflict with
    another setjmp-based non-local-exit construct in the same dynamic
-   extent.  Two disqualifiers, both rooted in the runtime's SINGLE shared
+   extent.  One disqualifier, rooted in the runtime's SINGLE shared
    setjmp-slot stack (cl-conditions.lisp notes handler-case / restart-case
    / unwind-protect can't nest arbitrarily):
 
@@ -22086,15 +22086,22 @@
          cleanups (unwind-protect.6/7/8 regressed when the block was
          wrapped unconditionally).
 
-     (b) A cross-unit GO — a (go ...) inside a function-creating form
-         (lambda / flet / labels).  That GO is a DIFFERENT non-local exit
-         not lowered at runtime (flet.52 / labels.27); wrapping the block
-         perturbs its pre-existing (coincidentally-working) lowering.
+   (A cross-unit GO -- a (go ...) inside a lambda / flet / labels -- used to
+   disqualify too, from before such a GO had a runtime lowering.  Since #278
+   it is a THROW to its TAGBODY's own CATCH frame, and the two catch frames
+   nest.  Disqualifying them was not harmless: the RETURN-FROM fell back to
+   returning from its lambda, so in
+     (block n (tagbody (handler-bind ((error (lambda (c) (go x))))
+                         (return-from n 1))
+                  x)
+        :fell-through)
+   the RETURN-FROM left only HANDLER-BIND's body function and the block went
+   on to :FELL-THROUGH -- the expansion CLHS gives HANDLER-CASE.)
 
-   When either is present the block stays on the ORIGINAL fast path — the
-   cross-unit return-from keeps its old (function-return) lowering, no
-   worse than before, while the common cross-unit RETURN-FROM-through-
-   lambda/flet/labels wins are preserved for everything else."
+   When it is present the block stays on the ORIGINAL fast path — the
+   cross-unit return-from keeps its old (function-return) lowering, while
+   the common cross-unit RETURN-FROM-through-lambda/flet/labels wins are
+   preserved for everything else."
   (let ((found nil))
     (labels ((walk (form in-fn)
                (when (and (not found) (consp form)
@@ -22116,8 +22123,6 @@
                     (let ((cur (cdr form)))
                       (loop while (consp cur) do (walk (car cur) in-fn)
                             (setq cur (cdr cur)))))
-                   ((and in-fn (%form-op-is form 502453647 "GO"))
-                    (setq found t))
                    ((%form-op-is form 80380232 "LAMBDA")
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) t)

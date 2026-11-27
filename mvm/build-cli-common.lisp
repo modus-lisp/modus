@@ -1552,6 +1552,10 @@
     ;; DNS-over-UDP/TCP resolver.  The gateway to networked ql:quickload.
     (mvm-text "net/hosted-sockets.lisp")
     (string #\Newline)
+    ;; i386: the same primitives and the SB-BSD-SOCKETS floor in i386's syscall numbers,
+    ;; through socketcall(2).  After hosted-sockets.lisp, whose x86-64 DEFUNs it replaces.
+    (if (eq *cli-arch* :i386) (mvm-text "net/hosted-sockets-i386.lisp") "")
+    (string #\Newline)
     ;; Hosted block storage + durability: raw-fd positioned block I/O + fsync/
     ;; ftruncate.  The persistence layer for pagetree/cabinet/cl-consensus.
     (mvm-text "net/hosted-storage.lisp")
@@ -2007,6 +2011,41 @@
 ;; through this file have no such helper, and get "".
 (defun %cli-spin (name)
   (if (fboundp '%lisp-spin-form) (funcall '%lisp-spin-form name) ""))
+
+;;; HOSTED i386: THE SB-THREAD SHIM'S PRIMITIVES, single-threaded.  The shim is
+;;; boot-evaluated in every image (*SB-SHIM-TEXT*), but its primitives -- %SYNC-CELL,
+;;; %MUTEX-LOCK and the rest -- come from net/hosted-sync.lisp, which only the threaded
+;;; x64 and AArch64 CLIs carry, or net/bare-sync.lisp, which only the bare images carry.
+;;; Hosted i386 had neither, so its first SB-THREAD:MAKE-MUTEX (natrium's *POOL-LOCK*,
+;;; glass/fb's framebuffer locks, loom's page lock) died UNDEFINED-FUNCTION NIL.  It has
+;;; one thread, so bare-sync's answers are the honest ones; what differs is the arena (64
+;;; KB of BSS at #x10020000, boot/boot-linux-i386.lisp, zeroed by exec) and the clock,
+;;; which here is a real one: the process's clock and nanosleep(2), not a busy loop.
+;;; Cells go round-robin, as on the bare PCs (build-cl-repl-common): one thread never
+;;; blocks on a lock, so two mutexes sharing a cell cannot wait on each other, and a long
+;;; session that keeps making framebuffers does not run the arena out.
+(when (and (eq *cli-arch* :i386) (not *cli-bare-metal*))
+  (setf *cli-arch-probe-source*
+        (concatenate 'string *cli-arch-probe-source* (string #\Newline)
+                     (mvm-text "net/bare-sync.lisp")
+                     "
+(defun %bare-sync-arena () (values #x10020000 #x10030000))
+(defun %sync-cell ()
+  (let* ((n (mem-ref #x10020000 :u32))
+         (a (+ #x10020000 64 (* (mod n 1023) 64))))
+    (when (< n 1023) (dotimes (i 8) (%gc-write64 (+ a (* i 8)) 0)))
+    (setf (mem-ref #x10020000 :u32) (+ n 1))
+    a))
+(defun %monotonic-ns ()
+  (* (get-internal-real-time) (floor 1000000000 internal-time-units-per-second)))
+;; nanosleep(2) is syscall 162 on i386; the timespec is the arena's words at +16 / +20.
+(defun %sleep-ms (ms)
+  (let ((ms (max ms 0)))
+    (setf (mem-ref #x10020010 :u32) (floor ms 1000))
+    (setf (mem-ref #x10020014 :u32) (* (mod ms 1000) 1000000))
+    (syscall3 162 #x10020010 0 0))
+  nil)
+")))
 
 (defvar *driver-source*
  (concatenate 'string

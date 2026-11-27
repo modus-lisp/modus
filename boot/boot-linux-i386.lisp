@@ -46,8 +46,10 @@
 
 (defconstant +linux-i386-load-addr+   #x08048000)
 (defconstant +linux-i386-bss-addr+    #x10000000)
-(defconstant +linux-i386-bss-end+     #x10020000
-  "End of the demand-zeroed BSS block.  Was #x10001000 (one page) while the
+(defconstant +linux-i386-bss-end+     #x10030000
+  "End of the demand-zeroed BSS block.  [#x10020000, #x10030000) is the SB-THREAD
+   shim's mutex arena (net/bare-sync.lisp's cells; build-cli-common's hosted-i386
+   %BARE-SYNC-ARENA): 64 KB, 1023 cells, zeroed by exec like the rest.  Below it:  Was #x10001000 (one page) while the
    image only needed the fixed metadata slots.  File I/O needs two scratch
    buffers at fixed RAW addresses — cl-fileio's *cstr-scratch* (C-string
    staging for path arguments) and *io-buf-addr* (the 4 KB read/write

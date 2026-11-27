@@ -1368,7 +1368,16 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
   (:i386-hstack-ext-limit #x1001FF04 4 :constants ("MODUS.MVM.I386::+I386-HSTACK-EXT-LIMIT-ADDR+")
    :doc "TEST-ONLY limit."))
 
-(define-fixed-word :i386-hosted-bss #x10000000 #x20000 :kind :container :images (:i386-hosted)
+(define-fixed-word :i386-sync-arena #x10020000 #x10000 :kind :range :images (:i386-hosted)
+  :owner "mvm/build-cli-common.lisp (hosted i386 %BARE-SYNC-ARENA)"
+  :doc "The SB-THREAD shim's mutex cells: +0 count, +8 bare-sync's clock, +10 a timespec, cells from +40.")
+
+(define-fixed-word :i386-bare-hstack-ext #x10020000 #x10000 :kind :range :images (:i386-bare)
+  :owner "boot/boot-i386-cl.lisp (+I386-CL-HEXT-VA+)"
+  :doc "Handler-frame extension: 2048 frames x 24 bytes, mapped by the boot stub; its address
+   and limit go in the fixed block's #x1FF00 / #x1FF04 words (translate-i386 I386-HSTACK-EXT-P).")
+
+(define-fixed-word :i386-hosted-bss #x10000000 #x30000 :kind :container :images (:i386-hosted)
   :owner "boot/boot-linux-i386.lisp"
   :constants ("MODUS-INT::+LINUX-I386-BSS-ADDR+")
   :doc "The demand-zeroed BSS everything above lives in (to +LINUX-I386-BSS-END+).")

@@ -111,6 +111,10 @@
 ;;; The blocking ones are overridden in net/hosted-sockets-post.lisp to run as stop-the-world
 ;;; safe regions (BLOCKING CALLS ARE STOP-THE-WORLD SAFE REGIONS there).
 (declaim (overridable %sock-connect-fd %sock-write %sock-read socket-accept udp-recvfrom))
+;;; ... and every function here that issues a syscall is a seam for net/hosted-sockets-i386.lisp,
+;;; which restates them in i386's numbers (socketcall 102, read 3, write 4, close 6).
+(declaim (overridable %sock-open socket-close %sock-set-reuseaddr socket-listen-on
+                      socket-local-port udp-sendto vsock-connect vsock-listen))
 (defun %sock-open (type)       (syscall3 41 2 type 0))   ; socket(AF_INET, type, 0)
 (defun %sock-connect-fd (fd)   (syscall3 42 fd (%sock-addr-buf) 16))
 (defun %sock-write (fd len)    (syscall3 1 fd (%sock-io-buf) len))

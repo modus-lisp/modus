@@ -3359,6 +3359,37 @@ operation with its own cross-region story, untouched here; `BOUNDP` walks the
 table, so a special bound only per-thread reads as unbound on that thread; the
 58-binding ceiling; and `kiln modus-rfb PORT` was not run.
 
+### THE MAIN THREAD'S BINDINGS ARE ITS OWN TOO (2026-11-27)
+
+"The MAIN thread of an armed image is unarmed too ... and that is correct"
+(above) was right for the collector and wrong for CL: main bound shallowly in
+the globals pair, so every other thread read main's bindings --
+`(let ((*x* :main)) (join-thread (make-thread (lambda () *x*))))` answered
+`:MAIN` (SBCL: the global), and secp256k1-fast's per-call scratch specials made
+main and a worker share scratch.  Main now has a binding stack of its own in a
+worker block's layout, x86-64 hosted only: 24 KB of BSS at `#x10010000`, its
+segment delta in `#x10000D60` (low byte a flag).  mvm/prelude.lisp THE MAIN
+THREAD'S BINDING STACK has the design; the shape:
+
+- **Log mode** (no thread yet): main binds shallowly as before, and every
+  LET / PROGV also pushes `[key][replaced value]`, inline at fixed addresses
+  (compiler `%MLOG-PUSH-FORM`).  **`%RT-THREADS-ON` turns the log into deep
+  bindings** (`%DYNB-MAIN-ARM`), so a binding main already holds when the first
+  thread starts -- the LET around MAKE-THREAD, LOAD's `*PACKAGE*` -- is main's.
+- **Deep mode**: main pushes and pops like a worker (inline fixed-address paths
+  in `%DYNBIND` / `%DYNUNBIND`).  Reads and SETQs keep the inline cell path when
+  main's FILTER byte for the key is zero: `%EMIT-SHALLOW-THREAD-GATE` takes the
+  key, so that byte's address is a constant.
+- The collector scans main's entries in both modes (`EMIT-MAIN-DYNB-SEG`).
+- LOAD's `*PACKAGE*` / `*READTABLE*` are a real LET now (they were setq/restore).
+- Other targets leave `#x10000D60` zero: main binds shallowly, as before.
+
+`test/run-thread-bindings.sh` holds it against SBCL line for line.  Cost on
+the x64 CLI: a single-threaded LET of 3 specials +30% (the log), reads
+unchanged; after a thread has run main's LET is ~2x what it was (a worker's is
+~7x); image +0.8 MB.  **Not ported to aarch64** (its window block covers
+`#x10010000`; it needs its own fixed block, root scans and init).
+
 ### MODUS:MAKE-CHANNEL — messages between threads that cost the shared heap nothing (2026-10-14)
 
 `modus:share` (and `join-thread`'s result) copies into the runtime lock arena —

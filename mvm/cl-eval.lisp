@@ -1854,7 +1854,12 @@
    probe per read (cl-bench STAK)."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
+                   ;; main's own stack: the cell is right while main holds no
+                   ;; binding of the key (its filter counter, fixed address)
+                   (and (eql (mem-ref #x10000D60 :u32) #x10000) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ #x10015000 (logand hash 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if (and c (not (eq (cdr c) (%word->val #x0BADB0B5))))
             (cdr c)
@@ -1873,7 +1878,12 @@
    No cell yet: %GV-SET creates it, and the next store fills the site."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)
           (and (eql (mem-ref #x10000C30 :u32) 0)
-               (eql (mem-ref #x10000C34 :u32) 0)))
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
+                   ;; main's own stack: the cell is right while main holds no
+                   ;; binding of the key (its filter counter, fixed address)
+                   (and (eql (mem-ref #x10000D60 :u32) #x10000) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ #x10015000 (logand hash 4095)) :u8) 0)))))
       (let ((c (%gv-site-cell hash site)))
         (if c
             (progn (set-cdr c val) val)
@@ -1896,7 +1906,12 @@
    through SITE."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
+                   ;; main's own stack: the cell is right while main holds no
+                   ;; binding of the key (its filter counter, fixed address)
+                   (and (eql (mem-ref #x10000D60 :u32) #x10000) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ #x10015000 (logand hash 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site))) (if c (cdr c) (%word->val #x0BADB0B5)))
       (%gv-save hash)))
 
@@ -1904,7 +1919,8 @@
   "%DYNBIND through SITE: unarmed with a cell, store in place."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if c (progn (set-cdr c val) val) (%dynbind hash val)))
       (%dynbind hash val)))
@@ -1913,7 +1929,8 @@
   "%DYNUNBIND through SITE."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if c (progn (set-cdr c saved) saved) (%dynunbind hash saved)))
       (%dynunbind hash saved)))
@@ -6771,13 +6788,16 @@
    restore (measured: probes/p1.lisp P4).  Lexical save + UNWIND-PROTECT +
    setq restore is verified escape-safe for throw / ERROR / UNDEFINED-FUNCTION
    (probes/p2.lisp P5-P10) — the same remedy 279f2cc used for the
-   %WITH-HANDLER-BIND frame leak."
-  (let ((saved-package *package*)
-        (saved-readtable *readtable*))
-    (unwind-protect
-         (%load-from-stream stream verbose print fx0)
-      (setq *package* saved-package)
-      (setq *readtable* saved-readtable))))
+   %WITH-HANDLER-BIND frame leak.
+
+   NOW A REAL LET.  COMPILE-LET-WITH-SPECIALS restores in an UNWIND-PROTECT
+   since #240, so the escape-safety this hand-rolled shape bought is the LET's
+   own -- and only a real binding is THIS THREAD's: a file's (in-package :foo)
+   used to SETQ the global, so a thread started while loading read FOO, where
+   SBCL's reads CL-USER (test/thread-bindings.lisp)."
+  (let ((*package* *package*)
+        (*readtable* *readtable*))
+    (%load-from-stream stream verbose print fx0)))
 
 (defun load (&rest all-args)
   "Read and evaluate all forms from a file or stream.

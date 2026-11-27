@@ -4,12 +4,10 @@
 ;;;;   ./modus --script test/main-bind-armed.lisp
 ;;;;
 ;;;; Once any thread has been started (the threads-live word is set), the MAIN
-;;;; thread still binds specials SHALLOWLY: it has no per-thread binding block,
-;;;; so its LET writes the globals pair and its unbind writes the saved value
-;;;; back -- and a worker reading a special it has NOT bound reads that pair,
-;;;; i.e. sees main's current binding.  That is the semantics this file pins
-;;;; (it is what test/hosted-dynbind.lisp and test/worker-special-read.lisp
-;;;; already assume), while main and workers hammer the same specials at once:
+;;;; thread binds specials in a binding stack of its own (mvm/prelude.lisp, THE
+;;;; MAIN THREAD'S BINDING STACK; until 2026-11-27 it bound them SHALLOWLY in
+;;;; the globals pair, and every worker saw main's bindings).  This file pins
+;;;; that, while main and workers hammer the same specials at once:
 ;;;;
 ;;;;   MAIN'S OWN VIEW    inside main's LETs main reads exactly what it bound,
 ;;;;                      SETQ inside a binding hits the binding, a THROW or a
@@ -17,10 +15,11 @@
 ;;;;                      the loops every global is back -- whatever workers did.
 ;;;;   A WORKER'S OWN     a worker binding the same specials reads only its own
 ;;;;                      values, many times over, while main rebinds them.
-;;;;   A WORKER READING   a special the worker has NOT bound reads main's current
-;;;;   MAIN'S             value: always one main could have installed (never
-;;;;                      garbage, never another worker's), and a global main
-;;;;                      SETQs at top level reads monotonically on the worker.
+;;;;   A WORKER READING   a special the worker has NOT bound reads the GLOBAL
+;;;;   AN UNBOUND ONE     value -- never main's binding, never another worker's
+;;;;                      (until 2026-11-27 it read main's: main bound
+;;;;                      shallowly) -- and a global main SETQs at top level
+;;;;                      reads monotonically on the worker.
 ;;;;   THE INSERT PATH    specials with NO globals pair yet, first bound on main
 ;;;;                      after threads exist (a compiled LET of a DECLAIMed
 ;;;;                      special, and PROGV of freshly interned symbols), while
@@ -123,11 +122,13 @@
 
 ;;; ---- the worker side ----
 (defun main-value-p (v global)
-  "A value main can have installed in *MA* / *MB*: the global, one of main's
-   loop indices, its in-binding SETQ value, or a list main consed."
-  (or (eq v global)
-      (and (integerp v) (>= v 0) (< v 2000000))
-      (and (consp v) (integerp (car v)))))
+  "What a worker reads for *MA* / *MB* when it has not bound them: the GLOBAL
+   value, never one of main's bindings (main only SETQs them inside its own
+   LETs).  This used to accept any value main could have installed, because
+   main bound shallowly and a worker saw main's bindings; since main has a
+   binding stack of its own (mvm/prelude.lisp, THE MAIN THREAD'S BINDING
+   STACK) it must be the global, as in SBCL."
+  (eq v global))
 
 (defun worker-loop (base iters)
   "Bind the specials main is binding, read only our own; read the ones we do

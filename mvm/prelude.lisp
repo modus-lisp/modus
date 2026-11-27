@@ -3561,11 +3561,12 @@
 ;;; every image that has not declared it is running Lisp on more than one
 ;;; thread — so a single-threaded ./modus, every bare-metal image and every
 ;;; ANSI gate runner pays one 32-bit load and a branch on the read path and
-;;; reaches the identical code.  The MAIN thread of an armed image is unarmed
-;;; too: its FS base is 0 (nothing ever wrote the self slot), %DYNB-BLOCK
-;;; answers 0, and it shallow-binds exactly as before.  That is deliberate and
-;;; it is not a gap: main IS region 0's mutator, so a binding main publishes
-;;; into the globals table creates no cross-region pointer.
+;;; reaches the identical code.  The MAIN thread of an armed image has no
+;;; WINDOW block: its FS base is 0 (nothing ever wrote the self slot) and
+;;; %DYNB-BLOCK answers 0.  It used to shallow-bind for that reason, which was
+;;; right for the collector (main IS region 0's mutator) and wrong for CL: every
+;;; other thread read main's bindings.  It binds in a stack of its own now --
+;;; THE MAIN THREAD'S BINDING STACK, below.
 (defun %dynb-block ()
   "This thread's per-thread window BLOCK, or 0 when it has none.
 
@@ -3582,6 +3583,106 @@
         (if (>= hi #x80000000)
             (+ (%conv-addr #x10000000) (+ (* (* (- hi 4294967296) 65536) 65536) lo))
             (+ (%conv-addr #x10000000) (+ (* (* hi 65536) 65536) lo))))))
+
+;;; ---- THE MAIN THREAD'S BINDING STACK (#x10000D60) ----
+;;;
+;;; A LET of a special on the MAIN thread used to write the globals pair --
+;;; shallow binding -- even with threads running, so a worker reading a
+;;; special it had not bound saw main's binding: (let ((*x* :main)) (join-thread
+;;; (make-thread (lambda () *x*)))) answered :MAIN where CL (and SBCL) answer
+;;; the global value.  secp256k1-fast's per-call scratch specials then made main
+;;; and a worker share scratch ("ECDH produced the point at infinity").
+;;;
+;;; So main has a binding stack too, in the same layout as a worker's window
+;;; block (C50 next, C58 depth, C60 extension stack, C70 wide filter), in raw
+;;; memory of its own (net/hosted-sync.lisp %DYNB-MAIN-INIT maps it at boot).
+;;; Its address cannot be main's window block: main's window IS the low block,
+;;; whose C50..FFF are process-global words.  The word at #x10000D60 holds the
+;;; block's SEGMENT DELTA (block - #x10000000), the same encoding as the self
+;;; slot, so the collector reaches the entries exactly as it reaches a worker's
+;;; (EMIT-DYNBIND-ROOT-SCAN, the stop-the-world and parked-actor scans).  Its
+;;; LOW BYTE is a flag, the delta being page-aligned:
+;;;
+;;;   0            no stack (bare metal, every other image): main binds
+;;;                shallowly, exactly as before.
+;;;   delta | 1    LOG MODE, threads not yet declared.  Main binds shallowly
+;;;                (the unarmed path is untouched), and every LET of a special
+;;;                also pushes [key][OUTER value] here (the compiler's
+;;;                %MLOG-PUSH-FORM; PROGV's %PROGV-SET), popped by its cleanup.
+;;;   delta        DEEP MODE, threads declared (gate #x10000DB8 open).  Main
+;;;                binds in this stack like any worker; the globals pair keeps
+;;;                the GLOBAL value.
+;;;
+;;; WHY A LOG.  Threads are declared at the first MAKE-THREAD, and main is
+;;; usually inside bindings by then -- LOAD's *PACKAGE* / *READTABLE*, or the
+;;; LET around the MAKE-THREAD itself.  Those were made shallowly, so the
+;;; global values exist only in the cleanups' saved lexicals, out of reach.
+;;; The log records them; %DYNB-MAIN-ARM (at %RT-THREADS-ON, gate still shut)
+;;; turns the log into deep bindings -- each entry takes the value the binding
+;;; above it saved, the innermost one the pair's current value, and the pair
+;;; gets back the outermost entry's saved value: the global.  The values are
+;;; GC roots in both modes (they are live objects either way).
+(defun %dynb-main-block ()
+  "Address of the main thread's binding stack's block (see THE MAIN THREAD'S
+   BINDING STACK), or 0 when it has none.  The flag byte is masked off."
+  (let ((lo (logand (mem-ref #x10000D60 :u32) #xFFFFFF00))
+        (hi (mem-ref #x10000D64 :u32)))
+    (if (eql hi 0)
+        (if (eql lo 0) 0 (+ (%conv-addr #x10000000) lo))
+        (if (>= hi #x80000000)
+            (+ (%conv-addr #x10000000) (+ (* (* (- hi 4294967296) 65536) 65536) lo))
+            (+ (%conv-addr #x10000000) (+ (* (* hi 65536) 65536) lo))))))
+
+(defun %dynb-bblk ()
+  "THIS thread's BINDING block: its window block, or on the main thread (no
+   window block) main's binding stack -- 0 when it has neither, i.e. when it
+   binds shallowly.  %DYNB-BLOCK keeps answering 0 on main: every other user of
+   it asks 'am I main / do I own a region', not 'where are my bindings'."
+  (let ((b (%dynb-block)))
+    (if (eql b 0) (%dynb-main-block) b)))
+
+(defun %mlog-main-p ()
+  "T on the main thread (no window block of its own)."
+  (and (eql (mem-ref #x10000C30 :u32) 0) (eql (mem-ref #x10000C34 :u32) 0)))
+
+;;; LOG MODE'S FAST PATH IS INLINE (mvm/compiler.lisp %MLOG-PUSH-FORM): the log
+;;; lives at a FIXED address on the one target that has it (x86-64 hosted:
+;;; block #x10010000, entries from #x10011000, 896 of them before the 64-entry
+;;; headroom), and the inline push and pop keep both the next-free word (C50)
+;;; and the depth (C58).  These two are its slow paths: a full log, and the
+;;; pops that match a full log's pushes.  The ORDER is the inline one: entry,
+;;; next-free, depth; pop: depth, next-free.
+(defun %mlog-push (key saved)
+  "LOG MODE, the log full (see THE MAIN THREAD'S BINDING STACK): COUNT the push
+   (blk+0xC68), so its pop is matched; such a binding just stays shallow."
+  (when (%mlog-main-p)
+    (let ((blk (%dynb-main-block)))
+      (unless (eql blk 0)
+        (let ((d (mem-ref (+ blk #xC58) :u64)))
+          (if (or (> (mem-ref (+ blk #xC68) :u64) 0) (>= d 896))
+              (setf (mem-ref (+ blk #xC68) :u64) (+ (mem-ref (+ blk #xC68) :u64) 1))
+              (let ((a (%dynb-next blk)))
+                (setf (mem-ref a :u64) key)
+                (setf (mem-ref (+ a 8) :u64) saved)
+                (%dynb-set-top blk (+ a 16) (+ d 1))))))))
+  saved)
+
+(defun %mlog-pop (key)
+  "The matching push's cleanup: undo a counted push, else pop the top entry
+   when it is KEY's (a LET* init that threw before its binding was made leaves
+   the top to the binding below)."
+  (when (%mlog-main-p)
+    (let ((blk (%dynb-main-block)))
+      (unless (eql blk 0)
+        (let ((sk (mem-ref (+ blk #xC68) :u64))
+              (d (mem-ref (+ blk #xC58) :u64)))
+          (if (> sk 0)
+              (setf (mem-ref (+ blk #xC68) :u64) (- sk 1))
+              (when (> d 0)
+                (let ((a (- (%dynb-next blk) 16)))
+                  (when (eql (mem-ref a :u64) key)
+                    (%dynb-set-top blk a (- d 1))))))))))
+  0)
 
 (defun %own-region-object-p (x)
   "T when X is a heap object inside THIS thread's own region pair -- the
@@ -3814,7 +3915,7 @@
    whole mechanism exists to prevent, and it would additionally desynchronise
    the stack so the matching %DYNUNBIND truncated somebody else's entry."
   (error "dynamic binding stack exhausted (~D nested specials) for key ~S"
-         (%dynb-capacity (%dynb-block)) key))
+         (%dynb-capacity (%dynb-bblk)) key))
 
 ;;; ---- UNBOUND, as a value a cell can hold ----
 ;;;
@@ -3835,6 +3936,15 @@
   "The value a globals cell holds while its special is unbound."
   (%word->val #x0BADB0B5))
 
+;;; THE ARMED MAIN THREAD'S PUSH AND POP (inline in %DYNBIND and %DYNUNBIND)
+;;; at the fixed addresses of x86-64
+;;; hosted (net/hosted-sync.lisp %DYNB-MAIN-INIT: block #x10010000, so the
+;;; delta word reads #x10000): next-free C50, depth C58, entries from
+;;; #x10011000, index cache #x10014C00, wide filter #x10015000.  The same
+;;; stores %DYNBIND / %DYNB-UNWIND make through the generic helpers, in raw
+;;; fixnum arithmetic and no calls -- the generic path made a LET of three
+;;; specials 7x dearer on main once a thread had run.  Order as there: entry,
+;;; next-free, depth (the collector scans DEPTH entries), then filter, cache.
 (defun %dynbind (key val)
   "Establish a dynamic binding of the global named by KEY (a name hash).
    A drop-in replacement for the SET-SYMBOL-VALUE that COMPILE-LET-WITH-
@@ -3871,15 +3981,34 @@
        rebuilt, and two threads inserting the same key must not both win.
        So the insert keeps the lock.
    A worker NEVER reaches this arm once its window is installed (its block is
-   non-zero), so main's shallow binding is still the global value a worker
-   reads for a special it has not bound -- the semantics test/hosted-
-   dynbind.lisp and test/main-bind-armed.lisp pin.  (The READER-ERROR an
+   non-zero).  SINCE 2026-11-27 main does not reach it either where it has a
+   binding stack of its own (x86-64 hosted: see THE MAIN THREAD'S BINDING
+   STACK, whose fixed-address push is inline just above), because main's
+   shallow binding WAS the global value a worker read for a special it had not
+   bound; test/thread-bindings.lisp holds that against SBCL.  The arm stays
+   for a main thread without a stack (the other threaded targets).  (The READER-ERROR an
    earlier attempt at this recorded did not reproduce on this tree, nor on a
    rebuild of the commit that recorded it with the change re-applied; that
    tree failed hosted-dynbind identically with and without the change.)"
   (if (eql (mem-ref #x10000DB8 :u32) 0)
       (%gv-set key val)
-      (let ((blk (%dynb-block)))
+      (if (and (eq (mem-ref #x10000C30 :u32) 0) (eq (mem-ref #x10000C34 :u32) 0)
+               (eq (mem-ref #x10000D60 :u32) #x10000) (eq (mem-ref #x10000D64 :u32) 0)
+               ;; %DYNB-MAIN-PUSH, inline
+               (< (the fixnum (mem-ref #x10010C58 :u64)) 896))
+          (let ((n (the fixnum (mem-ref #x10010C50 :u64)))
+                (d (the fixnum (mem-ref #x10010C58 :u64)))
+                (fa (%fixnum-+ #x10015000 (logand key 4095))))
+            (setf (mem-ref n :u64) key)
+            (setf (mem-ref (%fixnum-+ n 8) :u64) val)
+            (setf (mem-ref #x10010C50 :u64) (%fixnum-+ n 16))
+            (setf (mem-ref #x10010C58 :u64) (%fixnum-+ d 1))
+            (let ((v (the fixnum (mem-ref fa :u8))))
+              (when (< v 255) (setf (mem-ref fa :u8) (%fixnum-+ v 1))))
+            (setf (mem-ref (%fixnum-+ #x10014C00 (%fixnum-+ (logand key 511) (logand key 511))) :u16)
+                  (%fixnum-+ d 1))
+            val)
+      (let ((blk (%dynb-bblk)))
         (if (eql blk 0)
             ;; ARMED, NO BLOCK: the main thread (see THE ARMED MAIN THREAD
             ;; in the docstring).  An EXISTING pair is stored in place, unlocked, like
@@ -3914,7 +4043,7 @@
                                           (+ #x3C00 (ash (logand key 511) 1)))
                                        :u16)
                               (+ d 1))))
-                    val)))))))
+                    val))))))))
 
 (defun %dynunbind (key saved)
   "Undo the matching %DYNBIND.  SAVED is the value the compiler read before
@@ -3923,15 +4052,35 @@
    the entry below the one it truncates away."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
       (%gv-set key saved)
-      (let ((blk (%dynb-block)))
+      (if (and (eq (mem-ref #x10000C30 :u32) 0) (eq (mem-ref #x10000C34 :u32) 0)
+               (eq (mem-ref #x10000D60 :u32) #x10000) (eq (mem-ref #x10000D64 :u32) 0)
+               ;; %DYNB-MAIN-POP, inline
+               (> (the fixnum (mem-ref #x10010C58 :u64)) 0)
+               (eq (mem-ref (%fixnum-- (the fixnum (mem-ref #x10010C50 :u64)) 16) :u64) key))
+          (let ((n (the fixnum (mem-ref #x10010C50 :u64)))
+                (d (the fixnum (mem-ref #x10010C58 :u64)))
+                (fa (%fixnum-+ #x10015000 (logand key 4095))))
+            (setf (mem-ref #x10010C58 :u64) (%fixnum-- d 1))
+            (setf (mem-ref #x10010C50 :u64) (%fixnum-- n 16))
+            (let ((v (the fixnum (mem-ref fa :u8))))
+              (when (and (> v 0) (< v 255)) (setf (mem-ref fa :u8) (%fixnum-- v 1))))
+            saved)
+      (let ((blk (%dynb-bblk)))
         (if (eql blk 0)
             (let ((cl (%gv-cell key)))
               (if cl (progn (set-cdr cl saved) saved) (set-symbol-value key saved)))
             (let ((d (%dynb-depth blk)))
-              (if (<= d 0)
+              (if (and (> d 0)
+                       (eql (%dynb-unwind blk key (- (%dynb-next blk) 16) (- d 1)) 1))
                   saved
-                  (progn (%dynb-unwind blk key (- (%dynb-next blk) 16) (- d 1))
-                         saved)))))))
+                  ;; NOTHING OF KEY'S ON TOP.  On the MAIN thread that is a
+                  ;; binding made shallowly -- before its stack existed, or
+                  ;; past the log's headroom (%MLOG-PUSH) -- so it is undone
+                  ;; shallowly.  A worker's never were: nothing to undo.
+                  (if (and (eql (%dynb-block) 0) (eql (%dynb-lookup blk key) 0))
+                      (let ((cl (%gv-cell key)))
+                        (if cl (progn (set-cdr cl saved) saved) (set-symbol-value key saved)))
+                      saved))))))))
 
 (defun set-symbol-value (name-hash value)
   "Set a global variable by its tagged name hash.  O(1) via the globals
@@ -3943,7 +4092,7 @@
   ;; table: that is a different operation with a different (and still open)
   ;; cross-region story, and it is not what a LET does.
   (unless (eql (mem-ref #x10000DB8 :u32) 0)
-    (let ((blk (%dynb-block)))
+    (let ((blk (%dynb-bblk)))
       (unless (eql blk 0)
         (let ((a (%dynb-lookup blk name-hash)))
           (unless (eql a 0)
@@ -4039,6 +4188,24 @@
       0
       (let ((lo (mem-ref #x10000C30 :u32))
             (hi (mem-ref #x10000C34 :u32)))
+        ;; MAIN (no window block): its binding stack, if it has one.
+        (when (and (eq hi 0) (eq lo 0))
+          (setq lo (logand (mem-ref #x10000D60 :u32) #xFFFFFF00))
+          (setq hi (mem-ref #x10000D64 :u32))
+          ;; THE FIXED x86-64 ONE, fused at its constant addresses (see THE
+          ;; ARMED MAIN THREAD'S PUSH AND POP): the filter, then the index cache.
+          (when (and (eq lo #x10000) (eq hi 0))
+            (return-from %dynb-value-addr
+              (if (eq (mem-ref (%fixnum-+ #x10015000 (logand key 4095)) :u8) 0)
+                  0
+                  (let ((ix (the fixnum (mem-ref (%fixnum-+ #x10014C00 (%fixnum-+ (logand key 511) (logand key 511))) :u16))))
+                    (let* ((i2 (%fixnum-+ ix ix)) (i4 (%fixnum-+ i2 i2))
+                           (i8 (%fixnum-+ i4 i4)) (i16 (%fixnum-+ i8 i8)))
+                      (if (and (> ix 0)
+                               (<= ix (the fixnum (mem-ref #x10010C58 :u64)))
+                               (eq (mem-ref (%fixnum-+ #x10010FF0 i16) :u64) key))
+                          (%fixnum-+ #x10010FF8 i16)
+                          (%dynb-lookup (%conv-addr #x10010000) key))))))))
         (if (and (eq hi 0) (eq lo 0))
             0
             (let* ((blk (if (eq hi 0)
@@ -4193,7 +4360,12 @@
    (unbound comes back as the unbound marker), memoising the cell."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
+                   ;; main's own stack: the cell is right while main holds no
+                   ;; binding of the key (its filter counter, fixed address)
+                   (and (eql (mem-ref #x10000D60 :u32) #x10000) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ #x10015000 (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
         (if %gv-c (cdr %gv-c) (%gv-save %gv-key)))
       (%gv-save %gv-key)))
@@ -4223,7 +4395,12 @@
    cell -- flushing the cache -- when there is none)."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
+                   ;; main's own stack: the cell is right while main holds no
+                   ;; binding of the key (its filter counter, fixed address)
+                   (and (eql (mem-ref #x10000D60 :u32) #x10000) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ #x10015000 (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
         (if %gv-c
             (progn (set-cdr %gv-c %gv-val) %gv-val)
@@ -4234,7 +4411,8 @@
   "%DYNBIND through the cell cache: its unarmed arm is %GV-SET (see there)."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))) ; ARMED MAIN THREAD
       (%gv-set-c %gv-key %gv-val %gv-slot)
       (%dynbind %gv-key %gv-val)))
 
@@ -4242,7 +4420,8 @@
   "%DYNUNBIND through the cell cache: its unarmed arm is %GV-SET too."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))) ; ARMED MAIN THREAD
       (%gv-set-c %gv-key %gv-saved %gv-slot)
       (%dynunbind %gv-key %gv-saved)))
 
@@ -4251,7 +4430,12 @@
    cell's value on an unarmed image, else %GV-SAVE (thread bindings first)."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
+                   ;; main's own stack: the cell is right while main holds no
+                   ;; binding of the key (its filter counter, fixed address)
+                   (and (eql (mem-ref #x10000D60 :u32) #x10000) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ #x10015000 (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (cdr %gv-cell)
       (%gv-save %gv-key)))
 
@@ -4260,7 +4444,8 @@
    store into the cell (%GV-SET's in-place update, without the probe)."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-val) %gv-val)
       (%dynbind %gv-key %gv-val)))
 
@@ -4268,7 +4453,8 @@
   "%DYNUNBIND through a cell baked at a runtime compile."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-saved) %gv-saved)
       (%dynunbind %gv-key %gv-saved)))
 
@@ -4278,7 +4464,12 @@
    the cell, else %GV-SET (this thread's binding first)."
   (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
           (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
-               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+               (eql (mem-ref #x10000C34 :u32) 0)
+               (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
+                   ;; main's own stack: the cell is right while main holds no
+                   ;; binding of the key (its filter counter, fixed address)
+                   (and (eql (mem-ref #x10000D60 :u32) #x10000) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ #x10015000 (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-val) %gv-val)
       (%gv-set %gv-key %gv-val)))
 

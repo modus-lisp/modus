@@ -1933,6 +1933,151 @@ Stopping.
         (list (%gc-read64 (+ tt #xD0)) (%gc-read64 (+ tt #xD8))
               (%gc-read64 (+ tt #xE0)) (%gc-read64 (+ tt #xE8))))))
 
+;;; ============================================================
+;;; THE MAIN THREAD'S BINDING STACK (mvm/prelude.lisp has the design)
+;;; ============================================================
+;;;
+;;; 24 KB of x86-64 hosted BSS at #x10010000, outside every heap: the block
+;;; page (only its +0xC50..+0xE7F is used, the same offsets a worker's window
+;;; block has), a 16 KB extension stack at +0x1000 (960 entries; its top 1 KB is
+;;; the index cache, as a worker's) and a 4 KB wide filter at +0x5000.
+;;; #x10000D60 holds the segment delta with flag byte 1: LOG MODE, until
+;;; %RT-THREADS-ON.  The inline push and pop of log mode (mvm/compiler.lisp
+;;; %MLOG-PUSH-FORM) keep next-free and depth, as %DYNBIND does in deep mode.
+
+(defun %dynb-main-set-word (delta flag)
+  "Store DELTA|FLAG at #x10000D60 as the exact machine word (two halves: a
+   :U64 store deposits val*2, and the collector reads the raw word)."
+  (let* ((hi (ash (ash delta -16) -16))
+         (lo (- delta (* (* hi 65536) 65536))))
+    (setf (mem-ref #x10000D64 :u32) hi)
+    (setf (mem-ref #x10000D60 :u32) (logior lo flag))
+    0))
+
+(defun %dynb-main-init ()
+  "Give the main thread its binding stack, in log mode.  Called once at boot,
+   before the toplevel binds anything.  Off with MODUS_MAIN_SHALLOW=1 (main
+   then binds shallowly even with threads: the old behaviour, for bisection).
+   0 on success, 1 if not done."
+  (let ((off (%cli-getenv "MODUS_MAIN_SHALLOW")))
+    (if (or (not (eql (mem-ref #x10000D60 :u32) 0))
+            (not (eql (mem-ref #x10000D64 :u32) 0))
+            (and off (> (length off) 0) (not (string= off "0"))))
+        1
+        ;; A FIXED address, not a mapping: the compiler inlines log mode's
+        ;; push and pop against it (%MLOG-PUSH-FORM).  x86-64 hosted BSS.
+        (let ((m (%conv-addr #x10010000)))
+          (if (not (= (%layout-if :a64-threads 0 1) 1))
+              1
+              (progn
+                (setf (mem-ref (+ m #xC50) :u64) (+ m #x1000)) ; next free
+                (setf (mem-ref (+ m #xC58) :u64) 0)            ; depth
+                (setf (mem-ref (+ m #xC60) :u64) (+ m #x1000)) ; stack
+                (setf (mem-ref (+ m #xC68) :u64) 0)            ; log overflow count
+                (setf (mem-ref (+ m #xC70) :u64) (+ m #x5000)) ; wide filter
+                (%dynb-main-set-word (- m (%conv-addr #x10000000)) 1)
+                0))))))
+
+(defun %dynb-main-cell-value (key)
+  "The globals pair's value for KEY, the unbound marker when there is none."
+  (let ((c (%gv-cell key)))
+    (if (consp c) (cdr c) (%unbound-marker))))
+
+(defun %dynb-main-cell-set (key v)
+  (let ((c (%gv-cell key)))
+    (if (consp c) (set-cdr c v) (set-symbol-value key v))
+    v))
+
+(defun %dynb-main-entry (blk i) (+ (mem-ref (+ blk #xC60) :u64) (* i 16)))
+
+(defun %dynb-main-arm ()
+  "LOG MODE -> DEEP MODE, on the main thread, threads gate still shut.  Each
+   logged entry [key][saved] becomes a deep binding [key][bound value]: the
+   value is what the next binding of KEY above it saved, or for the innermost
+   the pair's current value; the pair gets back the outermost entry's saved
+   value -- the global.  Then the filter and index cache are rebuilt and the
+   flag cleared.  A log that overflowed (blk+0xC68 non-zero) is not converted:
+   it is emptied, and every binding main holds stays shallow until undone
+   (%DYNUNBIND's no-entry arm), which is the old behaviour."
+  (let ((blk (%dynb-main-block)))
+    (when (and (not (eql blk 0)) (not (eql (mem-ref #x10000D60 :u8) 0)))
+      (let ((d (%dynb-depth blk)))
+        (if (> (mem-ref (+ blk #xC68) :u64) 0)
+            (%dynb-set-top blk (mem-ref (+ blk #xC60) :u64) 0)
+            (let ((outer nil) (i 0))
+              ;; the outermost saved value of each key: the global
+              (loop
+                (when (>= i d) (return nil))
+                (let ((k (mem-ref (%dynb-main-entry blk i) :u64)))
+                  (unless (assoc k outer)
+                    (setq outer (cons (cons k (mem-ref (+ (%dynb-main-entry blk i) 8) :u64)) outer))))
+                (setq i (+ i 1)))
+              ;; each entry's bound value (ascending: reads only entries above)
+              (setq i 0)
+              (loop
+                (when (>= i d) (return nil))
+                (let* ((a (%dynb-main-entry blk i))
+                       (k (mem-ref a :u64))
+                       (j (+ i 1)) (nv nil) (found nil))
+                  (loop
+                    (when (or found (>= j d)) (return nil))
+                    (when (eql (mem-ref (%dynb-main-entry blk j) :u64) k)
+                      (setq found t)
+                      (setq nv (mem-ref (+ (%dynb-main-entry blk j) 8) :u64)))
+                    (setq j (+ j 1)))
+                  (setf (mem-ref (+ a 8) :u64) (if found nv (%dynb-main-cell-value k))))
+                (setq i (+ i 1)))
+              (dolist (p outer) (%dynb-main-cell-set (car p) (cdr p)))))
+        ;; filter and index cache, from the entries now live
+        (%dynb-filter-clear blk)
+        (let ((ext (mem-ref (+ blk #xC60) :u64)) (f (%dynb-filter blk)) (i 0)
+              (n (%dynb-depth blk)))
+          (%ha-zero (+ ext #x3C00) (+ ext #x4000))
+          (loop
+            (when (>= i n) (return nil))
+            (let ((k (mem-ref (%dynb-main-entry blk i) :u64)))
+              (%dynb-filter-count blk f k)
+              (setf (mem-ref (+ ext (+ #x3C00 (ash (logand k 511) 1))) :u16) (+ i 1)))
+            (setq i (+ i 1))))
+        (setf (mem-ref (+ blk #xC68) :u64) 0)
+        (setf (mem-ref (+ blk #xC50) :u64)
+              (+ (mem-ref (+ blk #xC60) :u64) (ash (%dynb-depth blk) 4)))
+        (%dynb-main-set-word (- blk (%conv-addr #x10000000)) 0))))
+  0)
+
+(defun %dynb-main-disarm ()
+  "DEEP MODE -> LOG MODE (%RT-THREADS-OFF): the inverse of %DYNB-MAIN-ARM.
+   Each entry's saved value becomes what the binding below it bound, or for the
+   outermost the pair's (global) value; the pair gets the innermost binding."
+  (let ((blk (%dynb-main-block)))
+    (when (and (not (eql blk 0)) (eql (mem-ref #x10000D60 :u8) 0))
+      (let ((d (%dynb-depth blk)) (inner nil) (i 0))
+        (loop
+          (when (>= i d) (return nil))
+          (let* ((a (%dynb-main-entry blk i)) (k (mem-ref a :u64)) (e (assoc k inner)))
+            (if e (setf (cdr e) (mem-ref (+ a 8) :u64))
+                (setq inner (cons (cons k (mem-ref (+ a 8) :u64)) inner))))
+          (setq i (+ i 1)))
+        ;; descending: reads only entries below, not yet rewritten
+        (setq i (- d 1))
+        (loop
+          (when (< i 0) (return nil))
+          (let* ((a (%dynb-main-entry blk i)) (k (mem-ref a :u64))
+                 (j (- i 1)) (nv nil) (found nil))
+            (loop
+              (when (or found (< j 0)) (return nil))
+              (when (eql (mem-ref (%dynb-main-entry blk j) :u64) k)
+                (setq found t)
+                (setq nv (mem-ref (+ (%dynb-main-entry blk j) 8) :u64)))
+              (setq j (- j 1)))
+            (setf (mem-ref (+ a 8) :u64) (if found nv (%dynb-main-cell-value k))))
+          (setq i (- i 1)))
+        (dolist (p inner) (%dynb-main-cell-set (car p) (cdr p)))
+        (setf (mem-ref (+ blk #xC50) :u64)
+              (+ (mem-ref (+ blk #xC60) :u64) (ash d 4)))
+        (%dynb-main-set-word (- blk (%conv-addr #x10000000)) 1))))
+  0)
+
 (defun %rt-threads-on ()
   "Declare that more than one thread is about to run Lisp through the shared
    runtime tables.  Returns 1 on success, 0 if the precondition is not met.
@@ -1987,6 +2132,9 @@ Stopping.
         ;; and the next toplevel form died TYPE-ERROR.  Nothing is running on
         ;; a second thread yet, so compiling here loses nothing.
         (%rt-eager-compile)
+        ;; MAIN'S BINDINGS GO DEEP (prelude, THE MAIN THREAD'S BINDING STACK):
+        ;; last, so nothing between here and the gate binds through the log.
+        (%dynb-main-arm)
         (setf (mem-ref (%rt-gate-addr) :u32) 1)
         ;; (%RT-EAGER-COMPILE, above.)  COMPILE THE COMPAT SURFACE, because from here on it is hot and
         ;; it is BYTECODE.  net/cooperative-atomics.lisp and the SB-* shims
@@ -2029,6 +2177,7 @@ Stopping.
 
 (defun %rt-threads-off ()
   (setf (mem-ref (%rt-gate-addr) :u32) 0)
+  (%dynb-main-disarm)
   0)
 
 (defun %rt-acquisitions () (%gc-read64 (%conv-addr #x10000DE0)))

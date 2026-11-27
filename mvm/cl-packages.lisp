@@ -2294,7 +2294,7 @@
     ;; hold — so a NIL key must never be handed to the scan or it could match
     ;; some other binding's value word and return that binding's value.
     (unless (or (null key) (eql (mem-ref #x10000DB8 :u32) 0))
-      (let ((blk (%dynb-block)))
+      (let ((blk (%dynb-bblk)))
         (unless (eql blk 0)
           (let ((a (%dynb-lookup blk key)))
             (unless (eql a 0)
@@ -2659,6 +2659,10 @@
       ;; rather than in region 0's globals table — the same reason
       ;; COMPILE-LET-WITH-SPECIALS emits it.  Identical to the old call on
       ;; every unarmed thread.
+      ;; LOG MODE (prelude, THE MAIN THREAD'S BINDING STACK): record the
+      ;; shallow binding with the value it replaces, as a compiled LET does.
+      (unless (eql (mem-ref #x10000D60 :u8) 0)
+        (let ((h (%progv-hash (car vc)))) (%mlog-push h (%gv-save h))))
       (if (null vlc)
           (%dynbind (%progv-hash (car vc)) (%unbound-marker))
           (progn (%dynbind (%progv-hash (car vc)) (car vlc))
@@ -2674,6 +2678,7 @@
         ;; The %DYNBIND above's counterpart.  %DYNUNBIND pops this thread's
         ;; top entry when it is this variable's, so the restores run innermost
         ;; first.
+        (unless (eql (mem-ref #x10000D60 :u8) 0) (%mlog-pop (car p)))
         (%dynunbind (car p) (cdr p)))
       (setq cur (cdr cur)))))
 

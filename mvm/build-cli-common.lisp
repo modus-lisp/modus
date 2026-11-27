@@ -2076,14 +2076,15 @@
   ;; the save come back unpatched with the binary (mvm-eval.lisp, REDEFINING A
   ;; KERNEL FUNCTION), and a restored process must call the definitions it saved.
   (cond ((not *cli-bare-metal*)
-         "  (when (%core-requested-p)
+         (concatenate 'string "  (when (%core-requested-p)
     (%restore-image)
     (%core-post-restore)
     (%kernel-redirects-reapply)
     (%core-run-restore-hooks)
-    (handler-case (cli-toplevel) (t (c) (%cli-exit 1)))
+" (if *cli-hosted-actor-runtime-p* "    (%dynb-main-init)
+" "") "    (handler-case (cli-toplevel) (t (c) (%cli-exit 1)))
     (%cli-exit 0))
-")
+"))
         ;; Bare metal: the core is a RAM range the boot loader placed; the
         ;; arch says what a restored process runs instead of boot init.
         ((string= *cli-arch-core-resume* "") "")
@@ -2260,6 +2261,14 @@
   (if (and (eq *cli-arch* :x64) (not *cli-bare-metal*))
       "  (modus.ssh::%bind-ssh-seams)
   (%bind-hosted-ssh-seams)
+"
+      "")
+  ;; The main thread's binding stack (net/hosted-sync.lisp %DYNB-MAIN-INIT;
+  ;; prelude THE MAIN THREAD'S BINDING STACK): before the toplevel binds
+  ;; anything, so a thread started later sees global values, not main's.
+  ;; x86-64 hosted only: its collector scans the stack (EMIT-DYNBIND-ROOT-SCAN).
+  (if *cli-hosted-actor-runtime-p*
+      "  (%dynb-main-init)
 "
       "")
   "  ;; WS5 rung 2: initialize the native JIT if it was baked (MODUS_USE_JIT=1).

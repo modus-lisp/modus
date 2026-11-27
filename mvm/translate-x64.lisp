@@ -863,6 +863,35 @@
     (emit-add-reg-imm buf 'rax #x10000198)
     (emit-call buf scan-word-label)))
 
+(defun emit-stw-dynb-entries (buf seg-reg scan-word-label)
+  "Scan the dynamic-binding entries of the block whose segment delta is in
+   SEG-REG (non-zero): the loop the per-thread scan below inlines.  Clobbers
+   RAX RDI R10 and SEG-REG."
+  (let ((dbl (make-label)) (dbd (make-label)) (dbin (make-label)) (dbgo (make-label)))
+    (emit-mov-reg-mem buf 'r10 seg-reg #x10000C58)   ; tagged depth
+    (emit-shr-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :le dbd)
+    (emit-mov-reg-mem buf 'rax seg-reg #x10000C60)   ; tagged stack base
+    (emit-shr-reg-imm buf 'rax 1)
+    (emit-cmp-reg-imm buf 'rax 0)
+    (emit-jcc buf :e dbin)
+    (emit-mov-reg-reg buf 'rdi 'rax)
+    (emit-add-reg-imm buf 'rdi 8)
+    (emit-jmp buf dbgo)
+    (emit-label buf dbin)
+    (emit-mov-reg-reg buf 'rdi seg-reg)
+    (emit-add-reg-imm buf 'rdi #x10000C78)
+    (emit-label buf dbgo)
+    (emit-label buf dbl)
+    (emit-mov-reg-reg buf 'rax 'rdi)
+    (emit-call buf scan-word-label)
+    (emit-add-reg-imm buf 'rdi 16)
+    (emit-sub-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :g dbl)
+    (emit-label buf dbd)))
+
 (defun emit-stw-scan-subroutine (buf label scan-word-label)
   "Scan every STOPPED thread's roots.  Called after the collector's own roots
    and before the Cheney loop, with RBX/RCX/R13/RBP live; clobbers RAX RSI R8
@@ -885,6 +914,12 @@
     (emit-stw-scan-range buf scan-word-label)
     (emit-bytes buf #x45 #x31 #xE4)                  ; xor r12d, r12d (seg 0)
     (emit-stw-scan-handler-rbx buf 'r12 scan-word-label)
+    ;; ... and its dynamic bindings (prelude, THE MAIN THREAD'S BINDING STACK)
+    (when *x64-tls-window*
+      (emit-main-dynb-seg buf 'rsi)
+      (emit-cmp-reg-imm buf 'rsi 0)
+      (emit-jcc buf :e skip-main)
+      (emit-stw-dynb-entries buf 'rsi scan-word-label))
     (emit-label buf skip-main)
     (emit-mov-reg-reg buf 'r12 'r11)
     (emit-add-reg-imm buf 'r12 #x180)                ; record 1
@@ -1102,6 +1137,16 @@
     (emit-stw-scan-handler-rbx buf 'rsi scan-word-label)
     (emit-mov-reg-mem buf 'rax 'rsp 0)
     (emit-mov-reg-mem buf 'rsi 'rax 24)
+    ;; segment 0 is the MAIN computation (a parked coroutine 0): its bindings
+    ;; are in main's binding stack, not at the low block's C58.
+    (when *x64-tls-window*
+      (let ((seg-ok (make-label)))
+        (emit-cmp-reg-imm buf 'rsi 0)
+        (emit-jcc buf :ne seg-ok)
+        (emit-main-dynb-seg buf 'rsi)
+        (emit-cmp-reg-imm buf 'rsi 0)
+        (emit-jcc buf :e dbd)
+        (emit-label buf seg-ok)))
     (emit-mov-reg-mem buf 'r10 'rsi #x10000C58)
     (emit-shr-reg-imm buf 'r10 1)
     (emit-cmp-reg-imm buf 'r10 0)
@@ -1196,6 +1241,14 @@
       (emit-jmp buf ar-loop)
       (emit-label buf ar-done))))
 
+(defun emit-main-dynb-seg (buf reg)
+  "REG = the main thread's binding-stack segment delta: [#x10000D60] with its
+   flag byte cleared, 0 when main has none (mvm/prelude.lisp, THE MAIN
+   THREAD'S BINDING STACK)."
+  (emit-mov-reg-abs buf reg #x10000D60)
+  (emit-shr-reg-imm buf reg 8)
+  (emit-shl-reg-imm buf reg 8))
+
 (defun emit-dynbind-root-scan (buf scan-word-label)
   "Scan THIS THREAD's dynamic-binding stack as a precise root set.
 
@@ -1211,9 +1264,11 @@
    THE COLLECTOR RUNS ON THE THREAD THAT HIT ITS OWN LIMIT, so EMIT-TLS-BASE
    resolves to that thread's block and the stack walked is that thread's —
    the same argument the MV-extras loop above rests on.  The main thread's
-   base is 0 and it never binds here, so the first test skips everything;
-   with the window off nothing is emitted at all and every other image stays
-   byte-identical.
+   base is 0; its bindings are in its own binding stack (prelude, THE MAIN
+   THREAD'S BINDING STACK), reached through #x10000D60, and in log mode those
+   entries hold the values main's shallow bindings replaced -- live objects
+   too.  With the window off nothing is emitted at all and every other image
+   stays byte-identical.
 
    Layout, from mvm/prelude.lisp: blk+0xC58 = depth as a TAGGED fixnum (one
    SHR, exactly like the MV count), blk+0xC60 = the thread's extension stack
@@ -1226,10 +1281,19 @@
   (when *x64-tls-window*
     (let ((db-loop (make-label))
           (db-done (make-label))
+          (db-have (make-label))
           (db-inwin (make-label)))
       (emit-tls-base buf 'rdi)                       ; rdi = this thread's base
       (emit-cmp-reg-imm buf 'rdi 0)
-      (emit-jcc buf :e db-done)                      ; base 0 = main thread
+      (emit-jcc buf :ne db-have)
+      ;; base 0 = the main thread: ITS binding stack, if it has one (prelude,
+      ;; THE MAIN THREAD'S BINDING STACK) -- same layout, segment delta in
+      ;; #x10000D60 with a flag byte.  In log mode the values are the saved
+      ;; outer values; live objects either way.
+      (emit-main-dynb-seg buf 'rdi)
+      (emit-cmp-reg-imm buf 'rdi 0)
+      (emit-jcc buf :e db-done)
+      (emit-label buf db-have)
       (emit-mov-reg-mem buf 'r10 'rdi #x10000C58)    ; r10 = tagged depth
       (emit-shr-reg-imm buf 'r10 1)                  ; untag
       (emit-cmp-reg-imm buf 'r10 0)
@@ -9056,8 +9120,8 @@
       (emit-label buf skip))))
 
 (defun emit-x64-window-root-scan (buf scan-word-label)
-  "Scan the per-thread window whose BASE is at [rbp-40]: its MV extras and,
-   when the base is not 0 (main never binds there), its dynamic bindings.
+  "Scan the per-thread window whose BASE is at [rbp-40]: its MV extras and its
+   dynamic bindings -- for base 0 (main) those in main's binding stack.
    Same layout as the collector's own loops (EMIT-DYNBIND-ROOT-SCAN)."
   (let ((mv-loop (make-label)) (mv-done (make-label))
         (db-loop (make-label)) (db-done (make-label)) (db-inwin (make-label)))
@@ -9080,7 +9144,14 @@
     (emit-label buf mv-done)
     (emit-mov-reg-mem buf 'rdi 'rbp -40)
     (emit-cmp-reg-imm buf 'rdi 0)
-    (emit-jcc buf :e db-done)
+    (let ((have (make-label)))
+      (emit-jcc buf :ne have)
+      ;; base 0 = main: its binding stack (prelude, THE MAIN THREAD'S BINDING
+      ;; STACK), if it has one
+      (when *x64-tls-window* (emit-main-dynb-seg buf 'rdi))
+      (emit-cmp-reg-imm buf 'rdi 0)
+      (emit-jcc buf :e db-done)
+      (emit-label buf have))
     (emit-mov-reg-mem buf 'r10 'rdi #x10000C58)
     (emit-shr-reg-imm buf 'r10 1)
     (emit-cmp-reg-imm buf 'r10 0)

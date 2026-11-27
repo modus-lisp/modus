@@ -15619,7 +15619,64 @@
                      (mapcar (lambda (n) (list n (list 'symbol-value (list 'quote n)))) shadowed)
                      body)))))
 
-(defun %special-bind-form (spec tmp)
+(defun %mlog-p ()
+  "Emit main's binding log at all?  Only on a 64-bit target (the log is an
+   x86-64 hosted feature: prelude, THE MAIN THREAD'S BINDING STACK) and not
+   where the shallow-thread gate is compiled out."
+  (and *shallow-thread-gate* (> (ct-fixnum-bits) 32)))
+
+(defun %mlog-push-form (k sv)
+  "Main's binding LOG (prelude, THE MAIN THREAD'S BINDING STACK): while the
+   flag byte at #x10000D60 is set -- main has a binding stack and no thread
+   has been declared yet -- record the shallow binding of key K that replaces
+   the value in SV.  INLINE, and in raw fixnum arithmetic over the next-free
+   word (#x10010C50) and the depth (#x10010C58): an out-of-line push made a
+   LET of three specials 3.4x dearer, a checked ASH/+ one 1.35x.  The entry is
+   written before the depth that publishes it (the collector scans DEPTH
+   entries).  A full log (next-free at #x10014800, 896 entries) goes to
+   %MLOG-PUSH."
+  (if (%mlog-p)
+      (let ((n (%mvm-gensym "MLN")))
+        `(if (eql (mem-ref #x10000D60 :u8) 0)
+             nil
+             (let ((,n (the fixnum (mem-ref #x10010C50 :u64))))
+               (if (< ,n #x10014800)
+                   (progn (setf (mem-ref ,n :u64) ,k)
+                          (setf (mem-ref (%fixnum-+ ,n 8) :u64) ,sv)
+                          (setf (mem-ref #x10010C50 :u64) (%fixnum-+ ,n 16))
+                          (setf (mem-ref #x10010C58 :u64)
+                                (%fixnum-+ (the fixnum (mem-ref #x10010C58 :u64)) 1)))
+                   (%mlog-push ,k ,sv)))))
+      nil))
+
+(defun %mlog-pop-form (k)
+  "The cleanup's twin of %MLOG-PUSH-FORM: pop the top entry if it is K's.  A
+   full log (where counted pushes live) goes to %MLOG-POP."
+  (if (%mlog-p)
+      (let ((n (%mvm-gensym "MLN")))
+        `(if (eql (mem-ref #x10000D60 :u8) 0)
+             nil
+             (let ((,n (the fixnum (mem-ref #x10010C50 :u64))))
+               (if (< ,n #x10014800)
+                   (if (> ,n #x10011000)
+                       (if (eql (mem-ref (%fixnum-- ,n 16) :u64) ,k)
+                           (progn
+                             (setf (mem-ref #x10010C58 :u64)
+                                   (%fixnum-- (the fixnum (mem-ref #x10010C58 :u64)) 1))
+                             (setf (mem-ref #x10010C50 :u64) (%fixnum-- ,n 16)))
+                           nil)
+                       nil)
+                   (%mlog-pop ,k)))))
+      nil))
+
+(defun %special-bind-form (spec tmp &optional sv)
+  "With SV (the binding's save variable), preceded by main's log push."
+  (let ((f (%special-bind-form-1 spec tmp)))
+    (if (and sv (%mlog-p))
+        `(progn ,(%mlog-push-form (%global-var-bind-key spec) sv) ,f)
+        f)))
+
+(defun %special-bind-form-1 (spec tmp)
   "The form that dynamically binds special SPEC to the value of variable TMP:
    unarmed, a store into the variable's cell (baked at a runtime compile, the
    AOT cache slot, or the per-site cache); armed, this thread's own binding.
@@ -15639,6 +15696,9 @@
           (site (%site-fast site `(progn (set-cdr c ,tmp) ,tmp)
                             `(%dynbind-site ,k ,tmp (quote ,site))))
           (t `(%dynbind ,k ,tmp)))))
+
+(defun %mlog-pop-wrap (k form)
+  (if (%mlog-p) `(progn ,(%mlog-pop-form k) ,form) form))
 
 (defun compile-let-with-specials (bindings body specials env dest &optional sequential
                                   &aux (%all-declared-specials nil))
@@ -15756,13 +15816,13 @@
            ;; b3f22df merge — the agent's LET-path fix had this filter).
            (set-forms
              (let ((acc nil))
-               (mapc (lambda (spec tmp)
+               (mapc (lambda (spec tmp sv)
                        (when (find (symbol-name spec) special-bindings
                                    :key (lambda (b)
                                           (symbol-name (if (consp b) (car b) b)))
                                    :test #'string=)
-                         (push (%special-bind-form spec tmp) acc)))
-                     specials temp-vars)
+                         (push (%special-bind-form spec tmp sv) acc)))
+                     specials temp-vars save-vars)
                (nreverse acc)))
            (restore-forms
              (mapcar (lambda (sv spec)
@@ -15770,6 +15830,7 @@
                               (cell (%let-special-cell spec k))
                               (slot (and (not cell) (%gv-aot-slot k spec)))
                               (site (and (not cell) (not slot) (%let-special-site spec k))))
+                         (%mlog-pop-wrap k
                          (cond (cell `(%dynunbind-cell (quote ,cell) ,k ,sv))
                                ((and slot (eql k (%global-name-key spec)))
                                 `(if ,(%shallow-thread-form)
@@ -15778,7 +15839,7 @@
                                (slot `(%dynunbind-c ,k ,sv ,slot))
                                (site (%site-fast site `(progn (set-cdr c ,sv) ,sv)
                                                  `(%dynunbind-site ,k ,sv (quote ,site))))
-                               (t `(%dynunbind ,k ,sv)))))
+                               (t `(%dynunbind ,k ,sv))))))
                      ;; REVERSE binding order: the innermost entry is undone first, so each
                      ;; restore finds its own entry on top of the thread's binding stack
                      ;; (%DYNB-UNWIND pops only the top).  On the shallow path the order is
@@ -15842,7 +15903,8 @@
                                       (list rb
                                             (list (%mvm-gensym "SPECSET")
                                                   (%special-bind-form (nth pos specials)
-                                                                      (nth pos temp-vars))))
+                                                                      (nth pos temp-vars)
+                                                                      (nth pos save-vars))))
                                       (list rb)))))
                             bindings renamed-bindings)))
               (compile-form
@@ -17145,13 +17207,25 @@
 ;;; the armed arm's self-slot load at every inline site: ~0.8 MB of native
 ;;; code in the x64 CLI image (+1.4%), down from 2.3 MB for the first shape
 ;;; (two half-word loads, LI+CMP instead of CMP-IMM).
+;;;
+;;; 2026-11-27: AND THAT WAS WRONG FOR CL, though right for the collector.  A
+;;; binding main made in the globals pair is the value every OTHER thread
+;;; reads: (let ((*x* :main)) (join-thread (make-thread (lambda () *x*))))
+;;; answered :MAIN, where SBCL answers the global value.  So main has a binding
+;;; stack of its own now (prelude, THE MAIN THREAD'S BINDING STACK; x86-64
+;;; hosted), and an armed main is shallow only where it holds no binding of the
+;;; variable: reads and SETQs still take the fast arm when main's FILTER says
+;;; so (%EMIT-SHALLOW-THREAD-GATE, given the key), and a BIND never does
+;;; (%SHALLOW-THREAD-FORM is the unarmed test alone).  A main without a stack
+;;; (other targets) keeps the old shallow behaviour through the slow arms.
 (defun %shallow-thread-form ()
-  "A source form that is true when THIS thread binds specials shallowly in the
-   globals pairs: threads were never declared, or this thread has no binding
-   block (the main thread).  See THE ARMED MAIN THREAD BINDS SHALLOWLY."
-  '(or (eql (mem-ref #x10000DB8 :u32) 0)
-       (and (eql (mem-ref #x10000C30 :u32) 0)
-            (eql (mem-ref #x10000C34 :u32) 0))))
+  "A source form that is true when THIS thread may bind a special shallowly in
+   its globals pair: threads were never declared.  (The armed main thread used
+   to qualify too; see the 2026-11-27 note above.)"
+  ;; Threads declared = every thread binds deeply, MAIN included (prelude, THE
+  ;; MAIN THREAD'S BINDING STACK); a main with no binding stack still binds
+  ;; shallowly, out of line (%DYNBIND's no-block arm).
+  '(eql (mem-ref #x10000DB8 :u32) 0))
 
 (defvar *shallow-thread-gate* t
   "NIL: %EMIT-SHALLOW-THREAD-GATE emits nothing.  For a target that can never
@@ -17160,11 +17234,13 @@
    build-mac68k-cl-repl), 131 KB of a Mac floppy image's resident code.  A
    host special, so the image's own compiler keeps the gate (correct, larger).")
 
-(defun %emit-shallow-thread-gate (a b slow)
-  "Emit IR that falls through when THIS thread binds shallowly (see THE ARMED
-   MAIN THREAD BINDS SHALLOWLY) and branches to SLOW otherwise -- i.e. when
-   threads are armed AND this thread has a per-thread binding block.  A and B
-   are scratch registers; both are clobbered.  Nothing at all when
+(defun %emit-shallow-thread-gate (a b slow &optional key)
+  "Emit IR that falls through when the globals pair of KEY is what THIS thread
+   reads and writes, and branches to SLOW otherwise: unarmed; or the main
+   thread with no binding stack; or the main thread whose stack holds no
+   binding of KEY (its filter counter is zero).  Workers always take SLOW.  For
+   READ and SETQ sites only -- a bind on an armed main must push.  A and B are
+   scratch registers; both are clobbered.  Nothing at all when
    *SHALLOW-THREAD-GATE* is NIL."
   (unless *shallow-thread-gate* (return-from %emit-shallow-thread-gate nil))
   (let ((fast (make-compiler-label)))
@@ -17173,15 +17249,33 @@
     (emit-ir :load b a (%tls-width (car (memory-width-code :u32)) #x10000DB8))
     (emit-ir :cmp-imm b 0)
     (emit-ir :beq fast)
-    ;; Armed: the whole self slot in ONE raw word load (%DYNB-BLOCK reads it
-    ;; as two tagged halves only because a tagged :U64 MEM-REF is not exact;
-    ;; an IR load compared with zero is).  One sequence, not two: every
-    ;; inline special read carries this, and the second cost ~1 MB of code.
+    ;; Armed.  A thread with a window block of its own (a worker) takes SLOW.
     (emit-li-tagged a (conv-real #x10000C30))
     (emit-ir :shr a a +fixnum-shift+)
     (emit-ir :load b a (%tls-width (car (memory-width-code :u64)) #x10000C30))
     (emit-ir :cmp-imm b 0)
     (emit-ir :bne slow)
+    ;; The MAIN thread.  It used to fall through here unconditionally -- it
+    ;; bound shallowly, and so published its bindings to every other thread.
+    ;; Now it has a binding stack of its own (prelude, THE MAIN THREAD'S
+    ;; BINDING STACK), and the cell is right for KEY only when main holds no
+    ;; binding of it: its wide filter's counter for KEY (a byte at a FIXED
+    ;; address, KEY being a compile-time constant) is zero.  Without a stack
+    ;; (#x10000D60 zero: not x86-64 hosted) main binds shallowly, as before.
+    ;; Without KEY (no caller does that today), SLOW.
+    (emit-li-tagged a (conv-real #x10000D60))
+    (emit-ir :shr a a +fixnum-shift+)
+    (emit-ir :load b a (%tls-width (car (memory-width-code :u64)) #x10000D60))
+    (emit-ir :cmp-imm b 0)
+    (emit-ir :beq fast)
+    (if (integerp key)
+        (let ((fa (+ #x10015000 (logand key 4095))))
+          (emit-li-tagged a (conv-real fa))
+          (emit-ir :shr a a +fixnum-shift+)
+          (emit-ir :load b a (%tls-width (car (memory-width-code :u8)) fa))
+          (emit-ir :cmp-imm b 0)
+          (emit-ir :bne slow))
+        (emit-ir :br slow))
     (emit-ir-label fast)))
 
 (defvar *let-special-sites* nil
@@ -17391,7 +17485,7 @@
       ;; an armed image has no per-thread bindings and reads the cache like an
       ;; unarmed one (%EMIT-SHALLOW-THREAD-GATE).  Unarmed: one 32-bit load
       ;; and a branch, as %COMPILE-GLOBAL-READ-BAKED pays.
-      (%emit-shallow-thread-gate dest cell miss)
+      (%emit-shallow-thread-gate dest cell miss key)
       ;; cell = [+GV-CACHE-ROOT+]  (the cache vector, or 0 before boot built it)
       (emit-li-tagged cell (conv-real +gv-cache-root+))
       (emit-ir :shr cell cell +fixnum-shift+)
@@ -17549,7 +17643,7 @@
     (let ((w (alloc-temp-reg)))
       ;; w = (mem-ref #x10000DB8 :u32); DEST is the second scratch until the
       ;; result lands in it.
-      (%emit-shallow-thread-gate dest w slow)
+      (%emit-shallow-thread-gate dest w slow key)
       (if site
           ;; THE PER-SITE CACHE (see %GV-SITE-CELL): SITE's car is the cell
           ;; once found, NIL until then, which takes the slow arm (it fills).
@@ -17643,7 +17737,7 @@
                (zed (alloc-temp-reg))
                (slow (make-compiler-label))
                (done (make-compiler-label)))
-           (%emit-shallow-thread-gate zed tmp slow)
+           (%emit-shallow-thread-gate zed tmp slow hash)
            ;; ONLY A FIXNUM OR NIL IS STORED IN PLACE.  Anything else may be,
            ;; or hold, an in-module lambda (a #x52 closure whose slot 0 is
            ;; THIS module's bytecode offset), and only the %GV-SET bridge call
@@ -17712,7 +17806,7 @@
            (when islot
              (let ((a (alloc-temp-reg)) (b (alloc-temp-reg)) (c (alloc-temp-reg))
                    (dest (or vreg-copy dest)))
-               (%emit-shallow-thread-gate a b inline-slow)
+               (%emit-shallow-thread-gate a b inline-slow hash)
                (emit-li-tagged a (conv-real +gv-cache-root+))
                (emit-ir :shr a a +fixnum-shift+)
                (emit-ir :load a a (%tls-width (car (memory-width-code :u64)) +gv-cache-root+))

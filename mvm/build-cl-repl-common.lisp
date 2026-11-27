@@ -1464,6 +1464,7 @@
   (setf (mem-ref #x10000D48 :u64) 0)
   (setf (mem-ref #x10000D50 :u64) 0)
   (setf (mem-ref #x10000D58 :u64) 0)
+  (setf (mem-ref #x10000D60 :u64) 0)   ; main's binding stack (prelude): none
   (setf (mem-ref #x10000DA0 :u64) 0)
   (setf (mem-ref #x10000F00 :u64) 0)
   (setf (mem-ref #x10000FD0 :u64) 0)
@@ -1546,6 +1547,7 @@
                     #x10000098     ; MV values
                     #x10000C30 #x10000C38 #x10000C40   ; fault diag slots
                     #x10000C48 #x10000C50 #x10000C58
+                    #x10000D60     ; main's binding stack (prelude): none
                     #x10000DA0))   ; safepoint boundary
       (format s "  (setf (mem-ref #x~X :u32) 0)~%" addr)
       (format s "  (setf (mem-ref #x~X :u32) 0)~%" (+ addr 4)))

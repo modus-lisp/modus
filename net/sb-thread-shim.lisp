@@ -469,11 +469,24 @@ modus: unhandled error in a thread: "))
             c
             (error "modus:share: ~A cannot be passed between threads" c)))))
 
+(defun %shared-array-element-bytes (element-type)
+  "Bytes one element of ELEMENT-TYPE takes in a modus array: a byte for octets,
+   4 for packed (unsigned-byte 32) and single-float lanes, a word otherwise."
+  (cond ((null element-type) 8)
+        ((or (subtypep element-type '(unsigned-byte 8)) (subtypep element-type '(signed-byte 8))) 1)
+        ((or (subtypep element-type '(unsigned-byte 32)) (subtypep element-type 'single-float)) 4)
+        (t 8)))
+
 (defun modus::make-shared-array (n &rest args)
   (if (zerop (%tls-self-base))
       (apply (function make-array) n args)
-      ;; Room for the largest element type, header and padding included.
-      (%sb-locked ((+ (* 8 (if (integerp n) n (reduce (function *) n))) 64))
+      ;; Room for N elements of the array's own element type, header and
+      ;; padding included.  It reserved 8 bytes an element whatever the type,
+      ;; so an 8 MB octet ring (an 8 MB MODUS:MAKE-CHANNEL) asked the 64 MB
+      ;; lock arena for 64 MB from a worker and stopped the process.
+      (%sb-locked ((+ (* (%shared-array-element-bytes (getf args :element-type))
+                         (if (integerp n) n (reduce (function *) n)))
+                      64))
         (apply (function make-array) n args))))
 
 (export (list (intern "SHARE" "MODUS") (intern "MAKE-SHARED-ARRAY" "MODUS")) "MODUS")

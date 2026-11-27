@@ -1517,8 +1517,15 @@
           (if (>= (- limit alloc) need)
               blk
               (let* ((af (%rt-arena-alloc))
-                     (chunk (if (> (+ need #x10000) #x100000)
-                                (logand (+ need #x10000 #xFFFF) (- 0 #x10000))
+                     ;; The slice's limit is its end less the guard band
+                     ;; (%GC-GUARDED-LIMIT: a 16th), so a chunk of NEED + 64 KB
+                     ;; held less than NEED: every locked allocation over ~900 KB
+                     ;; (an 8 MB MODUS:MAKE-CHANNEL ring on a worker) ran past
+                     ;; the limit and stopped the process as heap exhausted.
+                     ;; 17/16 of NEED + 64 KB leaves NEED + 64 KB below it.
+                     (chunk (if (> (+ need #x10000) #xF0000)
+                                (logand (+ (* 17 (ash (+ need #x10000) -4)) #x10000 #xFFFF)
+                                        (- 0 #x10000))
                                 #x100000)))
                 (if (> (+ af chunk) ae)
                     (progn

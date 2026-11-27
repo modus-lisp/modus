@@ -44,7 +44,9 @@
   "Walk SRC hash-table internal alist and mirror each (name-string → fn)
    entry as (name-hash → fn) into *native-sym-function-table*.
    Written without maphash to avoid closure-capture issues."
-  (let ((cur (%ht-pairs src)))
+  ;; newest first, as this walked before %HT-PAIRS became insertion order: on a
+  ;; name-hash collision the OLDEST name's function is the one left mirrored
+  (let ((cur (%ht-alist-oldest-first (%ht-pairs src))))
     (loop
       (when (null cur) (return nil))
       (let ((pair (car cur)))
@@ -350,6 +352,14 @@
    not EQ to it, so (eq #'f (fdefinition 'f)) failed inside a DEFUN body while
    holding at top level (user report, 2026-10-20)."
   (and *%e2-set-function-names* (gethash name *%e2-set-function-names*) t))
+
+(defun %e2-name-interpreted-p (name)
+  "NAME's global definition is a heap function (an interpreter trampoline, a
+   closure), not native code (tag 3).  A runtime-compiled #'NAME of such a name
+   reads SYMBOL-FUNCTION when evaluated (compile-function-ref): the baked load
+   would be a late-binding thunk, which follows later redefinitions."
+  (and (symbolp name) (fboundp name) (not (macro-function name))
+       (not (eql (logand (%val->word (symbol-function name)) 15) 3))))
 
 (defvar *seams* nil
   "Interface functions bound per image (builder packages step 3): EQUAL hash,

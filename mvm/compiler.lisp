@@ -22871,6 +22871,17 @@
                      ;; cell so #'NAME is EQ to it (see %E2-NAME-SET-FUNCTION-P).
                      (and (fboundp (quote %e2-name-set-function-p))
                           (%e2-name-set-function-p fn-name)
+                          (not (%e2-fn-in-module-p resolved-name)))
+                     ;; An INTERPRETED runtime DEFUN (its trampoline, not native
+                     ;; code): the baked load is a late-binding thunk that
+                     ;; resolves NAME at every CALL, so a #'NAME kept across a
+                     ;; (SETF FDEFINITION) called the NEW definition -- the
+                     ;; wrapper idiom (let ((old #'f)) (setf (fdefinition 'f)
+                     ;; (lambda () ... (funcall old)))) recursed until the stack
+                     ;; was gone (cl-deposits' index-test REPORT).  CLHS: #'F is
+                     ;; F's definition when the form is EVALUATED.
+                     (and (fboundp (quote %e2-name-interpreted-p))
+                          (%e2-name-interpreted-p name)
                           (not (%e2-fn-in-module-p resolved-name)))))
             (if (fboundp name)
                 (compile-form (list 'symbol-function (list 'quote name)) env dest)

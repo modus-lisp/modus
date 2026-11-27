@@ -2823,9 +2823,8 @@
 ;; We provide a do-hash-table helper instead
 (defun %ht-to-alist (ht)
   "Convert hash table to alist for iteration."
-  (let ((result nil))
-    (maphash (lambda (k v) (setq result (cons (cons k v) result))) ht)
-    result))
+  ;; a fresh list in MAPHASH's order (insertion order); the iterator pops it
+  (%ht-pairs ht))
 
 (defun set-symbol-plist (symbol plist)
   "Set SYMBOL's property list to PLIST."

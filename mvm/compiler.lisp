@@ -6397,6 +6397,16 @@
           do (push (pop body) head))
     (values (nreverse head) body)))
 
+;; The implicit BLOCK CLHS gives a macro's body, named after the macro: DEFMACRO, a MACROLET
+;; definition, DEFINE-SETF-EXPANDER (named after the accessor).  Declarations and the
+;; docstring stay ahead of it.  Without it a (RETURN-FROM NAME ...) in the body signalled
+;; nothing and left only the innermost loop around it, and the expander ran on.
+(defun %block-wrap-body (name body)
+  (if (and name (symbolp name))
+      (multiple-value-bind (decls forms) (%split-body-decls body)
+        (append decls (list (list* 'block name forms))))
+      body))
+
 (defun build-macrolet-expander (mparams mbody &optional sym-macros)
   "Build a compile-time macro expander for a MACROLET local macro with
    macro lambda-list MPARAMS and body MBODY.  Returns a one-arg function
@@ -8184,7 +8194,7 @@
              (ll       (caddr form))
              (ebody    (cdddr form))
              (efn      (and (listp ll) (consp ebody)
-                            (handler-case (build-macrolet-expander ll ebody)
+                            (handler-case (build-macrolet-expander ll (%block-wrap-body accessor ebody))
                               (t (c) (progn c nil))))))
         (mvm-define-setf-expander
           accessor
@@ -11166,6 +11176,10 @@
          (%check-package-lock name "a macro")
          (when (and (stringp (car body)) (cdr body))
            (setq body (cdr body)))
+         ;; CLHS DEFMACRO: the body is in an implicit BLOCK named NAME (%BLOCK-WRAP-BODY).
+         ;; MIT LOOP's LOOP-BODY returns (MAKEBODY) from inside two nested DOs that way,
+         ;; and without the block it spun forever.
+         (setq body (%block-wrap-body name body))
          ;; Macro lambda-lists can lead with &whole VAR and/or carry
          ;; &environment VAR.  destructuring-bind itself does NOT accept
          ;; &environment, and &whole must bind to the WHOLE call form (not
@@ -11591,7 +11605,7 @@
          (dolist (mdef macro-defs)
            (let* ((mname (normalize-name (car mdef)))
                   (mparams (cadr mdef))
-                  (mbody (cddr mdef))
+                  (mbody (%block-wrap-body (car mdef) (cddr mdef)))
                   (old (gethash mname *macro-table*))
                   (expander (build-macrolet-expander
                              mparams mbody (%env-visible-symbol-macros env))))
@@ -14347,7 +14361,7 @@
                   (let ((mname (normalize-name (car mdef))))
                     (push (cons mname (gethash mname *macro-table*)) saved)
                     (mvm-define-macro mname (build-macrolet-expander
-                                             (cadr mdef) (cddr mdef) nil)))))
+                                             (cadr mdef) (%block-wrap-body (car mdef) (cddr mdef)) nil)))))
               (%mexp-memo-invalidate)
               (collect-setq-vars-in-body (cons 'progn (cddr form)) bound-vars mx))
          (%mexp-memo-invalidate)
@@ -18554,7 +18568,7 @@
                        (let ((mname (normalize-name (car mdef))))
                          (push (cons mname (gethash mname *macro-table*)) saved)
                          (mvm-define-macro mname (build-macrolet-expander
-                                                  (cadr mdef) (cddr mdef) nil)))))
+                                                  (cadr mdef) (%block-wrap-body (car mdef) (cddr mdef)) nil)))))
                    (%mexp-memo-invalidate)
                    `(macrolet ,(cadr form)
                       ,@(mapcar (lambda (f) (%flet-rewrite-calls f new-locals new-cells))

@@ -43,3 +43,15 @@
   (dotimes (i 60) (setf (gethash (format nil "k~d" i) h) i))
   (setf (gethash "k3" h) :again)                ; a new value keeps the key's place
   (format t "large equal table: ~s~%" (first (dg-walks h))))
+
+;;; 3. #'NAME is NAME's definition when the form is EVALUATED.  For an interpreted runtime DEFUN
+;;;    the JIT baked a late-binding thunk instead, so the wrapper idiom below called ITSELF until
+;;;    the stack was gone (cl-deposits' index-test wraps its harness's REPORT this way).
+(load (merge-pathnames "deposits-gaps-defs.lisp" *load-truename*))
+(defvar *dg-calls* 0)
+(let ((old #'dg-report))
+  (setf (fdefinition 'dg-report)
+        (lambda () (when (> (incf *dg-calls*) 5) (error "recursed")) (list :wrapped (funcall old)))))
+(format t "wrapped once: ~s ~s~%" (dg-report) *dg-calls*)
+(let ((before #'dg-report))
+  (format t "#'NAME is the current definition: ~s~%" (eq before (fdefinition 'dg-report))))

@@ -353,6 +353,14 @@
    holding at top level (user report, 2026-10-20)."
   (and *%e2-set-function-names* (gethash name *%e2-set-function-names*) t))
 
+(defun %e2-name-interpreted-p (name)
+  "NAME's global definition is a heap function (an interpreter trampoline, a
+   closure), not native code (tag 3).  A runtime-compiled #'NAME of such a name
+   reads SYMBOL-FUNCTION when evaluated (compile-function-ref): the baked load
+   would be a late-binding thunk, which follows later redefinitions."
+  (and (symbolp name) (fboundp name) (not (macro-function name))
+       (not (eql (logand (%val->word (symbol-function name)) 15) 3))))
+
 (defvar *seams* nil
   "Interface functions bound per image (builder packages step 3): EQUAL hash,
    function key -> the global symbol holding the function the interface

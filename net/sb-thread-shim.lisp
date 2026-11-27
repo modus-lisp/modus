@@ -60,7 +60,7 @@
            "WAITQUEUE" "MAKE-WAITQUEUE" "WAITQUEUE-NAME"
            "CONDITION-WAIT" "CONDITION-NOTIFY" "CONDITION-BROADCAST"
            "SEMAPHORE" "MAKE-SEMAPHORE" "SEMAPHORE-NAME" "SEMAPHORE-COUNT"
-           "SIGNAL-SEMAPHORE" "WAIT-ON-SEMAPHORE"
+           "SIGNAL-SEMAPHORE" "WAIT-ON-SEMAPHORE" "TRY-SEMAPHORE"
            "THREAD-ERROR" "JOIN-THREAD-ERROR" "INTERRUPT-THREAD-ERROR"))
 
 ;;; ============================================================
@@ -191,7 +191,7 @@
   "sched_yield(2) -- syscall 24 on x86-64.  On bare metal there is no OS behind the
    SVC (it halts the core): with threads (net/bare-threads.lisp) it is BT-YIELD, which
    on the main thread runs core 0's ready threads; on a one-thread board, nothing."
-  (cond ((fboundp 'bt-yield) (bt-yield))
+  (cond ((fboundp 'bt-yield) (funcall 'bt-yield))   ; FUNCALL: a guarded call is not an undefined one
         ((fboundp '%bare-sync-arena) nil)
         (t (syscall3 24 0 0 0)))
   nil)
@@ -728,8 +728,18 @@ modus: unhandled error in a thread: "))
 ;;; it; WITH-MUTEX stays non-recursive, which is what makes a genuine re-entrant
 ;;; deadlock still show up as one.
 (defmacro sb-thread:with-recursive-lock ((mutex &rest options) &body body)
-  (let ((m (gensym "MUTEX")) (cell (gensym "CELL")) (mine (gensym "MINE")))
-    (declare (ignore options))
+  ":WAIT-P and :TIMEOUT as WITH-MUTEX takes them: with :WAIT-P NIL a lock another thread holds
+   is not waited for -- the body is not run and the form is NIL, as in SBCL.  (They were
+   ignored: :WAIT-P NIL blocked until the holder let go.)  Re-entry by the holding thread
+   always succeeds."
+  (let ((m (gensym "MUTEX")) (cell (gensym "CELL")) (mine (gensym "MINE"))
+        (waitp t) (timeout nil) (rest options))
+    (loop
+      (when (null rest) (return nil))
+      (cond ((eq (car rest) :wait-p) (setq waitp (cadr rest)))
+            ((eq (car rest) :timeout) (setq timeout (cadr rest)))
+            (t (error "sb-thread:with-recursive-lock: unknown option ~S" (car rest))))
+      (setq rest (cddr rest)))
     `(let* ((,m ,mutex)
             (,cell (%mutex-cell ,m))
             (,mine (sb-thread::holding-mutex-p ,m)))
@@ -739,10 +749,10 @@ modus: unhandled error in a thread: "))
              (unwind-protect (progn ,@body)
                (%gc-write64 (+ ,cell #x18)
                             (- (%gc-read64 (+ ,cell #x18)) 1))))
-           (progn
-             (sb-thread::grab-mutex ,m)
-             (unwind-protect (progn ,@body)
-               (sb-thread::release-mutex ,m)))))))
+           (if (sb-thread::grab-mutex ,m :waitp ,waitp :timeout ,timeout)
+               (unwind-protect (progn ,@body)
+                 (sb-thread::release-mutex ,m))
+               nil)))))
 
 ;;; ============================================================
 ;;; CONDITION VARIABLES
@@ -836,6 +846,20 @@ modus: unhandled error in a thread: "))
     (%futex-wake (+ cell #x08) n)
     (%mutex-unlock cell)
     nil))
+
+(defun sb-thread::try-semaphore (semaphore &optional (n 1) notification)
+  "Decrement by N if the count allows it now, without waiting: the count after, or NIL.
+   NOTIFICATION (a semaphore-notification object) is not supported and must be NIL.  It was
+   undefined."
+  (when notification
+    (error "sb-thread:try-semaphore: semaphore notifications are not supported on modus"))
+  (let ((cell (%semaphore-cell semaphore)) (result nil))
+    (%mutex-lock cell)
+    (when (>= (%gc-read64 (+ cell #x20)) n)
+      (%gc-write64 (+ cell #x20) (- (%gc-read64 (+ cell #x20)) n))
+      (setq result (%gc-read64 (+ cell #x20))))
+    (%mutex-unlock cell)
+    result))
 
 (defun sb-thread::wait-on-semaphore (semaphore &key timeout (n 1))
   "Decrement by N when the count allows it.  Returns the count AFTER the

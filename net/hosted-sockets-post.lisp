@@ -1064,6 +1064,12 @@
    0 timed out, < 0 -errno."
   (socket-wait-readable fd ms))
 
+(defun %sbs-wait-writable (fd ms)
+  "poll(2) FD for OUTPUT (POLLOUT) for at most MS milliseconds (-1: no limit): > 0 when a
+   write would not block, 0 timed out, < 0 -errno.  The x86-64 twin of
+   net/hosted-sockets-a64.lisp's, through the reserved write-wait entry."
+  (if (zerop (%sk-pollfds)) 1 (%sk-wait-writable fd ms)))
+
 (defun %sbs-bind-un (fd path)
   (let ((len (%sbs-addr-un path)))
     (if (< len 0) -36 (syscall3 49 fd (%sbs-scratch) len))))

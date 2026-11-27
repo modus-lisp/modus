@@ -8737,7 +8737,8 @@
     ;; itself) are in its own binding stack (mvm/prelude.lisp, THE MAIN
     ;; THREAD'S BINDING STACK), if it has one
     (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 40)
-    (let ((have (incf *mvm-label-counter*)))
+    (when *aarch64-linux-mode*         ; hosted only: bare metal has no such stack
+     (let ((have (incf *mvm-label-counter*)))
       (a64-load-real-addr buf +a64-x10+ (conv-real #x10000000))
       (a64-cmp-reg buf +a64-x9+ +a64-x10+)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i have :bcond))
@@ -8745,7 +8746,7 @@
       (a64-cmp-imm buf +a64-x11+ 0)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i db-done :bcond))
       (a64-add-reg buf +a64-x9+ +a64-x9+ +a64-x11+ 0 0)
-      (a64-set-label buf have))
+      (a64-set-label buf have)))
     (a64-ldr-unsigned buf +a64-x26+ +a64-x9+ #xC58)
     (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
     (a64-cmp-imm buf +a64-x26+ 0)
@@ -10555,11 +10556,15 @@
           (db-inwin (incf *mvm-label-counter*)))
       (a64-load-thread-delta buf +a64-x10+)
       (a64-cmp-imm buf +a64-x10+ 0)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i db-have :bcond))
-      ;; delta 0 = the main thread: its binding stack, if it has one
-      (a64-load-main-dynb-delta buf +a64-x10+)
-      (a64-cmp-imm buf +a64-x10+ 0)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i db-done :bcond))
+      (if *aarch64-linux-mode*
+          (progn
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i db-have :bcond))
+            ;; delta 0 = the main thread: its binding stack, if it has one
+            (a64-load-main-dynb-delta buf +a64-x10+)
+            (a64-cmp-imm buf +a64-x10+ 0)
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i db-done :bcond)))
+          ;; bare metal: main has no binding stack (its DRAM word need not be zero)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i db-done :bcond)))
       (a64-set-label buf db-have)
       (a64-load-real-addr buf +a64-x9+ (conv-real #x10000000))
       (a64-add-reg buf +a64-x9+ +a64-x9+ +a64-x10+ 0 0)      ; x9 = this thread's block

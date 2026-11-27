@@ -961,7 +961,7 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
   (:jit-spare-d58     #x10000D58 8 :doc "Zeroed by the virt prologue; no reader found."))
 
 (define-fixed-word :main-dynb #x10000D60 8 :images (:low-block)
-  :owner "mvm/prelude.lisp (THE MAIN THREAD'S BINDING STACK), net/hosted-sync.lisp, mvm/translate-x64.lisp"
+  :owner "mvm/prelude.lisp (THE MAIN THREAD'S BINDING STACK), net/hosted-sync.lisp, mvm/translate-x64.lisp, mvm/translate-aarch64.lisp"
   :doc "The main thread's binding stack: its block's segment delta, low byte a
    flag (1 = log mode, threads not yet declared).  0 = none: main binds
    shallowly.  Zeroed by the bare prologues; BSS zero when hosted.")
@@ -971,6 +971,13 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
   :doc "The main thread's binding stack (prelude, THE MAIN THREAD'S BINDING
    STACK): block words at +0xC50..+0xE7F, 960 entries from +0x1000 (index cache
    at +0x4C00), wide filter at +0x5000.  Hosted BSS, outside every heap.")
+
+(define-fixed-word :a64-main-dynb-block #x10020000 #x6000 :kind :region :images (:a64-hosted)
+  :owner "mvm/hosted-layout-env.lisp (:MAIN-DYNB), net/hosted-sync.lisp (%DYNB-MAIN-INIT), mvm/translate-aarch64.lisp"
+  :doc "The main thread's binding stack on hosted AArch64 (x86-64's is at
+   #x10010000, which is AArch64 main's handler-frame stack): the same layout,
+   block words +0xC50..+0xE7F, entries from +0x1000, index cache +0x4C00, wide
+   filter +0x5000.  Hosted BSS, outside every heap and the window block.")
 
 (define-fixed-word :fork-rescue-frame #x10000D68 #x20 :images (:x64-bare)
   :owner "boot/boot-x64.lisp (IDT rescue)"

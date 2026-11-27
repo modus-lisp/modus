@@ -1738,6 +1738,25 @@
 (defvar *cli-hosted-actor-runtime-p*
   (and (eq *cli-arch* :x64) (not *cli-bare-metal*)))
 
+(defvar *cli-main-dynb-p*
+  (or *cli-hosted-actor-runtime-p*
+      (and (eq *cli-arch* :aarch64) (not *cli-bare-metal*) cl-user::*layout-threads*
+           (getf cl-user::*layout-plist* :main-dynb) t))
+  "The main thread gets a binding stack of its own at boot (net/hosted-sync.lisp
+   %DYNB-MAIN-INIT; prelude THE MAIN THREAD'S BINDING STACK): hosted x86-64,
+   and hosted AArch64 with threads where the layout gives it a block
+   (hosted-layout-env.lisp :MAIN-DYNB).  Both collectors scan it.")
+
+(defvar *cli-early-layout-source*
+  (if (and (eq *cli-arch* :aarch64) *cli-main-dynb-p*)
+      (format nil "  ;; THE MAIN THREAD'S BINDING STACK's block, for the in-image compiler,
+  ;; before anything is compiled at runtime: a LET compiled now inlines main's
+  ;; log push at that address (compiler.lisp %MAIN-DYNB-BASE), and the JIT
+  ;; co-init that sets the whole layout runs later.  (It sets the same value.)
+  (setq *hosted-layout* (list :main-dynb ~D))
+" (getf cl-user::*layout-plist* :main-dynb))
+      ""))
+
 (defvar *cli-hosted-actors-source*
   (cond
    ((and (eq *cli-arch* :aarch64) (not *cli-bare-metal*) cl-user::*layout-threads*)
@@ -2081,7 +2100,7 @@
     (%core-post-restore)
     (%kernel-redirects-reapply)
     (%core-run-restore-hooks)
-" (if *cli-hosted-actor-runtime-p* "    (%dynb-main-init)
+" (if *cli-main-dynb-p* "    (%dynb-main-init)
 " "") "    (handler-case (cli-toplevel) (t (c) (%cli-exit 1)))
     (%cli-exit 0))
 "))
@@ -2161,6 +2180,7 @@
 "
       "  (init-all-globals)
 ")
+  *cli-early-layout-source*
   (%cli-spin "km-after-globals")
   ;; The standard GFs with system-supplied methods (PRINT-OBJECT,
   ;; DESCRIBE-OBJECT, INITIALIZE-INSTANCE, ...): the CL REPL images always ran
@@ -2266,8 +2286,9 @@
   ;; The main thread's binding stack (net/hosted-sync.lisp %DYNB-MAIN-INIT;
   ;; prelude THE MAIN THREAD'S BINDING STACK): before the toplevel binds
   ;; anything, so a thread started later sees global values, not main's.
-  ;; x86-64 hosted only: its collector scans the stack (EMIT-DYNBIND-ROOT-SCAN).
-  (if *cli-hosted-actor-runtime-p*
+  ;; Hosted x86-64 and threaded AArch64: their collectors scan the stack
+  ;; (EMIT-DYNBIND-ROOT-SCAN, EMIT-AARCH64-DYNBIND-ROOT-SCAN).
+  (if *cli-main-dynb-p*
       "  (%dynb-main-init)
 "
       "")

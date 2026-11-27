@@ -706,16 +706,21 @@
         (return (cadr p)))
       (setq p (cddr p)))))
 
-(defun %layout (key default)
+(defun %layout (key default &optional (offset 0))
   "Function twin of the %LAYOUT form."
-  (hosted-layout key default))
+  (+ (hosted-layout key default) offset))
 
 (defun compile-layout (form env dest)
-  "(%LAYOUT :KEY DEFAULT) — a hosted layout address as a compile-time constant."
+  "(%LAYOUT :KEY DEFAULT [OFFSET]) — a hosted layout address (plus a literal
+   OFFSET) as a compile-time constant."
   (unless (and (consp (cdr form)) (symbolp (cadr form))
-               (consp (cddr form)) (integerp (caddr form)) (null (cdddr form)))
+               (consp (cddr form)) (integerp (caddr form))
+               (or (null (cdddr form))
+                   (and (integerp (car (cdddr form))) (null (cdr (cdddr form))))))
     (error "MVM compiler: %LAYOUT needs a keyword and a literal default, got ~S" form))
-  (compile-form (hosted-layout (cadr form) (caddr form)) env dest))
+  (compile-form (+ (hosted-layout (cadr form) (caddr form))
+                   (if (cdddr form) (car (cdddr form)) 0))
+                env dest))
 
 (defun compile-link-int (form env dest)
   "(%LINK-INT K) — the integer K exactly as written, never an :LI-ADDR: a
@@ -15620,32 +15625,39 @@
                      body)))))
 
 (defun %mlog-p ()
-  "Emit main's binding log at all?  Only on a 64-bit target (the log is an
-   x86-64 hosted feature: prelude, THE MAIN THREAD'S BINDING STACK) and not
-   where the shallow-thread gate is compiled out."
+  "Emit main's binding log at all?  Only on a 64-bit target (the log is a
+   hosted x86-64 / threaded AArch64 feature: prelude, THE MAIN THREAD'S
+   BINDING STACK) and not where the shallow-thread gate is compiled out."
   (and *shallow-thread-gate* (> (ct-fixnum-bits) 32)))
+
+(defun %main-dynb-base ()
+  "Virtual address of the main thread's binding-stack block (prelude, THE MAIN
+   THREAD'S BINDING STACK): the layout's :MAIN-DYNB (hosted AArch64 sets it,
+   hosted-layout-env.lisp ENABLE-LAYOUT-THREADS), else x86-64 hosted's
+   #x10010000.  The inline forms below and the gate add fixed offsets to it."
+  (hosted-layout :main-dynb #x10010000))
 
 (defun %mlog-push-form (k sv)
   "Main's binding LOG (prelude, THE MAIN THREAD'S BINDING STACK): while the
    flag byte at #x10000D60 is set -- main has a binding stack and no thread
    has been declared yet -- record the shallow binding of key K that replaces
    the value in SV.  INLINE, and in raw fixnum arithmetic over the next-free
-   word (#x10010C50) and the depth (#x10010C58): an out-of-line push made a
+   word (block+0xC50) and the depth (block+0xC58): an out-of-line push made a
    LET of three specials 3.4x dearer, a checked ASH/+ one 1.35x.  The entry is
    written before the depth that publishes it (the collector scans DEPTH
-   entries).  A full log (next-free at #x10014800, 896 entries) goes to
-   %MLOG-PUSH."
+   entries).  A full log (next-free at block+0x4800, 896 entries) goes to
+   %MLOG-PUSH.  The block is %MAIN-DYNB-BASE (x86-64 #x10010000)."
   (if (%mlog-p)
-      (let ((n (%mvm-gensym "MLN")))
+      (let ((n (%mvm-gensym "MLN")) (b (%main-dynb-base)))
         `(if (eql (mem-ref #x10000D60 :u8) 0)
              nil
-             (let ((,n (the fixnum (mem-ref #x10010C50 :u64))))
-               (if (< ,n #x10014800)
+             (let ((,n (the fixnum (mem-ref ,(+ b #xC50) :u64))))
+               (if (< ,n ,(+ b #x4800))
                    (progn (setf (mem-ref ,n :u64) ,k)
                           (setf (mem-ref (%fixnum-+ ,n 8) :u64) ,sv)
-                          (setf (mem-ref #x10010C50 :u64) (%fixnum-+ ,n 16))
-                          (setf (mem-ref #x10010C58 :u64)
-                                (%fixnum-+ (the fixnum (mem-ref #x10010C58 :u64)) 1)))
+                          (setf (mem-ref ,(+ b #xC50) :u64) (%fixnum-+ ,n 16))
+                          (setf (mem-ref ,(+ b #xC58) :u64)
+                                (%fixnum-+ (the fixnum (mem-ref ,(+ b #xC58) :u64)) 1)))
                    (%mlog-push ,k ,sv)))))
       nil))
 
@@ -15653,17 +15665,17 @@
   "The cleanup's twin of %MLOG-PUSH-FORM: pop the top entry if it is K's.  A
    full log (where counted pushes live) goes to %MLOG-POP."
   (if (%mlog-p)
-      (let ((n (%mvm-gensym "MLN")))
+      (let ((n (%mvm-gensym "MLN")) (b (%main-dynb-base)))
         `(if (eql (mem-ref #x10000D60 :u8) 0)
              nil
-             (let ((,n (the fixnum (mem-ref #x10010C50 :u64))))
-               (if (< ,n #x10014800)
-                   (if (> ,n #x10011000)
+             (let ((,n (the fixnum (mem-ref ,(+ b #xC50) :u64))))
+               (if (< ,n ,(+ b #x4800))
+                   (if (> ,n ,(+ b #x1000))
                        (if (eql (mem-ref (%fixnum-- ,n 16) :u64) ,k)
                            (progn
-                             (setf (mem-ref #x10010C58 :u64)
-                                   (%fixnum-- (the fixnum (mem-ref #x10010C58 :u64)) 1))
-                             (setf (mem-ref #x10010C50 :u64) (%fixnum-- ,n 16)))
+                             (setf (mem-ref ,(+ b #xC58) :u64)
+                                   (%fixnum-- (the fixnum (mem-ref ,(+ b #xC58) :u64)) 1))
+                             (setf (mem-ref ,(+ b #xC50) :u64) (%fixnum-- ,n 16)))
                            nil)
                        nil)
                    (%mlog-pop ,k)))))
@@ -17261,15 +17273,16 @@
     ;; BINDING STACK), and the cell is right for KEY only when main holds no
     ;; binding of it: its wide filter's counter for KEY (a byte at a FIXED
     ;; address, KEY being a compile-time constant) is zero.  Without a stack
-    ;; (#x10000D60 zero: not x86-64 hosted) main binds shallowly, as before.
-    ;; Without KEY (no caller does that today), SLOW.
+    ;; (#x10000D60 zero: not a hosted x86-64 / threaded AArch64 image) main
+    ;; binds shallowly, as before.  Without KEY (no caller does that today),
+    ;; SLOW.  The filter is at block+0x5000 (%MAIN-DYNB-BASE).
     (emit-li-tagged a (conv-real #x10000D60))
     (emit-ir :shr a a +fixnum-shift+)
     (emit-ir :load b a (%tls-width (car (memory-width-code :u64)) #x10000D60))
     (emit-ir :cmp-imm b 0)
     (emit-ir :beq fast)
     (if (integerp key)
-        (let ((fa (+ #x10015000 (logand key 4095))))
+        (let ((fa (+ (%main-dynb-base) #x5000 (logand key 4095))))
           (emit-li-tagged a (conv-real fa))
           (emit-ir :shr a a +fixnum-shift+)
           (emit-ir :load b a (%tls-width (car (memory-width-code :u8)) fa))
@@ -35591,10 +35604,16 @@
          ;; Unmoved: the argument as written (see %CONV-MOVES-P).
          (let ((k (%conv-const-int (cadr form))))
            (if (eql (conv-real k) k) (cadr form) (conv-real k))))
+        ;; (%LAYOUT :KEY DEFAULT [OFFSET]): OFFSET, a literal integer, is
+        ;; added -- a word at a fixed offset from a layout address (the main
+        ;; thread's binding stack, prelude) is then one literal too.
         ((and (symbolp (car form)) (name-eq (car form) "%LAYOUT")
               (consp (cdr form)) (symbolp (cadr form))
-              (consp (cddr form)) (integerp (caddr form)) (null (cdddr form)))
-         (hosted-layout (cadr form) (caddr form)))
+              (consp (cddr form)) (integerp (caddr form))
+              (or (null (cdddr form))
+                  (and (integerp (car (cdddr form))) (null (cdr (cdddr form))))))
+         (+ (hosted-layout (cadr form) (caddr form))
+            (if (cdddr form) (car (cdddr form)) 0)))
         ;; (%LAYOUT-IF :KEY THEN [ELSE]): THEN when the layout gives KEY a
         ;; non-zero value, else ELSE — chosen HERE, so the arm not taken is
         ;; never compiled.  That is the point: it lets one runtime source hold

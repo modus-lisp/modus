@@ -1937,7 +1937,8 @@ Stopping.
 ;;; THE MAIN THREAD'S BINDING STACK (mvm/prelude.lisp has the design)
 ;;; ============================================================
 ;;;
-;;; 24 KB of x86-64 hosted BSS at #x10010000, outside every heap: the block
+;;; 24 KB of hosted BSS, outside every heap -- x86-64 #x10010000, AArch64
+;;; #x10020000 (the layout's :MAIN-DYNB, hosted-layout-env.lisp): the block
 ;;; page (only its +0xC50..+0xE7F is used, the same offsets a worker's window
 ;;; block has), a 16 KB extension stack at +0x1000 (960 entries; its top 1 KB is
 ;;; the index cache, as a worker's) and a 4 KB wide filter at +0x5000.
@@ -1965,9 +1966,14 @@ Stopping.
             (and off (> (length off) 0) (not (string= off "0"))))
         1
         ;; A FIXED address, not a mapping: the compiler inlines log mode's
-        ;; push and pop against it (%MLOG-PUSH-FORM).  x86-64 hosted BSS.
-        (let ((m (%conv-addr #x10010000)))
-          (if (not (= (%layout-if :a64-threads 0 1) 1))
+        ;; push and pop against it (%MLOG-PUSH-FORM).  Hosted BSS: x86-64's
+        ;; #x10010000, or the layout's :MAIN-DYNB on AArch64 (#x10020000,
+        ;; hosted-layout-env.lisp), whose collector scans it too
+        ;; (EMIT-AARCH64-DYNBIND-ROOT-SCAN).  An AArch64 layout without the
+        ;; key (macOS, a moved region) declines: main binds shallowly.
+        (let ((m (%conv-addr (%layout :main-dynb #x10010000))))
+          (if (and (= (%layout-if :a64-threads 1 0) 1)
+                   (eql (%layout :main-dynb 0) 0))
               1
               (progn
                 (setf (mem-ref (+ m #xC50) :u64) (+ m #x1000)) ; next free

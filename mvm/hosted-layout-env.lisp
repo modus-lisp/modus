@@ -91,6 +91,18 @@
       (setq *layout-threads* t)
       (unless (getf *layout-plist* :a64-threads)
         (setq *layout-plist* (list* :a64-threads 1 *layout-plist*)))
+      ;; THE MAIN THREAD'S BINDING STACK (mvm/prelude.lisp): its fixed block.
+      ;; x86-64 keeps it at #x10010000, which on AArch64 is main's handler-
+      ;; frame stack (the window block reaches #x10011000), so here it is
+      ;; #x10020000..#x10026000 -- hosted BSS nothing else claims (registered
+      ;; in mvm/fixed-addresses.lisp :A64-MAIN-DYNB-BLOCK), inside even a
+      ;; compact region (which maps through #x10100000).  Only where the
+      ;; region is not moved: the inline paths name the block by literal
+      ;; address, and a moved or PC-relative layout (macOS, iOS) keeps main's
+      ;; old shallow binding -- no key, so %DYNB-MAIN-INIT declines.
+      (when (and (eql *layout-conv-delta* 0) (not *layout-pcrel*) (not *layout-darwin*)
+                 (not (getf *layout-plist* :main-dynb)))
+        (setq *layout-plist* (list* :main-dynb #x10020000 *layout-plist*)))
       ;; Stop-the-world region-0 collection (translate-aarch64).
       (unless (getf *layout-plist* :stw)
         (setq *layout-plist* (list* :stw 1 *layout-plist*)))

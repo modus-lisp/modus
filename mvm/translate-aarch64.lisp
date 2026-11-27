@@ -8733,8 +8733,19 @@
     (a64-cmp-imm buf +a64-x26+ 0)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-gt+ 0) (a64-add-fixup buf i mvloop :bcond))
     (a64-set-label buf mvdone)
-    ;; dynamic bindings
+    ;; dynamic bindings -- the MAIN thread's (its window is the low block
+    ;; itself) are in its own binding stack (mvm/prelude.lisp, THE MAIN
+    ;; THREAD'S BINDING STACK), if it has one
     (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 40)
+    (let ((have (incf *mvm-label-counter*)))
+      (a64-load-real-addr buf +a64-x10+ (conv-real #x10000000))
+      (a64-cmp-reg buf +a64-x9+ +a64-x10+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i have :bcond))
+      (a64-load-main-dynb-delta buf +a64-x11+)
+      (a64-cmp-imm buf +a64-x11+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i db-done :bcond))
+      (a64-add-reg buf +a64-x9+ +a64-x9+ +a64-x11+ 0 0)
+      (a64-set-label buf have))
     (a64-ldr-unsigned buf +a64-x26+ +a64-x9+ #xC58)
     (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
     (a64-cmp-imm buf +a64-x26+ 0)
@@ -10513,23 +10524,43 @@
     (a64-ldp-post buf +a64-x0+ +a64-x1+ +a64-sp+ 240)
     (a64-ret buf)))
 
+(defun a64-load-main-dynb-delta (buf rd)
+  "RD := the main thread's binding-stack segment delta: [#x10000D60] with its
+   flag byte cleared, 0 when main has none (mvm/prelude.lisp, THE MAIN
+   THREAD'S BINDING STACK; translate-x64's EMIT-MAIN-DYNB-SEG).  The word is
+   the exact machine word (net/hosted-sync.lisp %DYNB-MAIN-SET-WORD)."
+  (a64-load-real-addr buf rd (conv-real #x10000D60))
+  (a64-ldr-unsigned buf rd rd 0)
+  (a64-lsr-imm buf rd rd 8)
+  (a64-lsl-imm buf rd rd 8))
+
 ;;; THIS THREAD's dynamic-binding stack as a precise root set — the AArch64
 ;;; twin of translate-x64's EMIT-DYNBIND-ROOT-SCAN, which says why a binding
 ;;; made on a worker lives in the thread's own block and why that makes its
 ;;; value words roots the collector must forward.  Same layout (mvm/prelude.lisp,
 ;;; PER-THREAD DYNAMIC BINDINGS): blk+0xC58 tagged depth, blk+0xC60 tagged
 ;;; extension-stack base (0 = in-window entries from blk+0xC70), 16-byte
-;;; [key][value] entries.  The main thread's delta is 0 and it never binds
-;;; here, so it skips everything; with threads off nothing is emitted.
+;;; [key][value] entries.  The main thread's delta is 0: its bindings are in
+;;; its own binding stack (mvm/prelude.lisp, THE MAIN THREAD'S BINDING STACK),
+;;; the same layout, whose delta #x10000D60 holds with a flag byte -- and in
+;;; log mode those entries hold the values main's shallow bindings replaced,
+;;; live objects too.  0 there (no stack): nothing.  With threads off nothing
+;;; is emitted.
 ;;; x9 (slot address) and x26 (count) survive scan_word, as the MV loop needs.
 (defun emit-aarch64-dynbind-root-scan (buf scan-word)
   (when *a64-tls-window*
     (let ((db-loop (incf *mvm-label-counter*))
           (db-done (incf *mvm-label-counter*))
+          (db-have (incf *mvm-label-counter*))
           (db-inwin (incf *mvm-label-counter*)))
       (a64-load-thread-delta buf +a64-x10+)
       (a64-cmp-imm buf +a64-x10+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i db-have :bcond))
+      ;; delta 0 = the main thread: its binding stack, if it has one
+      (a64-load-main-dynb-delta buf +a64-x10+)
+      (a64-cmp-imm buf +a64-x10+ 0)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i db-done :bcond))
+      (a64-set-label buf db-have)
       (a64-load-real-addr buf +a64-x9+ (conv-real #x10000000))
       (a64-add-reg buf +a64-x9+ +a64-x9+ +a64-x10+ 0 0)      ; x9 = this thread's block
       (a64-ldr-unsigned buf +a64-x26+ +a64-x9+ #xC58)

@@ -913,6 +913,34 @@
        (%call-interp-closure closure (cdr form)))
       (t (%signal-program-error)))))
 
+(defun %interp-cm-shim (form &rest extra)
+  "%INTERP-MACRO-SHIM for a COMPILER macro (COMPILER-MACRO-FUNCTION): the same
+   (form env) protocol, and a leading &WHOLE bound to the WHOLE form, operator
+   included (CLHS 3.4.4, 3.2.2.1).  The expander is an %INTERP-CLOSURE over the
+   raw lambda list, called with (CDR FORM), so &WHOLE took the argument list:
+   (funcall (compiler-macro-function 'f) '(f 1 2) nil) gave &WHOLE (1 2).  A
+   compiler macro that declines returns its &WHOLE form, so that answer was a
+   call to 1.  &WHOLE is taken off the lambda list and bound around the body --
+   or destructured, when it is a pattern -- and the rest is called as before."
+  (declare (ignore extra))
+  (let* ((nargs (%get-nargs))
+         (closure (car (%get-cenv)))
+         (params (cadr closure)))
+    (cond
+      ((/= nargs 2) (%signal-program-error))
+      ((and (consp params) (symbolp (car params)) (car params)
+            (string= (symbol-name (car params)) "&WHOLE") (consp (cdr params)))
+       (let* ((whole (cadr params))
+              (body (caddr closure))
+              (inner (if (consp whole)
+                         (list (list 'destructuring-bind whole (list 'quote form)
+                                     (cons 'locally body)))
+                         (list (list* 'let (list (list whole (list 'quote form)))
+                                      body)))))
+         (%call-interp-closure (list '%interp-closure (cddr params) inner (cadddr closure))
+                               (cdr form))))
+      (t (%call-interp-closure closure (cdr form))))))
+
 (defun %argfn-macro-shim (form &rest extra)
   "A DEFMACRO's expander when its lambda list is an ordinary one (the
    compiler's DEFMACRO, %MAKE-ARGFN-EXPANDER): the macro's own function,
@@ -2734,9 +2762,9 @@
             (if (and (>= i start) (< i end))
                 (if (alphanumericp (code-char ch))
                     (if in-word
-                        (aset result i (if (upper-case-p (code-char ch)) (+ ch 32) ch))
+                        (aset result i (%code-downcase ch))
                         (progn
-                          (aset result i (if (lower-case-p (code-char ch)) (- ch 32) ch))
+                          (aset result i (%code-upcase ch))
                           (setq in-word t)))
                     (progn (aset result i ch) (setq in-word nil)))
                 (aset result i ch)))
@@ -2836,8 +2864,8 @@
         (let ((ca (%ensure-char-code (aref sa (+ s1 i))))
               (cb (%ensure-char-code (aref sb (+ s2 i)))))
           (when fold-p
-            (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
-            (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32))))
+            (setq ca (%code-fold ca))
+            (setq cb (%code-fold cb)))
           (cond ((< ca cb) (setq result :less) (setq m (+ s1 i)))
                 ((> ca cb) (setq result :greater) (setq m (+ s1 i)))))
         (setq i (+ i 1)))
@@ -2909,26 +2937,26 @@
 ;;; in exchange for the +5 wins from char-upcase/upper/lower/etc.
 (defun char-upcase (c)
   (unless (characterp c) (%signal-type-error))
-  (let ((code (%ensure-char-code c)))
-    (code-char (if (and (>= code 97) (<= code 122)) (- code 32) code))))
+  (code-char (%code-upcase (%ensure-char-code c))))
 (defun char-downcase (c)
   (unless (characterp c) (%signal-type-error))   ; CHAR-DOWNCASE.4
-  (let ((code (%ensure-char-code c)))
-    (code-char (if (and (>= code 65) (<= code 90)) (+ code 32) code))))
+  (code-char (%code-downcase (%ensure-char-code c))))
+;;; The predicates and case maps are Unicode, as SBCL's: prelude.lisp's %CODE-* primitives,
+;;; over tables generated from SBCL (scripts/gen-unicode-case.lisp).
 (defun upper-case-p (c)
   (unless (characterp c) (%signal-type-error))
-  (let ((code (%ensure-char-code c))) (if (>= code 65) (<= code 90) nil)))
+  (if (%code-upper-p (%ensure-char-code c)) t nil))
 (defun lower-case-p (c)
   (unless (characterp c) (%signal-type-error))
-  (let ((code (%ensure-char-code c))) (if (>= code 97) (<= code 122) nil)))
-(defun both-case-p (c) (if (upper-case-p c) t (lower-case-p c)))
-(defun alpha-char-p (c) (both-case-p c))
+  (if (%code-lower-p (%ensure-char-code c)) t nil))
+(defun both-case-p (c)
+  (unless (characterp c) (%signal-type-error))
+  (if (%code-both-case-p (%ensure-char-code c)) t nil))
+(defun alpha-char-p (c)
+  (unless (characterp c) (%signal-type-error))
+  (if (%code-alpha-p (%ensure-char-code c)) t nil))
 (defun digit-char-p (c &optional (radix 10))
-  (let ((code (%ensure-char-code c)))
-    (cond ((and (>= code 48) (<= code 57)) (let ((v (- code 48))) (if (< v radix) v nil)))
-          ((and (>= code 65) (<= code 90)) (let ((v (+ 10 (- code 65)))) (if (< v radix) v nil)))
-          ((and (>= code 97) (<= code 122)) (let ((v (+ 10 (- code 97)))) (if (< v radix) v nil)))
-          (t nil))))
+  (%code-digit-weight (%ensure-char-code c) radix))
 (defun alphanumericp (c) (if (or (alpha-char-p c) (digit-char-p c)) t nil))
 (defun graphic-char-p (c)
   (unless (characterp c) (%signal-type-error))
@@ -3109,57 +3137,63 @@
                (unless (%char2<= (car rest) a) (return nil))
                (setq a (car rest))
                (setq rest (cdr rest)))))))
+(defun %char-fold (c)
+  "The character CHAR-EQUAL and CHAR-LESSP compare C by: CHAR-DOWNCASE of CHAR-UPCASE, as in
+   SBCL, so #\\_ sorts before #\\a (by the upcase it sorted after) and the Kelvin sign is not
+   CHAR-EQUAL to #\\k."
+  (unless (characterp c) (%signal-type-error))
+  (code-char (%code-fold (%ensure-char-code c))))
 (defun char-equal (&rest cs)
   (cond ((null cs) t)
         ((null (cdr cs)) t)
-        (t (let ((a (char-upcase (car cs))) (rest (cdr cs)))
+        (t (let ((a (%char-fold (car cs))) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (%char2= a (char-upcase (car rest))) (return nil))
+               (unless (%char2= a (%char-fold (car rest))) (return nil))
                (setq rest (cdr rest)))))))
 (defun char-not-equal (&rest cs)
   (cond ((null cs) t)
         ((null (cdr cs)) t)
         (t (let ((outer cs))
              (loop (when (null (cdr outer)) (return t))
-               (let ((a (char-upcase (car outer))) (inner (cdr outer)))
+               (let ((a (%char-fold (car outer))) (inner (cdr outer)))
                  (loop (when (null inner) (return nil))
-                   (when (%char2= a (char-upcase (car inner)))
+                   (when (%char2= a (%char-fold (car inner)))
                      (return-from char-not-equal nil))
                    (setq inner (cdr inner))))
                (setq outer (cdr outer)))))))
 (defun char-lessp (&rest cs)
   (cond ((null cs) t)
         ((null (cdr cs)) t)
-        (t (let ((a (char-upcase (car cs))) (rest (cdr cs)))
+        (t (let ((a (%char-fold (car cs))) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (let ((b (char-upcase (car rest))))
+               (let ((b (%char-fold (car rest))))
                  (unless (%char2< a b) (return nil))
                  (setq a b))
                (setq rest (cdr rest)))))))
 (defun char-greaterp (&rest cs)
   (cond ((null cs) t)
         ((null (cdr cs)) t)
-        (t (let ((a (char-upcase (car cs))) (rest (cdr cs)))
+        (t (let ((a (%char-fold (car cs))) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (let ((b (char-upcase (car rest))))
+               (let ((b (%char-fold (car rest))))
                  (unless (%char2< b a) (return nil))
                  (setq a b))
                (setq rest (cdr rest)))))))
 (defun char-not-greaterp (&rest cs)
   (cond ((null cs) t)
         ((null (cdr cs)) t)
-        (t (let ((a (char-upcase (car cs))) (rest (cdr cs)))
+        (t (let ((a (%char-fold (car cs))) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (let ((b (char-upcase (car rest))))
+               (let ((b (%char-fold (car rest))))
                  (unless (%char2<= a b) (return nil))
                  (setq a b))
                (setq rest (cdr rest)))))))
 (defun char-not-lessp (&rest cs)
   (cond ((null cs) t)
         ((null (cdr cs)) t)
-        (t (let ((a (char-upcase (car cs))) (rest (cdr cs)))
+        (t (let ((a (%char-fold (car cs))) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (let ((b (char-upcase (car rest))))
+               (let ((b (%char-fold (car rest))))
                  (unless (%char2<= b a) (return nil))
                  (setq a b))
                (setq rest (cdr rest)))))))
@@ -5214,6 +5248,8 @@
    signals program-error."
   (when (%seq-type-u8-p result-type)
     (return-from map (%seq-u8-copy (apply (function map) 'vector fn seqs))))
+  (when (and seqs (%seq-type-f64-p result-type))
+    (return-from map (%f64-result result-type (apply (function map) 'vector fn seqs))))
   ;; a bit-vector result: map into a general vector, then the packed array
   (when (and seqs (%bit-seq-type-p result-type))
     (return-from map
@@ -5470,6 +5506,10 @@
         (when (%bulk-copy-u32-ok-p seq1 seq2)
           (%bulk-copy-u32 seq1 start1 seq2 start2 count)
           (return-from %replace-pos seq1))
+        ;; packed double vectors: the lanes as raw bits
+        (when (%bulk-copy-f64-ok-p seq1 seq2)
+          (%bulk-copy-f64 seq1 start1 seq2 start2 count)
+          (return-from %replace-pos seq1))
         (when (%bulk-copy-ok-p seq1 seq2)
           (%bulk-copy seq1 start1 seq2 start2 count)
           (return-from %replace-pos seq1))
@@ -5484,6 +5524,9 @@
               (return-from %replace-pos seq1))
             (when (%bulk-copy-u32-ok-p d1 d2)
               (%bulk-copy-u32 d1 start1 d2 start2 count)
+              (return-from %replace-pos seq1))
+            (when (%bulk-copy-f64-ok-p d1 d2)
+              (%bulk-copy-f64 d1 start1 d2 start2 count)
               (return-from %replace-pos seq1))
             (when (%bulk-copy-ok-p d1 d2)
               (%bulk-copy d1 start1 d2 start2 count)
@@ -5846,7 +5889,10 @@
       (handler-bind ((warning (lambda (c)
                                 (setq warnings-p t)
                                 (unless (typep c 'style-warning) (setq failure-p t)))))
-        (%compile-file-1 in-true out-path))
+        ;; A file is a compilation unit: a function a later form defines is
+        ;; not warned of, as SBCL (%CALL-WITH-COMPILATION-UNIT).
+        (modus-int::%call-with-compilation-unit
+         (lambda () (%compile-file-1 in-true out-path)) nil))
       (when verbose
         (format t "~&; wrote ~A~%" (namestring out-path)))
       (values (truename out-path) warnings-p failure-p))))
@@ -6413,7 +6459,7 @@
       (cond
         ((null raw) nil)
         ((%interp-closure-p raw)
-         (%make-closure #'%interp-macro-shim (cons raw nil)))
+         (%make-closure #'%interp-cm-shim (cons raw nil)))
         (t raw)))))
 
 ;;; ============================================================
@@ -6671,12 +6717,29 @@
           (setq result val))))
     result))
 
+(defvar *%load-warning-resignal* nil
+  "The warning %LOAD-REPORT-WARNING is re-signalling, so that a re-entry of the
+   same handler declines it rather than recursing.")
+
 (defun %load-report-warning (c)
   "An unhandled WARNING during LOAD: report it and let the form CONTINUE
    (CLHS 9.2 WARN).  The per-form HANDLER-CASE below has a T clause, which
    also caught warnings -- aborting the rest of the form and reporting the
    warning as an UNHANDLED-ESCAPE (the real ansi-test's 'Redefining test'
-   warning did exactly that)."
+   warning did exactly that).
+
+   UNHANDLED is the word: the handlers of LOAD's CALLER come first, as they
+   would with this one not here.  Being innermost, it used to muffle every
+   warning a loaded file raised before any of them saw it -- a HANDLER-BIND
+   around (LOAD ...) caught nothing.  So the warning is signalled again from
+   here, which offers it to the outer handlers (and their MUFFLE-WARNING still
+   reaches WARN's restart); only if that returns is it reported."
+  (when (eq *%load-warning-resignal* c)
+    (return-from %load-report-warning nil))
+  (let ((saved *%load-warning-resignal*))
+    (setq *%load-warning-resignal* c)
+    (unwind-protect (signal c)
+      (setq *%load-warning-resignal* saved)))
   (handler-case
       (let ((out (symbol-value '*error-output*)))
         (write-string "WARNING: " out)

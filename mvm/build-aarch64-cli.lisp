@@ -879,6 +879,16 @@
   (+ (%gc-stack-base-0) 8))
 ")
 
+;; PACKED DOUBLE-FLOAT VECTORS (prelude.lisp %F64-VECTORS-P, #x18): aarch64's collectors
+;; take #x18 as a leaf and its translator has :FPD-LANE-LOAD / -STORE.  On unless
+;; MODUS_F64_VECTORS=0.
+(defvar *cli-f64-vectors*
+  (let ((v (sb-ext:posix-getenv "MODUS_F64_VECTORS"))) (not (and v (string= v "0")))))
+(when *cli-f64-vectors*
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source*
+                     (string #\Newline) "(defun %f64-vectors-p () t)" (string #\Newline))))
+
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 
@@ -1383,6 +1393,9 @@
 (mvm-load "boot/boot-linux-aarch64.lisp")
 
 (in-package :modus.mvm)
+
+;; ... and the compiler emits the packed double-float arms (compiler.lisp *F64-VECTORS-P*).
+(when cl-user::*cli-f64-vectors* (setq *f64-vectors-p* t))
 
 ;; a modus host (the builder CLI) has the translator baked; %BUILDER-PREPARE-TARGET
 ;; configures it for :LINUX-AARCH64 (mvm/builder.lisp)

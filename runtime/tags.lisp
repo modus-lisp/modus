@@ -39,6 +39,7 @@
 (defconstant +subtag-u64-vector+ #x14)
 (defconstant +subtag-sap+ #x16)
 (defconstant +subtag-u32-vector+ #x17)   ; packed (simple-array (unsigned-byte 32) (*)): 4-byte lanes, no pointers
+(defconstant +subtag-f64-vector+ #x18)   ; packed (simple-array double-float (*)): 8-byte IEEE754 lanes, no pointers
 (defconstant +subtag-bignum+ #x30)
 (defconstant +subtag-array+ #x32)
 ;;; 2-slot object holding a ratio: slot 0 = numerator, slot 1 = denominator.

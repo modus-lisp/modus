@@ -574,7 +574,7 @@
    set, a restored big bignum kept its old limb pointer -- every bignum global came back
    corrupt on the phone (natrium's constants, seal's curves)."
   (or (= subtag #x10) (= subtag #x11) (= subtag #x12) (= subtag #x13) (= subtag #x14) (= subtag #x15)
-      (= subtag #x16) (= subtag #x17) (= subtag #x31) (= subtag #x60)
+      (= subtag #x16) (= subtag #x17) (= subtag #x18) (= subtag #x31) (= subtag #x60)
       (= subtag #x64) (= subtag #x65) (= subtag #x66)))
 
 (defun %core-reloc-heap (from free l0 l1 d)

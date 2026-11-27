@@ -185,6 +185,16 @@
         (concatenate 'string *cli-arch-override-source*
                      (string #\Newline) "(defun %u32-vectors-p () t)" (string #\Newline))))
 
+;; PACKED DOUBLE-FLOAT VECTORS (prelude.lisp %F64-VECTORS-P, #x18): x64's collectors take
+;; #x18 as a leaf and its translator has :FPD-LANE-LOAD / -STORE.  On unless
+;; MODUS_F64_VECTORS=0.
+(defvar *cli-f64-vectors*
+  (let ((v (sb-ext:posix-getenv "MODUS_F64_VECTORS"))) (not (and v (string= v "0")))))
+(when *cli-f64-vectors*
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source*
+                     (string #\Newline) "(defun %f64-vectors-p () t)" (string #\Newline))))
+
 ;; NARROW STRINGS (prelude.lisp %NARROW-STRINGS-P): x64's collector sizes #x13
 ;; as bytes; MODUS_NARROW_STRINGS=1 has the reader make them in this build.
 (when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
@@ -224,6 +234,8 @@
 
 ;; ... and the compiler emits their arms (compiler.lisp *U32-VECTORS-P*).
 (when cl-user::*cli-u32-vectors* (setq *u32-vectors-p* t))
+;; ... and the packed double-float arms (compiler.lisp *F64-VECTORS-P*).
+(when cl-user::*cli-f64-vectors* (setq *f64-vectors-p* t))
 
 ;; ... and its AOT string literals narrow too (compiler.lisp *NARROW-LITERALS-P*).
 (when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))

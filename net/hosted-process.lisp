@@ -190,7 +190,13 @@
         nil
         (let ((res nil))
           (loop
-            (let ((r (syscall6 61 pid buf (if hang 0 1) 0 0 0)))
+            ;; A waiting wait4 is a STOP-THE-WORLD SAFE REGION (net/hosted-sync.lisp): a thread
+            ;; parked in the kernel here used to hold every region-0 collection on main until
+            ;; the child exited -- main's allocation loop went 0.12 s -> 9.6 s while a worker
+            ;; waited on `sleep 10'.  BUF is mmap'd scratch, not a heap object.
+            (let ((r (if hang
+                         (%gc-safe-syscall6 61 pid buf 0 0 0 0)
+                         (syscall6 61 pid buf 1 0 0 0))))
               (cond
                 ((= r -4) nil)                            ; EINTR: again
                 ((< r 0) (setq res -1) (return nil))      ; ECHILD etc.
@@ -224,7 +230,7 @@
       (setf (mem-ref (+ pfd 4) :u32) 1)
       (setf (mem-ref (+ pfd 8) :u32) (logand b #xFFFFFFFF))
       (setf (mem-ref (+ pfd 12) :u32) 1)
-      (let ((r (syscall3 7 pfd 2 -1)))
+      (let ((r (%gc-safe-syscall6 7 pfd 2 -1 0 0 0)))   ; blocks: a STW safe region, as wait4
         (when (>= r 0)
           (let ((ra (mem-ref (+ pfd 6) :u16))
                 (rb (mem-ref (+ pfd 14) :u16)))

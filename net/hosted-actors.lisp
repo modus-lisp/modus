@@ -247,7 +247,8 @@
     (if (< n 2) 2 n)))
 
 (defvar *thread-heap-bytes* nil
-  "How big each thread's heap (its region's semispace) is to be, in bytes, or NIL for 16 MB.  Read
+  "How big each thread's heap (its region's semispace) is to be, in bytes, or NIL for the default
+   (%HA-DEFAULT-REGION-SIZE: 16 MB at the shipping heap, more with --dynamic-space-size).  Read
    ONCE, when the regions are carved -- the first thread -- so a program sets it before it starts
    one; MODUS_THREAD_HEAP (megabytes) in the environment overrides it.  Rounded down to a megabyte,
    never below 16 MB.
@@ -348,6 +349,18 @@
           (setq *ha-layout-total* (- used (+ g 4096)))
           t))))
 
+(defun %ha-default-region-size (size0)
+  "A thread's heap when nothing asked for a size: a QUARTER of region 0's semispace, less the
+   band, shared among the thread slots -- 16 MB at the shipping x86-64 heap (896 MB semispaces:
+   a quarter is 224 MB, under 16 x 16 MB), and growing with --dynamic-space-size, so a program
+   given more heap can use it on a worker as well as on main (at 8 GB, ~64 MB each).  It was a
+   flat 16 MB whatever the heap: a 3M-character string on a worker was heap-exhausted with
+   --dynamic-space-size 8192, where main had gigabytes.  A quarter and not the half the carve may
+   take, because what the regions take, main loses, and a library load can need most of main's.
+   Never below 16 MB; whole megabytes.  No allocation (the carve's arithmetic must not)."
+  (let ((share (ash (- (ash size0 -2) (+ #x1000000 4096)) -4)))
+    (max #x1000000 (logand share (- 0 #x100000)))))
+
 (defun %ha-region-size (size0)
   "Each region's semispace size for a region-0 semispace of SIZE0: *THREAD-HEAP-BYTES* (or
    MODUS_THREAD_HEAP, in MB), at least 16 MB, cut so at least two regions fit."
@@ -356,7 +369,7 @@
          (want (or (and mb (> mb 0) (* mb #x100000))
                    ;; BOUNDP first: a kernel DEFVAR's initform does not run in every image
                    (and (boundp '*thread-heap-bytes*) (integerp *thread-heap-bytes*) *thread-heap-bytes*)
-                   #x1000000))
+                   (%ha-default-region-size size0)))
          (want (max #x1000000 (logand want (- 0 #x100000))))
          (avail (- (- size0 (ash size0 -1)) (+ #x1000000 4096))))
     (if (>= avail (* 2 want))

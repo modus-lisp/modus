@@ -785,6 +785,7 @@
    (if (= subtag #x15) t
    (if (= subtag #x12) t
    (if (= subtag #x17) t
+   (if (= subtag #x18) t
     (if (= subtag #x14) t
      (if (= subtag #x16) t
       ;; NOT bignum #x30: a big bignum's slot 1 points at its limb array
@@ -795,7 +796,7 @@
         (if (= subtag #x64) t
          (if (= subtag #x65) t
           (if (= subtag #x66) t
-           nil)))))))))))))))
+           nil))))))))))))))))
 
 (defun %gc-clear-bitmap-range (range-start size)
   "Zero the object-start AND cons-kind bitmap bits for [RANGE-START,
@@ -1797,7 +1798,7 @@
    Compares, not (MEMBER ST '(...)): that conses its list on every call here,
    ~48 bytes an object, enough for every audit walk on the board to trigger a
    collection of a 25 MB young space halfway through."
-  (or (and (>= st #x10) (<= st #x16)) (= st #x31) (= st #x60)
+  (or (and (>= st #x10) (<= st #x18)) (= st #x31) (= st #x60)
       (and (>= st #x64) (<= st #x66))))
 
 (defun %gc-audit-stable (fn what)
@@ -2957,7 +2958,7 @@
   (case st
     (256 "cons") (#x01 "simple-vector") (#x10 "string") (#x11 "u8-vector")
     (#x12 "f32-vector") (#x13 "string-8") (#x14 "u64-vector") (#x15 "string-32")
-    (#x16 "sap") (#x17 "u32-vector") (#x30 "bignum") (#x31 "string-wide") (#x32 "array/struct/instance")
+    (#x16 "sap") (#x17 "u32-vector") (#x18 "f64-vector") (#x30 "bignum") (#x31 "string-wide") (#x32 "array/struct/instance")
     (#x33 "ratio") (#x40 "struct") (#x41 "hash-table") (#x50 "symbol")
     (#x51 "function") (#x52 "closure") (#x53 "keyword") (#x60 "double-float")
     (#x61 "mvm-module") (#x64 "single-float") (t nil)))

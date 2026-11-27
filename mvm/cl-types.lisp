@@ -1112,6 +1112,7 @@
     ((eq n 'simple-error) '(simple-condition error))
     ((eq n 'simple-type-error) '(simple-condition type-error))
     ((eq n 'simple-warning) '(simple-condition warning))
+    ((eq n 'simple-style-warning) '(simple-condition style-warning))
     ((eq n 'type-error) '(error))
     ((eq n 'storage-condition) '(serious-condition))
     ((eq n 'warning) '(condition))
@@ -1841,8 +1842,14 @@
       ((%typename-eq et1 'extended-char) (values t t))
       ((%typename-eq et2 'extended-char) (values nil t))
       (t
-       (let ((et-ok (%array-etype-equiv-p et1 et2)))
+       (let* ((f64 (%f64-etype-pair-p et1 et2))
+              (et-ok (if f64
+                         ;; an element type that upgrades to DOUBLE-FLOAT is decided by
+                         ;; upgrading (CLHS 15.1.2.1), certainly, as SBCL does
+                         (eq (upgraded-array-element-type et1) (upgraded-array-element-type et2))
+                         (%array-etype-equiv-p et1 et2))))
          (cond
+           ((and (not et-ok) f64) (values nil t))
            ((not et-ok) (values nil nil))
            ;; dims2 is * → any rank/dims accepted
            ((eq dims2 '*) (values t t))
@@ -1851,6 +1858,14 @@
            ;; Both are lists — pairwise check
            ((%dims-le-p dims1 dims2) (values t t))
            (t (values nil t))))))))
+
+(defun %f64-etype-pair-p (et1 et2)
+  "Both element types given (neither *) and one of them upgrades to DOUBLE-FLOAT, in a
+   build with packed double vectors: SUBTYPEP decides the pair by upgrading."
+  (and (%f64-vectors-p)
+       (not (or (eq et1 '*) (%typename-eq et1 '*))) (not (or (eq et2 '*) (%typename-eq et2 '*)))
+       (or (eq (upgraded-array-element-type et1) 'double-float)
+           (eq (upgraded-array-element-type et2) 'double-float))))
 
 (defun %array-etype-equiv-p (et1 et2)
   "True iff array element-type specs ET1 and ET2 should be considered
@@ -3959,6 +3974,11 @@
     ((eql (obj-subtag arr) #x17)
      (or (null elt) (eq elt '*)
          (equal (upgraded-array-element-type elt) '(unsigned-byte 32))))
+    ;; Packed double-float vector (subtag #x18): exactly the element types that
+    ;; upgrade to DOUBLE-FLOAT (CLHS 15.1.2.1), as SBCL answers.
+    ((eql (obj-subtag arr) #x18)
+     (or (null elt) (eq elt '*)
+         (eq (upgraded-array-element-type elt) 'double-float)))
     ((eql (obj-subtag arr) #x12)
      (or (null elt) (eq elt '*)
          (%typename-eq elt 'single-float) (%typename-eq elt 'short-float)
@@ -3986,6 +4006,10 @@
         t)
        ;; NOT element-type T, character, or bit.
        (t nil)))
+    ;; A header (multi-dimensional, adjustable, fill-pointer, displaced) whose element type
+    ;; is DOUBLE-FLOAT: exactly the element types that upgrade to it, as the packed vector.
+    ((and (%f64-vectors-p) (%mda-p arr) (eq (array-element-type arr) 'double-float))
+     (eq (upgraded-array-element-type elt) 'double-float))
     (t
      ;; Non-string array.  ELT = T or T-equivalent matches.  CHARACTER
      ;; on a non-string array doesn't (since the elt is T, not character).
@@ -4697,6 +4721,14 @@
         (error 'type-error :datum object :expected-type result-type)))
     (return-from coerce
       (if (%u8-vector-of-type-p object result-type) object (%seq-u8-copy object))))
+  ;; A packed double vector type: the object itself when it already is one (of the length
+  ;; asked), else a packed copy -- whose stores signal on an element that is not a double.
+  (when (%seq-type-f64-p result-type)
+    (let ((n (%f64-type-length result-type)))
+      (when (and n (/= n (length object)))
+        (error 'type-error :datum object :expected-type result-type)))
+    (return-from coerce
+      (if (%f64-bare-p object) object (%seq-f64-copy object))))
   ;; (COMPLEX <float type>): a real becomes a complex of that format with a
   ;; zero imaginary part, a complex has its parts converted (SBCL; the
   ;; upstream ACOSH.3/ASINH.3/ATANH.3 build their zeros this way).
@@ -5668,6 +5700,9 @@
     ;; packed (unsigned-byte 32) vector (subtag #x17)
     ((and (not (consp obj)) (not (%mda-p obj)) (eql (obj-subtag obj) #x17))
      (list 'simple-array '(unsigned-byte 32) (list (length obj))))
+    ;; packed double-float vector (subtag #x18)
+    ((and (not (consp obj)) (not (%mda-p obj)) (eql (obj-subtag obj) #x18))
+     (list 'simple-array 'double-float (list (length obj))))
     ;; Other arrays by their ELEMENT TYPE: a byte vector is
     ;; (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (n)), not SIMPLE-VECTOR (CLHS: a
     ;; simple-vector holds T).  Non-simple (fill pointer) vectors as for strings.
@@ -6126,6 +6161,10 @@
                        (or (null et) (eq et '*)
                            (eq (upgraded-array-element-type et) 'bit))))
                  ((or (null et) (eq et '*)) t)
+                 ;; a DOUBLE-FLOAT header (its store packed, #x18): exactly the element
+                 ;; types that upgrade to DOUBLE-FLOAT, as SBCL answers
+                 ((and (%f64-vectors-p) (eq (array-element-type obj) 'double-float))
+                  (eq (upgraded-array-element-type et) 'double-float))
                  ((eq et t) (not str))
                  ((or (eq et 'character) (eq et 'base-char)
                       (eq et 'standard-char)) str)
@@ -6170,7 +6209,7 @@
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
                    (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12)
                    (= (obj-subtag obj) #x13) (= (obj-subtag obj) #x15)
-                   (= (obj-subtag obj) #x17))
+                   (= (obj-subtag obj) #x17) (= (obj-subtag obj) #x18))
                (let* ((et (and (cdr type) (%element-type-expand (cadr type))))
                       (sz-given (and (cddr type) t))
                       (sz (and (cddr type) (caddr type)))
@@ -6186,6 +6225,8 @@
                       (is-f32     (= (obj-subtag obj) #x12))
                       ;; Packed (unsigned-byte 32) vector (subtag #x17).
                       (is-u32     (= (obj-subtag obj) #x17))
+                      ;; Packed double-float vector (subtag #x18).
+                      (is-f64     (= (obj-subtag obj) #x18))
                       (is-bitvec  (and is-array
                                        (> (array-length obj) 0)
                                        (bit-vector-p obj)))
@@ -6221,6 +6262,10 @@
                          (is-u32
                           (or (null et) (eq et '*)
                               (equal (upgraded-array-element-type et) '(unsigned-byte 32))))
+                         ;; f64 vector: exactly the element types that upgrade to it
+                         (is-f64
+                          (or (null et) (eq et '*)
+                              (eq (upgraded-array-element-type et) 'double-float)))
                          ;; f32 vector: single-float and its float/real/number
                          ;; supertypes; NOT T / character / integer types.
                          (is-f32

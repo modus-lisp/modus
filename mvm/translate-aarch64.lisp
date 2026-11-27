@@ -6348,6 +6348,22 @@
              (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
              (a64-fmov-d-x buf fd +a64-x9+)))
 
+          ;; ---- FPD-LANE-LOAD Fd, Varr, Vidx / FPD-LANE-STORE Varr, Vidx, Fs ----
+          ;; packed double-float vector (#x18): LDUR / STUR D, [x9, #7] with
+          ;; x9 = arr + 4*tagged-idx (= 8*idx), as FP-LANE-LOAD's 4-byte lane.
+          ((= op +op-fpd-lane-load+)
+           (let* ((fd (fpp (vr 0)))
+                  (parr (ensure-src (vr 1) +a64-x16+))
+                  (pidx (ensure-src (vr 2) +a64-x17+)))
+             (a64-add-reg buf +a64-x9+ parr pidx 0 2)
+             (a64-emit buf (logior #xFC407000 (ash +a64-x9+ 5) fd))))
+          ((= op +op-fpd-lane-store+)
+           (let* ((parr (ensure-src (vr 0) +a64-x16+))
+                  (pidx (ensure-src (vr 1) +a64-x17+))
+                  (fs (fpp (vr 2))))
+             (a64-add-reg buf +a64-x10+ parr pidx 0 2)
+             (a64-emit buf (logior #xFC007000 (ash +a64-x10+ 5) fs))))
+
           ;; ---- FPD-LT / FPD-LE Vd, Fa, Fb ----  FCMP Da, Db; CSET x9, MI / LS
           ;; (both false for an unordered pair); tag as a fixnum.
           ((or (= op +op-fpd-lt+) (= op +op-fpd-le+))
@@ -9062,7 +9078,7 @@
     (a64-set-label buf havesz)
     (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4)
     (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)       ; next object
-    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x31 #x60 #x64 #x65 #x66))
+    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x18 #x31 #x60 #x64 #x65 #x66))
       (a64-cmp-imm buf +a64-x14+ st)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i nextobj :bcond)))
     ;; slots [max(obj+16, card start), min(obj+16+count*8, card end))
@@ -9746,7 +9762,7 @@
     ;; from-space was reused -- natrium's *P25519* after a tarball install on the
     ;; Pi (INTEGER-LENGTH never returned).  A small bignum's two slots are tagged
     ;; fixnums, safe to scan.  x64 made the same fix in 9d0790c.
-    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x31 #x60 #x64 #x65 #x66))
+    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x18 #x31 #x60 #x64 #x65 #x66))
       (a64-cmp-imm buf +a64-x14+ st)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i leafskip :bcond)))
     ;; pointer-bearing: scan slots [x23 .. slot_end=x26)

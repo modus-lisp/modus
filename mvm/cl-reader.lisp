@@ -785,12 +785,10 @@
               ;; Unescaped: apply case conversion
               (cond
                 ((eq rc :upcase)
-                 (setq result (cons (if (and (>= code 97) (<= code 122))
-                                        (- code 32) code)
+                 (setq result (cons (%code-upcase code)
                                     result)))
                 ((eq rc :downcase)
-                 (setq result (cons (if (and (>= code 65) (<= code 90))
-                                        (+ code 32) code)
+                 (setq result (cons (%code-downcase code)
                                     result)))
                 ((eq rc :preserve)
                  (setq result (cons code result)))
@@ -810,8 +808,8 @@
             (when (null r-cur) (return nil))
             (unless (car e-cur)
               (let ((code (car r-cur)))
-                (when (and (>= code 65) (<= code 90)) (setq has-upper t))
-                (when (and (>= code 97) (<= code 122)) (setq has-lower t))))
+                (when (%code-upper-p code) (setq has-upper t))
+                (when (%code-lower-p code) (setq has-lower t))))
             (setq r-cur (cdr r-cur))
             (setq e-cur (cdr e-cur))))
         ;; If all same case, invert
@@ -824,8 +822,7 @@
                 (let ((code (car r-cur)))
                   (if (car e-cur)
                       (setq new-result (cons code new-result))
-                      (setq new-result (cons (if (and (>= code 65) (<= code 90))
-                                                  (+ code 32) code)
+                      (setq new-result (cons (%code-downcase code)
                                               new-result))))
                 (setq r-cur (cdr r-cur))
                 (setq e-cur (cdr e-cur))))
@@ -839,8 +836,7 @@
                 (let ((code (car r-cur)))
                   (if (car e-cur)
                       (setq new-result (cons code new-result))
-                      (setq new-result (cons (if (and (>= code 97) (<= code 122))
-                                                  (- code 32) code)
+                      (setq new-result (cons (%code-upcase code)
                                               new-result))))
                 (setq r-cur (cdr r-cur))
                 (setq e-cur (cdr e-cur))))
@@ -906,11 +902,7 @@
                         t))
                 (return-from %try-parse-integer nil)))
           (let ((code (car cur)))
-            (let ((digit (cond
-                           ((and (>= code 48) (<= code 57)) (- code 48))
-                           ((and (>= code 65) (<= code 90)) (+ 10 (- code 65)))
-                           ((and (>= code 97) (<= code 122)) (+ 10 (- code 97)))
-                           (t nil))))
+            (let ((digit (%code-digit-weight code 36)))   ; any decimal digit, as SBCL
               (if (and digit (< digit base))
                   (progn
                     ;; Lazy bignum promote: while n stays small, use fast
@@ -1722,7 +1714,7 @@
            ;; CLHS says it is what #<sub-char> means in RT.  Consulted only after the built-ins,
            ;; a program's own #. #\ #+ #R ... was silently ignored.
            (user-fn (let ((sub-table (%get-dispatch-table #\# rt))
-                          (upper-code (if (and (>= code 97) (<= code 122)) (- code 32) code)))
+                          (upper-code (%code-upcase code)))
                       (and sub-table (< upper-code 128) (aref sub-table upper-code)))))
       (cond
         (user-fn (%call-reader-macro user-fn stream sub-ch arg))
@@ -1883,8 +1875,7 @@
         (t
          (let ((sub-table (%get-dispatch-table #\# rt)))
            (if sub-table
-               (let ((upper-code (if (and (>= code 97) (<= code 122))
-                                     (- code 32) code)))
+               (let ((upper-code (%code-upcase code)))
                  (let ((fn (if (< upper-code 128) (aref sub-table upper-code) nil)))
                    (if fn
                        (%call-reader-macro fn stream sub-ch arg)
@@ -2557,12 +2548,8 @@
             (loop
               (when (>= i end) (return))
               (let* ((c (%prim-aref string i))
-                     (digit
-                      (cond
-                        ((and (>= c 48) (<= c 57)) (- c 48))   ; 0-9
-                        ((and (>= c 65) (<= c 90)) (- c 55))   ; A-Z
-                        ((and (>= c 97) (<= c 122)) (- c 87))  ; a-z
-                        (t radix))))  ; invalid → radix (too large)
+                     (digit (or (%code-digit-weight (%ensure-char-code c) radix)
+                                radix)))  ; invalid -> radix (too large)
                 (when (>= digit radix) (return))
                 (setq result (+ (* result radix) digit))
                 (setq digit-count (+ digit-count 1)))

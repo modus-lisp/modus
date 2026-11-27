@@ -1862,6 +1862,24 @@ Stopping.
                 0)))
         0)))
 
+(defun %rt-abandon ()
+  "If this thread holds the runtime lock, at whatever depth, release it ENTIRELY: back to its own
+   region, ownership dropped, mutex unlocked.  For an error raised INSIDE a locked section that is
+   about to unwind past its %RT-LEAVE -- the shared-store guard refusing the value a locked
+   SET-SYMBOL-VALUE or %MACRO-PKG-PUT was storing (a worker's (setf (symbol-value '*x*) 3d0)).
+   That unwind used to leave the lock held, and the next thread to need it waited 60 s and
+   stopped the process ('its owner leaked it').  The section it interrupts may have left its
+   table half-updated; that is what refusing a store mid-section means, and it beats a dead
+   process.  Returns T if it released."
+  (if (= (mem-ref #x10000DB8 :u32) 0)
+      nil
+      (let ((me (+ (%thr-cpu) 1)))
+        (if (= (%gc-read64 (%rt-owner-addr)) me)
+            (progn (%gc-write64 (%rt-depth-addr) 1)   ; so the leave below is the outermost
+                   (%rt-leave-locked)
+                   t)
+            nil))))
+
 (defun %gc-stw-arm ()
   "Arm STOP-THE-WORLD for region-0 collections (translate-aarch64, STOP-THE-
    WORLD FOR REGION 0): publish the band and the region count in the thread

@@ -119,6 +119,7 @@
    #:+op-fp-add+ #:+op-fp-sub+ #:+op-fp-mul+ #:+op-fp-div+
    #:mvm-fp-unbox #:mvm-fp-box #:mvm-fp-lane-load #:mvm-fp-lane-store
    #:mvm-fp-add #:mvm-fp-sub #:mvm-fp-mul #:mvm-fp-div
+   #:+op-fpd-lane-load+ #:+op-fpd-lane-store+ #:mvm-fpd-lane-load #:mvm-fpd-lane-store
    #:+op-fpd-unbox+ #:+op-fpd-box+ #:+op-fpd-add+ #:+op-fpd-sub+ #:+op-fpd-mul+ #:+op-fpd-div+ #:+op-fpd-itof+ #:+op-fpd-lt+ #:+op-fpd-le+
    #:mvm-fpd-unbox #:mvm-fpd-box #:mvm-fpd-add #:mvm-fpd-sub #:mvm-fpd-mul #:mvm-fpd-div #:mvm-fpd-itof #:mvm-fpd-lt #:mvm-fpd-le
    #:+op-v4-lane-load+ #:+op-v4-lane-store+ #:+op-v4-dup+ #:+op-v4-dup-lane-load+
@@ -575,6 +576,11 @@
 (defconstant +op-fp-mov+           #xE1) ; (fp-mov Fd Fs)  full 128-bit register copy (scalar or vector)
 ;;; Unboxed DOUBLE-float FP register class: the single-float ops above, in double
 ;;; precision.  An FP vreg holds one IEEE double; nothing is live across a call.
+;; PACKED DOUBLE-FLOAT VECTOR lanes (subtag #x18): 8 bytes at data + 8*idx, the tagged
+;; pointer + 4*TAGGED-idx + 7.  Moved as raw bits between the vector and an FP vreg (no
+;; box, no conversion); x86-64, aarch64 and the interpreter only.
+(defconstant +op-fpd-lane-load+  #x98) ; (fpd-lane-load Fd Varr Vidx)  packed f64 lane -> double in Fd
+(defconstant +op-fpd-lane-store+ #x99) ; (fpd-lane-store Varr Vidx Fs) double in Fs -> packed f64 lane
 (defconstant +op-fpd-unbox+ #xEB) ; (fpd-unbox Fd Vsrc)  boxed float payload -> double in Fd
 (defconstant +op-fpd-box+   #xEC) ; (fpd-box Vd Fs)      double in Fs -> fresh boxed double-float (allocates)
 (defconstant +op-fpd-add+   #xED) ; (fpd-add Fd Fa Fb)   double-precision arithmetic
@@ -883,6 +889,8 @@
 (defopcode :v4-div           #xE0 (:reg :reg :reg) "f32x4 div")
 (defopcode :fp-mov           #xE1 (:reg :reg)      "FP vreg copy (128-bit)")
 (defopcode :fpd-unbox        #xEB (:reg :reg)      "Boxed float -> unboxed double in FP vreg")
+(defopcode :fpd-lane-load    #x98 (:reg :reg :reg) "Packed f64 lane -> double in FP vreg")
+(defopcode :fpd-lane-store   #x99 (:reg :reg :reg) "Double in FP vreg -> packed f64 lane")
 (defopcode :fpd-box          #xEC (:reg :reg)      "Unboxed double in FP vreg -> fresh boxed double-float (allocates)")
 (defopcode :fpd-add          #xED (:reg :reg :reg) "FP vreg double add")
 (defopcode :fpd-sub          #xEE (:reg :reg :reg) "FP vreg double sub")
@@ -1610,6 +1618,8 @@
 (defun mvm-fp-div (buf fd fa fb) (encode-instruction buf +op-fp-div+ fd fa fb))
 (defun mvm-fpd-unbox (buf fd vs) (encode-instruction buf +op-fpd-unbox+ fd vs))
 (defun mvm-fpd-box (buf vd fs) (encode-instruction buf +op-fpd-box+ vd fs))
+(defun mvm-fpd-lane-load (buf fd varr vidx) (encode-instruction buf +op-fpd-lane-load+ fd varr vidx))
+(defun mvm-fpd-lane-store (buf varr vidx fs) (encode-instruction buf +op-fpd-lane-store+ varr vidx fs))
 (defun mvm-fpd-add (buf fd fa fb) (encode-instruction buf +op-fpd-add+ fd fa fb))
 (defun mvm-fpd-sub (buf fd fa fb) (encode-instruction buf +op-fpd-sub+ fd fa fb))
 (defun mvm-fpd-mul (buf fd fa fb) (encode-instruction buf +op-fpd-mul+ fd fa fb))

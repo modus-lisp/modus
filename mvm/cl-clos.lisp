@@ -7238,7 +7238,7 @@
       (when (>= i end) (return str))
       (let ((ch (%ensure-char-code (aref str i))))   ; AREF→char; want raw code
         (when (lower-case-p (code-char ch))
-          (aset str i (- ch 32))))
+          (aset str i (%code-upcase ch))))
       (setq i (+ i 1)))))
 
 (defun nstring-downcase-raw (str start end)
@@ -7248,7 +7248,7 @@
       (when (>= i end) (return str))
       (let ((ch (%ensure-char-code (aref str i))))   ; AREF→char; want raw code
         (when (upper-case-p (code-char ch))
-          (aset str i (+ ch 32))))
+          (aset str i (%code-downcase ch))))
       (setq i (+ i 1)))))
 
 (defun nstring-capitalize-raw (str start end)
@@ -7260,10 +7260,10 @@
         (if (alphanumericp (code-char ch))
             (if in-word
                 (when (upper-case-p (code-char ch))
-                  (aset str i (+ ch 32)))
+                  (aset str i (%code-downcase ch)))
                 (progn
                   (when (lower-case-p (code-char ch))
-                    (aset str i (- ch 32)))
+                    (aset str i (%code-upcase ch)))
                   (setq in-word t)))
             (setq in-word nil)))
       (setq i (+ i 1)))))
@@ -7832,6 +7832,8 @@
                              (or (eq etype 'character) (eq etype 'base-char)))
                         (%make-string-array sz))
                        (str-data (%make-string-array sz))
+                       ;; a packed double store stays one (#x18)
+                       ((%f64-bare-p old-data) (%make-f64-vector sz))
                        (t (make-array sz)))))
       (cond
         ;; :initial-contents — flatten nested lists row-major into new-data.
@@ -7934,6 +7936,8 @@
                        (str-data (%make-string-array new-size))
                        ((%prim-u8-vector-p old-data)
                         (make-array new-size :element-type '(unsigned-byte 8)))
+                       ;; ... and a packed double store a packed double store (#x18)
+                       ((%f64-bare-p old-data) (%make-f64-vector new-size))
                        (t (make-array new-size)))))
       (cond
         (displaced-to
@@ -8122,9 +8126,10 @@
                         nil)
                        ((and (eq init-contents :unset) (eq init-elem :unset))
                         ;; Copy first min(new-size, src-len) from src
-                        (let ((nb (if string-elt
-                                      (%make-string-array new-size)
-                                      (make-array new-size)))
+                        (let ((nb (cond (string-elt (%make-string-array new-size))
+                                        ;; a packed double vector adjusts to one (SBCL)
+                                        ((%f64-bare-p src-arr) (%make-f64-vector new-size))
+                                        (t (make-array new-size))))
                               (i 0))
                           (loop
                             (when (>= i new-size) (return nb))
@@ -8133,9 +8138,10 @@
                                 (aset nb i (aref src-arr si))))
                             (setq i (+ i 1)))))
                        ((not (eq init-elem :unset))
-                        (let ((nb (if string-elt
-                                      (%make-string-array new-size)
-                                      (make-array new-size)))
+                        (let ((nb (cond (string-elt (%make-string-array new-size))
+                                        ;; a packed double vector adjusts to one (SBCL)
+                                        ((%f64-bare-p src-arr) (%make-f64-vector new-size))
+                                        (t (make-array new-size))))
                               (i 0))
                           (loop
                             (when (>= i new-size) (return nb))
@@ -8145,9 +8151,10 @@
                                   (aset nb i init-elem)))
                             (setq i (+ i 1)))))
                        ((not (eq init-contents :unset))
-                        (let ((nb (if string-elt
-                                      (%make-string-array new-size)
-                                      (make-array new-size))))
+                        (let ((nb (cond (string-elt (%make-string-array new-size))
+                                        ;; a packed double vector adjusts to one (SBCL)
+                                        ((%f64-bare-p src-arr) (%make-f64-vector new-size))
+                                        (t (make-array new-size)))))
                           ;; Walk init-contents and aset
                           (let ((i 0) (cur init-contents))
                             (loop
@@ -8487,6 +8494,10 @@
     ((and (not (%mda-p seq)) (eql (obj-subtag seq) #x11))
      (let ((r (%make-u8-vector (length seq))))
        (dotimes (i (length seq) r) (setf (aref r i) (aref seq i)))))
+    ;; packed double-float vector (subtag #x18): the lanes, as raw bits
+    ((%f64-bare-p seq)
+     (let ((r (%make-f64-vector (length seq))))
+       (%bulk-copy-f64 r 0 seq 0 (length seq))))
     ;; packed single-float vector (subtag #x12) copies to a packed one
     ((and (not (%mda-p seq)) (eql (obj-subtag seq) #x12))
      (let ((r (%make-f32-vector (length seq))))

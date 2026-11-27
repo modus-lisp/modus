@@ -383,7 +383,8 @@
 ;;; STAGING, per actor, 256 KB: +0 write offset, +8 messages outstanding,
 ;;; data from +16.  Messages are consumed in order, so the area empties when
 ;;; the outstanding count reaches zero and the write offset rewinds then.  A
-;;; message that does not fit waits (backpressure) and, after 10 s, signals.
+;;; message that does not fit waits (backpressure) and, after 10 s, signals -- or,
+;;; given a :TIMEOUT, returns NIL once that has passed.
 
 (defun %ar-staging-bytes () #x40000)
 (defun %ar-staging (id) (+ (%ar-get #x58) (* id (%ar-staging-bytes))))
@@ -558,18 +559,24 @@
                 (mailbox-enqueue-and-wake target cell)
                 1))))))
 
-(defun actors-send (target message)
+(defun actors-send (target message &key (timeout nil timeout-p))
   "Send MESSAGE (data: see the encoding above) to actor TARGET.  Returns
-   MESSAGE.  Waits while TARGET's staging is full; signals after 10 s."
+   MESSAGE.  While TARGET's staging is full it waits: with TIMEOUT (seconds; NIL
+   = forever) for that long, then returns NIL; without one, 10 s, then signals.
+   *FEATURES* has :MODUS-ACTOR-SEND-TIMEOUT where TIMEOUT is accepted."
   (let ((bytes (%ar-encode message)))
     (when (> (length bytes) (- (%ar-staging-bytes) 16))
       (error "actors-send: the message is ~D bytes; at most ~D fit."
              (length bytes) (- (%ar-staging-bytes) 16)))
-    (let ((deadline (+ (%monotonic-ns) 10000000000)))
+    (let ((deadline (cond ((not timeout-p) (+ (%monotonic-ns) 10000000000))
+                          ((null timeout) 0)
+                          (t (+ (%monotonic-ns) (max 0 (round (* timeout 1000000000))))))))
       (loop
         (unless (zerop (%ar-post target bytes)) (return 0))
-        (when (> (%monotonic-ns) deadline)
-          (error "actors-send: actor ~D has not drained its mailbox for 10 s." target))
+        (when (and (/= deadline 0) (> (%monotonic-ns) deadline))
+          (if timeout-p
+              (return-from actors-send nil)
+              (error "actors-send: actor ~D has not drained its mailbox for 10 s." target)))
         (if (>= (get-current-actor) 2) (actors-yield) (%sleep-ms 1))))
     (when (= target 1)
       (xchg-mem (+ *ar-ctl* #x48) 1)

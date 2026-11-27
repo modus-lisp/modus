@@ -70,6 +70,10 @@
       (when (>= iters 40000) (return 0)))
     (actors-send 1 bad)))
 
+(defun napper ()
+  ;; takes :go, then does not receive for 2 s: its mailbox fills
+  (actors-receive) (sleep 2) (loop (when (eq (actors-receive) :stop) (return 0))))
+
 (defun waiter ()
   ;; (:wait ms): report whether a receive with that timeout got a message, and how long it took
   (loop (let ((m (actors-receive)))
@@ -218,6 +222,19 @@
   (let ((ms (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
     (chk "waiting actors do not hold a thread (3 x 300 ms on 3 threads < 900 ms)" (< ms 850) ms))
   (dolist (w ws) (actors-send w :stop)))
+
+(let* ((n (actors-spawn 'napper))
+       (big (make-string (floor (modus-int::%ar-staging-bytes) 5) :initial-element #\x))
+       (t0 (get-internal-real-time)) (sent 0) (r t))
+  (actors-send n :go)
+  (loop while (and r (< sent 50)) do (setq r (actors-send n big :timeout 0.2)) (when r (incf sent)))
+  (let ((ms (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
+    (chk "send :timeout to a full mailbox returns NIL within the timeout, not after 10 s"
+         (and (null r) (plusp sent) (< sent 50) (>= ms 190) (< ms 1500)) (list sent ms)))
+  (chk ":modus-actor-send-timeout is on *features*" (member :modus-actor-send-timeout *features*))
+  (sleep 2)
+  (chk "send :timeout NIL waits for room" (eq (actors-send n big :timeout nil) big))
+  (actors-send n :stop))
 
 (chk "stop" (actors-stop))
 

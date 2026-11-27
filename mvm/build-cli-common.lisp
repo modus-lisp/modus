@@ -2853,6 +2853,8 @@
   (unless (%surface-off-p \"MODUS_NO_SB\")
     (%push-feature :sb-thread)
     (%push-feature :modus-channel)
+    ;; the actor runtime's ACTORS-SEND takes :TIMEOUT (bobbin asks for this)
+    (when (fboundp 'actors-start) (%push-feature :modus-actor-send-timeout))
     (%push-feature :sb-bsd-sockets)
     ;; :SB-MOP only if every MOP function the shim re-exports exists -- the
     ;; shim's own condition, checked here so the feature is not a promise the

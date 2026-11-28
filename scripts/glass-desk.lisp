@@ -1,5 +1,6 @@
 ;;;; glass-desk.lisp -- the glass desk from a modus-lisp source tree, with nothing else.
 ;;;;
+;;;;   desk.sh [FLAGS]       (a release zip: desk.cmd on Windows, desk.command on macOS)
 ;;;;   modus.com desk [FLAGS]
 ;;;;   modus --dynamic-space-size 8192 --script modus/scripts/glass-desk.lisp [FLAGS]
 ;;;;   sbcl --dynamic-space-size 8192 --script modus/scripts/glass-desk.lisp [FLAGS]
@@ -38,7 +39,8 @@
     ("--help"     :help     nil            nil         nil    "this")))
 
 (defun cl-user::desk-usage (&optional (stream *standard-output*))
-  (format stream "~&usage: modus.com desk [FLAGS]~%~
+  (format stream "~&usage: desk [FLAGS]                    (a release: desk.sh, desk.cmd, desk.command)~%~
+                    ~7@Tmodus.com desk [FLAGS]~%~
                     ~7@Tmodus --script modus/scripts/glass-desk.lisp [FLAGS]~%~%")
   (loop for (flag nil nil default arg doc) in cl-user::*desk-flags*
         ;; ~22A, not ~T: modus's FORMAT does not know stdout's column, and ~24T there is 24 spaces

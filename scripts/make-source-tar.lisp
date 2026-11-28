@@ -17,85 +17,13 @@
 ;;;; the files -- then zlib-compressed with cram (which loads from DIR too).  MODUS_SRC_TAR=FILE
 ;;;; also writes the uncompressed tar.
 
-(require :asdf)
-
-(defun env (name &optional default)
-  (let ((v (funcall (find-symbol "POSIX-GETENV" "SB-EXT") name)))
-    (if (and v (plusp (length v))) v default)))
+;; the selection (which repositories, which of their files) is scripts/source-set.lisp's,
+;; shared with scripts/make-release-zip.lisp
+(load (merge-pathnames "source-set.lisp" (or *load-truename* *load-pathname*)))
 
 (defparameter *tree* (let ((d (env "MODUS_SRC_TREE")))
                        (unless d (error "make-source-tar: set MODUS_SRC_TREE"))
-                       (if (char= (char d (1- (length d))) #\/) d (concatenate 'string d "/"))))
-
-(defparameter *roots*
-  (let ((s (env "MODUS_SRC_SYSTEMS" "glass/wm cram fs-fat fs-apple")) (acc nil) (start 0))
-    (loop (let ((sp (position #\Space s :start start)))
-            (when (> (or sp (length s)) start) (push (subseq s start sp) acc))
-            (if sp (setq start (1+ sp)) (return))))
-    (nreverse acc)))
-
-;; natrium too: building modus itself needs it (mvm/build-macos-cli.lisp's code signature)
-(defparameter *always* '("modus" "natrium" "vessel"))
-
-(defparameter *drop-types* '("pdf" "png" "jpg" "jpeg" "gif" "mp4" "webm" "mkv" "vob" "mov"))
-(defparameter *drop-dirs* '("inspect" ".git" ".github"))
-(defparameter *drop-paths* '("modus/test/ladder/tars/"))
-
-;;; --- which repositories ------------------------------------------------------------
-
-(setf asdf:*central-registry* (directory (concatenate 'string *tree* "*/")))
-
-(defun repo-of (system)
-  "The repository directory name under *TREE* that holds SYSTEM, or NIL for a system from
-   elsewhere (the host's own ASDF and UIOP)."
-  (let ((dir (namestring (asdf:system-source-directory system)))
-        (root (namestring (truename *tree*))))
-    (when (eql 0 (search root dir))
-      (let ((rel (subseq dir (length root))))
-        (subseq rel 0 (position #\/ rel))))))
-
-(defun dep-name (d)
-  (cond ((stringp d) d)
-        ((symbolp d) (string-downcase d))
-        ((and (consp d) (member (car d) '(:version :require))) (and (stringp (second d)) (second d)))
-        ((and (consp d) (eq (car d) :feature)) (dep-name (third d)))))
-
-(defun closure-repos ()
-  (let ((seen (make-hash-table :test 'equal)) (repos (make-hash-table :test 'equal)))
-    (labels ((walk (name)
-               (unless (or (null name) (gethash name seen))
-                 (setf (gethash name seen) t)
-                 (let ((s (ignore-errors (asdf:find-system name nil))))
-                   (when (and s (repo-of s))
-                     (setf (gethash (repo-of s) repos) t)
-                     (dolist (d (append (asdf:system-depends-on s) (asdf:system-defsystem-depends-on s)))
-                       (walk (dep-name d))))))))
-      (dolist (r *roots*) (walk r)))
-    (dolist (r *always*) (setf (gethash r repos) t))
-    (sort (loop for k being the hash-keys of repos collect k) #'string<)))
-
-;;; --- which files ---------------------------------------------------------------------
-
-(defun keep-p (rel)
-  "REL is a path under *TREE* (REPO/...)."
-  (let ((type (let ((dot (position #\. rel :from-end t)) (slash (position #\/ rel :from-end t)))
-                (and dot (or (null slash) (> dot slash)) (string-downcase (subseq rel (1+ dot)))))))
-    (not (or (member type *drop-types* :test #'string=)
-             (some (lambda (d) (search (concatenate 'string "/" d "/") rel)) *drop-dirs*)
-             (some (lambda (p) (eql 0 (search p rel))) *drop-paths*)))))
-
-(defun files-under (repo)
-  "Every regular file of REPO, as paths relative to *TREE*."
-  (let ((root (namestring (truename *tree*))) (acc nil))
-    (labels ((walk (dir)
-               (dolist (f (directory (concatenate 'string dir "*.*")))
-                 (let ((n (namestring f)))
-                   (unless (char= (char n (1- (length n))) #\/)
-                     (push (subseq n (length root)) acc))))
-               (dolist (d (directory (concatenate 'string dir "*/")))
-                 (walk (namestring d)))))
-      (walk (concatenate 'string root repo "/")))
-    acc))
+                       (tree-directory d)))
 
 ;;; --- a ustar writer --------------------------------------------------------------------
 
@@ -150,25 +78,10 @@
 
 ;;; --- run ----------------------------------------------------------------------------
 
-(defun words (s)
-  (let ((acc nil) (start 0))
-    (loop (let ((sp (position #\Space s :start start)))
-            (when (> (or sp (length s)) start) (push (subseq s start sp) acc))
-            (if sp (setq start (1+ sp)) (return))))
-    (nreverse acc)))
-
-(defun all-repos ()
-  "MODUS_SRC_REPOS=all: every repository in *TREE* -- the tree is the org's, exported --
-   less MODUS_SRC_EXCLUDE (default dist: the release binaries, modus.com among them)."
-  (let ((root (namestring (truename *tree*)))
-        (exclude (words (env "MODUS_SRC_EXCLUDE" "dist"))))
-    (sort (loop for d in (directory (concatenate 'string root "*/"))
-                for n = (let ((s (namestring d))) (subseq s (length root) (1- (length s))))
-                unless (member n exclude :test #'string=) collect n)
-          #'string<)))
-
-(let* ((repos (if (string-equal (env "MODUS_SRC_REPOS" "") "all") (all-repos) (closure-repos)))
-       (names (sort (remove-if-not #'keep-p (loop for r in repos append (files-under r))) #'string<))
+(let* ((repos (source-repos *tree* :all (string-equal (env "MODUS_SRC_REPOS" "") "all")
+                                   :systems (env "MODUS_SRC_SYSTEMS" *default-systems*)
+                                   :exclude (env "MODUS_SRC_EXCLUDE" "dist")))
+       (names (source-files *tree* repos))
        (tar (write-tar names (env "MODUS_SRC_TAR"))))
   (format t "~&make-source-tar: ~D repositories (~{~A~^ ~}), ~D files, ~D bytes of tar~%"
           (length repos) repos (length names) (length tar))

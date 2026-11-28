@@ -34,6 +34,14 @@
       (if (eq (car obj) 7770001) t nil)
       nil))
 
+;;; THE RUNTIME'S OWN STREAMS, and only those.  STREAMP answers T for a Gray stream too once
+;;; net/sb-gray-shim.lisp has wrapped it, and a Gray stream is a CLOS instance with no
+;;; (TAG TYPE . DATA) under it -- so a predicate that asks STREAMP and then %STREAM-TYPE took
+;;; the CAR of an instance: (typep a-gray-stream 'file-stream) signalled "not of type LIST".
+;;; The subtype predicates below ask this instead; none of them is ever true of a Gray stream.
+(defun %native-stream-p (obj)
+  (if (consp obj) (if (eq (car obj) 7770001) t nil) nil))
+
 (defun %stream-type (s)
   (car (cdr s)))
 
@@ -121,38 +129,38 @@
 
 (defun string-stream-p (s)
   "Return t if S is a string stream (input or output)."
-  (if (streamp s)
+  (if (%native-stream-p s)
       (let ((ty (%stream-type s)))
         (if (= ty 1) t (if (= ty 2) t nil)))
       nil))
 
 (defun broadcast-stream-p (s)
   "Return t if S is a broadcast stream."
-  (if (streamp s)
+  (if (%native-stream-p s)
       (if (= (%stream-type s) 5) t nil)
       nil))
 
 (defun concatenated-stream-p (s)
   "Return t if S is a concatenated stream."
-  (if (streamp s)
+  (if (%native-stream-p s)
       (if (= (%stream-type s) 6) t nil)
       nil))
 
 (defun echo-stream-p (s)
   "Return t if S is an echo stream."
-  (if (streamp s)
+  (if (%native-stream-p s)
       (if (= (%stream-type s) 3) t nil)
       nil))
 
 (defun synonym-stream-p (s)
   "Return t if S is a synonym stream."
-  (if (streamp s)
+  (if (%native-stream-p s)
       (if (= (%stream-type s) 7) t nil)
       nil))
 
 (defun two-way-stream-p (s)
   "Return t if S is a two-way stream."
-  (if (streamp s)
+  (if (%native-stream-p s)
       (if (= (%stream-type s) 4) t nil)
       nil))
 

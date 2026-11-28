@@ -1340,6 +1340,9 @@
    written nothing, unless STREAM is a buffered socket output: the caller takes its byte path."
   (declare (type (simple-array (unsigned-byte 32) (*)) px) (fixnum fw x y w h)
            (optimize (speed 3) (safety 0)))
+  ;; a Gray stream (glass's WebSocket stream) is not one: the byte path, as promised
+  (unless (and (%native-stream-p stream) (eql (%stream-type stream) 9))
+    (return-from %fs-write-pixel-rows nil))
   (let ((fd (%fs-fd stream)))
     (unless (%fs-obuf-p stream fd) (return-from %fs-write-pixel-rows nil))
     ;; whatever the stream already holds (the rectangle header, written byte by byte) goes first
@@ -3123,7 +3126,7 @@
 ;;; --- Stream type predicate for file-stream ---
 (defun file-stream-p (s)
   "Return t if S is a file stream."
-  (if (streamp s) (= (%stream-type s) 9) nil))
+  (if (%native-stream-p s) (= (%stream-type s) 9) nil))
 
 ;;; file-string-length: for file streams, just return string length
 (defun file-string-length (s str)

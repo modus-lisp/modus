@@ -8,7 +8,8 @@
 ;;;; %LOCALAPPDATA%\modus\ on Windows); everything else is loaded from there.
 ;;;;
 ;;;;   modus.com              a menu
-;;;;   modus.com desk         the glass desk over VNC (DESK_PORT, DESK_ADDRESS, DESK_SIZE)
+;;;;   modus.com desk         the glass desk, in a web browser and over VNC
+;;;;                          (--port, --web-port, --address, --size, --no-open; desk --help)
 ;;;;   modus.com repl         the REPL (or run modus.com with any option: it is modus)
 ;;;;   modus.com sources      unpack the sources and print where they are
 ;;;;   modus.com help
@@ -105,14 +106,17 @@
 
 (defun cmd-help ()
   (say "~&modus.com -- modus for ~A~%~%~
-  modus.com desk      the glass desk, over VNC on DESK_PORT (5910)~%~
+  modus.com desk      the glass desk: in a web browser at http://127.0.0.1:6080/ (opened~%~
+                      for you), and to VNC viewers on 127.0.0.1:5910~%~
+                      [--port N] [--web-port N | --no-web] [--address ADDR] [--size WxH]~%~
+                      [--no-open] [--apps \"SYS ...\"] [--lean] [--core FILE]; desk --help~%~
   modus.com repl      the Lisp REPL~%~
   modus.com sources   unpack the sources (every modus-lisp repository) and say where~%~
   modus.com OPTIONS   with --eval, --load, --script ...: modus itself~%"
        (software-version)))
 
 (defparameter *commands*
-  '(("desk" cmd-desk "the glass desk, over VNC")
+  '(("desk" cmd-desk "the glass desk, in a web browser and over VNC")
     ("repl" cmd-repl "the Lisp REPL")
     ("sources" cmd-sources "unpack the sources and say where")
     ("help" cmd-help "what modus.com can do")))

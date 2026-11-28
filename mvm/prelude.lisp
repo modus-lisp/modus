@@ -3996,19 +3996,19 @@
   (if (eql (mem-ref #x10000DB8 :u32) 0)
       (%gv-set key val)
       (if (and (eq (mem-ref #x10000C30 :u32) 0) (eq (mem-ref #x10000C34 :u32) 0)
-               (eq (mem-ref #x10000D60 :u32) (%layout :main-dynb #x10010000 -268435456)) (eq (mem-ref #x10000D64 :u32) 0)
+               (eq (mem-ref #x10000D60 :u32) (+ (%layout :main-dynb #x10010000) -268435456)) (eq (mem-ref #x10000D64 :u32) 0)
                ;; %DYNB-MAIN-PUSH, inline
-               (< (the fixnum (mem-ref (%layout :main-dynb #x10010000 #xC58) :u64)) 896))
-          (let ((n (the fixnum (mem-ref (%layout :main-dynb #x10010000 #xC50) :u64)))
-                (d (the fixnum (mem-ref (%layout :main-dynb #x10010000 #xC58) :u64)))
-                (fa (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand key 4095))))
+               (< (the fixnum (mem-ref (+ (%layout :main-dynb #x10010000) #xC58) :u64)) 896))
+          (let ((n (the fixnum (mem-ref (+ (%layout :main-dynb #x10010000) #xC50) :u64)))
+                (d (the fixnum (mem-ref (+ (%layout :main-dynb #x10010000) #xC58) :u64)))
+                (fa (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand key 4095))))
             (setf (mem-ref n :u64) key)
             (setf (mem-ref (%fixnum-+ n 8) :u64) val)
-            (setf (mem-ref (%layout :main-dynb #x10010000 #xC50) :u64) (%fixnum-+ n 16))
-            (setf (mem-ref (%layout :main-dynb #x10010000 #xC58) :u64) (%fixnum-+ d 1))
+            (setf (mem-ref (+ (%layout :main-dynb #x10010000) #xC50) :u64) (%fixnum-+ n 16))
+            (setf (mem-ref (+ (%layout :main-dynb #x10010000) #xC58) :u64) (%fixnum-+ d 1))
             (let ((v (the fixnum (mem-ref fa :u8))))
               (when (< v 255) (setf (mem-ref fa :u8) (%fixnum-+ v 1))))
-            (setf (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x4C00) (%fixnum-+ (logand key 511) (logand key 511))) :u16)
+            (setf (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x4C00) (%fixnum-+ (logand key 511) (logand key 511))) :u16)
                   (%fixnum-+ d 1))
             val)
       (let ((blk (%dynb-bblk)))
@@ -4056,15 +4056,15 @@
   (if (eql (mem-ref #x10000DB8 :u32) 0)
       (%gv-set key saved)
       (if (and (eq (mem-ref #x10000C30 :u32) 0) (eq (mem-ref #x10000C34 :u32) 0)
-               (eq (mem-ref #x10000D60 :u32) (%layout :main-dynb #x10010000 -268435456)) (eq (mem-ref #x10000D64 :u32) 0)
+               (eq (mem-ref #x10000D60 :u32) (+ (%layout :main-dynb #x10010000) -268435456)) (eq (mem-ref #x10000D64 :u32) 0)
                ;; %DYNB-MAIN-POP, inline
-               (> (the fixnum (mem-ref (%layout :main-dynb #x10010000 #xC58) :u64)) 0)
-               (eq (mem-ref (%fixnum-- (the fixnum (mem-ref (%layout :main-dynb #x10010000 #xC50) :u64)) 16) :u64) key))
-          (let ((n (the fixnum (mem-ref (%layout :main-dynb #x10010000 #xC50) :u64)))
-                (d (the fixnum (mem-ref (%layout :main-dynb #x10010000 #xC58) :u64)))
-                (fa (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand key 4095))))
-            (setf (mem-ref (%layout :main-dynb #x10010000 #xC58) :u64) (%fixnum-- d 1))
-            (setf (mem-ref (%layout :main-dynb #x10010000 #xC50) :u64) (%fixnum-- n 16))
+               (> (the fixnum (mem-ref (+ (%layout :main-dynb #x10010000) #xC58) :u64)) 0)
+               (eq (mem-ref (%fixnum-- (the fixnum (mem-ref (+ (%layout :main-dynb #x10010000) #xC50) :u64)) 16) :u64) key))
+          (let ((n (the fixnum (mem-ref (+ (%layout :main-dynb #x10010000) #xC50) :u64)))
+                (d (the fixnum (mem-ref (+ (%layout :main-dynb #x10010000) #xC58) :u64)))
+                (fa (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand key 4095))))
+            (setf (mem-ref (+ (%layout :main-dynb #x10010000) #xC58) :u64) (%fixnum-- d 1))
+            (setf (mem-ref (+ (%layout :main-dynb #x10010000) #xC50) :u64) (%fixnum-- n 16))
             (let ((v (the fixnum (mem-ref fa :u8))))
               (when (and (> v 0) (< v 255)) (setf (mem-ref fa :u8) (%fixnum-- v 1))))
             saved)
@@ -4197,17 +4197,17 @@
           (setq hi (mem-ref #x10000D64 :u32))
           ;; THE FIXED x86-64 ONE, fused at its constant addresses (see THE
           ;; ARMED MAIN THREAD'S PUSH AND POP): the filter, then the index cache.
-          (when (and (eq lo (%layout :main-dynb #x10010000 -268435456)) (eq hi 0))
+          (when (and (eq lo (+ (%layout :main-dynb #x10010000) -268435456)) (eq hi 0))
             (return-from %dynb-value-addr
-              (if (eq (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand key 4095)) :u8) 0)
+              (if (eq (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand key 4095)) :u8) 0)
                   0
-                  (let ((ix (the fixnum (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x4C00) (%fixnum-+ (logand key 511) (logand key 511))) :u16))))
+                  (let ((ix (the fixnum (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x4C00) (%fixnum-+ (logand key 511) (logand key 511))) :u16))))
                     (let* ((i2 (%fixnum-+ ix ix)) (i4 (%fixnum-+ i2 i2))
                            (i8 (%fixnum-+ i4 i4)) (i16 (%fixnum-+ i8 i8)))
                       (if (and (> ix 0)
-                               (<= ix (the fixnum (mem-ref (%layout :main-dynb #x10010000 #xC58) :u64)))
-                               (eq (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #xFF0) i16) :u64) key))
-                          (%fixnum-+ (%layout :main-dynb #x10010000 #xFF8) i16)
+                               (<= ix (the fixnum (mem-ref (+ (%layout :main-dynb #x10010000) #xC58) :u64)))
+                               (eq (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #xFF0) i16) :u64) key))
+                          (%fixnum-+ (+ (%layout :main-dynb #x10010000) #xFF8) i16)
                           (%dynb-lookup (%conv-addr (%layout :main-dynb #x10010000)) key))))))))
         (if (and (eq hi 0) (eq lo 0))
             0
@@ -4367,8 +4367,8 @@
                (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
                    ;; main's own stack: the cell is right while main holds no
                    ;; binding of the key (its filter counter, fixed address)
-                   (and (eql (mem-ref #x10000D60 :u32) (%layout :main-dynb #x10010000 -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
-                        (eql (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
+                   (and (eql (mem-ref #x10000D60 :u32) (+ (%layout :main-dynb #x10010000) -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
         (if %gv-c (cdr %gv-c) (%gv-save %gv-key)))
       (%gv-save %gv-key)))
@@ -4402,8 +4402,8 @@
                (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
                    ;; main's own stack: the cell is right while main holds no
                    ;; binding of the key (its filter counter, fixed address)
-                   (and (eql (mem-ref #x10000D60 :u32) (%layout :main-dynb #x10010000 -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
-                        (eql (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
+                   (and (eql (mem-ref #x10000D60 :u32) (+ (%layout :main-dynb #x10010000) -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
         (if %gv-c
             (progn (set-cdr %gv-c %gv-val) %gv-val)
@@ -4437,8 +4437,8 @@
                (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
                    ;; main's own stack: the cell is right while main holds no
                    ;; binding of the key (its filter counter, fixed address)
-                   (and (eql (mem-ref #x10000D60 :u32) (%layout :main-dynb #x10010000 -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
-                        (eql (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
+                   (and (eql (mem-ref #x10000D60 :u32) (+ (%layout :main-dynb #x10010000) -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (cdr %gv-cell)
       (%gv-save %gv-key)))
 
@@ -4471,8 +4471,8 @@
                (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
                    ;; main's own stack: the cell is right while main holds no
                    ;; binding of the key (its filter counter, fixed address)
-                   (and (eql (mem-ref #x10000D60 :u32) (%layout :main-dynb #x10010000 -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
-                        (eql (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
+                   (and (eql (mem-ref #x10000D60 :u32) (+ (%layout :main-dynb #x10010000) -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand %gv-key 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-val) %gv-val)
       (%gv-set %gv-key %gv-val)))
 

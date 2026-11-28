@@ -1858,8 +1858,8 @@
                (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
                    ;; main's own stack: the cell is right while main holds no
                    ;; binding of the key (its filter counter, fixed address)
-                   (and (eql (mem-ref #x10000D60 :u32) (%layout :main-dynb #x10010000 -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
-                        (eql (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand hash 4095)) :u8) 0))))) ; ARMED MAIN THREAD
+                   (and (eql (mem-ref #x10000D60 :u32) (+ (%layout :main-dynb #x10010000) -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand hash 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if (and c (not (eq (cdr c) (%word->val #x0BADB0B5))))
             (cdr c)
@@ -1882,8 +1882,8 @@
                (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
                    ;; main's own stack: the cell is right while main holds no
                    ;; binding of the key (its filter counter, fixed address)
-                   (and (eql (mem-ref #x10000D60 :u32) (%layout :main-dynb #x10010000 -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
-                        (eql (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand hash 4095)) :u8) 0)))))
+                   (and (eql (mem-ref #x10000D60 :u32) (+ (%layout :main-dynb #x10010000) -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand hash 4095)) :u8) 0)))))
       (let ((c (%gv-site-cell hash site)))
         (if c
             (progn (set-cdr c val) val)
@@ -1910,8 +1910,8 @@
                (or (and (eql (mem-ref #x10000D60 :u32) 0) (eql (mem-ref #x10000D64 :u32) 0))
                    ;; main's own stack: the cell is right while main holds no
                    ;; binding of the key (its filter counter, fixed address)
-                   (and (eql (mem-ref #x10000D60 :u32) (%layout :main-dynb #x10010000 -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
-                        (eql (mem-ref (%fixnum-+ (%layout :main-dynb #x10010000 #x5000) (logand hash 4095)) :u8) 0))))) ; ARMED MAIN THREAD
+                   (and (eql (mem-ref #x10000D60 :u32) (+ (%layout :main-dynb #x10010000) -268435456)) (eql (mem-ref #x10000D64 :u32) 0)
+                        (eql (mem-ref (%fixnum-+ (+ (%layout :main-dynb #x10010000) #x5000) (logand hash 4095)) :u8) 0))))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site))) (if c (cdr c) (%word->val #x0BADB0B5)))
       (%gv-save hash)))
 

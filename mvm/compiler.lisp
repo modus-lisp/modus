@@ -26341,6 +26341,22 @@
 
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
+  ;; (+ (%LAYOUT :KEY DEFAULT) OFF...) is one layout address: the same literal as
+  ;; (%LAYOUT :KEY DEFAULT OFF).  The runtime source spells it with +, so a builder
+  ;; from before %LAYOUT took an offset (release 20261126) still compiles it -- as
+  ;; an add -- when `kiln windows' builds stage 1 from this tree with that builder.
+  (let ((lay nil) (sum 0) (ok (consp args)))
+    (dolist (a args)
+      (cond ((integerp a) (setq sum (+ sum a)))
+            ((and (null lay) (consp a) (symbolp (car a)) (name-eq (car a) "%LAYOUT")
+                  (consp (cdr a)) (consp (cddr a)))
+             (setq lay a))
+            (t (setq ok nil))))
+    (when (and ok lay)
+      (return-from compile-add
+        (compile-layout (list (car lay) (cadr lay) (caddr lay)
+                              (+ sum (if (consp (cdddr lay)) (car (cdddr lay)) 0)))
+                        env dest))))
   (when (%single-float-arith-applicable-p args env)
     (return-from compile-add (%compile-single-float-arith "+" args env dest)))
   (when (%double-float-arith-applicable-p args env)

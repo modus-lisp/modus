@@ -5710,7 +5710,18 @@
                          (let ((cur (%sys-lseek fd 0 1)))
                            (if (and (integerp cur) (>= cur 0))
                                (< cur (%sys-fstat-size fd))
-                               (%fd-input-ready-p fd))))))))
+                               ;; a socket or pipe: poll says "ready" at EOF
+                               ;; too, so READ what it has into the buffer (it
+                               ;; cannot block now).  0 bytes is EOF, and
+                               ;; LISTEN is false there (CLHS; SBCL answers NIL
+                               ;; for a peer that sent and closed).
+                               (and (%fd-input-ready-p fd)
+                                    (let ((n (progn (%fs-oflush s)
+                                                    (%sys-read-into-buf fd (%fs-buf s) 4096))))
+                                      (when (and (integerp n) (> n 0))
+                                        (%fs-set-bpos s 0)
+                                        (%fs-set-blen s n)
+                                        t))))))))))
             (t nil)))
         nil)))
 (defun %substring (str start end)
